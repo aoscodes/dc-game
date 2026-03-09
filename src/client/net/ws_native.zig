@@ -1,18 +1,5 @@
-//! Native (non-WASM) WebSocket transport for desktop development/testing.
-//!
-//! This is a minimal WebSocket client implementation using std.net.  It
-//! performs the HTTP upgrade handshake and then reads/writes frames in a
-//! background thread.
-//!
-//! The public API mirrors ws_browser.zig so client/main.zig can select
-//! between the two at comptime.
-
 const std = @import("std");
 const shared = @import("shared");
-
-// ---------------------------------------------------------------------------
-// Callbacks (same shape as ws_browser.zig)
-// ---------------------------------------------------------------------------
 
 pub const Callbacks = struct {
     on_open: *const fn (handle: i32) void,
@@ -34,25 +21,14 @@ fn default_cb_open(_: i32) void {}
 fn default_cb_message(_: i32, _: []const u8) void {}
 fn default_cb_close(_: i32) void {}
 
-// ---------------------------------------------------------------------------
-// WsBrowserTransport (same name as in ws_browser.zig for comptime swap)
-// ---------------------------------------------------------------------------
-
 pub const WsBrowserTransport = struct {
     stream: std.net.Stream,
     allocator: std.mem.Allocator,
     handle: i32,
     thread: std.Thread,
     alive: std.atomic.Value(bool),
-    /// Set by the caller (main) after storing the transport pointer.
-    /// The read loop waits on this before firing on_ws_open, ensuring
-    /// the transport is available when send_join() runs.
     caller_ready: std.atomic.Value(bool),
 
-    /// Connect and perform the HTTP upgrade handshake.
-    /// The read thread is NOT spawned yet — call `start(self)` after storing
-    /// this struct at its final address (e.g. in a var in main), so the thread
-    /// holds a stable pointer.
     pub fn connect(url: []const u8) error{ConnectionFailed}!WsBrowserTransport {
         const addr = parse_ws_url(url) catch return error.ConnectionFailed;
         const stream = std.net.tcpConnectToHost(
@@ -61,7 +37,6 @@ pub const WsBrowserTransport = struct {
             addr.port,
         ) catch return error.ConnectionFailed;
 
-        // HTTP WebSocket upgrade handshake
         ws_handshake(stream, addr.host, addr.path) catch {
             stream.close();
             return error.ConnectionFailed;
@@ -77,9 +52,6 @@ pub const WsBrowserTransport = struct {
         };
     }
 
-    /// Spawn the read thread.  Must be called on the final in-place address of
-    /// this struct (after `var ws_transport = try connect(...)`), and AFTER
-    /// storing the transport in g_state so that on_ws_open → send_join works.
     pub fn notify_open(self: *WsBrowserTransport) void {
         self.caller_ready.store(true, .release);
         self.thread = std.Thread.spawn(.{}, read_loop, .{self}) catch {
@@ -106,14 +78,7 @@ pub const WsBrowserTransport = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Background read loop
-// ---------------------------------------------------------------------------
-
 fn read_loop(self: *WsBrowserTransport) void {
-    // Transport is guaranteed stored in g_state before this thread starts
-    // (notify_open both sets caller_ready and spawns this thread).
-    // Fire on_ws_open immediately — send_join will find a non-null transport.
     g_callbacks.on_open(self.handle);
 
     var buf: [8192]u8 = undefined;
@@ -128,13 +93,12 @@ fn read_loop(self: *WsBrowserTransport) void {
             break;
         }
         if (frame.opcode == 9) {
-            // Ping — send pong (opcode 10)
             write_frame_opcode(self.stream, 10, frame.payload) catch |err| {
                 std.log.err("read_loop: pong write error: {}", .{err});
             };
             continue;
         }
-        if (frame.opcode == 2 or frame.opcode == 1) { // binary or text
+        if (frame.opcode == 2 or frame.opcode == 1) {
             g_callbacks.on_message(self.handle, frame.payload);
         }
     }
@@ -142,17 +106,11 @@ fn read_loop(self: *WsBrowserTransport) void {
     g_callbacks.on_close(self.handle);
 }
 
-// ---------------------------------------------------------------------------
-// Minimal WS framing
-// ---------------------------------------------------------------------------
-
 const Frame = struct {
     opcode: u8,
     payload: []u8,
 };
 
-/// Read one WebSocket frame from `stream` into `buf`.
-/// Only handles unmasked frames (server→client).
 fn read_frame(stream: std.net.Stream, buf: []u8) !Frame {
     var header: [2]u8 = undefined;
     _ = try stream.read(&header);
@@ -171,8 +129,6 @@ fn read_frame(stream: std.net.Stream, buf: []u8) !Frame {
     }
 
     if (mask_bit) {
-        // Server-to-client frames should not be masked per RFC 6455,
-        // but we drain the 4-byte mask key if present.
         var mask_scratch: [4]u8 = undefined;
         _ = try stream.read(&mask_scratch);
     }
@@ -186,12 +142,11 @@ fn read_frame(stream: std.net.Stream, buf: []u8) !Frame {
     return .{ .opcode = opcode, .payload = slice };
 }
 
-/// Write one masked WebSocket frame with a given opcode to `stream`.
 fn write_frame_opcode(stream: std.net.Stream, opcode: u8, payload: []const u8) !void {
     var header_buf: [10 + 4]u8 = undefined;
     var pos: usize = 0;
 
-    header_buf[pos] = 0x80 | (opcode & 0x0F); // FIN + opcode
+    header_buf[pos] = 0x80 | (opcode & 0x0F);
     pos += 1;
 
     const len = payload.len;
@@ -241,16 +196,15 @@ fn write_frame_opcode(stream: std.net.Stream, opcode: u8, payload: []const u8) !
     }
 }
 
-/// Write one masked binary WebSocket frame to `stream`.
 fn write_frame(stream: std.net.Stream, payload: []const u8) !void {
     var header_buf: [10 + 4]u8 = undefined;
     var pos: usize = 0;
 
     header_buf[pos] = 0x82;
-    pos += 1; // FIN + opcode=binary
+    pos += 1;
 
     const len = payload.len;
-    const mask_key = [4]u8{ 0xDE, 0xAD, 0xBE, 0xEF }; // static mask for dev
+    const mask_key = [4]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
 
     if (len <= 125) {
         header_buf[pos] = @as(u8, @intCast(len)) | 0x80;
@@ -284,7 +238,6 @@ fn write_frame(stream: std.net.Stream, payload: []const u8) !void {
 
     try stream.writeAll(header_buf[0..pos]);
 
-    // Write masked payload
     var tmp_buf: [4096]u8 = undefined;
     var off: usize = 0;
     while (off < len) {
@@ -297,14 +250,9 @@ fn write_frame(stream: std.net.Stream, payload: []const u8) !void {
     }
 }
 
-// ---------------------------------------------------------------------------
-// HTTP upgrade handshake
-// ---------------------------------------------------------------------------
-
 const ParsedUrl = struct { host: []const u8, port: u16, path: []const u8 };
 
 fn parse_ws_url(url: []const u8) !ParsedUrl {
-    // Expect ws://host[:port][/path]
     var rest = url;
     if (std.mem.startsWith(u8, rest, "ws://")) {
         rest = rest[5..];
@@ -317,9 +265,9 @@ fn parse_ws_url(url: []const u8) !ParsedUrl {
     const path: []const u8 = if (slash) |s| rest[s..] else "/";
 
     const colon = std.mem.indexOf(u8, host_port, ":");
-    const host: []const u8 = if (colon) |c| host_port[0..c] else host_port;
-    const port: u16 = if (colon) |c|
-        std.fmt.parseInt(u16, host_port[c + 1 ..], 10) catch 80
+    const host: []const u8 = if (colon) |col| host_port[0..col] else host_port;
+    const port: u16 = if (colon) |col|
+        std.fmt.parseInt(u16, host_port[col + 1 ..], 10) catch 80
     else
         80;
 
@@ -327,7 +275,6 @@ fn parse_ws_url(url: []const u8) !ParsedUrl {
 }
 
 fn ws_handshake(stream: std.net.Stream, host: []const u8, path: []const u8) !void {
-    // Minimal HTTP/1.1 upgrade request
     var buf: [512]u8 = undefined;
     const req = try std.fmt.bufPrint(
         &buf,
@@ -341,7 +288,6 @@ fn ws_handshake(stream: std.net.Stream, host: []const u8, path: []const u8) !voi
     );
     try stream.writeAll(req);
 
-    // Read response until \r\n\r\n
     var resp_buf: [1024]u8 = undefined;
     var resp_len: usize = 0;
     while (resp_len < resp_buf.len) {
@@ -349,6 +295,5 @@ fn ws_handshake(stream: std.net.Stream, host: []const u8, path: []const u8) !voi
         resp_len += n;
         if (resp_len >= 4 and std.mem.eql(u8, resp_buf[resp_len - 4 .. resp_len], "\r\n\r\n")) break;
     }
-    // Verify 101 Switching Protocols
     if (!std.mem.startsWith(u8, &resp_buf, "HTTP/1.1 101")) return error.HandshakeFailed;
 }

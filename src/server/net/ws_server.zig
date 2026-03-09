@@ -7,9 +7,6 @@ const std = @import("std");
 const ws = @import("websocket");
 const shared = @import("shared");
 
-/// A Transport backed by a single websocket.zig connection.
-///
-/// `conn` must outlive the returned Transport value.
 pub fn conn_transport(conn: *ws.Conn) shared.Transport {
     return .{ .send_fn = conn_send, .ctx = conn };
 }

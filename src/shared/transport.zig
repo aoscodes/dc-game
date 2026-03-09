@@ -11,31 +11,15 @@
 
 const std = @import("std");
 
-// ---------------------------------------------------------------------------
-// Transport
-// ---------------------------------------------------------------------------
-
-/// A type-erased, non-owning handle to a send channel.
-///
-/// The concrete implementation stores its state behind `ctx` and provides
-/// `send_fn`.  The Transport value itself is small (two pointers) and cheap
-/// to copy; the backing connection object must outlive all Transport copies.
 pub const Transport = struct {
     send_fn: *const fn (ctx: *anyopaque, msg: []const u8) anyerror!void,
     ctx: *anyopaque,
 
-    /// Send `msg` over the underlying channel.
-    /// Errors are propagated from the concrete implementation.
     pub fn send(self: Transport, msg: []const u8) !void {
         return self.send_fn(self.ctx, msg);
     }
 };
 
-// ---------------------------------------------------------------------------
-// Null transport (useful for tests / AI-only sessions)
-// ---------------------------------------------------------------------------
-
-/// A Transport that silently discards every message.  No allocation needed.
 pub const null_transport = Transport{
     .send_fn = null_send,
     .ctx = @ptrFromInt(1), // non-null sentinel; never dereferenced
@@ -43,14 +27,6 @@ pub const null_transport = Transport{
 
 fn null_send(_: *anyopaque, _: []const u8) anyerror!void {}
 
-// ---------------------------------------------------------------------------
-// Buffer transport (useful for unit tests)
-// ---------------------------------------------------------------------------
-
-/// Accumulates sent messages into a caller-provided buffer (ArrayList(u8)).
-/// Use `BufferTransport.transport()` to obtain the Transport handle.
-/// The caller owns the ArrayList and must pass the same allocator to every
-/// ArrayList method (Zig 0.15 unmanaged style).
 pub const BufferTransport = struct {
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -64,10 +40,6 @@ pub const BufferTransport = struct {
         try self.buf.appendSlice(self.allocator, msg);
     }
 };
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 test "null_transport discards silently" {
     try null_transport.send("hello");

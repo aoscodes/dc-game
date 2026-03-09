@@ -1,38 +1,21 @@
-//! Client rendering: lobby and game scenes.
-//!
-//! All visuals are colored rectangles + text (no sprites in this build).
-//! The renderer reads from a `ClientState` struct that the main loop maintains.
-//! It does not touch the network or ECS directly.
-
 const rl = @import("raylib");
 const shared = @import("shared");
 const proto = shared.protocol;
 const c = shared.components;
 const input = @import("input.zig");
 
-// ---------------------------------------------------------------------------
-// Layout constants
-// ---------------------------------------------------------------------------
-
 pub const SW: f32 = 1024;
 pub const SH: f32 = 768;
 
-/// Size of a single character cell on a grid.
 const CELL_W: f32 = 90;
 const CELL_H: f32 = 100;
 const CELL_PAD: f32 = 6;
 
-/// Top-left origin of the player grid (left side of screen).
 const PLAYER_GRID_X: f32 = 60;
 const PLAYER_GRID_Y: f32 = 180;
 
-/// Top-left origin of the enemy grid (right side of screen).
 const ENEMY_GRID_X: f32 = SW - 60 - (CELL_W + CELL_PAD) * 3;
 const ENEMY_GRID_Y: f32 = 180;
-
-// ---------------------------------------------------------------------------
-// Colors
-// ---------------------------------------------------------------------------
 
 fn class_color(class: c.ClassTag) rl.Color {
     return switch (class) {
@@ -58,60 +41,39 @@ const COLOR_MITIGATED = rl.Color{ .r = 80, .g = 120, .b = 255, .a = 80 };
 const COLOR_TEXT = rl.Color{ .r = 230, .g = 230, .b = 230, .a = 255 };
 const COLOR_HEADER = rl.Color{ .r = 180, .g = 200, .b = 255, .a = 255 };
 
-// ---------------------------------------------------------------------------
-// Scene discriminant
-// ---------------------------------------------------------------------------
-
 pub const SceneTag = enum { lobby, game };
-
-// ---------------------------------------------------------------------------
-// Lobby scene data
-// ---------------------------------------------------------------------------
 
 pub const LobbyState = struct {
     update: proto.LobbyUpdate = std.mem.zeroes(proto.LobbyUpdate),
     our_player_id: u8 = 0xFF,
     selected_class: c.ClassTag = .fighter,
     ready: bool = false,
-    /// User-visible error string (e.g. "Connection lost").
     error_msg: [64]u8 = [_]u8{0} ** 64,
     error_msg_len: u8 = 0,
 };
-
-// ---------------------------------------------------------------------------
-// Game scene data
-// ---------------------------------------------------------------------------
 
 pub const GameState = struct {
     snapshot: proto.GameState = std.mem.zeroes(proto.GameState),
     our_player_id: u8 = 0xFF,
     our_entity: u32 = std.math.maxInt(u32),
     cursor: input.InputState = .{},
-    /// true = targeting enemy grid; false = targeting player grid (heal)
     targeting_enemy: bool = true,
     action_selected: ?proto.ActionTag = null,
     wave_label: [32]u8 = [_]u8{0} ** 32,
     wave_label_len: u8 = 0,
 };
 
-// ---------------------------------------------------------------------------
-// draw_lobby
-// ---------------------------------------------------------------------------
-
 pub fn draw_lobby(state: *const LobbyState) void {
     rl.clearBackground(COLOR_BG);
 
-    // Title
     rl.drawText("JRPG  —  Lobby", 40, 30, 32, COLOR_HEADER);
 
-    // Join code
     {
         var buf: [32]u8 = undefined;
         const s = std.fmt.bufPrintZ(&buf, "Room: {s}", .{state.update.join_code}) catch "Room: ??????";
         rl.drawText(s, 40, 80, 22, COLOR_TEXT);
     }
 
-    // Player list
     const list_y: i32 = 130;
     {
         var i: u8 = 0;
@@ -136,7 +98,6 @@ pub fn draw_lobby(state: *const LobbyState) void {
         }
     }
 
-    // Class picker (for our slot)
     {
         const picker_y: i32 = list_y + @as(i32, proto.MAX_PLAYERS) * 36 + 20;
         rl.drawText("Class:  [1] Fighter   [2] Mage   [3] Healer", 60, picker_y, 18, COLOR_TEXT);
@@ -149,7 +110,6 @@ pub fn draw_lobby(state: *const LobbyState) void {
         rl.drawText(ready_label, 60, picker_y + 60, 18, COLOR_TEXT);
     }
 
-    // Error message
     if (state.error_msg_len > 0) {
         var buf: [80]u8 = undefined;
         const err_s = std.fmt.bufPrintZ(&buf, "{s}", .{state.error_msg[0..state.error_msg_len]}) catch "error";
@@ -157,14 +117,9 @@ pub fn draw_lobby(state: *const LobbyState) void {
     }
 }
 
-// ---------------------------------------------------------------------------
-// draw_game
-// ---------------------------------------------------------------------------
-
 pub fn draw_game(state: *const GameState) void {
     rl.clearBackground(COLOR_BG);
 
-    // Wave label
     {
         var buf: [48]u8 = undefined;
         const s = std.fmt.bufPrintZ(&buf, "Wave: {s}", .{
@@ -173,15 +128,12 @@ pub fn draw_game(state: *const GameState) void {
         rl.drawText(s, 40, 20, 20, COLOR_HEADER);
     }
 
-    // Grid headers
     rl.drawText("ALLIES", @intFromFloat(PLAYER_GRID_X), 155, 18, COLOR_HEADER);
     rl.drawText("ENEMIES", @intFromFloat(ENEMY_GRID_X), 155, 18, .{ .r = 255, .g = 120, .b = 80, .a = 255 });
 
-    // Draw both grids
     draw_grid(state, .players, PLAYER_GRID_X, PLAYER_GRID_Y);
     draw_grid(state, .enemies, ENEMY_GRID_X, ENEMY_GRID_Y);
 
-    // Action menu (only when it's our turn and we haven't committed yet)
     if (state.cursor.is_our_turn) {
         draw_action_menu(state);
     }
@@ -192,7 +144,6 @@ fn draw_grid(state: *const GameState, team: c.TeamId, ox: f32, oy: f32) void {
         (team == .enemies and state.cursor.is_our_turn and state.targeting_enemy) or
         (team == .players and state.cursor.is_our_turn and !state.targeting_enemy);
 
-    // Draw empty cell backgrounds
     {
         var col: u8 = 0;
         while (col < 3) : (col += 1) {
@@ -208,7 +159,6 @@ fn draw_grid(state: *const GameState, team: c.TeamId, ox: f32, oy: f32) void {
         }
     }
 
-    // Draw entities on this grid
     {
         var i: u8 = 0;
         while (i < state.snapshot.entity_count) : (i += 1) {
@@ -218,13 +168,11 @@ fn draw_grid(state: *const GameState, team: c.TeamId, ox: f32, oy: f32) void {
             const cx = ox + @as(f32, @floatFromInt(e.grid_col)) * (CELL_W + CELL_PAD);
             const cy = oy + @as(f32, @floatFromInt(e.grid_row)) * (CELL_H + CELL_PAD);
 
-            // Character card background
             rl.drawRectangleRec(
                 .{ .x = cx, .y = cy, .width = CELL_W, .height = CELL_H },
                 class_color(e.class),
             );
 
-            // Charging flash
             if (e.action_state == .charging) {
                 rl.drawRectangleRec(
                     .{ .x = cx, .y = cy, .width = CELL_W, .height = CELL_H },
@@ -232,7 +180,6 @@ fn draw_grid(state: *const GameState, team: c.TeamId, ox: f32, oy: f32) void {
                 );
             }
 
-            // HP bar  (top strip)
             {
                 const BAR_H: f32 = 8;
                 const frac = if (e.hp_max > 0)
@@ -243,7 +190,6 @@ fn draw_grid(state: *const GameState, team: c.TeamId, ox: f32, oy: f32) void {
                 rl.drawRectangleRec(.{ .x = cx, .y = cy, .width = CELL_W * frac, .height = BAR_H }, COLOR_HP_FILL);
             }
 
-            // ATB bar  (bottom strip)
             {
                 const BAR_H: f32 = 6;
                 const atb_y = cy + CELL_H - BAR_H;
@@ -252,7 +198,6 @@ fn draw_grid(state: *const GameState, team: c.TeamId, ox: f32, oy: f32) void {
                 rl.drawRectangleRec(.{ .x = cx, .y = atb_y, .width = CELL_W * frac, .height = BAR_H }, COLOR_ATB_FILL);
             }
 
-            // Class label
             {
                 const label: [:0]const u8 = switch (e.class) {
                     .fighter => "FTR",
@@ -266,14 +211,12 @@ fn draw_grid(state: *const GameState, team: c.TeamId, ox: f32, oy: f32) void {
                 rl.drawText(label, @intFromFloat(cx + 4), @intFromFloat(cy + 14), 16, COLOR_TEXT);
             }
 
-            // HP numbers
             {
                 var buf: [16]u8 = undefined;
                 const s = std.fmt.bufPrintZ(&buf, "{d}", .{e.hp_current}) catch "?";
                 rl.drawText(s, @intFromFloat(cx + 4), @intFromFloat(cy + 36), 14, COLOR_TEXT);
             }
 
-            // Mark our own character
             if (e.owner == state.our_player_id and team == .players) {
                 rl.drawRectangleLinesEx(
                     .{ .x = cx + 1, .y = cy + 1, .width = CELL_W - 2, .height = CELL_H - 2 },
@@ -284,7 +227,6 @@ fn draw_grid(state: *const GameState, team: c.TeamId, ox: f32, oy: f32) void {
         }
     }
 
-    // Targeting cursor overlay
     if (is_targeting) {
         const cc = state.cursor.cursor_col;
         const cr = state.cursor.cursor_row;
