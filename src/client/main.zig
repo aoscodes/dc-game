@@ -35,6 +35,49 @@ else
 
 const ClientPhase = enum { connecting, lobby, game, game_over };
 
+/// Simple mutex-protected message queue.
+/// The WS read thread pushes; the main loop pops one message at a time.
+const MsgQueue = struct {
+    /// Flat byte buffer storing length-prefixed messages (2-byte LE header).
+    buf: [16384]u8 = undefined,
+    len: usize = 0,
+    mu: std.Thread.Mutex = .{},
+
+    fn push(self: *MsgQueue, data: []const u8) void {
+        if (data.len > 0xFFFF) return;
+        self.mu.lock();
+        defer self.mu.unlock();
+        const needed = 2 + data.len;
+        if (self.len + needed > self.buf.len) {
+            std.log.warn("msg queue full, dropping {} byte message", .{data.len});
+            return;
+        }
+        self.buf[self.len] = @intCast(data.len & 0xFF);
+        self.buf[self.len + 1] = @intCast(data.len >> 8);
+        @memcpy(self.buf[self.len + 2 .. self.len + 2 + data.len], data);
+        self.len += needed;
+    }
+
+    /// Pop one message into `out`. Returns slice or null if empty.
+    fn pop(self: *MsgQueue, out: []u8) ?[]u8 {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.len < 2) return null;
+        const msg_len: usize = @as(usize, self.buf[0]) | (@as(usize, self.buf[1]) << 8);
+        if (self.len < 2 + msg_len) return null;
+        if (msg_len > out.len) {
+            // Skip oversized message.
+            std.mem.copyForwards(u8, self.buf[0..], self.buf[2 + msg_len .. self.len]);
+            self.len -= 2 + msg_len;
+            return null;
+        }
+        @memcpy(out[0..msg_len], self.buf[2 .. 2 + msg_len]);
+        std.mem.copyForwards(u8, self.buf[0..], self.buf[2 + msg_len .. self.len]);
+        self.len -= 2 + msg_len;
+        return out[0..msg_len];
+    }
+};
+
 const ClientState = struct {
     phase: ClientPhase = .connecting,
     lobby: render.LobbyState = .{},
@@ -46,17 +89,64 @@ const ClientState = struct {
 
     /// Scratch buffer for outgoing messages.
     send_buf: [512]u8 = undefined,
-    /// Scratch buffer for incoming messages (populated by ws read thread).
-    /// Access pattern: read thread writes buf+len then sets recv_ready;
-    /// main thread checks recv_ready then reads buf+len.
-    /// Must be atomic to guarantee the write is visible across threads.
-    recv_buf: [4096]u8 = undefined,
-    recv_len: usize = 0,
-    recv_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Message queue: WS read thread pushes, main loop pops.
+    recv_queue: MsgQueue = .{},
+    /// Scratch buffer used by process_recv to pop one message at a time.
+    recv_scratch: [4096]u8 = undefined,
 };
 
 /// Global client state — one instance per WASM module / process.
 var g_state: ClientState = .{};
+
+/// Server URL used by the connection loop.
+var g_server_url: []const u8 = "ws://127.0.0.1:9001";
+
+/// Set by on_ws_close (from the read thread) to signal that the connection
+/// dropped and the connect loop should retry.  Cleared by the connect loop.
+var g_need_reconnect: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Persistent storage for the WsBrowserTransport.  Lives at a stable address
+/// so the read thread can hold a pointer to it for its full lifetime.
+/// Only ever written by the connect loop thread.
+var g_ws_transport: net.WsBrowserTransport = undefined;
+var g_ws_transport_valid: bool = false;
+
+/// Long-lived thread that owns all connect/reconnect logic.
+/// Runs for the lifetime of the process.  Never touches g_state.phase directly
+/// from a racing context; instead it drives open/close in strict sequence.
+fn connect_loop(_: void) void {
+    while (true) {
+        // Attempt TCP connect + WS handshake.
+        const result = net.WsBrowserTransport.connect(g_server_url);
+        if (result) |t| {
+            // Install fresh transport at stable address.
+            g_ws_transport = t;
+            g_ws_transport_valid = true;
+            g_state.transport = g_ws_transport.transport();
+            g_need_reconnect.store(false, .monotonic);
+
+            // notify_open fires on_ws_open → send_join, spawns read thread.
+            g_ws_transport.notify_open();
+
+            // Block until the read thread exits (connection dropped or closed).
+            // notify_open spawned the thread; close() joins it.
+            // We spin-wait on g_need_reconnect which on_ws_close sets just
+            // before the read thread exits.
+            while (!g_need_reconnect.load(.acquire)) {
+                std.Thread.sleep(10 * std.time.ns_per_ms);
+            }
+
+            // Join the read thread and clean up.
+            g_ws_transport.close();
+            g_ws_transport_valid = false;
+            g_state.transport = null;
+            g_state.phase = .connecting;
+        } else |_| {
+            // Connection failed — wait before retrying.
+            std.Thread.sleep(std.time.ns_per_s);
+        }
+    }
+}
 
 /// Player display name (set before connect).
 var g_name_buf: [16]u8 = [_]u8{0} ** 16;
@@ -68,30 +158,19 @@ var g_name_len: u8 = 0;
 
 fn on_ws_open(_: i32) void {
     std.log.info("ws open", .{});
+    send_join();
 }
 
 fn on_ws_message(_: i32, data: []const u8) void {
     std.log.info("ws message: {} bytes, tag=0x{x}", .{ data.len, if (data.len > 0) data[0] else 0 });
-    // Copy into recv buffer and mark ready for main-loop processing.
-    // We process one message per frame (sufficient at 20 Hz server tick).
-    if (data.len <= g_state.recv_buf.len) {
-        @memcpy(g_state.recv_buf[0..data.len], data);
-        g_state.recv_len = data.len;
-        // Release store: buf+len writes must be visible before the flag.
-        g_state.recv_ready.store(true, .release);
-    } else {
-        std.log.warn("ws message too large ({} bytes), dropping", .{data.len});
-    }
+    g_state.recv_queue.push(data);
 }
 
 fn on_ws_close(_: i32) void {
     std.log.warn("ws closed", .{});
-    g_state.transport = null;
-    // Show reconnecting message
-    const msg = "Connection lost. Reconnecting...";
-    const len: u8 = @intCast(@min(msg.len, 63));
-    @memcpy(g_state.lobby.error_msg[0..len], msg[0..len]);
-    g_state.lobby.error_msg_len = len;
+    // Signal connect_loop to wake up and reconnect.  Do not touch phase or
+    // transport here — connect_loop owns those after the read thread exits.
+    g_need_reconnect.store(true, .release);
 }
 
 // ---------------------------------------------------------------------------
@@ -153,73 +232,66 @@ fn send_action(action: proto.ActionTag, target: u32) void {
 // ---------------------------------------------------------------------------
 
 fn process_recv() void {
-    // Acquire load: pairs with the release store in on_ws_message.
-    if (!g_state.recv_ready.load(.acquire)) return;
-    g_state.recv_ready.store(false, .monotonic);
+    // Drain all queued messages each frame.
+    while (g_state.recv_queue.pop(&g_state.recv_scratch)) |data| {
+        var fbs = std.io.fixedBufferStream(data);
+        const r = fbs.reader();
 
-    const data = g_state.recv_buf[0..g_state.recv_len];
-    var fbs = std.io.fixedBufferStream(data);
-    const r = fbs.reader();
-
-    const tag = proto.read_tag(r) catch |err| {
-        std.log.err("process_recv: bad tag: {}", .{err});
-        return;
-    };
-    std.log.info("process_recv: tag={s}", .{@tagName(tag)});
-    switch (tag) {
-        .lobby_update => {
-            const p = proto.decode_lobby_update(r) catch |err| {
-                std.log.err("decode lobby_update failed: {}", .{err});
-                return;
-            };
-            // First lobby_update is the server's ready signal.
-            // If we haven't joined yet, send join_lobby now.
-            if (g_state.our_player_id == 0xFF) {
-                send_join();
-            }
-            if (p.your_player_id != 0xFF) {
-                g_state.our_player_id = p.your_player_id;
-            }
-            g_state.lobby.update = p;
-            g_state.lobby.our_player_id = g_state.our_player_id;
-            g_state.phase = .lobby;
-        },
-        .game_start => {
-            const p = proto.decode_game_start(r) catch return;
-            g_state.our_player_id = p.your_player_id;
-            g_state.game = .{};
-            g_state.game.our_player_id = p.your_player_id;
-            g_state.game.wave_label_len = p.wave_label_len;
-            @memcpy(g_state.game.wave_label[0..p.wave_label_len], p.wave_label[0..p.wave_label_len]);
-            g_state.phase = .game;
-        },
-        .game_state => {
-            const p = proto.decode_game_state(r) catch return;
-            g_state.game.snapshot = p;
-        },
-        .your_turn => {
-            const p = proto.decode_your_turn(r) catch return;
-            // Check if the entity belongs to us
-            for (g_state.game.snapshot.entities[0..g_state.game.snapshot.entity_count]) |e| {
-                if (e.entity == p.entity and e.owner == g_state.game.our_player_id) {
-                    g_state.game.cursor.is_our_turn = true;
-                    g_state.game.cursor.cursor_col = 0;
-                    g_state.game.cursor.cursor_row = 0;
-                    g_state.game.action_selected = null;
-                    g_state.game.our_entity = p.entity;
-                    break;
+        const tag = proto.read_tag(r) catch |err| {
+            std.log.err("process_recv: bad tag: {}", .{err});
+            continue;
+        };
+        std.log.info("process_recv: tag={s}", .{@tagName(tag)});
+        switch (tag) {
+            .lobby_update => {
+                const p = proto.decode_lobby_update(r) catch |err| {
+                    std.log.err("decode lobby_update failed: {}", .{err});
+                    continue;
+                };
+                if (p.your_player_id != 0xFF) {
+                    g_state.our_player_id = p.your_player_id;
                 }
-            }
-        },
-        .game_over => {
-            _ = proto.decode_game_over(r) catch return;
-            g_state.phase = .game_over;
-        },
-        .action_result => {
-            // Currently just consumed; future: show damage numbers
-            _ = proto.decode_action_result(r) catch return;
-        },
-        else => {},
+                g_state.lobby.update = p;
+                g_state.lobby.our_player_id = g_state.our_player_id;
+                g_state.phase = .lobby;
+            },
+            .game_start => {
+                const p = proto.decode_game_start(r) catch continue;
+                g_state.our_player_id = p.your_player_id;
+                g_state.game = .{};
+                g_state.game.our_player_id = p.your_player_id;
+                g_state.game.wave_label_len = p.wave_label_len;
+                @memcpy(g_state.game.wave_label[0..p.wave_label_len], p.wave_label[0..p.wave_label_len]);
+                g_state.phase = .game;
+            },
+            .game_state => {
+                const p = proto.decode_game_state(r) catch continue;
+                g_state.game.snapshot = p;
+            },
+            .your_turn => {
+                const p = proto.decode_your_turn(r) catch continue;
+                // Check if the entity belongs to us
+                for (g_state.game.snapshot.entities[0..g_state.game.snapshot.entity_count]) |e| {
+                    if (e.entity == p.entity and e.owner == g_state.game.our_player_id) {
+                        g_state.game.cursor.is_our_turn = true;
+                        g_state.game.cursor.cursor_col = 0;
+                        g_state.game.cursor.cursor_row = 0;
+                        g_state.game.action_selected = null;
+                        g_state.game.our_entity = p.entity;
+                        break;
+                    }
+                }
+            },
+            .game_over => {
+                _ = proto.decode_game_over(r) catch continue;
+                g_state.phase = .game_over;
+            },
+            .action_result => {
+                // Currently just consumed; future: show damage numbers
+                _ = proto.decode_action_result(r) catch continue;
+            },
+            else => {},
+        }
     }
 }
 
@@ -330,9 +402,6 @@ pub fn main() !void {
     g_name_len = @intCast(default_name.len);
     @memcpy(g_name_buf[0..g_name_len], default_name);
 
-    // Server URL: env var WS_URL or default localhost.
-    const server_url = "ws://127.0.0.1:9001";
-
     // Wire up WS callbacks
     net.set_callbacks(.{
         .on_open = on_ws_open,
@@ -340,17 +409,16 @@ pub fn main() !void {
         .on_close = on_ws_close,
     });
 
-    // Connect — assign transport BEFORE firing on_open so send_join() works.
-    var ws_transport = try net.WsBrowserTransport.connect(server_url);
-    g_state.transport = ws_transport.transport();
-    ws_transport.notify_open();
+    // Spawn the persistent connect loop — it handles all reconnect logic.
+    const loop_thread = try std.Thread.spawn(.{}, connect_loop, .{{}});
+    loop_thread.detach();
 
     rl.initWindow(@intFromFloat(render.SW), @intFromFloat(render.SH), "JRPG Client");
     defer rl.closeWindow();
     rl.setTargetFPS(60);
 
     while (!rl.windowShouldClose()) {
-        // Process any pending incoming message
+        // Process any pending incoming messages
         process_recv();
 
         // Update
@@ -382,6 +450,4 @@ pub fn main() !void {
 
         rl.drawFPS(4, 4);
     }
-
-    ws_transport.close();
 }

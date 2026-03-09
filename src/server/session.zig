@@ -166,8 +166,17 @@ pub const Session = struct {
 
     pub fn disconnect(self: *Session, player_id: u8) void {
         if (player_id >= MAX_PLAYERS) return;
-        self.players[player_id].connected = false;
-        self.players[player_id].transport = null;
+        const p = &self.players[player_id];
+        p.connected = false;
+        p.transport = null;
+        // Free the slot entirely if the game hasn't started; otherwise keep
+        // it so the player can reconnect mid-game.
+        if (self.phase == .lobby) {
+            p.occupied = false;
+            p.ready = false;
+            p.name_len = 0;
+            self.player_count -= 1;
+        }
     }
 
     pub fn set_class(self: *Session, player_id: u8, class: c.ClassTag) void {
