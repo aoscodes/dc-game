@@ -1,0 +1,29 @@
+First, criticize this prompt and ask clarification questions to re-write the prompt before we use it:
+
+
+-------------
+
+Lets use this codebase to make a small game. Make a plan to build the game I describe. Break the plan up between multiple agents if necessary. 
+
+adhere strictly to the ECS architecture laid out in the codebase already.
+Game will be 2d with simple pixel sprites. It will be a multiplayer game in the browser, so we will compile to WASM. Each player will play in their own browser instance.
+
+The game will be similar to an oldschool JRPG with simplified mechanics. The game is not turn based, however. Instead players and enemies 
+will have a "speed" attribute which will effect how often they can make an action.
+Players can choose between to attack or defend.
+
+
+Players will deploy to a 3x4 grid. row 1 will be the "Front Rank". Row 2 will be the "Mid Rank". Row 3 will be the "Back Rank". 
+AI enemies will deploy on a similar grid. 
+
+
+We will have a "holy trinity" class structure meaning "healer" "mage" "fighter". 
+
+Fighter can attack a single target or defend in a "triangle" (on the grid) behind them, adding damage mitigation to any character they are in front of.
+
+Mages can attack in an area of effect on the enemy grid or defend themselves.
+
+Healers can heal in an area of effect on the player grid or defend themselves.
+
+
+-------------
