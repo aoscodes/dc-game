@@ -32,7 +32,8 @@ The client connects to `ws://127.0.0.1:9001`. **Start the server first** — the
 | `zig build server` | Game server (`zig-out/bin/jrpg_server`) |
 | `zig build run-server` | Build + run server |
 | `zig build -Dtarget=wasm32-emscripten` | WASM bundle → `zig-out/web/` |
-| `zig build test` | Run all tests (protocol, game logic, ECS core) |
+| `zig build test` | Unit + integration tests (protocol, game logic, ECS, session) |
+| `zig build e2e` | E2E test: spawn real server, 2 bot clients, assert players win |
 
 ## WASM / browser
 
@@ -69,7 +70,7 @@ When your ATB bar fills the server sends `YourTurn`. Then:
 - **Mage** — 2×2 AoE on the enemy grid.
 - **Healer** — 2×2 AoE heal on the player grid.
 
-Six scripted enemy waves; clearing all waves wins the match.
+Six scripted enemy waves (`wave_01_basic` through `wave_05_boss_plus_grunts`); clearing all waves wins. `wave_01_basic` is a standalone warm-up (3 grunts, no chaining); the full campaign starts at `wave_02_spread`.
 
 ## Architecture
 
@@ -111,8 +112,11 @@ src/
   server/
     main.zig             server entry point
     session.zig          Session struct: lobby, tick, AI, broadcasts
+    session_test.zig     13 in-process integration tests (no network)
     net/
       ws_server.zig      websocket.zig → Transport adapter
+  e2e/
+    e2e_test.zig         end-to-end test (spawns server, 2 bots, full game loop)
 specs/
   game-plan.md           original milestone plan
   next-steps.md          bug fix log
