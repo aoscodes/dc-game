@@ -44,7 +44,15 @@ pub const WsBrowserTransport = struct {
     handle: i32,
     thread: std.Thread,
     alive: std.atomic.Value(bool),
+    /// Set by the caller (main) after storing the transport pointer.
+    /// The read loop waits on this before firing on_ws_open, ensuring
+    /// the transport is available when send_join() runs.
+    caller_ready: std.atomic.Value(bool),
 
+    /// Connect and perform the HTTP upgrade handshake.
+    /// The read thread is NOT spawned yet — call `start(self)` after storing
+    /// this struct at its final address (e.g. in a var in main), so the thread
+    /// holds a stable pointer.
     pub fn connect(url: []const u8) error{ConnectionFailed}!WsBrowserTransport {
         const addr = parse_ws_url(url) catch return error.ConnectionFailed;
         const stream = std.net.tcpConnectToHost(
@@ -59,35 +67,33 @@ pub const WsBrowserTransport = struct {
             return error.ConnectionFailed;
         };
 
-        var self = WsBrowserTransport{
+        return WsBrowserTransport{
             .stream = stream,
             .allocator = std.heap.page_allocator,
             .handle = 0,
             .thread = undefined,
             .alive = std.atomic.Value(bool).init(true),
+            .caller_ready = std.atomic.Value(bool).init(false),
         };
-
-        self.thread = std.Thread.spawn(.{}, read_loop, .{&self}) catch {
-            stream.close();
-            return error.ConnectionFailed;
-        };
-
-        // NOTE: on_ws_open is NOT called here.
-        // The caller must call notify_open() after assigning the transport
-        // to g_state, so that send_join() can find a non-null transport.
-        return self;
     }
 
-    /// Fire the on_open callback.  Call this after the transport has been
-    /// stored in g_state (i.e. after `g_state.transport = ws_transport.transport()`).
+    /// Spawn the read thread.  Must be called on the final in-place address of
+    /// this struct (after `var ws_transport = try connect(...)`), and AFTER
+    /// storing the transport in g_state so that on_ws_open → send_join works.
     pub fn notify_open(self: *WsBrowserTransport) void {
-        g_callbacks.on_open(self.handle);
+        self.caller_ready.store(true, .release);
+        self.thread = std.Thread.spawn(.{}, read_loop, .{self}) catch {
+            self.alive.store(false, .monotonic);
+            return;
+        };
     }
 
     pub fn close(self: *WsBrowserTransport) void {
         self.alive.store(false, .monotonic);
         self.stream.close();
-        self.thread.join();
+        if (self.caller_ready.load(.monotonic)) {
+            self.thread.join();
+        }
     }
 
     pub fn transport(self: *WsBrowserTransport) shared.Transport {
@@ -105,10 +111,29 @@ pub const WsBrowserTransport = struct {
 // ---------------------------------------------------------------------------
 
 fn read_loop(self: *WsBrowserTransport) void {
+    // Transport is guaranteed stored in g_state before this thread starts
+    // (notify_open both sets caller_ready and spawns this thread).
+    // Fire on_ws_open immediately — send_join will find a non-null transport.
+    g_callbacks.on_open(self.handle);
+
     var buf: [8192]u8 = undefined;
     while (self.alive.load(.monotonic)) {
-        const frame = read_frame(self.stream, &buf) catch break;
-        if (frame.opcode == 8) break; // close frame
+        const frame = read_frame(self.stream, &buf) catch |err| {
+            std.log.err("read_loop: read_frame error: {}", .{err});
+            break;
+        };
+        std.log.debug("read_loop: opcode={} len={}", .{ frame.opcode, frame.payload.len });
+        if (frame.opcode == 8) {
+            std.log.info("read_loop: close frame received", .{});
+            break;
+        }
+        if (frame.opcode == 9) {
+            // Ping — send pong (opcode 10)
+            write_frame_opcode(self.stream, 10, frame.payload) catch |err| {
+                std.log.err("read_loop: pong write error: {}", .{err});
+            };
+            continue;
+        }
         if (frame.opcode == 2 or frame.opcode == 1) { // binary or text
             g_callbacks.on_message(self.handle, frame.payload);
         }
@@ -159,6 +184,61 @@ fn read_frame(stream: std.net.Stream, buf: []u8) !Frame {
         total += try stream.read(slice[total..]);
     }
     return .{ .opcode = opcode, .payload = slice };
+}
+
+/// Write one masked WebSocket frame with a given opcode to `stream`.
+fn write_frame_opcode(stream: std.net.Stream, opcode: u8, payload: []const u8) !void {
+    var header_buf: [10 + 4]u8 = undefined;
+    var pos: usize = 0;
+
+    header_buf[pos] = 0x80 | (opcode & 0x0F); // FIN + opcode
+    pos += 1;
+
+    const len = payload.len;
+    const mask_key = [4]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
+
+    if (len <= 125) {
+        header_buf[pos] = @as(u8, @intCast(len)) | 0x80;
+        pos += 1;
+    } else if (len <= 65535) {
+        header_buf[pos] = 126 | 0x80;
+        pos += 1;
+        header_buf[pos] = @intCast(len >> 8);
+        pos += 1;
+        header_buf[pos] = @intCast(len & 0xFF);
+        pos += 1;
+    } else {
+        header_buf[pos] = 127 | 0x80;
+        pos += 1;
+        var i: u3 = 7;
+        while (true) : (i -= 1) {
+            header_buf[pos] = @intCast((len >> (@as(u6, i) * 8)) & 0xFF);
+            pos += 1;
+            if (i == 0) break;
+        }
+    }
+
+    header_buf[pos] = mask_key[0];
+    pos += 1;
+    header_buf[pos] = mask_key[1];
+    pos += 1;
+    header_buf[pos] = mask_key[2];
+    pos += 1;
+    header_buf[pos] = mask_key[3];
+    pos += 1;
+
+    try stream.writeAll(header_buf[0..pos]);
+
+    var tmp_buf: [4096]u8 = undefined;
+    var off: usize = 0;
+    while (off < len) {
+        const chunk = @min(tmp_buf.len, len - off);
+        for (payload[off .. off + chunk], 0..) |b, i| {
+            tmp_buf[i] = b ^ mask_key[i % 4];
+        }
+        try stream.writeAll(tmp_buf[0..chunk]);
+        off += chunk;
+    }
 }
 
 /// Write one masked binary WebSocket frame to `stream`.

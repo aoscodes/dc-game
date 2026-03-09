@@ -58,11 +58,15 @@ const Handler = struct {
         const sess = &(g_session orelse return error.NoSession);
         const t = ws_server.conn_transport(self.conn);
 
-        // Check if this is a reconnect attempt — we'll handle after receiving
-        // the first message.  For now, assign a new slot.
-        if (sess.join(t, "connecting...")) |pid| {
+        // Reserve a slot. The client must send join_lobby (or reconnect)
+        // as its first message; only then is the lobby broadcast sent.
+        // We do NOT broadcast here — the slot has no name yet and a premature
+        // lobby_update races with the client's on_open → send_join path.
+        if (sess.join(t, "")) |pid| {
             self.player_id = pid;
-            std.log.info("player {} connected", .{pid});
+            std.log.info("player {} connected (slot reserved)", .{pid});
+            // Send lobby state so the client knows the connection is live.
+            // The client will respond with join_lobby on receiving this.
             sess.broadcast_lobby_update() catch {};
         } else {
             std.log.warn("session full, rejecting connection", .{});
@@ -110,9 +114,12 @@ const Handler = struct {
         g_session_lock.lock();
         defer g_session_lock.unlock();
         const sess = &(g_session orelse return);
+        const joined = self.player_id < session_mod.MAX_PLAYERS and
+            sess.players[self.player_id].name_len > 0;
         sess.disconnect(self.player_id);
         std.log.info("player {} disconnected", .{self.player_id});
-        sess.broadcast_lobby_update() catch {};
+        // Only update lobby if the player had actually joined (sent join_lobby).
+        if (joined) sess.broadcast_lobby_update() catch {};
     }
 };
 

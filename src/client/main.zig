@@ -67,11 +67,11 @@ var g_name_len: u8 = 0;
 // ---------------------------------------------------------------------------
 
 fn on_ws_open(_: i32) void {
-    // Send JoinLobby or Reconnect
-    send_join();
+    std.log.info("ws open", .{});
 }
 
 fn on_ws_message(_: i32, data: []const u8) void {
+    std.log.info("ws message: {} bytes, tag=0x{x}", .{ data.len, if (data.len > 0) data[0] else 0 });
     // Copy into recv buffer and mark ready for main-loop processing.
     // We process one message per frame (sufficient at 20 Hz server tick).
     if (data.len <= g_state.recv_buf.len) {
@@ -79,10 +79,13 @@ fn on_ws_message(_: i32, data: []const u8) void {
         g_state.recv_len = data.len;
         // Release store: buf+len writes must be visible before the flag.
         g_state.recv_ready.store(true, .release);
+    } else {
+        std.log.warn("ws message too large ({} bytes), dropping", .{data.len});
     }
 }
 
 fn on_ws_close(_: i32) void {
+    std.log.warn("ws closed", .{});
     g_state.transport = null;
     // Show reconnecting message
     const msg = "Connection lost. Reconnecting...";
@@ -96,14 +99,18 @@ fn on_ws_close(_: i32) void {
 // ---------------------------------------------------------------------------
 
 fn send_join() void {
-    const t = g_state.transport orelse return;
+    const t = g_state.transport orelse {
+        std.log.err("send_join: no transport", .{});
+        return;
+    };
     var fbs = std.io.fixedBufferStream(&g_state.send_buf);
     const w = fbs.writer();
 
     if (g_state.our_player_id != 0xFF) {
-        // Previously assigned — attempt reconnect.
+        std.log.info("send_join: reconnect pid={}", .{g_state.our_player_id});
         proto.encode(w, .reconnect, proto.Reconnect{ .player_id = g_state.our_player_id }) catch return;
     } else {
+        std.log.info("send_join: join_lobby name={s}", .{g_name_buf[0..g_name_len]});
         var p = proto.JoinLobby{
             .name = [_]u8{0} ** 16,
             .name_len = g_name_len,
@@ -111,7 +118,10 @@ fn send_join() void {
         @memcpy(p.name[0..g_name_len], g_name_buf[0..g_name_len]);
         proto.encode(w, .join_lobby, p) catch return;
     }
-    t.send(fbs.getWritten()) catch return;
+    t.send(fbs.getWritten()) catch |err| {
+        std.log.err("send_join: send failed: {}", .{err});
+        return;
+    };
 }
 
 fn send_choose_class(class: c.ClassTag) void {
@@ -151,10 +161,22 @@ fn process_recv() void {
     var fbs = std.io.fixedBufferStream(data);
     const r = fbs.reader();
 
-    const tag = proto.read_tag(r) catch return;
+    const tag = proto.read_tag(r) catch |err| {
+        std.log.err("process_recv: bad tag: {}", .{err});
+        return;
+    };
+    std.log.info("process_recv: tag={s}", .{@tagName(tag)});
     switch (tag) {
         .lobby_update => {
-            const p = proto.decode_lobby_update(r) catch return;
+            const p = proto.decode_lobby_update(r) catch |err| {
+                std.log.err("decode lobby_update failed: {}", .{err});
+                return;
+            };
+            // First lobby_update is the server's ready signal.
+            // If we haven't joined yet, send join_lobby now.
+            if (g_state.our_player_id == 0xFF) {
+                send_join();
+            }
             if (p.your_player_id != 0xFF) {
                 g_state.our_player_id = p.your_player_id;
             }
