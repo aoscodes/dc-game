@@ -292,12 +292,13 @@ pub const Session = struct {
     // ------------------------------------------------------------------
 
     pub fn tick(self: *Session, dt: f32) !void {
+        // Always drain queues so lobby messages (join_lobby, choose_class,
+        // ready_up) are processed even before the game starts.
+        try self.drain_queues();
+
         if (self.phase != .playing) return;
 
         self.tick_count += 1;
-
-        // Drain incoming client messages
-        try self.drain_queues();
 
         // Tick ATB
         self.world.get_system(AtbSystem).dt = dt;
@@ -336,10 +337,12 @@ pub const Session = struct {
             p.msg_queue.clearRetainingCapacity();
             p.queue_lock.unlock();
 
-            // Process the message
+            // Process all messages in the copied buffer.
             var fbs = std.io.fixedBufferStream(local_buf[0..len]);
-            const tag = proto.read_tag(fbs.reader()) catch continue;
-            self.handle_client_message(p.player_id, tag, &fbs) catch continue;
+            while (fbs.pos < len) {
+                const tag = proto.read_tag(fbs.reader()) catch break;
+                self.handle_client_message(p.player_id, tag, &fbs) catch {};
+            }
         }
     }
 
@@ -433,6 +436,12 @@ pub const Session = struct {
         const as = self.world.get_component(actor, c.ActionState);
         if (as.tag != .charging) return; // not this player's turn
 
+        // Consume the turn unconditionally: reset ATB now so the entity
+        // re-enters the idle→charging cycle even if the chosen target is
+        // already dead (avoids permanent `.charging` lock-out).
+        logic.reset_atb(self.world.get_component(actor, c.Speed));
+        as.tag = .idle;
+
         const actor_stats = self.world.get_component(actor, c.Stats);
         const actor_class = self.world.get_component(actor, c.Class);
         const actor_pos = self.world.get_component(actor, c.GridPos);
@@ -450,9 +459,6 @@ pub const Session = struct {
                 try self.resolve_defend(actor, actor_class.tag, actor_pos.*);
             },
         }
-
-        logic.reset_atb(self.world.get_component(actor, c.Speed));
-        as.tag = .idle;
     }
 
     fn resolve_fighter_attack(
@@ -683,6 +689,10 @@ pub const Session = struct {
         }
 
         for (actors[0..n_actors]) |actor| {
+            // The actor may have been killed by an AoE from a previous actor
+            // in this same batch (e.g. archers dealing self-splash).  Skip it.
+            if (self.find_living(actor) == null) continue;
+
             const actor_class = self.world.get_component(actor, c.Class);
             const actor_stats = self.world.get_component(actor, c.Stats);
             const actor_pos = self.world.get_component(actor, c.GridPos);
@@ -694,6 +704,8 @@ pub const Session = struct {
                 else => try self.ai_attack_front_rank(actor, actor_stats),
             }
 
+            // Re-check: AoE may have killed the actor itself.
+            if (self.find_living(actor) == null) continue;
             logic.reset_atb(self.world.get_component(actor, c.Speed));
             self.world.get_component(actor, c.ActionState).tag = .idle;
         }

@@ -81,7 +81,9 @@ pub fn resolve_stats(class: ClassTag, override: StatOverride) DefaultStats {
 // Wave scripts
 // ---------------------------------------------------------------------------
 
-/// wave_01_basic — three grunts in the front rank; easiest encounter.
+/// wave_01_basic — three grunts in the front rank; easiest standalone encounter.
+/// No chaining: intended as a self-contained tutorial or matchmaking warm-up.
+/// The full campaign starts with wave_02_spread.
 pub const wave_01_basic = Wave{
     .label = "wave_01_basic",
     .entries = &[_]SpawnEntry{
@@ -89,7 +91,7 @@ pub const wave_01_basic = Wave{
         .{ .class = .grunt, .grid_col = 1, .grid_row = 0 },
         .{ .class = .grunt, .grid_col = 2, .grid_row = 0 },
     },
-    .next_wave = "wave_02_spread",
+    .next_wave = null,
 };
 
 /// wave_02_spread — grunts and archers spread across all three rows.
