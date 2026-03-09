@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>JRPG</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #111;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: monospace;
+      color: #ccc;
+    }
+    #canvas-container {
+      position: relative;
+    }
+    canvas {
+      display: block;
+      image-rendering: pixelated;
+    }
+    #status {
+      margin-top: 8px;
+      font-size: 13px;
+      color: #888;
+    }
+    #name-form {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+    }
+    #name-form input {
+      background: #222;
+      border: 1px solid #444;
+      color: #eee;
+      padding: 8px 12px;
+      font-family: monospace;
+      font-size: 16px;
+      width: 200px;
+    }
+    #name-form button {
+      background: #334;
+      border: 1px solid #55f;
+      color: #aaf;
+      padding: 8px 24px;
+      font-family: monospace;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    #name-form button:hover { background: #445; }
+    #game-wrapper { display: none; }
+  </style>
+</head>
+<body>
+
+<!-- Name entry — shown before WASM loads -->
+<div id="name-form">
+  <p style="font-size:20px;color:#aaf;">JRPG — Enter your name</p>
+  <input id="player-name" type="text" maxlength="16" placeholder="Player" autofocus />
+  <button id="join-btn">Join Game</button>
+</div>
+
+<div id="game-wrapper">
+  <div id="canvas-container">
+    <!-- Emscripten injects the canvas here -->
+    <canvas id="canvas"></canvas>
+  </div>
+  <div id="status">Connecting...</div>
+</div>
+
+<script src="ws_glue.js"></script>
+<script>
+"use strict";
+
+// ---------------------------------------------------------------------------
+// Name → sessionStorage
+// ---------------------------------------------------------------------------
+const savedName = sessionStorage.getItem("player_name") || "";
+const savedPid  = sessionStorage.getItem("player_id");
+
+document.getElementById("player-name").value = savedName;
+
+document.getElementById("join-btn").addEventListener("click", () => {
+  const name = document.getElementById("player-name").value.trim() || "Player";
+  sessionStorage.setItem("player_name", name);
+  document.getElementById("name-form").style.display = "none";
+  document.getElementById("game-wrapper").style.display = "block";
+  startGame(name);
+});
+
+// Allow Enter key in name field
+document.getElementById("player-name").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") document.getElementById("join-btn").click();
+});
+
+// ---------------------------------------------------------------------------
+// WASM / Emscripten bootstrap
+// ---------------------------------------------------------------------------
+function startGame(playerName) {
+  const wsGlue = createWsGlue();
+
+  // Derive server URL from current page origin (ws:// or wss://)
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const serverUrl = `${protocol}//${location.hostname}:9001`;
+
+  // Emscripten module configuration
+  const Module = {
+    canvas: document.getElementById("canvas"),
+
+    // Inject ws_glue env functions into Emscripten's import object.
+    // Emscripten looks for a global `Module.env` or merges via
+    // `instantiateWasm` when provided.
+    instantiateWasm(imports, successCallback) {
+      // Merge our env into Emscripten's env imports
+      Object.assign(imports.env, wsGlue.env);
+
+      // Also expose player name and server URL as null-terminated strings
+      // in WASM memory via a small JS helper called after instantiation.
+      fetch("jrpg_client.wasm")
+        .then(r => r.arrayBuffer())
+        .then(buf => WebAssembly.instantiate(buf, imports))
+        .then(({ instance, module }) => {
+          wsGlue.setInstance(instance.exports, instance.exports.memory);
+          successCallback(instance, module);
+
+          // Write player name into WASM memory so main() can read it
+          writePlayerName(instance.exports, playerName);
+
+          // Write reconnect pid if we have one
+          if (savedPid !== null) {
+            writeSavedPid(instance.exports, parseInt(savedPid, 10));
+          }
+
+          // Write server URL
+          writeServerUrl(instance.exports, serverUrl);
+        })
+        .catch(err => {
+          console.error("WASM load failed:", err);
+          document.getElementById("status").textContent = "Failed to load game.";
+        });
+
+      return {}; // signal async init
+    },
+
+    print(text) { console.log("[game]", text); },
+    printErr(text) { console.warn("[game:err]", text); },
+
+    onRuntimeInitialized() {
+      document.getElementById("status").textContent = "Connected";
+    },
+  };
+
+  window.Module = Module;
+
+  // Load the Emscripten-generated JS glue script
+  const script = document.createElement("script");
+  script.src = "jrpg_client.js";
+  document.body.appendChild(script);
+}
+
+// ---------------------------------------------------------------------------
+// WASM memory helpers
+// ---------------------------------------------------------------------------
+
+function writeNullTerminated(exports, ptr, str) {
+  const mem = new Uint8Array(exports.memory.buffer);
+  const enc = new TextEncoder().encode(str);
+  mem.set(enc, ptr);
+  mem[ptr + enc.length] = 0;
+}
+
+function writePlayerName(exports, name) {
+  if (!exports.g_name_ptr) return; // export not available; main handles default
+  writeNullTerminated(exports, exports.g_name_ptr.value, name.slice(0, 16));
+}
+
+function writeSavedPid(exports, pid) {
+  if (!exports.g_saved_pid) return;
+  const view = new DataView(exports.memory.buffer);
+  view.setUint8(exports.g_saved_pid.value, pid);
+}
+
+function writeServerUrl(exports, url) {
+  if (!exports.g_server_url_ptr) return;
+  writeNullTerminated(exports, exports.g_server_url_ptr.value, url);
+}
+
+// Persist player_id when received from server (called by WASM via export)
+// This is wired up through the Zig export `save_player_id(u8)`.
+window.save_player_id = function(pid) {
+  sessionStorage.setItem("player_id", pid);
+};
+</script>
+</body>
+</html>

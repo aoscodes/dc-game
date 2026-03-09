@@ -1,62 +1,13 @@
 const std = @import("std");
 
-// Although this function looks imperative, it does not perform the build
-// directly and instead it mutates the build graph (`b`) that will be then
-// executed by an external runner. The functions in `std.Build` implement a DSL
-// for defining build steps and express dependencies between them, allowing the
-// build runner to parallelize the build automatically (and the cache system to
-// know when a step doesn't need to be re-run).
-pub fn build(b: *std.Build) void {
-    // Standard target options allow the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
+pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
-    // Standard optimization options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
-    // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
-    // It's also possible to define more custom flags to toggle optional features
-    // of this build script using `b.option()`. All defined flags (including
-    // target and optimize options) will be listed when running `zig build --help`
-    // in this directory.
 
-    // This creates a module, which represents a collection of source files alongside
-    // some compilation options, such as optimization mode and linked system libraries.
-    // Zig modules are the preferred way of making Zig code available to consumers.
-    // addModule defines a module that we intend to make available for importing
-    // to our consumers. We must give it a name because a Zig package can expose
-    // multiple modules and consumers will need to be able to specify which
-    // module they want to access.
-    const mod = b.addModule("ecs_zig", .{
-        // The root source file is the "entry point" of this module. Users of
-        // this module will only be able to access public declarations contained
-        // in this file, which means that if you have declarations that you
-        // intend to expose to consumers that were defined in other files part
-        // of this module, you will have to make sure to re-export them from
-        // the root file.
-        .root_source_file = b.path("src/root.zig"),
-        // Later on we'll use this module as the root module of a test executable
-        // which requires us to specify a target.
-        .target = target,
-    });
+    // -----------------------------------------------------------------------
+    // Dependencies
+    // -----------------------------------------------------------------------
 
-    // Here we define an executable. An executable needs to have a root module
-    // which needs to expose a `main` function. While we could add a main function
-    // to the module defined above, it's sometimes preferable to split business
-    // logic and the CLI into two separate modules.
-    //
-    // If your goal is to create a Zig library for others to use, consider if
-    // it might benefit from also exposing a CLI tool. A parser library for a
-    // data serialization format could also bundle a CLI syntax checker, for example.
-    //
-    // If instead your goal is to create an executable, consider if users might
-    // be interested in also being able to embed the core functionality of your
-    // program in their own executable in order to avoid the overhead involved in
-    // subprocessing your CLI tool.
-    //
-    // If neither case applies to you, feel free to delete the declaration you
-    // don't need and to put everything under a single module.
     const raylib_dep = b.dependency("raylib_zig", .{
         .target = target,
         .optimize = optimize,
@@ -64,88 +15,154 @@ pub fn build(b: *std.Build) void {
     const raylib_mod = raylib_dep.module("raylib");
     const raylib_artifact = raylib_dep.artifact("raylib");
 
-    const exe = b.addExecutable(.{
-        .name = "ecs_zig",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+    const ws_dep = b.dependency("websocket", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const ws_mod = ws_dep.module("websocket");
+
+    // -----------------------------------------------------------------------
+    // Shared module
+    // -----------------------------------------------------------------------
+
+    // A single module that both client and server import.  Contains all
+    // component definitions, the wire protocol, transport interface, wave
+    // scripts, and pure game logic.  Registered as "shared" in every
+    // downstream module's import list.
+    const shared_mod = b.addModule("shared", .{
+        .root_source_file = b.path("src/shared/shared.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // -----------------------------------------------------------------------
+    // ECS core module
+    // -----------------------------------------------------------------------
+
+    const ecs_mod = b.addModule("ecs_zig", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // -----------------------------------------------------------------------
+    // Build path: WASM client vs native client vs server
+    // -----------------------------------------------------------------------
+
+    const is_wasm = target.query.os_tag == .emscripten;
+
+    if (is_wasm) {
+        // -------------------------------------------------------------------
+        // WASM client  (zig build -Dtarget=wasm32-emscripten)
+        // -------------------------------------------------------------------
+        const rlz = @import("raylib_zig");
+        const emsdk_dep = b.dependency("emsdk", .{});
+
+        const client_mod = b.createModule(.{
+            .root_source_file = b.path("src/client/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "ecs_zig", .module = mod },
+                .{ .name = "ecs_zig", .module = ecs_mod },
                 .{ .name = "raylib", .module = raylib_mod },
+                .{ .name = "shared", .module = shared_mod },
             },
-        }),
-    });
-    exe.root_module.linkLibrary(raylib_artifact);
+        });
 
-    // This declares intent for the executable to be installed into the
-    // install prefix when running `zig build` (i.e. when executing the default
-    // step). By default the install prefix is `zig-out/` but can be overridden
-    // by passing `--prefix` or `-p`.
-    b.installArtifact(exe);
+        const wasm = b.addLibrary(.{
+            .name = "jrpg_client",
+            .root_module = client_mod,
+        });
+        wasm.root_module.linkLibrary(raylib_artifact);
 
-    // This creates a top level step. Top level steps have a name and can be
-    // invoked by name when running `zig build` (e.g. `zig build run`).
-    // This will evaluate the `run` step rather than the default step.
-    // For a top level step to actually do something, it must depend on other
-    // steps (e.g. a Run step, as we will see in a moment).
-    const run_step = b.step("run", "Run the app");
+        const emcc_flags = rlz.emsdk.emccDefaultFlags(b.allocator, .{ .optimize = optimize });
+        const emcc_settings = rlz.emsdk.emccDefaultSettings(b.allocator, .{ .optimize = optimize });
 
-    // This creates a RunArtifact step in the build graph. A RunArtifact step
-    // invokes an executable compiled by Zig. Steps will only be executed by the
-    // runner if invoked directly by the user (in the case of top level steps)
-    // or if another step depends on it, so it's up to you to define when and
-    // how this Run step will be executed. In our case we want to run it when
-    // the user runs `zig build run`, so we create a dependency link.
-    const run_cmd = b.addRunArtifact(exe);
-    run_step.dependOn(&run_cmd.step);
+        const emcc_step = rlz.emsdk.emccStep(b, raylib_artifact, wasm, .{
+            .optimize = optimize,
+            .flags = emcc_flags,
+            .settings = emcc_settings,
+            .shell_file_path = rlz.emsdk.shell(raylib_dep.builder),
+            .install_dir = .{ .custom = "web" },
+            .embed_paths = &.{},
+        });
+        _ = emsdk_dep; // emsdk is pulled in transitively by raylib_zig
+        b.getInstallStep().dependOn(emcc_step);
+    } else {
+        // -------------------------------------------------------------------
+        // Native desktop client  (zig build  /  zig build run)
+        // -------------------------------------------------------------------
+        const client_mod = b.createModule(.{
+            .root_source_file = b.path("src/client/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ecs_zig", .module = ecs_mod },
+                .{ .name = "raylib", .module = raylib_mod },
+                .{ .name = "shared", .module = shared_mod },
+            },
+        });
 
-    // By making the run step depend on the default step, it will be run from the
-    // installation directory rather than directly from within the cache directory.
-    run_cmd.step.dependOn(b.getInstallStep());
+        const client_exe = b.addExecutable(.{
+            .name = "jrpg_client",
+            .root_module = client_mod,
+        });
+        client_exe.root_module.linkLibrary(raylib_artifact);
+        b.installArtifact(client_exe);
 
-    // This allows the user to pass arguments to the application in the build
-    // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
+        const run_client = b.addRunArtifact(client_exe);
+        run_client.step.dependOn(b.getInstallStep());
+        if (b.args) |args| run_client.addArgs(args);
+        const run_step = b.step("run", "Run the desktop client");
+        run_step.dependOn(&run_client.step);
+
+        // -------------------------------------------------------------------
+        // Server  (zig build server)
+        // -------------------------------------------------------------------
+        const server_mod = b.createModule(.{
+            .root_source_file = b.path("src/server/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ecs_zig", .module = ecs_mod },
+                .{ .name = "shared", .module = shared_mod },
+                .{ .name = "websocket", .module = ws_mod },
+            },
+        });
+
+        const server_exe = b.addExecutable(.{
+            .name = "jrpg_server",
+            .root_module = server_mod,
+        });
+
+        const server_step = b.step("server", "Build and install the game server");
+        const server_install = b.addInstallArtifact(server_exe, .{});
+        server_step.dependOn(&server_install.step);
+
+        const run_server = b.addRunArtifact(server_exe);
+        run_server.step.dependOn(&server_install.step);
+        if (b.args) |args| run_server.addArgs(args);
+        const run_server_step = b.step("run-server", "Run the game server");
+        run_server_step.dependOn(&run_server.step);
     }
 
-    // Creates an executable that will run `test` blocks from the provided module.
-    // Here `mod` needs to define a target, which is why earlier we made sure to
-    // set the releative field.
-    const mod_tests = b.addTest(.{
-        .root_module = mod,
+    // -----------------------------------------------------------------------
+    // Tests
+    // -----------------------------------------------------------------------
+
+    const test_step = b.step("test", "Run all tests");
+
+    // ECS core tests
+    const ecs_tests = b.addTest(.{ .root_module = ecs_mod });
+    test_step.dependOn(&b.addRunArtifact(ecs_tests).step);
+
+    // Shared module tests (protocol round-trips, game logic, transport)
+    const shared_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/shared/shared.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
-
-    // A run step that will run the test executable.
-    const run_mod_tests = b.addRunArtifact(mod_tests);
-
-    // Creates an executable that will run `test` blocks from the executable's
-    // root module. Note that test executables only test one module at a time,
-    // hence why we have to create two separate ones.
-    const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
-    });
-
-    // A run step that will run the second test executable.
-    const run_exe_tests = b.addRunArtifact(exe_tests);
-
-    // A top level step for running all tests. dependOn can be called multiple
-    // times and since the two run steps do not depend on one another, this will
-    // make the two of them run in parallel.
-    const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
-
-    // Just like flags, top level steps are also listed in the `--help` menu.
-    //
-    // The Zig build system is entirely implemented in userland, which means
-    // that it cannot hook into private compiler APIs. All compilation work
-    // orchestrated by the build system will result in other Zig compiler
-    // subcommands being invoked with the right flags defined. You can observe
-    // these invocations when one fails (or you pass a flag to increase
-    // verbosity) to validate assumptions and diagnose problems.
-    //
-    // Lastly, the Zig build system is relatively simple and self-contained,
-    // and reading its source code will allow you to master it.
+    test_step.dependOn(&b.addRunArtifact(shared_tests).step);
 }

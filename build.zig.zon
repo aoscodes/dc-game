@@ -36,6 +36,14 @@
             .url = "git+https://github.com/raylib-zig/raylib-zig?ref=devel#cd71c85d571027ac8033357f83b124ee051825b3",
             .hash = "raylib_zig-5.6.0-dev-KE8REENOBQC-m5nK7M2b5aKSIubJPbPLUYcRhT7aT3RN",
         },
+        .websocket = .{
+            .url = "git+https://github.com/karlseguin/websocket.zig#97fefafa59cc78ce177cff540b8685cd7f699276",
+            .hash = "websocket-0.1.0-ZPISdRlzAwBB_Bz2UMMqxYqF6YEVTIBoFsbzwPUJTHIc",
+        },
+        .emsdk = .{
+            .url = "git+https://github.com/emscripten-core/emsdk#d6b88f4ffd8d6163aadb6ff48ca4b32ceec890dd",
+            .hash = "N-V-__8AAK7rCQCU2Za022ZHJAWcCBiertj50lZfoP6ppahW",
+        },
     },
     .paths = .{
         "build.zig",
