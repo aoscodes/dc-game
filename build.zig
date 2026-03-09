@@ -144,6 +144,36 @@ pub fn build(b: *std.Build) !void {
         if (b.args) |args| run_server.addArgs(args);
         const run_server_step = b.step("run-server", "Run the game server");
         run_server_step.dependOn(&run_server.step);
+
+        // -------------------------------------------------------------------
+        // E2E test  (zig build e2e)
+        // Spawns a real jrpg_server process, runs two bot clients through a
+        // full game session, asserts players win.  Separate from `zig build
+        // test` to avoid flakiness from process spawning in CI.
+        // -------------------------------------------------------------------
+        const e2e_mod = b.createModule(.{
+            .root_source_file = b.path("src/e2e/e2e_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "shared", .module = shared_mod },
+                .{ .name = "websocket", .module = ws_mod },
+            },
+        });
+        const e2e_exe = b.addExecutable(.{
+            .name = "jrpg_e2e",
+            .root_module = e2e_mod,
+        });
+
+        const e2e_server_install = b.addInstallArtifact(server_exe, .{});
+        const e2e_install = b.addInstallArtifact(e2e_exe, .{});
+        const run_e2e = b.addRunArtifact(e2e_exe);
+        // server binary must be installed before the test runs
+        run_e2e.step.dependOn(&e2e_server_install.step);
+        run_e2e.step.dependOn(&e2e_install.step);
+
+        const e2e_step = b.step("e2e", "Run end-to-end game session test");
+        e2e_step.dependOn(&run_e2e.step);
     }
 
     // -----------------------------------------------------------------------
