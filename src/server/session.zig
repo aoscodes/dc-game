@@ -197,8 +197,14 @@ pub const Session = struct {
     // ------------------------------------------------------------------
 
     pub fn start_game(self: *Session, wave_label: []const u8) !void {
-        self.phase = .playing;
         const wave = waves.find_wave(wave_label) orelse waves.find_wave("wave_01_basic").?;
+        try self.start_game_wave(wave);
+    }
+
+    /// Start the game with an explicit wave pointer.  Used by tests to inject
+    /// a minimal wave not present in waves.ALL_WAVES.
+    pub fn start_game_wave(self: *Session, wave: *const waves.Wave) !void {
+        self.phase = .playing;
         self.current_wave = wave;
         std.log.info("game start — wave: {s}", .{wave.label});
         try self.spawn_players();
@@ -837,7 +843,7 @@ pub const Session = struct {
         }
     }
 
-    fn broadcast_game_start(self: *Session, wave_label: []const u8) !void {
+    pub fn broadcast_game_start(self: *Session, wave_label: []const u8) !void {
         for (&self.players) |*slot| {
             if (!slot.connected) continue;
             const t = slot.transport orelse continue;

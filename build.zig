@@ -165,4 +165,19 @@ pub fn build(b: *std.Build) !void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(shared_tests).step);
+
+    // Session integration tests (server game loop, no network, no raylib)
+    const session_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/server/session_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ecs_zig", .module = ecs_mod },
+                .{ .name = "shared", .module = shared_mod },
+                .{ .name = "websocket", .module = ws_mod },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(session_tests).step);
 }
