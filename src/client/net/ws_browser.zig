@@ -58,6 +58,10 @@ pub const WsBrowserTransport = struct {
         ws_close(self.handle);
     }
 
+    /// No-op on WASM — the JS glue fires on_open asynchronously after the
+    /// WebSocket handshake, by which point g_state.transport is already set.
+    pub fn notify_open(_: *WsBrowserTransport) void {}
+
     /// Obtain a `shared.Transport` backed by this WebSocket.
     /// The `WsBrowserTransport` must outlive the returned Transport.
     pub fn transport(self: *WsBrowserTransport) shared.Transport {

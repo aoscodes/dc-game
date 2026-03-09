@@ -40,6 +40,9 @@ const ClientState = struct {
     lobby: render.LobbyState = .{},
     game: render.GameState = .{},
     transport: ?shared.Transport = null,
+    /// Our assigned player_id — set from lobby_update and game_start.
+    /// 0xFF = not yet assigned.
+    our_player_id: u8 = 0xFF,
 
     /// Scratch buffer for outgoing messages.
     send_buf: [512]u8 = undefined,
@@ -93,14 +96,17 @@ fn send_join() void {
     var fbs = std.io.fixedBufferStream(&g_state.send_buf);
     const w = fbs.writer();
 
-    // TODO: check sessionStorage for saved player_id (WASM) and send
-    // Reconnect instead when applicable.  For now always send JoinLobby.
-    var p = proto.JoinLobby{
-        .name = [_]u8{0} ** 16,
-        .name_len = g_name_len,
-    };
-    @memcpy(p.name[0..g_name_len], g_name_buf[0..g_name_len]);
-    proto.encode(w, .join_lobby, p) catch return;
+    if (g_state.our_player_id != 0xFF) {
+        // Previously assigned — attempt reconnect.
+        proto.encode(w, .reconnect, proto.Reconnect{ .player_id = g_state.our_player_id }) catch return;
+    } else {
+        var p = proto.JoinLobby{
+            .name = [_]u8{0} ** 16,
+            .name_len = g_name_len,
+        };
+        @memcpy(p.name[0..g_name_len], g_name_buf[0..g_name_len]);
+        proto.encode(w, .join_lobby, p) catch return;
+    }
     t.send(fbs.getWritten()) catch return;
 }
 
@@ -144,11 +150,16 @@ fn process_recv() void {
     switch (tag) {
         .lobby_update => {
             const p = proto.decode_lobby_update(r) catch return;
+            if (p.your_player_id != 0xFF) {
+                g_state.our_player_id = p.your_player_id;
+            }
             g_state.lobby.update = p;
+            g_state.lobby.our_player_id = g_state.our_player_id;
             g_state.phase = .lobby;
         },
         .game_start => {
             const p = proto.decode_game_start(r) catch return;
+            g_state.our_player_id = p.your_player_id;
             g_state.game = .{};
             g_state.game.our_player_id = p.your_player_id;
             g_state.game.wave_label_len = p.wave_label_len;
@@ -210,6 +221,14 @@ fn update_lobby() void {
     }
 }
 
+/// Returns true if the local player's entity has `class` in the current snapshot.
+fn is_our_class(gs: *render.GameState, class: c.ClassTag) bool {
+    for (gs.snapshot.entities[0..gs.snapshot.entity_count]) |e| {
+        if (e.owner == gs.our_player_id) return e.class == class;
+    }
+    return false;
+}
+
 fn update_game() void {
     const gs = &g_state.game;
     const ev = gs.cursor.poll();
@@ -221,7 +240,8 @@ fn update_game() void {
         },
         .select_attack => {
             gs.action_selected = .attack;
-            gs.targeting_enemy = true;
+            // Healers target allies; everyone else targets enemies.
+            gs.targeting_enemy = !is_our_class(gs, .healer);
         },
         .select_defend => {
             gs.action_selected = .defend;
@@ -230,11 +250,8 @@ fn update_game() void {
             if (gs.action_selected) |action| {
                 // Find target entity at cursor position
                 var target: u32 = 0;
-                if (action == .attack or (!gs.targeting_enemy)) {
-                    const target_team: c.TeamId = if (action == .attack or gs.targeting_enemy)
-                        .enemies
-                    else
-                        .players;
+                if (action == .attack) {
+                    const target_team: c.TeamId = if (gs.targeting_enemy) .enemies else .players;
                     const cur = gs.cursor.grid_pos();
                     for (gs.snapshot.entities[0..gs.snapshot.entity_count]) |e| {
                         if (e.team == target_team and
@@ -260,6 +277,12 @@ fn update_game() void {
 // ---------------------------------------------------------------------------
 // WASM memory helpers (called by ws_glue.js)
 // ---------------------------------------------------------------------------
+
+/// Called by JS (index.html) to persist player_id across page reloads.
+/// The WASM host reads it back from sessionStorage on reconnect.
+export fn save_player_id(pid: u8) void {
+    g_state.our_player_id = pid;
+}
 
 export fn wasm_alloc(len: usize) ?[*]u8 {
     const mem = std.heap.page_allocator.alloc(u8, len) catch return null;
@@ -290,9 +313,10 @@ pub fn main() !void {
         .on_close = on_ws_close,
     });
 
-    // Connect
+    // Connect — assign transport BEFORE firing on_open so send_join() works.
     var ws_transport = try net.WsBrowserTransport.connect(server_url);
     g_state.transport = ws_transport.transport();
+    ws_transport.notify_open();
 
     rl.initWindow(@intFromFloat(render.SW), @intFromFloat(render.SH), "JRPG Client");
     defer rl.closeWindow();

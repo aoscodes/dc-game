@@ -72,8 +72,16 @@ pub const WsBrowserTransport = struct {
             return error.ConnectionFailed;
         };
 
-        g_callbacks.on_open(self.handle);
+        // NOTE: on_ws_open is NOT called here.
+        // The caller must call notify_open() after assigning the transport
+        // to g_state, so that send_join() can find a non-null transport.
         return self;
+    }
+
+    /// Fire the on_open callback.  Call this after the transport has been
+    /// stored in g_state (i.e. after `g_state.transport = ws_transport.transport()`).
+    pub fn notify_open(self: *WsBrowserTransport) void {
+        g_callbacks.on_open(self.handle);
     }
 
     pub fn close(self: *WsBrowserTransport) void {
