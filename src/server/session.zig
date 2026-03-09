@@ -200,6 +200,7 @@ pub const Session = struct {
         self.phase = .playing;
         const wave = waves.find_wave(wave_label) orelse waves.find_wave("wave_01_basic").?;
         self.current_wave = wave;
+        std.log.info("game start — wave: {s}", .{wave.label});
         try self.spawn_players();
         try self.spawn_wave(wave);
         self.register_system_signatures();
@@ -260,6 +261,7 @@ pub const Session = struct {
     }
 
     fn spawn_wave(self: *Session, wave: *const waves.Wave) !void {
+        std.log.info("spawning wave: {s} ({} enemies)", .{ wave.label, wave.entries.len });
         for (wave.entries) |entry| {
             const d = waves.resolve_stats(entry.class, entry.stats);
             const e = self.world.create_entity();
@@ -348,24 +350,29 @@ pub const Session = struct {
                 const n = @min(p.name_len, 16);
                 @memcpy(slot.name[0..n], p.name[0..n]);
                 slot.name_len = @intCast(n);
+                std.log.info("player {} name set: {s}", .{ player_id, slot.name[0..slot.name_len] });
                 try self.broadcast_lobby_update();
             },
             .choose_class => {
                 const p = try proto.decode_choose_class(fbs.reader());
                 self.set_class(player_id, p.class);
+                std.log.info("player {} class: {s}", .{ player_id, @tagName(p.class) });
                 try self.broadcast_lobby_update();
             },
             .ready_up => {
                 const slot = &self.players[player_id];
                 slot.ready = !slot.ready;
+                std.log.info("player {} ready: {}", .{ player_id, slot.ready });
                 try self.broadcast_lobby_update();
                 if (self.all_ready()) {
+                    std.log.info("all players ready — starting game", .{});
                     try self.start_game("wave_01_basic");
                     try self.broadcast_game_start("wave_01_basic");
                 }
             },
             .choose_action => {
                 const p = try proto.decode_choose_action(fbs.reader());
+                std.log.info("player {} action: {s} target={}", .{ player_id, @tagName(p.action), p.target_entity });
                 try self.resolve_action(player_id, p);
             },
             .reconnect => {
@@ -457,6 +464,7 @@ pub const Session = struct {
         const mit = logic.sum_mitigation(self.effects[target].effects[0..self.effects[target].count]);
         const dmg = logic.mitigated_damage(raw, mit);
         logic.apply_damage(tgt_health, dmg);
+        std.log.debug("entity {} -> entity {}: {} dmg (raw={} mit={})", .{ actor, target, dmg, raw, mit });
 
         try self.broadcast_action_result(.{
             .tag = .damage,
@@ -466,6 +474,7 @@ pub const Session = struct {
         });
 
         if (logic.is_dead(tgt_health.*)) {
+            std.log.info("entity {} killed by entity {}", .{ target, actor });
             try self.kill_entity(target);
             try self.broadcast_action_result(.{
                 .tag = .death,
@@ -493,6 +502,7 @@ pub const Session = struct {
             const mit = logic.sum_mitigation(self.effects[target].effects[0..self.effects[target].count]);
             const dmg = logic.mitigated_damage(raw, mit);
             logic.apply_damage(tgt_health, dmg);
+            std.log.debug("mage entity {} -> entity {}: {} dmg (aoe)", .{ actor, target, dmg });
             try self.broadcast_action_result(.{
                 .tag = .damage,
                 .actor_entity = actor,
@@ -500,6 +510,7 @@ pub const Session = struct {
                 .value = dmg,
             });
             if (logic.is_dead(tgt_health.*)) {
+                std.log.info("entity {} killed by mage entity {}", .{ target, actor });
                 try self.kill_entity(target);
                 try self.broadcast_action_result(.{
                     .tag = .death,
@@ -525,6 +536,7 @@ pub const Session = struct {
             const tgt_health = self.world.get_component(target, c.Health);
             const amount: u16 = actor_stats.attack;
             logic.apply_heal(tgt_health, amount);
+            std.log.debug("healer entity {} -> entity {}: +{} hp", .{ actor, target, amount });
             try self.broadcast_action_result(.{
                 .tag = .heal,
                 .actor_entity = actor,
@@ -669,6 +681,7 @@ pub const Session = struct {
             const actor_stats = self.world.get_component(actor, c.Stats);
             const actor_pos = self.world.get_component(actor, c.GridPos);
 
+            std.log.debug("AI entity {} ({s}) acting", .{ actor, @tagName(actor_class.tag) });
             switch (actor_class.tag) {
                 .shaman => try self.ai_shaman(actor, actor_stats, actor_pos.*),
                 .archer => try self.resolve_mage_attack(actor, actor_stats, actor_pos.*),
@@ -764,6 +777,7 @@ pub const Session = struct {
                 if (wave.next_wave) |next_label| {
                     const next = waves.find_wave(next_label);
                     if (next) |w| {
+                        std.log.info("wave cleared — next: {s}", .{next_label});
                         self.current_wave = w;
                         try self.spawn_wave(w);
                         return;
@@ -771,13 +785,16 @@ pub const Session = struct {
                 }
             }
             // All waves cleared
+            std.log.info("all waves cleared — players win", .{});
             try self.end_game(.players);
         } else if (players_alive == 0) {
+            std.log.info("all players dead — enemies win", .{});
             try self.end_game(.enemies);
         }
     }
 
     fn end_game(self: *Session, winner: proto.WinnerId) !void {
+        std.log.info("game over — winner: {s}", .{@tagName(winner)});
         self.phase = .ended;
         var buf: [8]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
