@@ -46,10 +46,13 @@ const ClientState = struct {
 
     /// Scratch buffer for outgoing messages.
     send_buf: [512]u8 = undefined,
-    /// Scratch buffer for incoming messages (populated by ws callback).
+    /// Scratch buffer for incoming messages (populated by ws read thread).
+    /// Access pattern: read thread writes buf+len then sets recv_ready;
+    /// main thread checks recv_ready then reads buf+len.
+    /// Must be atomic to guarantee the write is visible across threads.
     recv_buf: [4096]u8 = undefined,
     recv_len: usize = 0,
-    recv_ready: bool = false,
+    recv_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 };
 
 /// Global client state — one instance per WASM module / process.
@@ -74,7 +77,8 @@ fn on_ws_message(_: i32, data: []const u8) void {
     if (data.len <= g_state.recv_buf.len) {
         @memcpy(g_state.recv_buf[0..data.len], data);
         g_state.recv_len = data.len;
-        g_state.recv_ready = true;
+        // Release store: buf+len writes must be visible before the flag.
+        g_state.recv_ready.store(true, .release);
     }
 }
 
@@ -139,8 +143,9 @@ fn send_action(action: proto.ActionTag, target: u32) void {
 // ---------------------------------------------------------------------------
 
 fn process_recv() void {
-    if (!g_state.recv_ready) return;
-    g_state.recv_ready = false;
+    // Acquire load: pairs with the release store in on_ws_message.
+    if (!g_state.recv_ready.load(.acquire)) return;
+    g_state.recv_ready.store(false, .monotonic);
 
     const data = g_state.recv_buf[0..g_state.recv_len];
     var fbs = std.io.fixedBufferStream(data);
