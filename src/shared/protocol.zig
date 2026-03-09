@@ -111,6 +111,9 @@ pub const LobbyUpdate = struct {
     join_code: [6]u8,
     player_count: u8,
     players: [MAX_PLAYERS]PlayerInfo,
+    /// The player_id assigned to the recipient of this message.
+    /// Each client receives a different value; 0xFF = unassigned.
+    your_player_id: u8,
 };
 
 pub const GameStart = struct {
@@ -222,6 +225,7 @@ fn encode_choose_action(w: anytype, p: ChooseAction) !void {
 fn encode_lobby_update(w: anytype, p: LobbyUpdate) !void {
     try w.writeAll(&p.join_code);
     try w.writeByte(p.player_count);
+    try w.writeByte(p.your_player_id);
     var i: u8 = 0;
     while (i < p.player_count) : (i += 1) {
         const pl = p.players[i];
@@ -318,6 +322,7 @@ pub fn decode_lobby_update(reader: anytype) !LobbyUpdate {
     var p: LobbyUpdate = undefined;
     _ = try reader.readAll(&p.join_code);
     p.player_count = try reader.readByte();
+    p.your_player_id = try reader.readByte();
     if (p.player_count > MAX_PLAYERS) return DecodeError.TooManyEntities;
     var i: u8 = 0;
     while (i < p.player_count) : (i += 1) {

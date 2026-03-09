@@ -342,6 +342,14 @@ pub const Session = struct {
         fbs: *std.io.FixedBufferStream([]u8),
     ) !void {
         switch (tag) {
+            .join_lobby => {
+                const p = try proto.decode_join_lobby(fbs.reader());
+                const slot = &self.players[player_id];
+                const n = @min(p.name_len, 16);
+                @memcpy(slot.name[0..n], p.name[0..n]);
+                slot.name_len = @intCast(n);
+                try self.broadcast_lobby_update();
+            },
             .choose_class => {
                 const p = try proto.decode_choose_class(fbs.reader());
                 self.set_class(player_id, p.class);
@@ -782,16 +790,16 @@ pub const Session = struct {
     // ------------------------------------------------------------------
 
     pub fn broadcast_lobby_update(self: *Session) !void {
-        var buf: [512]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        var p = proto.LobbyUpdate{
+        // Build the shared player list once.
+        var base = proto.LobbyUpdate{
             .join_code = self.join_code,
             .player_count = self.player_count,
             .players = [_]proto.PlayerInfo{std.mem.zeroes(proto.PlayerInfo)} ** proto.MAX_PLAYERS,
+            .your_player_id = 0xFF,
         };
         for (&self.players) |*slot| {
             if (!slot.occupied) continue;
-            const pi = &p.players[slot.player_id];
+            const pi = &base.players[slot.player_id];
             pi.player_id = slot.player_id;
             pi.name = slot.name;
             pi.name_len = slot.name_len;
@@ -799,8 +807,17 @@ pub const Session = struct {
             pi.ready = slot.ready;
             pi.connected = slot.connected;
         }
-        try proto.encode(fbs.writer(), .lobby_update, p);
-        try self.broadcast_raw(fbs.getWritten());
+        // Send each connected player a copy personalised with their own id.
+        for (&self.players) |*slot| {
+            if (!slot.connected) continue;
+            const t = slot.transport orelse continue;
+            var msg = base;
+            msg.your_player_id = slot.player_id;
+            var buf: [512]u8 = undefined;
+            var fbs = std.io.fixedBufferStream(&buf);
+            try proto.encode(fbs.writer(), .lobby_update, msg);
+            t.send(fbs.getWritten()) catch {};
+        }
     }
 
     fn broadcast_game_start(self: *Session, wave_label: []const u8) !void {
