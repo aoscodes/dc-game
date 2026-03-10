@@ -1,0 +1,72 @@
+{
+  "waves": [
+    {
+      "label": "wave_01_basic",
+      "next_wave": null,
+      "entries": [
+        { "class": "grunt", "grid_col": 0, "grid_row": 0 },
+        { "class": "grunt", "grid_col": 1, "grid_row": 0 },
+        { "class": "grunt", "grid_col": 2, "grid_row": 0 }
+      ]
+    },
+    {
+      "label": "wave_02_spread",
+      "next_wave": "wave_03_healer_back",
+      "entries": [
+        { "class": "grunt",  "grid_col": 0, "grid_row": 0 },
+        { "class": "grunt",  "grid_col": 2, "grid_row": 0 },
+        { "class": "archer", "grid_col": 1, "grid_row": 1 },
+        { "class": "archer", "grid_col": 0, "grid_row": 2 },
+        { "class": "archer", "grid_col": 2, "grid_row": 2 }
+      ]
+    },
+    {
+      "label": "wave_03_healer_back",
+      "next_wave": "wave_04_all_archers",
+      "entries": [
+        { "class": "grunt",  "grid_col": 0, "grid_row": 0 },
+        { "class": "grunt",  "grid_col": 1, "grid_row": 0 },
+        { "class": "grunt",  "grid_col": 2, "grid_row": 0 },
+        { "class": "shaman", "grid_col": 1, "grid_row": 2 }
+      ]
+    },
+    {
+      "label": "wave_04_all_archers",
+      "next_wave": "wave_05_boss_plus_grunts",
+      "entries": [
+        { "class": "archer", "grid_col": 0, "grid_row": 0 },
+        { "class": "archer", "grid_col": 2, "grid_row": 0 },
+        { "class": "archer", "grid_col": 0, "grid_row": 2 },
+        { "class": "archer", "grid_col": 2, "grid_row": 2 }
+      ]
+    },
+    {
+      "label": "wave_05_boss_plus_grunts",
+      "next_wave": "wave_06_full_grid",
+      "entries": [
+        { "class": "grunt", "grid_col": 0, "grid_row": 0 },
+        { "class": "grunt", "grid_col": 2, "grid_row": 0 },
+        { "class": "boss",  "grid_col": 1, "grid_row": 1 }
+      ]
+    },
+    {
+      "label": "wave_06_full_grid",
+      "next_wave": null,
+      "entries": [
+        { "class": "grunt",  "grid_col": 0, "grid_row": 0 },
+        { "class": "grunt",  "grid_col": 1, "grid_row": 0 },
+        { "class": "grunt",  "grid_col": 2, "grid_row": 0 },
+        { "class": "archer", "grid_col": 0, "grid_row": 1 },
+        { "class": "shaman", "grid_col": 1, "grid_row": 2 },
+        { "class": "archer", "grid_col": 2, "grid_row": 1 }
+      ]
+    },
+    {
+      "label": "wave_custom",
+      "next_wave": null,
+      "entries": [
+        { "class": "boss", "grid_col": 1, "grid_row": 1, "max_hp": 500, "attack": 40 }
+      ]
+    }
+  ]
+}

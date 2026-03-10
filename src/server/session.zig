@@ -17,8 +17,12 @@ const c = shared.components;
 const proto = shared.protocol;
 const logic = shared.game_logic;
 const waves = shared.waves;
+const dbg = @import("debug_zig");
 
 const ws_server = @import("net/ws_server.zig");
+
+/// Zones measured by the per-session tick profiler.
+pub const TickZones = enum { drain, atb, notify, effects, ai, broadcast, check_win };
 
 pub const GameWorld = ecs.World(
     .{
@@ -78,6 +82,19 @@ pub const Session = struct {
     tick_count: u32 = 0,
     current_wave: ?*const waves.Wave = null,
     living: std.ArrayListUnmanaged(ecs.Entity) = .empty,
+
+    /// Per-tick timing profiler.  Enabled by default; call
+    /// `sess.profiler.report(writer, "tick")` to flush.
+    profiler: dbg.Profiler(TickZones) = dbg.Profiler(TickZones).init(),
+
+    /// Optional GameState replay recorder.  Set to a non-null value before
+    /// starting a game to record all broadcast frames.  Caller owns the
+    /// underlying writer and must call `recorder.finish()` when done.
+    ///
+    /// Usage:
+    ///   var file = try std.fs.cwd().createFile("replay.bin", .{});
+    ///   sess.recorder = try dbg.replay.Recorder(std.io.AnyWriter).init(file.writer().any());
+    recorder: ?dbg.replay.Recorder(std.io.AnyWriter) = null,
 
     pub fn init(allocator: std.mem.Allocator, join_code: [6]u8) !Session {
         var players: [MAX_PLAYERS]PlayerSlot = undefined;
@@ -257,25 +274,44 @@ pub const Session = struct {
     }
 
     pub fn tick(self: *Session, dt: f32) !void {
+        self.profiler.begin(.drain);
         try self.drain_queues();
+        self.profiler.end(.drain);
 
         if (self.phase != .playing) return;
 
         self.tick_count += 1;
 
+        self.profiler.begin(.atb);
         self.world.get_system(AtbSystem).dt = dt;
         self.world.each(AtbSystem, atb_step);
+        self.profiler.end(.atb);
 
+        self.profiler.begin(.notify);
         try self.notify_ready_actors();
+        self.profiler.end(.notify);
 
+        self.profiler.begin(.effects);
         self.world.get_system(EffectSystem).dt = dt;
         self.world.each(EffectSystem, effect_step_trampoline);
+        self.profiler.end(.effects);
 
+        self.profiler.begin(.ai);
         self.world.each(AiSystem, ai_step_trampoline);
+        self.profiler.end(.ai);
 
+        self.profiler.begin(.broadcast);
         try self.broadcast_game_state();
+        self.profiler.end(.broadcast);
 
+        self.profiler.begin(.check_win);
         try self.check_win();
+        self.profiler.end(.check_win);
+
+        // Log profiler report every 200 ticks (~10 s at 20 Hz).
+        if (self.profiler.should_report(200)) {
+            self.profiler.report_stderr("session tick");
+        }
     }
 
     fn drain_queues(self: *Session) !void {
@@ -339,8 +375,7 @@ pub const Session = struct {
                 std.log.info("player {} action: {s} target={}", .{ player_id, @tagName(p.action), p.target_entity });
                 try self.resolve_action(player_id, p);
             },
-            .reconnect => {
-            },
+            .reconnect => {},
             else => {},
         }
     }
@@ -810,6 +845,13 @@ pub const Session = struct {
         var fbs = std.io.fixedBufferStream(&buf);
         try proto.encode(fbs.writer(), .game_state, snap);
         try self.broadcast_raw(fbs.getWritten());
+
+        // Record frame if a recorder is attached.
+        if (self.recorder) |*rec| {
+            rec.record(snap) catch |err| {
+                std.log.warn("replay recorder error: {}", .{err});
+            };
+        }
     }
 
     fn broadcast_action_result(self: *Session, result: proto.ActionResult) !void {

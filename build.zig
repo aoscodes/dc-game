@@ -90,6 +90,49 @@ pub fn build(b: *std.Build) !void {
         b.getInstallStep().dependOn(emcc_step);
     } else {
         // -------------------------------------------------------------------
+        // Debug tooling module  (raylib always available in native builds)
+        // -------------------------------------------------------------------
+        const debug_mod = b.addModule("debug_zig", .{
+            .root_source_file = b.path("src/debug/debug.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ecs_zig", .module = ecs_mod },
+                .{ .name = "shared", .module = shared_mod },
+                .{ .name = "raylib", .module = raylib_mod },
+            },
+        });
+
+        // -------------------------------------------------------------------
+        // ECS demo  (zig build demo / zig build run-demo)
+        // src/main.zig — 5 000 falling entities + debug HUD
+        // -------------------------------------------------------------------
+        const demo_mod = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ecs_zig", .module = ecs_mod },
+                .{ .name = "raylib", .module = raylib_mod },
+                .{ .name = "debug_zig", .module = debug_mod },
+            },
+        });
+        const demo_exe = b.addExecutable(.{
+            .name = "ecs_demo",
+            .root_module = demo_mod,
+        });
+        demo_exe.root_module.linkLibrary(raylib_artifact);
+        const demo_install = b.addInstallArtifact(demo_exe, .{});
+        const demo_step = b.step("demo", "Build the ECS gravity demo");
+        demo_step.dependOn(&demo_install.step);
+
+        const run_demo = b.addRunArtifact(demo_exe);
+        run_demo.step.dependOn(&demo_install.step);
+        if (b.args) |args| run_demo.addArgs(args);
+        const run_demo_step = b.step("run-demo", "Run the ECS gravity demo");
+        run_demo_step.dependOn(&run_demo.step);
+
+        // -------------------------------------------------------------------
         // Native desktop client  (zig build  /  zig build run)
         // -------------------------------------------------------------------
         const client_mod = b.createModule(.{
@@ -127,6 +170,7 @@ pub fn build(b: *std.Build) !void {
                 .{ .name = "ecs_zig", .module = ecs_mod },
                 .{ .name = "shared", .module = shared_mod },
                 .{ .name = "websocket", .module = ws_mod },
+                .{ .name = "debug_zig", .module = debug_mod },
             },
         });
 
@@ -134,6 +178,8 @@ pub fn build(b: *std.Build) !void {
             .name = "jrpg_server",
             .root_module = server_mod,
         });
+        // Link raylib for the server so hud.zig compiles (not rendered server-side)
+        server_exe.root_module.linkLibrary(raylib_artifact);
 
         const server_step = b.step("server", "Build and install the game server");
         const server_install = b.addInstallArtifact(server_exe, .{});
@@ -174,6 +220,41 @@ pub fn build(b: *std.Build) !void {
 
         const e2e_step = b.step("e2e", "Run end-to-end game session test");
         e2e_step.dependOn(&run_e2e.step);
+
+        // -------------------------------------------------------------------
+        // Debug module tests  (zig build debug-test)
+        // Tests in src/debug/ (profiler, inspector, snapshot, replay, etc.)
+        // Excludes hud.zig which requires a live window.
+        // -------------------------------------------------------------------
+        const debug_test_step = b.step("debug-test", "Run debug module tests");
+
+        const debug_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/debug/debug.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "ecs_zig", .module = ecs_mod },
+                    .{ .name = "shared", .module = shared_mod },
+                    .{ .name = "raylib", .module = raylib_mod },
+                },
+            }),
+        });
+        debug_tests.root_module.linkLibrary(raylib_artifact);
+        debug_test_step.dependOn(&b.addRunArtifact(debug_tests).step);
+
+        // snapshot_test.zig has its own test file; add it too
+        const snapshot_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/debug/snapshot_test.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "ecs_zig", .module = ecs_mod },
+                },
+            }),
+        });
+        debug_test_step.dependOn(&b.addRunArtifact(snapshot_tests).step);
     }
 
     // -----------------------------------------------------------------------
@@ -197,6 +278,19 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&b.addRunArtifact(shared_tests).step);
 
     // Session integration tests (server game loop, no network, no raylib)
+    // debug_zig is needed because session.zig imports it.
+    // We create a headless debug module (raylib_mod is still available in
+    // native builds; for the test runner it must be linked too).
+    const session_debug_mod = b.addModule("debug_zig_session_test", .{
+        .root_source_file = b.path("src/debug/debug.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ecs_zig", .module = ecs_mod },
+            .{ .name = "shared", .module = shared_mod },
+            .{ .name = "raylib", .module = raylib_mod },
+        },
+    });
     const session_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/server/session_test.zig"),
@@ -206,8 +300,10 @@ pub fn build(b: *std.Build) !void {
                 .{ .name = "ecs_zig", .module = ecs_mod },
                 .{ .name = "shared", .module = shared_mod },
                 .{ .name = "websocket", .module = ws_mod },
+                .{ .name = "debug_zig", .module = session_debug_mod },
             },
         }),
     });
+    session_tests.root_module.linkLibrary(raylib_artifact);
     test_step.dependOn(&b.addRunArtifact(session_tests).step);
 }

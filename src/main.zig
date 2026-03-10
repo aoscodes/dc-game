@@ -12,6 +12,7 @@
 const std = @import("std");
 const rl = @import("raylib");
 const ecs = @import("ecs_zig");
+const dbg = @import("debug_zig");
 
 // ---------------------------------------------------------------------------
 // Vec3
@@ -159,7 +160,8 @@ fn spawn_top(world: *MyWorld, rng: std.Random) ecs.Entity {
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var ta = dbg.TrackingAllocator.init(gpa.allocator());
+    const allocator = ta.allocator();
 
     var world = try MyWorld.init(allocator);
     defer world.deinit();
@@ -189,6 +191,10 @@ pub fn main() !void {
         tf.position.y = rng.float(f32) * (HALF_H * 2) - HALF_H;
     }
 
+    // ---- Debug HUD state ----
+    var hud_state = dbg.HudState{};
+    var hud_enabled = false;
+
     // ---- Raylib window ----
     rl.initWindow(@intFromFloat(SW), @intFromFloat(SH), "ECS — 5 000 falling entities");
     defer rl.closeWindow();
@@ -198,6 +204,9 @@ pub fn main() !void {
 
     while (!rl.windowShouldClose()) {
         const dt = rl.getFrameTime();
+
+        // Toggle debug HUD with D key.
+        if (rl.isKeyPressed(.d)) hud_enabled = !hud_enabled;
 
         // Write dt into the physics system before stepping.
         world.get_system(PhysicsSystem).dt = dt;
@@ -213,6 +222,9 @@ pub fn main() !void {
                 slot.* = spawn_top(&world, rng);
             }
         }
+
+        // Update HUD FPS history.
+        hud_state.push_fps(rl.getFPS());
 
         // Draw.
         rl.beginDrawing();
@@ -234,5 +246,8 @@ pub fn main() !void {
             16,
             .ray_white,
         );
+
+        // Debug HUD overlay (toggle with D).
+        dbg.hud.draw(&world, &hud_state, hud_enabled);
     }
 }

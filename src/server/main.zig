@@ -11,6 +11,7 @@ const ws = @import("websocket");
 const shared = @import("shared");
 const proto = shared.protocol;
 const c = shared.components;
+const dbg = @import("debug_zig");
 
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
@@ -21,6 +22,7 @@ const TICK_NS: u64 = std.time.ns_per_s / TICK_HZ;
 const DEFAULT_PORT: u16 = 9001;
 
 var g_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+var g_ta: dbg.TrackingAllocator = undefined;
 var g_session: ?Session = null;
 var g_session_lock: std.Thread.Mutex = .{};
 
@@ -127,8 +129,10 @@ fn tick_loop(_: void) void {
 }
 
 pub fn main() !void {
-    const allocator = g_gpa.allocator();
     defer _ = g_gpa.deinit();
+    g_ta = dbg.TrackingAllocator.init(g_gpa.allocator());
+    const allocator = g_ta.allocator();
+    defer g_ta.report_stderr("server");
 
     var port: u16 = DEFAULT_PORT;
     var args = try std.process.argsWithAllocator(allocator);
