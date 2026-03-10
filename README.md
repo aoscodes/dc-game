@@ -1,6 +1,6 @@
-# ecs-zig JRPG
+# DragonCon RPG
 
-Co-op browser JRPG with ATB (Active Time Battle) combat. Up to 6 players vs scripted enemy waves. Authoritative Zig server; browser client compiled to WASM via Emscripten + Raylib.
+Co-op RPG with ATB (Active Time Battle) combat. Up to 6 players vs scripted enemy waves. Authoritative Zig server; browser client compiled to WASM via Emscripten + Raylib.
 
 ## Requirements
 
@@ -25,15 +25,15 @@ The client connects to `ws://127.0.0.1:9001`. **Start the server first** — the
 
 ## Build targets
 
-| Command | Output |
-|---|---|
-| `zig build` | Native desktop client (`zig-out/bin/jrpg_client`) |
-| `zig build run` | Build + run native client |
-| `zig build server` | Game server (`zig-out/bin/jrpg_server`) |
-| `zig build run-server` | Build + run server |
-| `zig build -Dtarget=wasm32-emscripten` | WASM bundle → `zig-out/web/` |
-| `zig build test` | Unit + integration tests (protocol, game logic, ECS, session) |
-| `zig build e2e` | E2E test: spawn real server, 2 bot clients, assert players win |
+| Command                                | Output                                                         |
+| -------------------------------------- | -------------------------------------------------------------- |
+| `zig build`                            | Native desktop client (`zig-out/bin/client`)                   |
+| `zig build run`                        | Build + run native client                                      |
+| `zig build server`                     | Game server (`zig-out/bin/server`)                             |
+| `zig build run-server`                 | Build + run server                                             |
+| `zig build -Dtarget=wasm32-emscripten` | WASM bundle → `zig-out/web/`                                   |
+| `zig build test`                       | Unit + integration tests (protocol, game logic, ECS, session)  |
+| `zig build e2e`                        | E2E test: spawn real server, 2 bot clients, assert players win |
 
 ## WASM / browser
 
@@ -49,22 +49,22 @@ Open `http://localhost:8080`. Enter a player name; the page connects to the serv
 
 **Lobby**
 
-| Key | Action |
-|---|---|
+| Key             | Action                              |
+| --------------- | ----------------------------------- |
 | `1` / `2` / `3` | Pick class: Fighter / Mage / Healer |
-| `Enter` | Toggle ready |
+| `Enter`         | Toggle ready                        |
 
 **Combat (ATB)**
 
 When your ATB bar fills the server sends `YourTurn`. Then:
 
-| Key | Action |
-|---|---|
-| Arrow keys | Move cursor |
-| `A` | Select Attack |
-| `D` | Select Defend |
-| `Enter` | Confirm |
-| `Escape` | Cancel |
+| Key        | Action        |
+| ---------- | ------------- |
+| Arrow keys | Move cursor   |
+| `A`        | Select Attack |
+| `D`        | Select Defend |
+| `Enter`    | Confirm       |
+| `Escape`   | Cancel        |
 
 - **Fighter** — single-target melee attack; Defend shields allies in the row behind.
 - **Mage** — 2×2 AoE on the enemy grid.
@@ -123,3 +123,4 @@ specs/
 web/
   index.html
   ws_glue.js
+```

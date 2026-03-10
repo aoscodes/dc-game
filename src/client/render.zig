@@ -66,7 +66,7 @@ pub const GameState = struct {
 pub fn draw_lobby(state: *const LobbyState) void {
     rl.clearBackground(COLOR_BG);
 
-    rl.drawText("JRPG  —  Lobby", 40, 30, 32, COLOR_HEADER);
+    rl.drawText("Dragoncon Game", 40, 30, 32, COLOR_HEADER);
 
     {
         var buf: [32]u8 = undefined;

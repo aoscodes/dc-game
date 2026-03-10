@@ -70,7 +70,7 @@ pub fn build(b: *std.Build) !void {
         });
 
         const wasm = b.addLibrary(.{
-            .name = "jrpg_client",
+            .name = "client",
             .root_module = client_mod,
         });
         wasm.root_module.linkLibrary(raylib_artifact);
@@ -147,7 +147,7 @@ pub fn build(b: *std.Build) !void {
         });
 
         const client_exe = b.addExecutable(.{
-            .name = "jrpg_client",
+            .name = "client",
             .root_module = client_mod,
         });
         client_exe.root_module.linkLibrary(raylib_artifact);
@@ -175,7 +175,7 @@ pub fn build(b: *std.Build) !void {
         });
 
         const server_exe = b.addExecutable(.{
-            .name = "jrpg_server",
+            .name = "server",
             .root_module = server_mod,
         });
         // Link raylib for the server so hud.zig compiles (not rendered server-side)
@@ -193,7 +193,7 @@ pub fn build(b: *std.Build) !void {
 
         // -------------------------------------------------------------------
         // E2E test  (zig build e2e)
-        // Spawns a real jrpg_server process, runs two bot clients through a
+        // Spawns a real server process, runs two bot clients through a
         // full game session, asserts players win.  Separate from `zig build
         // test` to avoid flakiness from process spawning in CI.
         // -------------------------------------------------------------------
@@ -207,7 +207,7 @@ pub fn build(b: *std.Build) !void {
             },
         });
         const e2e_exe = b.addExecutable(.{
-            .name = "jrpg_e2e",
+            .name = "e2e",
             .root_module = e2e_mod,
         });
 

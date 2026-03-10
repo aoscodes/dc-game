@@ -1,4 +1,4 @@
-//! JRPG game server entry point.
+//! game server entry point.
 //!
 //! Listens on a configurable port (default 9001).  Each incoming WebSocket
 //! connection is handled by the websocket.zig server with our `Handler` type.

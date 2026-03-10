@@ -488,7 +488,7 @@ pub const Session = struct {
             const mit = logic.sum_mitigation(self.effects[target].effects[0..self.effects[target].count]);
             const dmg = logic.mitigated_damage(raw, mit);
             logic.apply_damage(tgt_health, dmg);
-            std.log.debug("mage entity {} -> entity {}: {} dmg (aoe)", .{ actor, target, dmg });
+            std.log.debug("mage entity {} -> entity {}: {} dmg (aoe). cells {any}", .{ actor, target, dmg, cells });
             try self.broadcast_action_result(.{
                 .tag = .damage,
                 .actor_entity = actor,

@@ -319,7 +319,7 @@ pub fn main() !void {
     const loop_thread = try std.Thread.spawn(.{}, connect_loop, .{{}});
     loop_thread.detach();
 
-    rl.initWindow(@intFromFloat(render.SW), @intFromFloat(render.SH), "JRPG Client");
+    rl.initWindow(@intFromFloat(render.SW), @intFromFloat(render.SH), "Client");
     defer rl.closeWindow();
     rl.setTargetFPS(60);
 

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>JRPG</title>
+  <title>DragonCon Game</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -60,7 +60,7 @@
 
 <!-- Name entry — shown before WASM loads -->
 <div id="name-form">
-  <p style="font-size:20px;color:#aaf;">JRPG — Enter your name</p>
+  <p style="font-size:20px;color:#aaf;">Enter your name</p>
   <input id="player-name" type="text" maxlength="16" placeholder="Player" autofocus />
   <button id="join-btn">Join Game</button>
 </div>
@@ -121,7 +121,7 @@ function startGame(playerName) {
 
       // Also expose player name and server URL as null-terminated strings
       // in WASM memory via a small JS helper called after instantiation.
-      fetch("jrpg_client.wasm")
+      fetch("client.wasm")
         .then(r => r.arrayBuffer())
         .then(buf => WebAssembly.instantiate(buf, imports))
         .then(({ instance, module }) => {
@@ -159,7 +159,7 @@ function startGame(playerName) {
 
   // Load the Emscripten-generated JS glue script
   const script = document.createElement("script");
-  script.src = "jrpg_client.js";
+  script.src = "client.js";
   document.body.appendChild(script);
 }
 

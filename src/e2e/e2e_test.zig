@@ -1,10 +1,10 @@
-//! End-to-end test: spawn a real jrpg_server, connect two bot clients over
+//! End-to-end test: spawn a real server, connect two bot clients over
 //! WebSocket, play through wave_01_basic, assert players win.
 //!
 //! Run with:  zig build e2e
 //!
-//! The test binary and jrpg_server are both installed into zig-out/bin/.
-//! We locate jrpg_server relative to our own executable path.
+//! The test binary and server are both installed into zig-out/bin/.
+//! We locate server relative to our own executable path.
 
 const std = @import("std");
 const ws = @import("websocket");
@@ -51,7 +51,7 @@ pub fn main() !void {
     // ---- Locate server binary -----------------------------------------------
     const exe_dir = try std.fs.selfExeDirPathAlloc(allocator);
     defer allocator.free(exe_dir);
-    const server_path = try std.fs.path.join(allocator, &.{ exe_dir, "jrpg_server" });
+    const server_path = try std.fs.path.join(allocator, &.{ exe_dir, "server" });
     defer allocator.free(server_path);
 
     std.debug.print("[e2e] server binary: {s}\n", .{server_path});
@@ -59,7 +59,7 @@ pub fn main() !void {
     // ---- Kill any stale server on the test port ----------------------------
     _ = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "pkill", "-f", "jrpg_server" },
+        .argv = &.{ "pkill", "-f", "server" },
     }) catch {};
     std.Thread.sleep(100 * std.time.ns_per_ms);
 
