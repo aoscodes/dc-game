@@ -90,6 +90,11 @@ pub fn build(b: *std.Build) !void {
             \\["_main","_start_connect","_save_player_id","_wasm_alloc","_wasm_free","_on_ws_open","_on_ws_message","_on_ws_close","_g_server_url_buf"]
         ) catch @panic("OOM");
 
+        // Export wasmMemory so ws_glue.js can read Module.wasmMemory after init.
+        // Also suppresses the spurious requestFullscreen warning from raylib's
+        // default emcc settings.
+        emcc_settings.put("EXPORTED_RUNTIME_METHODS", "[\"wasmMemory\"]") catch @panic("OOM");
+
         const emcc_step = rlz.emsdk.emccStep(b, raylib_artifact, wasm, .{
             .optimize = optimize,
             .flags = emcc_flags,
