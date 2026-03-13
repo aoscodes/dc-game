@@ -1,38 +1,47 @@
 /**
  * ws_glue.js — JavaScript WebSocket bridge for the WASM client.
  *
- * This file is injected into the Emscripten module's importObject under the
- * "env" namespace.  It implements the three extern functions declared in
- * src/client/net/ws_browser.zig and routes WebSocket events back into WASM
- * by calling the exported Zig functions.
+ * ws_connect / ws_send / ws_close are provided to WASM via web/ws_lib.js,
+ * an Emscripten JS library that preserves their names through Closure
+ * Compiler.  ws_lib.js exposes Module._ws_glue_register(impl) which this
+ * file calls from onRuntimeInitialized to wire up the live implementations.
  *
  * Usage (in index.html):
- *   const wsGlue = createWsGlue();   // call before instantiating WASM
- *   // merge wsGlue.env into your importObject.env
- *   // after WASM is instantiated, call wsGlue.setInstance(wasmInstance)
+ *   const wsGlue = createWsGlue();
+ *   // In Module.onRuntimeInitialized:
+ *   wsGlue.register(Module);
  *
  * Memory notes:
  *   - All Uint8Array views are derived fresh from memory.buffer on each use
  *     because WASM memory growth invalidates existing views.
  *   - Messages from WASM are copied out before the call returns.
- *   - Messages from JS are written into a small stack buffer allocated via
- *     the WASM allocator (see index.html bootstrap for the alloc export).
+ *   - Messages from JS are written into a buffer allocated via the WASM
+ *     allocator (Module._wasm_alloc / Module._wasm_free).
  */
 
 "use strict";
 
 function createWsGlue() {
-  let wasmInstance = null;
-  let wasmMemory   = null;   // WebAssembly.Memory object
+  let mod        = null;   // Emscripten Module, set by register()
+  let wasmMemory = null;   // WebAssembly.Memory, set by register()
 
   // handle → WebSocket map; handles are small integers starting at 0.
   const sockets = {};
   let nextHandle = 0;
 
-  /** Call after the Emscripten Module is initialised. Pass the Module object. */
-  function setInstance(module) {
-    wasmInstance = module;
-    wasmMemory   = module.wasmMemory;
+  /**
+   * Call from Module.onRuntimeInitialized.
+   * Registers the live ws_connect/ws_send/ws_close implementations with
+   * ws_lib.js and stores the Module reference for WASM callbacks.
+   */
+  function register(module) {
+    mod        = module;
+    wasmMemory = module.wasmMemory;
+    // Populate the ws_impl dispatch slots exposed by ws_lib.js via
+    // EXPORTED_RUNTIME_METHODS so ws_connect/ws_send/ws_close call our impls.
+    module['ws_impl'].connect = ws_connect;
+    module['ws_impl'].send    = ws_send;
+    module['ws_impl'].close   = ws_close;
   }
 
   /** Read a UTF-8 string from WASM linear memory. */
@@ -49,7 +58,7 @@ function createWsGlue() {
   }
 
   // -------------------------------------------------------------------------
-  // Extern functions (called FROM Zig/WASM)
+  // Extern implementations (called FROM Zig/WASM via ws_lib.js stubs)
   // -------------------------------------------------------------------------
 
   /**
@@ -65,24 +74,24 @@ function createWsGlue() {
       sockets[handle] = ws;
 
       ws.onopen = () => {
-        if (wasmInstance) wasmInstance._on_ws_open(handle);
+        if (mod) mod._on_ws_open(handle);
       };
 
       ws.onmessage = (ev) => {
-        if (!wasmInstance) return;
-        const bytes  = new Uint8Array(ev.data);
-        const len    = bytes.length;
+        if (!mod) return;
+        const bytes = new Uint8Array(ev.data);
+        const len   = bytes.length;
 
         // Allocate a buffer in WASM memory, copy message in, call handler,
         // then free.  Requires the WASM module to export alloc/free.
-        const ptr = wasmInstance._wasm_alloc(len);
+        const ptr = mod._wasm_alloc(len);
         if (!ptr) {
           console.error("ws_glue: wasm_alloc returned null, dropping message");
           return;
         }
         writeBytes(ptr, bytes);
-        wasmInstance._on_ws_message(handle, ptr, len);
-        wasmInstance._wasm_free(ptr, len);
+        mod._on_ws_message(handle, ptr, len);
+        mod._wasm_free(ptr, len);
       };
 
       ws.onerror = (err) => {
@@ -90,7 +99,7 @@ function createWsGlue() {
       };
 
       ws.onclose = () => {
-        if (wasmInstance) wasmInstance._on_ws_close(handle);
+        if (mod) mod._on_ws_close(handle);
         delete sockets[handle];
       };
 
@@ -128,9 +137,5 @@ function createWsGlue() {
     }
   }
 
-  return {
-    /** Merge these into your WASM importObject.env. */
-    env: { ws_connect, ws_send, ws_close },
-    setInstance,
-  };
+  return { register };
 }

@@ -75,14 +75,17 @@ pub fn build(b: *std.Build) !void {
         });
         wasm.root_module.linkLibrary(raylib_artifact);
 
-        const emcc_flags = rlz.emsdk.emccDefaultFlags(b.allocator, .{ .optimize = optimize });
+        var emcc_flags = rlz.emsdk.emccDefaultFlags(b.allocator, .{ .optimize = optimize });
         var emcc_settings = rlz.emsdk.emccDefaultSettings(b.allocator, .{ .optimize = optimize });
 
-        // ws_connect / ws_send / ws_close are declared as extern "env" in
-        // ws_browser.zig and injected at WASM instantiation time by ws_glue.js
-        // (see web/index.html instantiateWasm).  They are not present at link
-        // time, so we suppress the linker error here.
-        emcc_settings.put("ERROR_ON_UNDEFINED_SYMBOLS", "0") catch @panic("OOM");
+        // ws_connect / ws_send / ws_close are provided via ws_lib.js as a
+        // proper Emscripten JS library (--js-library).  This ensures Closure
+        // Compiler preserves their names in all optimize modes; without it
+        // -Oz renames them to single-letter keys that JS cannot inject into.
+        emcc_flags.put(
+            b.fmt("--js-library={s}", .{b.pathFromRoot("web/ws_lib.js")}),
+            {},
+        ) catch @panic("OOM");
 
         // Export all symbols that index.html calls directly or that ws_glue.js
         // invokes as callbacks.  Without this list emscripten only exports main.
@@ -90,10 +93,11 @@ pub fn build(b: *std.Build) !void {
             \\["_main","_start_connect","_save_player_id","_wasm_alloc","_wasm_free","_on_ws_open","_on_ws_message","_on_ws_close","_g_server_url_buf"]
         ) catch @panic("OOM");
 
-        // Export wasmMemory so ws_glue.js can read Module.wasmMemory after init.
+        // Export wasmMemory (for ws_glue.js) and ws_impl (so ws_glue.js can
+        // populate the ws_connect/ws_send/ws_close dispatch slots at runtime).
         // Also suppresses the spurious requestFullscreen warning from raylib's
         // default emcc settings.
-        emcc_settings.put("EXPORTED_RUNTIME_METHODS", "[\"wasmMemory\"]") catch @panic("OOM");
+        emcc_settings.put("EXPORTED_RUNTIME_METHODS", "[\"wasmMemory\",\"ws_impl\"]") catch @panic("OOM");
 
         const emcc_step = rlz.emsdk.emccStep(b, raylib_artifact, wasm, .{
             .optimize = optimize,

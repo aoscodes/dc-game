@@ -108,12 +108,10 @@ function startGame(playerName) {
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const serverUrl = `${protocol}//${location.hostname}/ws`;
 
-  // Patch WebAssembly.instantiate* to inject ws_connect/ws_send/ws_close
-  // before client.js loads.  Must run before the <script> tag is appended.
-  // See patchWasmInstantiate() below for full rationale.
-  patchWasmInstantiate(wsGlue.env);
-
-  // Emscripten module configuration
+  // Emscripten module configuration.
+  // ws_connect/ws_send/ws_close are provided via web/ws_lib.js (--js-library),
+  // so no import-object patching is needed here.  ws_glue.register(Module)
+  // wires up the live implementations via Module._ws_glue_register().
   const Module = {
     canvas: document.getElementById("canvas"),
 
@@ -121,9 +119,8 @@ function startGame(playerName) {
     printErr(text) { console.warn("[game:err]", text); },
 
     onRuntimeInitialized() {
-      // Emscripten has fully initialised; Module._* wrappers and
-      // Module.wasmMemory are now available.
-      wsGlue.setInstance(Module);
+      // Register live WebSocket implementations and store Module reference.
+      wsGlue.register(Module);
 
       // Write server URL into g_server_url_buf then kick off the connect.
       // Module._g_server_url_buf is the integer address of the exported buffer.
@@ -147,7 +144,7 @@ function startGame(playerName) {
 // ---------------------------------------------------------------------------
 
 // Write a null-terminated UTF-8 string into WASM memory at `ptr`.
-// `mod` is the Emscripten Module object; use Module.HEAPU8 for memory access.
+// `mod` is the Emscripten Module object; Module.HEAPU8 is used for access.
 function writeNullTerminated(mod, ptr, str) {
   const enc = new TextEncoder().encode(str);
   // Re-read HEAPU8 each time: memory growth invalidates previous views.
@@ -175,46 +172,6 @@ function writeServerUrl(mod, url) {
 window.save_player_id = function(pid) {
   sessionStorage.setItem("player_id", pid);
 };
-
-// ---------------------------------------------------------------------------
-// WebAssembly instantiation intercept
-// ---------------------------------------------------------------------------
-
-/**
- * Patch WebAssembly.instantiate and WebAssembly.instantiateStreaming to inject
- * `env` functions into the imports object before instantiation.
- *
- * This is the only reliable cross-build injection point.  Overriding
- * Module.instantiateWasm blocks Emscripten's source-map run-dependency, so
- * we hook at the WebAssembly API level instead.  Both debug builds (key "env")
- * and release builds (Closure-minified key "a") share the same wasmImports
- * object across all namespace keys, so mutating the first value object reaches
- * every namespace regardless of key name.
- *
- * Must be called before client.js is loaded.
- */
-function patchWasmInstantiate(envFunctions) {
-  function injectEnv(imports) {
-    if (!imports) return;
-    // All namespace keys alias the same wasmImports object.  Mutate in place.
-    const wasmImports = Object.values(imports)[0];
-    if (wasmImports && typeof wasmImports === 'object') {
-      Object.assign(wasmImports, envFunctions);
-    }
-  }
-
-  const origInstantiate = WebAssembly.instantiate;
-  WebAssembly.instantiate = function(bufferOrModule, imports, ...rest) {
-    injectEnv(imports);
-    return origInstantiate.call(this, bufferOrModule, imports, ...rest);
-  };
-
-  const origStreaming = WebAssembly.instantiateStreaming;
-  WebAssembly.instantiateStreaming = function(source, imports, ...rest) {
-    injectEnv(imports);
-    return origStreaming.call(this, source, imports, ...rest);
-  };
-}
 </script>
 </body>
 </html>
