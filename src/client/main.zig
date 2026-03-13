@@ -301,12 +301,16 @@ export fn save_player_id(pid: u8) void {
 }
 
 /// Called by JS after it has written the server URL into g_server_url_buf.
-/// Reads the null-terminated string from the buffer and opens the WebSocket.
+/// Reads the null-terminated string from the buffer, opens the WebSocket,
+/// and stores the transport so on_ws_open can send the join message.
 export fn start_connect() void {
     // Find null terminator to determine URL length.
     const len = std.mem.indexOfScalar(u8, &g_server_url_buf, 0) orelse g_server_url_buf.len;
     if (len > 0) g_server_url = g_server_url_buf[0..len];
-    _ = net.WsBrowserTransport.connect(g_server_url) catch {};
+    const t = net.WsBrowserTransport.connect(g_server_url) catch return;
+    g_ws_transport = t;
+    g_ws_transport_valid = true;
+    g_state.transport = g_ws_transport.transport();
 }
 
 export fn wasm_alloc(len: usize) ?[*]u8 {
@@ -316,6 +320,44 @@ export fn wasm_alloc(len: usize) ?[*]u8 {
 
 export fn wasm_free(ptr: [*]u8, len: usize) void {
     std.heap.page_allocator.free(ptr[0..len]);
+}
+
+/// C-ABI wrapper for emscripten_set_main_loop (WASM only).
+fn frame_c() callconv(.c) void {
+    frame();
+}
+
+/// One frame of update + draw, called by both the native loop and the
+/// Emscripten main-loop callback.  Must not block.
+fn frame() void {
+    process_recv();
+
+    switch (g_state.phase) {
+        .connecting => {},
+        .lobby => update_lobby(),
+        .game => update_game(),
+        .game_over => {
+            if (rl.isKeyPressed(.enter)) g_state.phase = .lobby;
+        },
+    }
+
+    rl.beginDrawing();
+    defer rl.endDrawing();
+
+    switch (g_state.phase) {
+        .connecting => {
+            rl.clearBackground(.black);
+            rl.drawText("Connecting to server...", 40, 40, 24, .ray_white);
+        },
+        .lobby => render.draw_lobby(&g_state.lobby),
+        .game => render.draw_game(&g_state.game),
+        .game_over => {
+            rl.clearBackground(.black);
+            rl.drawText("Game Over!  Press ENTER to return to lobby.", 40, 300, 24, .ray_white);
+        },
+    }
+
+    rl.drawFPS(4, 4);
 }
 
 pub fn main() !void {
@@ -329,51 +371,25 @@ pub fn main() !void {
         .on_close = on_ws_close,
     });
 
-    // WASM is single-threaded: the browser WebSocket is purely event-driven
-    // via JS callbacks (on_ws_open / on_ws_message / on_ws_close).  No
-    // background thread is needed; JS calls start_connect() explicitly after
-    // writing the server URL into g_server_url_buf via g_server_url_ptr.
-    // On native, the connect loop runs in a dedicated thread so it can block
-    // on send/recv and still let the Raylib render loop run.
-    if (comptime @import("builtin").target.os.tag == .emscripten) {
-        // connect deferred — JS calls start_connect() after setting URL
-    } else {
-        const loop_thread = try std.Thread.spawn(.{}, connect_loop, .{{}});
-        loop_thread.detach();
-    }
-
     rl.initWindow(@intFromFloat(render.SW), @intFromFloat(render.SH), "Client");
-    defer rl.closeWindow();
     rl.setTargetFPS(60);
 
-    while (!rl.windowShouldClose()) {
-        process_recv();
+    if (comptime @import("builtin").target.os.tag == .emscripten) {
+        // On WASM, never call WindowShouldClose() — it invokes emscripten_sleep
+        // which corrupts Asyncify's call stack when called from main().
+        // Instead, hand control to the browser via emscripten_set_main_loop and
+        // return immediately; JS calls start_connect() to open the WebSocket.
+        const emscripten_set_main_loop = struct {
+            extern fn emscripten_set_main_loop(cb: *const fn () callconv(.c) void, fps: c_int, simulate_infinite_loop: c_int) void;
+        }.emscripten_set_main_loop;
+        emscripten_set_main_loop(&frame_c, 0, 0);
+    } else {
+        defer rl.closeWindow();
+        const loop_thread = try std.Thread.spawn(.{}, connect_loop, .{{}});
+        loop_thread.detach();
 
-        switch (g_state.phase) {
-            .connecting => {},
-            .lobby => update_lobby(),
-            .game => update_game(),
-            .game_over => {
-                if (rl.isKeyPressed(.enter)) g_state.phase = .lobby;
-            },
+        while (!rl.windowShouldClose()) {
+            frame();
         }
-
-        rl.beginDrawing();
-        defer rl.endDrawing();
-
-        switch (g_state.phase) {
-            .connecting => {
-                rl.clearBackground(.black);
-                rl.drawText("Connecting to server...", 40, 40, 24, .ray_white);
-            },
-            .lobby => render.draw_lobby(&g_state.lobby),
-            .game => render.draw_game(&g_state.game),
-            .game_over => {
-                rl.clearBackground(.black);
-                rl.drawText("Game Over!  Press ENTER to return to lobby.", 40, 300, 24, .ray_white);
-            },
-        }
-
-        rl.drawFPS(4, 4);
     }
 }
