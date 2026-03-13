@@ -123,9 +123,11 @@ jobs:
       - name: cache zig packages
         uses: actions/cache@v4
         with:
-          path: ~/.cache/zig
-          key: zig-pkgs-${{ hashFiles('build.zig.zon') }}
-          restore-keys: zig-pkgs-
+          path: |
+            ~/.cache/zig
+            ~/.cache/emscripten
+          key: zig-pkgs-wasm-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-pkgs-wasm-
 
       # WASM build — raylib-zig bootstraps its own emsdk from the package
       # dependency in build.zig.zon; no system emcc required.
