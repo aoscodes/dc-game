@@ -84,6 +84,12 @@ pub fn build(b: *std.Build) !void {
         // time, so we suppress the linker error here.
         emcc_settings.put("ERROR_ON_UNDEFINED_SYMBOLS", "0") catch @panic("OOM");
 
+        // Export all symbols that index.html calls directly or that ws_glue.js
+        // invokes as callbacks.  Without this list emscripten only exports main.
+        emcc_settings.put("EXPORTED_FUNCTIONS",
+            \\["_main","_start_connect","_save_player_id","_wasm_alloc","_wasm_free","_on_ws_open","_on_ws_message","_on_ws_close","_g_server_url_buf"]
+        ) catch @panic("OOM");
+
         const emcc_step = rlz.emsdk.emccStep(b, raylib_artifact, wasm, .{
             .optimize = optimize,
             .flags = emcc_flags,
