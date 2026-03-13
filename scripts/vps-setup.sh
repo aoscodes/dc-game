@@ -114,6 +114,8 @@ server {
 
     # Ensure .wasm files are served with the correct MIME type.
     # Ubuntu 24.04 nginx may not have it in /etc/nginx/mime.types.
+    # include first so the full type table is inherited, then override wasm.
+    include /etc/nginx/mime.types;
     types {
         application/wasm  wasm;
     }
@@ -124,7 +126,8 @@ ln -sf /etc/nginx/sites-available/dragoncon /etc/nginx/sites-enabled/dragoncon
 rm -f /etc/nginx/sites-enabled/default
 
 nginx -t
-systemctl reload nginx
+systemctl enable nginx
+systemctl restart nginx
 
 echo ""
 echo "=== vps-setup.sh complete ==="

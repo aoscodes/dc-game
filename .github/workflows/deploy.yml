@@ -73,12 +73,24 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      - uses: actions/checkout@v4
+
       # download-artifact@v4 extracts into path: so deploy/ is restored exactly
       - name: download artifacts
         uses: actions/download-artifact@v4
         with:
           name: dragoncon-artifacts
           path: deploy/
+
+      - name: push setup script
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "scripts/vps-setup.sh"
+          target: "~/"
+          strip_components: 1
 
       - name: deploy web assets
         uses: appleboy/scp-action@v0.1.7
