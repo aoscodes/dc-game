@@ -75,6 +75,14 @@ pub fn build(b: *std.Build) !void {
         });
         wasm.root_module.linkLibrary(raylib_artifact);
 
+        // Disable raylib's built-in frame-rate limiter (SwapScreenBuffer +
+        // WaitTime + PollInputEvents in EndDrawing).  On WASM, WaitTime calls
+        // nanosleep/emscripten_sleep which corrupts Asyncify state and causes
+        // runaway frame rates (~1800 fps).  With SUPPORT_CUSTOM_FRAME_CONTROL
+        // the browser's requestAnimationFrame callback (set via
+        // emscripten_set_main_loop) is the sole frame-rate governor.
+        raylib_artifact.root_module.addCMacro("SUPPORT_CUSTOM_FRAME_CONTROL", "1");
+
         var emcc_flags = rlz.emsdk.emccDefaultFlags(b.allocator, .{ .optimize = optimize });
         var emcc_settings = rlz.emsdk.emccDefaultSettings(b.allocator, .{ .optimize = optimize });
 

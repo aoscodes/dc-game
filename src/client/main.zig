@@ -329,6 +329,10 @@ fn frame_c() callconv(.c) void {
 
 /// One frame of update + draw, called by both the native loop and the
 /// Emscripten main-loop callback.  Must not block.
+///
+/// On WASM, raylib is compiled with SUPPORT_CUSTOM_FRAME_CONTROL so
+/// EndDrawing() does not call SwapScreenBuffer/WaitTime/PollInputEvents.
+/// We drive those manually to avoid emscripten_sleep corrupting Asyncify.
 fn frame() void {
     process_recv();
 
@@ -342,8 +346,6 @@ fn frame() void {
     }
 
     rl.beginDrawing();
-    defer rl.endDrawing();
-
     switch (g_state.phase) {
         .connecting => {
             rl.clearBackground(.black);
@@ -356,8 +358,13 @@ fn frame() void {
             rl.drawText("Game Over!  Press ENTER to return to lobby.", 40, 300, 24, .ray_white);
         },
     }
-
     rl.drawFPS(4, 4);
+    rl.endDrawing();
+
+    if (comptime @import("builtin").target.os.tag == .emscripten) {
+        rl.swapScreenBuffer();
+        rl.pollInputEvents();
+    }
 }
 
 pub fn main() !void {
