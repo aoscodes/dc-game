@@ -188,8 +188,10 @@ function writeSavedPid(exports, pid) {
 }
 
 function writeServerUrl(exports, url) {
-  if (!exports.g_server_url_ptr) return;
-  writeNullTerminated(exports, exports.g_server_url_ptr.value, url);
+  if (!exports.g_server_url_buf) return;
+  // g_server_url_buf is a Zig exported [256]u8 array — its `.value` is the
+  // address of the buffer directly.  Write the URL as a null-terminated string.
+  writeNullTerminated(exports, exports.g_server_url_buf.value, url);
 }
 
 // Persist player_id when received from server (called by WASM via export)

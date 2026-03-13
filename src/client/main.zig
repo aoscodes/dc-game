@@ -65,14 +65,11 @@ const ClientState = struct {
 
 var g_state: ClientState = .{};
 
-// Storage for the server URL written by JS via g_server_url_ptr before
+// Storage for the server URL written by JS via g_server_url_buf before
 // start_connect is called.  The buffer is large enough for any reasonable URL.
-var g_server_url_buf: [256]u8 = [_]u8{0} ** 256;
+// Exported directly so JS can write into it without pointer indirection.
+export var g_server_url_buf: [256]u8 = [_]u8{0} ** 256;
 var g_server_url: []const u8 = "ws://127.0.0.1:9001";
-
-/// Exported so index.html can write the real server URL into WASM memory
-/// before calling start_connect.
-export var g_server_url_ptr: [*]u8 = &g_server_url_buf;
 
 var g_need_reconnect: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
