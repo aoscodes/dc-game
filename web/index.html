@@ -106,7 +106,7 @@ function startGame(playerName) {
 
   // Derive server URL from current page origin (ws:// or wss://)
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const serverUrl = `${protocol}//${location.hostname}:9001`;
+  const serverUrl = `${protocol}//${location.hostname}/ws`;
 
   // Emscripten module configuration
   const Module = {
