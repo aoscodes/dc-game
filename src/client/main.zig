@@ -353,6 +353,14 @@ fn updateDrawFrame() void {
     }
 
     rl.drawFPS(4, 4);
+
+    // With SUPPORT_CUSTOM_FRAME_CONTROL, EndDrawing skips SwapScreenBuffer,
+    // WaitTime and PollInputEvents. Drive them here; browser rAF (via
+    // emscripten_set_main_loop) is the sole frame-rate governor.
+    if (comptime @import("builtin").target.os.tag == .emscripten) {
+        rl.swapScreenBuffer();
+        rl.pollInputEvents();
+    }
 }
 
 pub fn main() !void {

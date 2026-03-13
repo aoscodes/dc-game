@@ -1,5 +1,4 @@
 <!DOCTYPE html>
-
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -10,169 +9,44 @@
     body {
       background: #111;
       display: flex;
-      flex-direction: column;
       align-items: center;
       justify-content: center;
       min-height: 100vh;
-      font-family: monospace;
-      color: #ccc;
     }
-    #canvas-container {
-      position: relative;
-    }
-    canvas {
-      display: block;
-      image-rendering: pixelated;
-    }
-    #status {
-      margin-top: 8px;
-      font-size: 13px;
-      color: #888;
-    }
-    #name-form {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      gap: 10px;
-    }
-    #name-form input {
-      background: #222;
-      border: 1px solid #444;
-      color: #eee;
-      padding: 8px 12px;
-      font-family: monospace;
-      font-size: 16px;
-      width: 200px;
-    }
-    #name-form button {
-      background: #334;
-      border: 1px solid #55f;
-      color: #aaf;
-      padding: 8px 24px;
-      font-family: monospace;
-      font-size: 14px;
-      cursor: pointer;
-    }
-    #name-form button:hover { background: #445; }
-    #game-wrapper { display: none; }
+    canvas { display: block; image-rendering: pixelated; }
   </style>
 </head>
 <body>
-
-<!-- Name entry — shown before WASM loads -->
-<div id="name-form">
-  <p style="font-size:20px;color:#aaf;">Enter your name</p>
-  <input id="player-name" type="text" maxlength="16" placeholder="Player" autofocus />
-  <button id="join-btn">Join Game</button>
-</div>
-
-<div id="game-wrapper">
-  <div id="canvas-container">
-    <!-- Emscripten injects the canvas here -->
-    <canvas id="canvas"></canvas>
-  </div>
-  <div id="status">Connecting...</div>
-</div>
-
+<canvas id="canvas"></canvas>
 <script src="ws_glue.js"></script>
 <script>
 "use strict";
 
-// ---------------------------------------------------------------------------
-// Name → sessionStorage
-// ---------------------------------------------------------------------------
-const savedName = sessionStorage.getItem("player_name") || "";
-const savedPid  = sessionStorage.getItem("player_id");
+const wsGlue = createWsGlue();
+const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+const serverUrl = `${protocol}//${location.hostname}/ws`;
 
-document.getElementById("player-name").value = savedName;
+window.Module = {
+  canvas: document.getElementById("canvas"),
+  print(text)    { console.log("[game]", text); },
+  printErr(text) { console.warn("[game:err]", text); },
 
-document.getElementById("join-btn").addEventListener("click", () => {
-  const name = document.getElementById("player-name").value.trim() || "Player";
-  sessionStorage.setItem("player_name", name);
-  document.getElementById("name-form").style.display = "none";
-  document.getElementById("game-wrapper").style.display = "block";
-  startGame(name);
-});
-
-// Allow Enter key in name field
-document.getElementById("player-name").addEventListener("keydown", (e) => {
-  if (e.key === "Enter") document.getElementById("join-btn").click();
-});
-
-// ---------------------------------------------------------------------------
-// WASM / Emscripten bootstrap
-// ---------------------------------------------------------------------------
-function startGame(playerName) {
-  const wsGlue = createWsGlue();
-
-  // Derive server URL from current page origin (ws:// or wss://)
-  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  const serverUrl = `${protocol}//${location.hostname}/ws`;
-
-  // Emscripten module configuration.
-  // ws_connect/ws_send/ws_close are provided via web/ws_lib.js (--js-library),
-  // so no import-object patching is needed here.  ws_glue.register(Module)
-  // wires up the live implementations via Module._ws_glue_register().
-  const Module = {
-    canvas: document.getElementById("canvas"),
-
-    print(text) { console.log("[game]", text); },
-    printErr(text) { console.warn("[game:err]", text); },
-
-    onRuntimeInitialized() {
-      // Register live WebSocket implementations and store Module reference.
-      wsGlue.register(Module);
-
-      // Write server URL into g_server_url_buf then kick off the connect.
-      // Module._g_server_url_buf is the integer address of the exported buffer.
-      writeServerUrl(Module, serverUrl);
-      Module._start_connect();
-
-      document.getElementById("status").textContent = "Connected";
-    },
-  };
-
-  window.Module = Module;
-
-  // Load the Emscripten-generated JS glue script
-  const script = document.createElement("script");
-  script.src = "client.js";
-  document.body.appendChild(script);
-}
-
-// ---------------------------------------------------------------------------
-// WASM memory helpers
-// ---------------------------------------------------------------------------
-
-// Write a null-terminated UTF-8 string into WASM memory at `ptr`.
-// `mod` is the Emscripten Module object; Module.HEAPU8 is used for access.
-function writeNullTerminated(mod, ptr, str) {
-  const enc = new TextEncoder().encode(str);
-  // Re-read HEAPU8 each time: memory growth invalidates previous views.
-  mod.HEAPU8.set(enc, ptr);
-  mod.HEAPU8[ptr + enc.length] = 0;
-}
-
-function writePlayerName(mod, name) {
-  if (!mod._g_name_ptr) return; // not exported; main() uses default
-  writeNullTerminated(mod, mod._g_name_ptr, name.slice(0, 16));
-}
-
-function writeSavedPid(mod, pid) {
-  if (!mod._g_saved_pid) return; // not exported; no-op
-  mod.HEAPU8[mod._g_saved_pid] = pid & 0xFF;
-}
-
-function writeServerUrl(mod, url) {
-  // Module._g_server_url_buf is the integer address of the exported [256]u8 buffer.
-  writeNullTerminated(mod, mod._g_server_url_buf, url);
-}
-
-// Persist player_id when received from server (called by WASM via export)
-// This is wired up through the Zig export `save_player_id(u8)`.
-window.save_player_id = function(pid) {
-  sessionStorage.setItem("player_id", pid);
+  onRuntimeInitialized() {
+    wsGlue.register(window.Module);
+    // Write server URL into g_server_url_buf and connect.
+    // Player name stays as the Zig default ("Player").
+    const mod = window.Module;
+    const enc = new TextEncoder().encode(serverUrl);
+    const mem = new Uint8Array(mod.wasmMemory.buffer);
+    mem.set(enc, mod._g_server_url_buf);
+    mem[mod._g_server_url_buf + enc.length] = 0;
+    mod._start_connect();
+  },
 };
+
+const script = document.createElement("script");
+script.src = "client.js";
+document.body.appendChild(script);
 </script>
 </body>
 </html>

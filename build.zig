@@ -73,7 +73,22 @@ pub fn build(b: *std.Build) !void {
             .name = "client",
             .root_module = client_mod,
         });
-        wasm.root_module.linkLibrary(raylib_artifact);
+
+        // With emscripten_set_main_loop the browser's rAF governs frame rate.
+        // EndDrawing's built-in WaitTime busy-spins on WASM (nanosleep is a
+        // no-op without Asyncify) causing ~1700 fps and browser starvation.
+        // SUPPORT_CUSTOM_FRAME_CONTROL removes that block; we call
+        // swapScreenBuffer + pollInputEvents manually each frame instead.
+        //
+        // addCMacro on raylib_artifact does not work (dep is pre-cached).
+        // Instead re-fetch raylib directly via raylib_zig's sub-dependency
+        // with the config flag, giving us a correctly compiled artifact.
+        const raylib_wasm_artifact = raylib_dep.builder.dependency("raylib", .{
+            .target = target,
+            .optimize = optimize,
+            .config = @as([]const u8, "-DSUPPORT_CUSTOM_FRAME_CONTROL"),
+        }).artifact("raylib");
+        wasm.root_module.linkLibrary(raylib_wasm_artifact);
 
         var emcc_flags = rlz.emsdk.emccDefaultFlags(b.allocator, .{ .optimize = optimize, .asyncify = false });
         var emcc_settings = rlz.emsdk.emccDefaultSettings(b.allocator, .{ .optimize = optimize });
@@ -104,7 +119,7 @@ pub fn build(b: *std.Build) !void {
         // because memory.grow returns -1 and Emscripten does not resize.
         emcc_settings.put("ALLOW_MEMORY_GROWTH", "1") catch @panic("OOM");
 
-        const emcc_step = rlz.emsdk.emccStep(b, raylib_artifact, wasm, .{
+        const emcc_step = rlz.emsdk.emccStep(b, raylib_wasm_artifact, wasm, .{
             .optimize = optimize,
             .flags = emcc_flags,
             .settings = emcc_settings,
