@@ -117,7 +117,7 @@ function startGame(playerName) {
     // `instantiateWasm` when provided.
     instantiateWasm(imports, successCallback) {
       // Merge our env into Emscripten's env imports
-      Object.assign(imports.env, wsGlue.env);
+      imports.env = Object.assign(imports.env || {}, wsGlue.env);
 
       // Also expose player name and server URL as null-terminated strings
       // in WASM memory via a small JS helper called after instantiation.
