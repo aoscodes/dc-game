@@ -322,18 +322,8 @@ export fn wasm_free(ptr: [*]u8, len: usize) void {
     std.heap.page_allocator.free(ptr[0..len]);
 }
 
-/// C-ABI wrapper for emscripten_set_main_loop (WASM only).
-fn frame_c() callconv(.c) void {
-    frame();
-}
-
-/// One frame of update + draw, called by both the native loop and the
-/// Emscripten main-loop callback.  Must not block.
-///
-/// On WASM, raylib is compiled with SUPPORT_CUSTOM_FRAME_CONTROL so
-/// EndDrawing() does not call SwapScreenBuffer/WaitTime/PollInputEvents.
-/// We drive those manually to avoid emscripten_sleep corrupting Asyncify.
-fn frame() void {
+/// One frame of update + draw.
+fn updateDrawFrame() void {
     process_recv();
 
     switch (g_state.phase) {
@@ -346,6 +336,8 @@ fn frame() void {
     }
 
     rl.beginDrawing();
+    defer rl.endDrawing();
+
     switch (g_state.phase) {
         .connecting => {
             rl.clearBackground(.black);
@@ -358,13 +350,8 @@ fn frame() void {
             rl.drawText("Game Over!  Press ENTER to return to lobby.", 40, 300, 24, .ray_white);
         },
     }
-    rl.drawFPS(4, 4);
-    rl.endDrawing();
 
-    if (comptime @import("builtin").target.os.tag == .emscripten) {
-        rl.swapScreenBuffer();
-        rl.pollInputEvents();
-    }
+    rl.drawFPS(4, 4);
 }
 
 pub fn main() !void {
@@ -379,24 +366,17 @@ pub fn main() !void {
     });
 
     rl.initWindow(@intFromFloat(render.SW), @intFromFloat(render.SH), "Client");
-    rl.setTargetFPS(60);
 
     if (comptime @import("builtin").target.os.tag == .emscripten) {
-        // On WASM, never call WindowShouldClose() — it invokes emscripten_sleep
-        // which corrupts Asyncify's call stack when called from main().
-        // Instead, hand control to the browser via emscripten_set_main_loop and
-        // return immediately; JS calls start_connect() to open the WebSocket.
-        const emscripten_set_main_loop = struct {
-            extern fn emscripten_set_main_loop(cb: *const fn () callconv(.c) void, fps: c_int, simulate_infinite_loop: c_int) void;
-        }.emscripten_set_main_loop;
-        emscripten_set_main_loop(&frame_c, 0, 0);
+        std.os.emscripten.emscripten_set_main_loop(@ptrCast(&updateDrawFrame), 0, 1);
     } else {
+        rl.setTargetFPS(60);
         defer rl.closeWindow();
         const loop_thread = try std.Thread.spawn(.{}, connect_loop, .{{}});
         loop_thread.detach();
 
         while (!rl.windowShouldClose()) {
-            frame();
+            updateDrawFrame();
         }
     }
 }
