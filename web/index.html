@@ -136,8 +136,10 @@ function startGame(playerName) {
             writeSavedPid(instance.exports, parseInt(savedPid, 10));
           }
 
-          // Write server URL
+          // Write server URL then kick off the WebSocket connect.
+          // start_connect() reads g_server_url_buf and calls ws_connect().
           writeServerUrl(instance.exports, serverUrl);
+          instance.exports.start_connect();
         })
         .catch(err => {
           console.error("WASM load failed:", err);

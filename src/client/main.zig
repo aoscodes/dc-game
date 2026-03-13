@@ -65,7 +65,14 @@ const ClientState = struct {
 
 var g_state: ClientState = .{};
 
+// Storage for the server URL written by JS via g_server_url_ptr before
+// start_connect is called.  The buffer is large enough for any reasonable URL.
+var g_server_url_buf: [256]u8 = [_]u8{0} ** 256;
 var g_server_url: []const u8 = "ws://127.0.0.1:9001";
+
+/// Exported so index.html can write the real server URL into WASM memory
+/// before calling start_connect.
+export var g_server_url_ptr: [*]u8 = &g_server_url_buf;
 
 var g_need_reconnect: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -296,6 +303,15 @@ export fn save_player_id(pid: u8) void {
     g_state.our_player_id = pid;
 }
 
+/// Called by JS after it has written the server URL into g_server_url_buf.
+/// Reads the null-terminated string from the buffer and opens the WebSocket.
+export fn start_connect() void {
+    // Find null terminator to determine URL length.
+    const len = std.mem.indexOfScalar(u8, &g_server_url_buf, 0) orelse g_server_url_buf.len;
+    if (len > 0) g_server_url = g_server_url_buf[0..len];
+    _ = net.WsBrowserTransport.connect(g_server_url) catch {};
+}
+
 export fn wasm_alloc(len: usize) ?[*]u8 {
     const mem = std.heap.page_allocator.alloc(u8, len) catch return null;
     return mem.ptr;
@@ -318,11 +334,12 @@ pub fn main() !void {
 
     // WASM is single-threaded: the browser WebSocket is purely event-driven
     // via JS callbacks (on_ws_open / on_ws_message / on_ws_close).  No
-    // background thread is needed; just kick off the initial connect.
+    // background thread is needed; JS calls start_connect() explicitly after
+    // writing the server URL into g_server_url_buf via g_server_url_ptr.
     // On native, the connect loop runs in a dedicated thread so it can block
     // on send/recv and still let the Raylib render loop run.
     if (comptime @import("builtin").target.os.tag == .emscripten) {
-        _ = net.WsBrowserTransport.connect(g_server_url) catch {};
+        // connect deferred — JS calls start_connect() after setting URL
     } else {
         const loop_thread = try std.Thread.spawn(.{}, connect_loop, .{{}});
         loop_thread.detach();
