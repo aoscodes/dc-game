@@ -370,12 +370,13 @@ pub fn main() !void {
     defer rl.closeWindow();
     rl.setTargetFPS(60);
 
-    if (comptime @import("builtin").target.os.tag != .emscripten) {
+    if (comptime @import("builtin").target.os.tag == .emscripten) {
+        std.os.emscripten.emscripten_set_main_loop(@ptrCast(&updateDrawFrame), 0, 1);
+    } else {
         const loop_thread = try std.Thread.spawn(.{}, connect_loop, .{{}});
         loop_thread.detach();
-    }
-
-    while (!rl.windowShouldClose()) {
-        updateDrawFrame();
+        while (!rl.windowShouldClose()) {
+            updateDrawFrame();
+        }
     }
 }
