@@ -50,17 +50,22 @@ jobs:
       - name: build wasm client (ReleaseSmall)
         run: zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall
 
-      # Bundle hand-written web assets alongside the emscripten output
-      - name: collect web assets
-        run: cp web/index.html web/ws_glue.js zig-out/web/
+      # Bundle hand-written web assets alongside the emscripten output and
+      # stage everything into deploy/ with a known flat layout:
+      #   deploy/server        — game server binary
+      #   deploy/web/          — WASM client + HTML/JS assets
+      - name: stage artifacts
+        run: |
+          mkdir -p deploy/web
+          cp zig-out/bin/server deploy/server
+          cp zig-out/web/client.wasm zig-out/web/client.js deploy/web/
+          cp web/index.html web/ws_glue.js deploy/web/
 
       - name: upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dragoncon-artifacts
-          path: |
-            zig-out/bin/server
-            zig-out/web/
+          path: deploy/
           retention-days: 7
 
   deploy:
@@ -68,31 +73,31 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      # download-artifact@v4 extracts into path: so deploy/ is restored exactly
       - name: download artifacts
         uses: actions/download-artifact@v4
         with:
           name: dragoncon-artifacts
+          path: deploy/
 
-      # web/ dir lands at zig-out/web/ after download; copy to vhost root
       - name: deploy web assets
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          source: "zig-out/web/"
+          source: "deploy/web/*"
           target: "/var/www/dragoncon/"
           strip_components: 2
 
-      # Server binary lands at zig-out/bin/server after download
       - name: deploy server binary
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          source: "zig-out/bin/server"
-          target: "/tmp/dragoncon-deploy/"
+          source: "deploy/server"
+          target: "/tmp/"
 
       - name: install binary and restart service
         uses: appleboy/ssh-action@v1.0.3
@@ -101,8 +106,8 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
-            sudo install -o root -g dragoncon -m 755 \
-              /tmp/dragoncon-deploy/zig-out/bin/server \
+            sudo install -o dragoncon -g dragoncon -m 755 \
+              /tmp/server \
               /opt/dragoncon/server
             sudo systemctl restart dragoncon-server
-            rm -rf /tmp/dragoncon-deploy
+            rm -f /tmp/server
