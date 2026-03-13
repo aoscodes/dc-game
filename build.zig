@@ -75,7 +75,7 @@ pub fn build(b: *std.Build) !void {
         });
         wasm.root_module.linkLibrary(raylib_artifact);
 
-        var emcc_flags = rlz.emsdk.emccDefaultFlags(b.allocator, .{ .optimize = optimize, .asyncify = false });
+        var emcc_flags = rlz.emsdk.emccDefaultFlags(b.allocator, .{ .optimize = optimize });
         var emcc_settings = rlz.emsdk.emccDefaultSettings(b.allocator, .{ .optimize = optimize });
 
         // ws_connect / ws_send / ws_close are provided via ws_lib.js as a
