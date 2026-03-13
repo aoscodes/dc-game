@@ -324,6 +324,7 @@ export fn wasm_free(ptr: [*]u8, len: usize) void {
 
 /// One frame of update + draw.
 fn updateDrawFrame() void {
+    if (comptime @import("builtin").target.os.tag == .emscripten) net.poll();
     process_recv();
 
     switch (g_state.phase) {

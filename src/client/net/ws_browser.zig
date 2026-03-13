@@ -32,6 +32,11 @@ extern "env" fn ws_send(handle: i32, ptr: [*]const u8, len: usize) void;
 /// Close the connection identified by `handle`.
 extern "env" fn ws_close(handle: i32) void;
 
+/// Flush all queued JS socket events (open/message/close) into WASM callbacks.
+/// Must be called once per frame from within the normal WASM call stack so that
+/// Asyncify is not suspended when the callbacks run.
+extern "env" fn ws_poll() void;
+
 // ---------------------------------------------------------------------------
 // WsBrowserTransport
 // ---------------------------------------------------------------------------
@@ -116,6 +121,11 @@ var g_callbacks: Callbacks = .{
 
 pub fn set_callbacks(cb: Callbacks) void {
     g_callbacks = cb;
+}
+
+/// Drain queued JS socket events. Call once per frame before processing input.
+pub fn poll() void {
+    ws_poll();
 }
 
 fn client_on_ws_open(handle: i32) void {

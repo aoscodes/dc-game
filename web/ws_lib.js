@@ -16,9 +16,8 @@
  */
 
 mergeInto(LibraryManager.library, {
-  // $ws_impl is emitted as: var ws_impl = { connect: null, send: null, close: null };
-  // Function bodies below reference it as `ws_impl` (no underscore).
-  $ws_impl: { connect: null, send: null, close: null },
+  // $ws_impl holds live implementations populated by ws_glue.js at runtime.
+  $ws_impl: { connect: null, send: null, close: null, poll: null },
 
   // WASM extern: ws_connect(url_ptr: [*]u8, url_len: usize) i32
   ws_connect__deps: ['$ws_impl'],
@@ -37,5 +36,13 @@ mergeInto(LibraryManager.library, {
   ws_close__deps: ['$ws_impl'],
   ws_close: function(handle) {
     if (ws_impl.close) ws_impl.close(handle);
+  },
+
+  // WASM extern: ws_poll() void
+  // Called once per frame from within the WASM main loop (safe Asyncify
+  // call stack).  Flushes all queued socket events into WASM callbacks.
+  ws_poll__deps: ['$ws_impl'],
+  ws_poll: function() {
+    if (ws_impl.poll) ws_impl.poll();
   },
 });
