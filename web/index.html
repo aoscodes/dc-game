@@ -119,14 +119,16 @@ function startGame(playerName) {
     // module is instantiated.  Module.env is NOT merged by this Emscripten
     // version — wasmImports is built statically at compile time.
     instantiateWasm(imports, successCallback) {
-      imports.env = Object.assign(imports.env || {}, wsGlue.env);
+      // Mutate imports.env in place — do NOT replace it.  getWasmImports()
+      // returns { env: wasmImports } and wasmImports is already referenced by
+      // Asyncify; swapping the object out leaves the stub functions in place.
+      Object.assign(imports.env, wsGlue.env);
       WebAssembly.instantiateStreaming(fetch("client.wasm"), imports)
         .then(({ instance, module }) => successCallback(instance, module))
-        .catch(err => {
-          console.error("WASM load failed:", err);
+        .catch(e => {
+          console.error("WASM load failed:", e);
           document.getElementById("status").textContent = "Failed to load game.";
         });
-      return {}; // signal async init
     },
 
     print(text) { console.log("[game]", text); },
