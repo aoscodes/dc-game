@@ -96,7 +96,7 @@ server {
     index index.html;
 
     # WebSocket proxy -> game server (localhost only)
-    location /ws {
+    location = /ws {
         proxy_pass         http://127.0.0.1:9001;
         proxy_http_version 1.1;
         proxy_set_header   Upgrade    $http_upgrade;
