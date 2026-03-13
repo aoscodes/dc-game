@@ -3,9 +3,55 @@ name: build-and-deploy
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_all:
+        description: 'Force deploy all components regardless of changed paths'
+        type: boolean
+        default: false
 
 jobs:
-  build:
+  # Detect which parts of the codebase changed so downstream jobs can skip
+  # work that isn't needed.  dorny/paths-filter compares the push against the
+  # previous commit on the branch (or the merge-base for PRs).
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      server: ${{ steps.filter.outputs.server }}
+      client: ${{ steps.filter.outputs.client }}
+      web:    ${{ steps.filter.outputs.web }}
+      setup:  ${{ steps.filter.outputs.setup }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            server:
+              - 'src/server/**'
+              - 'src/shared/**'
+              - 'src/root.zig'
+              - 'build.zig'
+              - 'build.zig.zon'
+            client:
+              - 'src/client/**'
+              - 'src/shared/**'
+              - 'src/root.zig'
+              - 'build.zig'
+              - 'build.zig.zon'
+            web:
+              - 'web/**'
+            setup:
+              - 'scripts/vps-setup.sh'
+
+  # ------------------------------------------------------------------
+  # Shared setup step (reusable composite would be cleaner, but an
+  # explicit job keeps the log easy to read and avoids composite overhead)
+  # ------------------------------------------------------------------
+
+  build-server:
+    needs: changes
+    if: needs.changes.outputs.server == 'true' || inputs.deploy_all == true
     runs-on: ubuntu-24.04
 
     steps:
@@ -28,7 +74,6 @@ jobs:
             libwayland-dev libwayland-bin wayland-scanner++ \
             libegl1-mesa-dev
 
-      # Cache zig package fetches across runs (keyed on build.zig.zon)
       - name: cache zig packages
         uses: actions/cache@v4
         with:
@@ -45,54 +90,110 @@ jobs:
       - name: build server (ReleaseSafe)
         run: zig build server -Doptimize=ReleaseSafe
 
-      # WASM build — raylib-zig bootstraps its own emsdk from the package
-      # dependency in build.zig.zon; no system emcc required.
-      - name: build wasm client (ReleaseSmall)
-        run: zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall
-
-      # Bundle hand-written web assets alongside the emscripten output and
-      # stage everything into deploy/ with a known flat layout:
-      #   deploy/server        — game server binary
-      #   deploy/web/          — WASM client + HTML/JS assets
-      - name: stage artifacts
-        run: |
-          mkdir -p deploy/web
-          cp zig-out/bin/server deploy/server
-          cp zig-out/web/client.wasm zig-out/web/client.js deploy/web/
-          cp web/index.html web/ws_glue.js deploy/web/
-
-      - name: upload artifacts
+      - name: upload server artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dragoncon-artifacts
-          path: deploy/
+          name: server-binary
+          path: zig-out/bin/server
           retention-days: 7
 
-  deploy:
-    needs: build
+  build-client:
+    needs: changes
+    if: needs.changes.outputs.client == 'true' || inputs.deploy_all == true
     runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v4
 
-      # download-artifact@v4 extracts into path: so deploy/ is restored exactly
-      - name: download artifacts
+      - name: install zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.15.2"
+
+      - name: install raylib system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            libx11-dev libxcursor-dev libxext-dev libxfixes-dev \
+            libxi-dev libxinerama-dev libxrandr-dev libxrender-dev \
+            libglx-dev libgl1-mesa-dev \
+            libwayland-dev libwayland-bin wayland-scanner++ \
+            libegl1-mesa-dev
+
+      - name: cache zig packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-pkgs-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-pkgs-
+
+      # WASM build — raylib-zig bootstraps its own emsdk from the package
+      # dependency in build.zig.zon; no system emcc required.
+      - name: build wasm client (ReleaseSmall)
+        run: zig build -Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall
+
+      - name: upload client artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-client
+          path: zig-out/web/
+          retention-days: 7
+
+  # ------------------------------------------------------------------
+  # Deploy jobs — each only runs if the corresponding build ran OR if
+  # static assets changed (web assets need no build job).
+  # ------------------------------------------------------------------
+
+  deploy-server:
+    needs: [changes, build-server]
+    # build-server is skipped when server files didn't change; that makes
+    # needs.build-server.result == 'skipped', which is also fine to gate on.
+    if: needs.changes.outputs.server == 'true' || inputs.deploy_all == true
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: download server artifact
         uses: actions/download-artifact@v4
         with:
-          name: dragoncon-artifacts
+          name: server-binary
           path: deploy/
 
-      - name: push setup script
+      - name: scp server binary to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          source: "scripts/vps-setup.sh"
-          target: "~/"
+          source: "deploy/server"
+          target: "/tmp/dragoncon-deploy/zig-out/bin/"
           strip_components: 1
 
-      - name: deploy web assets
+      - name: install binary and restart service
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script: |
+            sudo /usr/bin/install -o dragoncon -g dragoncon -m 755 \
+              /tmp/dragoncon-deploy/zig-out/bin/server \
+              /opt/dragoncon/server
+            sudo systemctl restart dragoncon-server
+            rm -rf /tmp/dragoncon-deploy
+
+  deploy-client:
+    needs: [changes, build-client]
+    if: needs.changes.outputs.client == 'true' || inputs.deploy_all == true
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: download client artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: wasm-client
+          path: deploy/web/
+
+      - name: scp wasm client to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
@@ -102,24 +203,38 @@ jobs:
           target: "/var/www/dragoncon/"
           strip_components: 2
 
-      - name: deploy server binary
+  deploy-web:
+    needs: changes
+    if: needs.changes.outputs.web == 'true' || inputs.deploy_all == true
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: scp static web assets to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          source: "deploy/server"
-          target: "/tmp/"
+          source: "web/*"
+          target: "/var/www/dragoncon/"
+          strip_components: 1
 
-      - name: install binary and restart service
-        uses: appleboy/ssh-action@v1.0.3
+  deploy-setup:
+    needs: changes
+    if: needs.changes.outputs.setup == 'true' || inputs.deploy_all == true
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: push setup script to VPS
+        uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          script: |
-            sudo install -o dragoncon -g dragoncon -m 755 \
-              /tmp/server \
-              /opt/dragoncon/server
-            sudo systemctl restart dragoncon-server
-            rm -f /tmp/server
+          source: "scripts/vps-setup.sh"
+          target: "~/"
+          strip_components: 1
