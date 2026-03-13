@@ -426,8 +426,8 @@ pub const Session = struct {
             .attack => {
                 switch (actor_class.tag) {
                     .fighter => try self.resolve_fighter_attack(actor, actor_stats, msg.target_entity),
-                    .mage => try self.resolve_mage_attack(actor, actor_stats, actor_pos.*),
-                    .healer => try self.resolve_healer_heal(actor, actor_stats, actor_pos.*),
+                    .mage => try self.resolve_mage_attack(actor, actor_stats, msg.target_entity),
+                    .healer => try self.resolve_healer_heal(actor, actor_stats, msg.target_entity),
                     else => {},
                 }
             },
@@ -472,14 +472,16 @@ pub const Session = struct {
         }
     }
 
-    fn resolve_mage_attack(
+    /// AoE damage from an explicit origin cell.  Used by both the player mage
+    /// (origin = targeted enemy's position) and the archer AI (origin = self).
+    fn resolve_mage_aoe(
         self: *Session,
         actor: ecs.Entity,
         actor_stats: *c.Stats,
-        actor_pos: c.GridPos,
+        origin: c.GridPos,
     ) !void {
         var cells: [4]c.GridPos = undefined;
-        const n = logic.aoe_cells_2x2(actor_pos.col, actor_pos.row, &cells);
+        const n = logic.aoe_cells_2x2(origin.col, origin.row, &cells);
         for (cells[0..n]) |cell| {
             const target = self.entity_at(cell, .enemies) orelse continue;
             const tgt_stats = self.world.get_component(target, c.Stats);
@@ -488,7 +490,7 @@ pub const Session = struct {
             const mit = logic.sum_mitigation(self.effects[target].effects[0..self.effects[target].count]);
             const dmg = logic.mitigated_damage(raw, mit);
             logic.apply_damage(tgt_health, dmg);
-            std.log.debug("mage entity {} -> entity {}: {} dmg (aoe). cells {any}", .{ actor, target, dmg, cells });
+            std.log.debug("mage entity {} -> entity {}: {} dmg (aoe origin {},{}) ", .{ actor, target, dmg, origin.col, origin.row });
             try self.broadcast_action_result(.{
                 .tag = .damage,
                 .actor_entity = actor,
@@ -508,20 +510,53 @@ pub const Session = struct {
         }
     }
 
+    /// Player mage attack: AoE 2×2 centered on the targeted enemy's position.
+    fn resolve_mage_attack(
+        self: *Session,
+        actor: ecs.Entity,
+        actor_stats: *c.Stats,
+        target_entity: u32,
+    ) !void {
+        const origin: c.GridPos = blk: {
+            if (self.find_living(target_entity)) |t| {
+                break :blk self.world.get_component(t, c.GridPos).*;
+            }
+            // Fallback: first living enemy (handles stale target IDs).
+            for (self.living.items) |e| {
+                if (self.world.get_component(e, c.Team).id == .enemies)
+                    break :blk self.world.get_component(e, c.GridPos).*;
+            }
+            return; // no enemies left
+        };
+        return self.resolve_mage_aoe(actor, actor_stats, origin);
+    }
+
+    /// Player healer: AoE 2×2 heal centered on the targeted ally's position.
     fn resolve_healer_heal(
         self: *Session,
         actor: ecs.Entity,
         actor_stats: *c.Stats,
-        actor_pos: c.GridPos,
+        target_entity: u32,
     ) !void {
+        const origin: c.GridPos = blk: {
+            if (self.find_living(target_entity)) |t| {
+                break :blk self.world.get_component(t, c.GridPos).*;
+            }
+            // Fallback: first living player.
+            for (self.living.items) |e| {
+                if (self.world.get_component(e, c.Team).id == .players)
+                    break :blk self.world.get_component(e, c.GridPos).*;
+            }
+            return; // no players left
+        };
         var cells: [4]c.GridPos = undefined;
-        const n = logic.aoe_cells_2x2(actor_pos.col, actor_pos.row, &cells);
+        const n = logic.aoe_cells_2x2(origin.col, origin.row, &cells);
         for (cells[0..n]) |cell| {
             const target = self.entity_at(cell, .players) orelse continue;
             const tgt_health = self.world.get_component(target, c.Health);
             const amount: u16 = actor_stats.attack;
             logic.apply_heal(tgt_health, amount);
-            std.log.debug("healer entity {} -> entity {}: +{} hp", .{ actor, target, amount });
+            std.log.debug("healer entity {} -> entity {}: +{} hp (origin {},{}) ", .{ actor, target, amount, origin.col, origin.row });
             try self.broadcast_action_result(.{
                 .tag = .heal,
                 .actor_entity = actor,
@@ -651,7 +686,7 @@ pub const Session = struct {
             std.log.debug("AI entity {} ({s}) acting", .{ actor, @tagName(actor_class.tag) });
             switch (actor_class.tag) {
                 .shaman => try self.ai_shaman(actor, actor_stats, actor_pos.*),
-                .archer => try self.resolve_mage_attack(actor, actor_stats, actor_pos.*),
+                .archer => try self.resolve_mage_aoe(actor, actor_stats, actor_pos.*),
                 else => try self.ai_attack_front_rank(actor, actor_stats),
             }
 
@@ -694,7 +729,7 @@ pub const Session = struct {
         if (lowest != null) {
             try self.resolve_enemy_heal(actor, actor_stats, actor_pos);
         } else {
-            try self.resolve_mage_attack(actor, actor_stats, actor_pos);
+            try self.resolve_mage_aoe(actor, actor_stats, actor_pos);
         }
     }
 

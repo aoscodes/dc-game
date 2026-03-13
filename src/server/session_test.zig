@@ -502,8 +502,8 @@ test "healer attack heals ally" {
     try tick_until_charging(&s.sess, healer_entity);
 
     s.p[1].clear(allocator);
-    // target_entity is ignored by server for healer (AoE on player grid)
-    try enqueue_msg(&s.sess, s.p[1].pid, .choose_action, proto.ChooseAction{ .action = .attack, .target_entity = 0 });
+    // Healer targets the fighter; AoE 2×2 originates from the fighter's position.
+    try enqueue_msg(&s.sess, s.p[1].pid, .choose_action, proto.ChooseAction{ .action = .attack, .target_entity = fighter_entity });
     try tick_n(&s.sess, 0.1, 1);
 
     const msgs = try drain(s.p[1].buf.items, arena);
@@ -513,7 +513,7 @@ test "healer attack heals ally" {
 
     try std.testing.expectEqual(proto.ActionResultTag.heal, ar.tag);
     try std.testing.expect(ar.value > 0);
-    // Target must be a player entity (healer heals players)
+    // The heal must land on a player entity.
     const target_team = s.sess.world.get_component(ar.target_entity, c.Team);
     try std.testing.expectEqual(c.TeamId.players, target_team.id);
 }
@@ -535,13 +535,64 @@ test "mage attack hits multiple adjacent enemies" {
     const mage_entity = s.sess.players[s.p[0].pid].entity;
     try tick_until_charging(&s.sess, mage_entity);
 
+    const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
+
     s.p[0].clear(allocator);
-    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .attack, .target_entity = 0 });
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .attack, .target_entity = enemy_e });
     try tick_n(&s.sess, 0.1, 1);
 
     const msgs = try drain(s.p[0].buf.items, arena);
     const dmg_count = count_tag(msgs, .action_result);
     // Two grunts at (0,0) and (1,0) — mage AoE 2×2 covers both.
+    try std.testing.expect(dmg_count >= 2);
+}
+
+test "mage aoe origin follows target not actor" {
+    // Regression: before fix, AoE origin was actor_pos. After fix it must be
+    // the target entity's GridPos. We put both enemies far from the mage's own
+    // position (0-row) so that only the target-centered AoE can reach them.
+    //
+    // Enemy layout:  (1,2) and (1,3)
+    // Mage spawns on player row (effectively col 0, row varies but irrelevant
+    // because the AoE logic uses the target's pos, not the actor's).
+    // aoe_cells_2x2(1,2) => (1,2),(2,2),(1,3),(2,3)  — both enemies in range.
+    // aoe_cells_2x2(actor_col,actor_row) could not reach row 2+ from row 0/1.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const wave_far = waves.Wave{
+        .label = "t_far",
+        .entries = &[_]waves.SpawnEntry{
+            .{ .class = .grunt, .grid_col = 1, .grid_row = 2, .stats = .{ .attack = 5, .defense = 1, .max_hp = 30, .speed_base = 0.001 } },
+            .{ .class = .grunt, .grid_col = 1, .grid_row = 3, .stats = .{ .attack = 5, .defense = 1, .max_hp = 30, .speed_base = 0.001 } },
+        },
+        .next_wave = null,
+    };
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .mage, .fighter);
+    defer s.deinit();
+
+    try s.sess.start_game_wave(&wave_far);
+    set_player_speeds(&s.sess, 10.0);
+    set_enemy_speeds(&s.sess, 0.001);
+
+    const mage_entity = s.sess.players[s.p[0].pid].entity;
+    try tick_until_charging(&s.sess, mage_entity);
+
+    // Target the first enemy (at grid 1,2); AoE must hit both (1,2) and (1,3).
+    const target_e = first_enemy(&s.sess) orelse return error.NoEnemy;
+
+    s.p[0].clear(allocator);
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .attack, .target_entity = target_e });
+    try tick_n(&s.sess, 0.1, 1);
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+    const dmg_count = count_tag(msgs, .action_result);
+    // Both enemies are within the 2×2 AoE of (1,2); the old (actor-pos) AoE
+    // would yield 0 hits because neither grunt is near the mage's spawn row.
     try std.testing.expect(dmg_count >= 2);
 }
 
