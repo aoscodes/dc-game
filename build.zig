@@ -99,6 +99,11 @@ pub fn build(b: *std.Build) !void {
         // default emcc settings.
         emcc_settings.put("EXPORTED_RUNTIME_METHODS", "[\"wasmMemory\",\"ws_impl\"]") catch @panic("OOM");
 
+        // Allow the WASM heap to grow beyond the default 16 MB initial size.
+        // Without this, page_allocator.alloc fails as soon as the heap is full
+        // because memory.grow returns -1 and Emscripten does not resize.
+        emcc_settings.put("ALLOW_MEMORY_GROWTH", "1") catch @panic("OOM");
+
         const emcc_step = rlz.emsdk.emccStep(b, raylib_artifact, wasm, .{
             .optimize = optimize,
             .flags = emcc_flags,
