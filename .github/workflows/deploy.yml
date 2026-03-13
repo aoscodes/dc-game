@@ -187,13 +187,20 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      - uses: actions/checkout@v4
+
       - name: download client artifact
         uses: actions/download-artifact@v4
         with:
           name: wasm-client
           path: deploy/web/
 
-      - name: scp wasm client to VPS
+      # Bundle hand-written web assets alongside the built WASM output so
+      # ws_glue.js and index.html are always in sync with the client binary.
+      - name: copy static web assets into deploy bundle
+        run: cp web/index.html web/ws_glue.js deploy/web/
+
+      - name: scp wasm client and web assets to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
