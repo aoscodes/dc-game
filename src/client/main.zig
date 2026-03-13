@@ -316,8 +316,17 @@ pub fn main() !void {
         .on_close = on_ws_close,
     });
 
-    const loop_thread = try std.Thread.spawn(.{}, connect_loop, .{{}});
-    loop_thread.detach();
+    // WASM is single-threaded: the browser WebSocket is purely event-driven
+    // via JS callbacks (on_ws_open / on_ws_message / on_ws_close).  No
+    // background thread is needed; just kick off the initial connect.
+    // On native, the connect loop runs in a dedicated thread so it can block
+    // on send/recv and still let the Raylib render loop run.
+    if (comptime @import("builtin").target.os.tag == .emscripten) {
+        _ = net.WsBrowserTransport.connect(g_server_url) catch {};
+    } else {
+        const loop_thread = try std.Thread.spawn(.{}, connect_loop, .{{}});
+        loop_thread.detach();
+    }
 
     rl.initWindow(@intFromFloat(render.SW), @intFromFloat(render.SH), "Client");
     defer rl.closeWindow();
