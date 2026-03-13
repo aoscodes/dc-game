@@ -68,23 +68,23 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+      # Restore the original zig-out/ tree so scp source paths match exactly.
       - name: download artifacts
         uses: actions/download-artifact@v4
         with:
           name: dragoncon-artifacts
+          path: zig-out/
 
-      # web/ dir lands at zig-out/web/ after download; copy to vhost root
       - name: deploy web assets
         uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
-          source: "zig-out/web/"
+          source: "zig-out/web/*"
           target: "/var/www/dragoncon/"
           strip_components: 2
 
-      # Server binary lands at zig-out/bin/server after download
       - name: deploy server binary
         uses: appleboy/scp-action@v0.1.7
         with:
