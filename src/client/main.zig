@@ -366,12 +366,12 @@ pub fn main() !void {
     });
 
     rl.initWindow(@intFromFloat(render.SW), @intFromFloat(render.SH), "Client");
+    defer rl.closeWindow();
+    rl.setTargetFPS(60);
 
     if (comptime @import("builtin").target.os.tag == .emscripten) {
         std.os.emscripten.emscripten_set_main_loop(@ptrCast(&updateDrawFrame), 0, 1);
     } else {
-        rl.setTargetFPS(60);
-        defer rl.closeWindow();
         const loop_thread = try std.Thread.spawn(.{}, connect_loop, .{{}});
         loop_thread.detach();
 
