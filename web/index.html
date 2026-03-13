@@ -112,40 +112,20 @@ function startGame(playerName) {
   const Module = {
     canvas: document.getElementById("canvas"),
 
-    // Inject ws_glue env functions into Emscripten's import object.
-    // Emscripten looks for a global `Module.env` or merges via
-    // `instantiateWasm` when provided.
+    // ws_connect/ws_send/ws_close are declared extern in ws_browser.zig but
+    // are not present at link time, so Emscripten emits abort stubs for them.
+    // The only way to supply live implementations is to intercept
+    // instantiateWasm and merge them into the import object before the WASM
+    // module is instantiated.  Module.env is NOT merged by this Emscripten
+    // version — wasmImports is built statically at compile time.
     instantiateWasm(imports, successCallback) {
-      // Merge our env into Emscripten's env imports
       imports.env = Object.assign(imports.env || {}, wsGlue.env);
-
-      // Also expose player name and server URL as null-terminated strings
-      // in WASM memory via a small JS helper called after instantiation.
-      fetch("client.wasm")
-        .then(r => r.arrayBuffer())
-        .then(buf => WebAssembly.instantiate(buf, imports))
-        .then(({ instance, module }) => {
-          wsGlue.setInstance(instance.exports, instance.exports.memory);
-          successCallback(instance, module);
-
-          // Write player name into WASM memory so main() can read it
-          writePlayerName(instance.exports, playerName);
-
-          // Write reconnect pid if we have one
-          if (savedPid !== null) {
-            writeSavedPid(instance.exports, parseInt(savedPid, 10));
-          }
-
-          // Write server URL then kick off the WebSocket connect.
-          // start_connect() reads g_server_url_buf and calls ws_connect().
-          writeServerUrl(instance.exports, serverUrl);
-          instance.exports.start_connect();
-        })
+      WebAssembly.instantiateStreaming(fetch("client.wasm"), imports)
+        .then(({ instance, module }) => successCallback(instance, module))
         .catch(err => {
           console.error("WASM load failed:", err);
           document.getElementById("status").textContent = "Failed to load game.";
         });
-
       return {}; // signal async init
     },
 
@@ -153,6 +133,15 @@ function startGame(playerName) {
     printErr(text) { console.warn("[game:err]", text); },
 
     onRuntimeInitialized() {
+      // Emscripten has fully initialised; Module._* wrappers and
+      // Module.wasmMemory are now available.
+      wsGlue.setInstance(Module);
+
+      // Write server URL into g_server_url_buf then kick off the connect.
+      // Module._g_server_url_buf is the integer address of the exported buffer.
+      writeServerUrl(Module, serverUrl);
+      Module._start_connect();
+
       document.getElementById("status").textContent = "Connected";
     },
   };
@@ -169,29 +158,28 @@ function startGame(playerName) {
 // WASM memory helpers
 // ---------------------------------------------------------------------------
 
-function writeNullTerminated(exports, ptr, str) {
-  const mem = new Uint8Array(exports.memory.buffer);
+// Write a null-terminated UTF-8 string into WASM memory at `ptr`.
+// `mod` is the Emscripten Module object; use Module.HEAPU8 for memory access.
+function writeNullTerminated(mod, ptr, str) {
   const enc = new TextEncoder().encode(str);
-  mem.set(enc, ptr);
-  mem[ptr + enc.length] = 0;
+  // Re-read HEAPU8 each time: memory growth invalidates previous views.
+  mod.HEAPU8.set(enc, ptr);
+  mod.HEAPU8[ptr + enc.length] = 0;
 }
 
-function writePlayerName(exports, name) {
-  if (!exports.g_name_ptr) return; // export not available; main handles default
-  writeNullTerminated(exports, exports.g_name_ptr.value, name.slice(0, 16));
+function writePlayerName(mod, name) {
+  if (!mod._g_name_ptr) return; // not exported; main() uses default
+  writeNullTerminated(mod, mod._g_name_ptr, name.slice(0, 16));
 }
 
-function writeSavedPid(exports, pid) {
-  if (!exports.g_saved_pid) return;
-  const view = new DataView(exports.memory.buffer);
-  view.setUint8(exports.g_saved_pid.value, pid);
+function writeSavedPid(mod, pid) {
+  if (!mod._g_saved_pid) return; // not exported; no-op
+  mod.HEAPU8[mod._g_saved_pid] = pid & 0xFF;
 }
 
-function writeServerUrl(exports, url) {
-  if (!exports.g_server_url_buf) return;
-  // g_server_url_buf is a Zig exported [256]u8 array — its `.value` is the
-  // address of the buffer directly.  Write the URL as a null-terminated string.
-  writeNullTerminated(exports, exports.g_server_url_buf.value, url);
+function writeServerUrl(mod, url) {
+  // Module._g_server_url_buf is the integer address of the exported [256]u8 buffer.
+  writeNullTerminated(mod, mod._g_server_url_buf, url);
 }
 
 // Persist player_id when received from server (called by WASM via export)

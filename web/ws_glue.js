@@ -29,10 +29,10 @@ function createWsGlue() {
   const sockets = {};
   let nextHandle = 0;
 
-  /** Call after the WASM module is instantiated. */
-  function setInstance(instance, memory) {
-    wasmInstance = instance;
-    wasmMemory   = memory;
+  /** Call after the Emscripten Module is initialised. Pass the Module object. */
+  function setInstance(module) {
+    wasmInstance = module;
+    wasmMemory   = module.wasmMemory;
   }
 
   /** Read a UTF-8 string from WASM linear memory. */
@@ -65,7 +65,7 @@ function createWsGlue() {
       sockets[handle] = ws;
 
       ws.onopen = () => {
-        if (wasmInstance) wasmInstance.exports.on_ws_open(handle);
+        if (wasmInstance) wasmInstance._on_ws_open(handle);
       };
 
       ws.onmessage = (ev) => {
@@ -75,14 +75,14 @@ function createWsGlue() {
 
         // Allocate a buffer in WASM memory, copy message in, call handler,
         // then free.  Requires the WASM module to export alloc/free.
-        const ptr = wasmInstance.exports.wasm_alloc(len);
+        const ptr = wasmInstance._wasm_alloc(len);
         if (!ptr) {
           console.error("ws_glue: wasm_alloc returned null, dropping message");
           return;
         }
         writeBytes(ptr, bytes);
-        wasmInstance.exports.on_ws_message(handle, ptr, len);
-        wasmInstance.exports.wasm_free(ptr, len);
+        wasmInstance._on_ws_message(handle, ptr, len);
+        wasmInstance._wasm_free(ptr, len);
       };
 
       ws.onerror = (err) => {
@@ -90,7 +90,7 @@ function createWsGlue() {
       };
 
       ws.onclose = () => {
-        if (wasmInstance) wasmInstance.exports.on_ws_close(handle);
+        if (wasmInstance) wasmInstance._on_ws_close(handle);
         delete sockets[handle];
       };
 
