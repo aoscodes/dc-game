@@ -88,7 +88,7 @@ jobs:
         run: zig build e2e
 
       - name: build server (ReleaseSafe)
-        run: zig build server -Doptimize=ReleaseSafe
+        run: zig build server -Doptimize=ReleaseSafe -Dcpu=baseline
 
       - name: upload server artifact
         uses: actions/upload-artifact@v4
