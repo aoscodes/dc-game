@@ -17,36 +17,7 @@
   </style>
 </head>
 <body>
-<canvas id="canvas"></canvas>
-<script src="ws_glue.js"></script>
-<script>
-"use strict";
-
-const wsGlue = createWsGlue();
-const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-const serverUrl = `${protocol}//${location.hostname}/ws`;
-
-window.Module = {
-  canvas: document.getElementById("canvas"),
-  print(text)    { console.log("[game]", text); },
-  printErr(text) { console.warn("[game:err]", text); },
-
-  onRuntimeInitialized() {
-    wsGlue.register(window.Module);
-    // Write server URL into g_server_url_buf and connect.
-    // Player name stays as the Zig default ("Player").
-    const mod = window.Module;
-    const enc = new TextEncoder().encode(serverUrl);
-    const mem = new Uint8Array(mod.wasmMemory.buffer);
-    mem.set(enc, mod._g_server_url_buf);
-    mem[mod._g_server_url_buf + enc.length] = 0;
-    mod._start_connect();
-  },
-};
-
-const script = document.createElement("script");
-script.src = "client.js";
-document.body.appendChild(script);
-</script>
+<canvas id="canvas" width="1024" height="768"></canvas>
+<script src="game.js"></script>
 </body>
 </html>

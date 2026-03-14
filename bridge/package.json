@@ -1,0 +1,12 @@
+{
+  "name": "ecs-bridge",
+  "version": "1.0.0",
+  "description": "Node.js bridge: relays Zig client stdio ↔ game server WebSocket ↔ browser canvas",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
