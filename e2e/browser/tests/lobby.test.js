@@ -15,9 +15,9 @@
 const { test, expect } = require("@playwright/test");
 const {
   spawnServer, spawnBridge, kill, waitForPort,
-  waitForCanvasContent, ROOT,
+  waitForCanvasContent,
 } = require("../helpers");
-const WS = require(require("path").join(ROOT, "bridge/node_modules/ws"));
+const WS = require("ws");
 
 const SERVER_PORT = 19110;
 const BRIDGE_PORT = 19111;

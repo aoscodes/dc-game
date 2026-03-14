@@ -12,12 +12,11 @@
  *   test 3 — 19124 / 19125
  */
 
-const path = require("path");
 const { test, expect } = require("@playwright/test");
 const {
-  spawnServer, spawnBridge, kill, waitForPort, waitForCanvasContent, Bot, ROOT,
+  spawnServer, spawnBridge, kill, waitForPort, waitForCanvasContent, Bot,
 } = require("../helpers");
-const WS = require(path.join(ROOT, "bridge/node_modules/ws"));
+const WS = require("ws");
 
 // ---------------------------------------------------------------------------
 // Shared helper: intercept render phases via Playwright WS frame events.
