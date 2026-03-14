@@ -212,4 +212,24 @@ pub fn build(b: *std.Build) !void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(session_tests).step);
+
+    // -----------------------------------------------------------------------
+    // Browser e2e  (Playwright + headless Chromium)
+    //
+    // Requires: Node.js, npm, and Playwright browsers installed.
+    // Run with:  zig build browser-e2e
+    //
+    // Spawns the server and bridge binaries from zig-out/bin/, so a prior
+    // `zig build` (or `zig build server client`) is required first.
+    // -----------------------------------------------------------------------
+
+    const browser_e2e_step = b.step("browser-e2e", "Run browser e2e tests (Playwright)");
+    const npm_install = b.addSystemCommand(&.{ "npm", "ci", "--prefix", "e2e/browser" });
+    const playwright_test = b.addSystemCommand(&.{
+        "npx",                              "--prefix", "e2e/browser",
+        "playwright",                       "test",     "--config",
+        "e2e/browser/playwright.config.js",
+    });
+    playwright_test.step.dependOn(&npm_install.step);
+    browser_e2e_step.dependOn(&playwright_test.step);
 }

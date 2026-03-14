@@ -17,10 +17,11 @@ jobs:
   changes:
     runs-on: ubuntu-24.04
     outputs:
-      server: ${{ steps.filter.outputs.server }}
-      client: ${{ steps.filter.outputs.client }}
-      web:    ${{ steps.filter.outputs.web }}
-      setup:  ${{ steps.filter.outputs.setup }}
+      server:  ${{ steps.filter.outputs.server }}
+      client:  ${{ steps.filter.outputs.client }}
+      web:     ${{ steps.filter.outputs.web }}
+      setup:   ${{ steps.filter.outputs.setup }}
+      browser: ${{ steps.filter.outputs.browser }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -45,6 +46,13 @@ jobs:
               - 'web/**'
             setup:
               - 'scripts/vps-setup.sh'
+            browser:
+              - 'e2e/browser/**'
+              - 'src/client/**'
+              - 'src/server/**'
+              - 'src/shared/**'
+              - 'bridge/**'
+              - 'web/**'
 
   # ------------------------------------------------------------------
   # Build server — runs tests and e2e, produces the server binary
@@ -139,6 +147,65 @@ jobs:
         with:
           name: client-bundle
           path: deploy/
+          retention-days: 7
+
+  # ------------------------------------------------------------------
+  # Browser e2e — Playwright + headless Chromium
+  # Requires server + client binaries, so depends on build-server and
+  # build-client (which upload their artifacts).
+  # ------------------------------------------------------------------
+
+  browser-e2e:
+    needs: [changes, build-server, build-client]
+    if: needs.changes.outputs.browser == 'true' || inputs.deploy_all == true
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download server artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: server-binary
+          path: zig-out/bin/
+
+      - name: download client artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: client-bundle
+          path: deploy/
+
+      - name: place client binary
+        run: |
+          mkdir -p zig-out/bin
+          cp deploy/zig-out/bin/client zig-out/bin/client
+          chmod +x zig-out/bin/server zig-out/bin/client
+
+      - name: install node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: e2e/browser/package-lock.json
+
+      - name: install browser e2e deps
+        run: npm ci
+        working-directory: e2e/browser
+
+      - name: install playwright browsers
+        run: npx playwright install --with-deps chromium
+        working-directory: e2e/browser
+
+      - name: run browser e2e
+        run: npx playwright test
+        working-directory: e2e/browser
+
+      - name: upload playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: e2e/browser/playwright-report/
           retention-days: 7
 
   # ------------------------------------------------------------------

@@ -1,2 +1,5 @@
 .zig-cache/
 zig-out/
+e2e/browser/node_modules/
+e2e/browser/test-results/
+e2e/browser/playwright-report/
