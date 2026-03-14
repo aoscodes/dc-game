@@ -1,4 +1,4 @@
-const rl = @import("raylib");
+const std = @import("std");
 const shared = @import("shared");
 const c = shared.components;
 
@@ -22,27 +22,81 @@ pub const InputEvent = union(InputEventTag) {
     select_defend: void,
 };
 
+/// Map a browser key name (as sent by JS KeyboardEvent.key) to a raw key token
+/// understood by InputState.poll.  Returns null for unrecognised keys.
+pub fn parse_key_name(name: []const u8) ?RawKey {
+    if (std.mem.eql(u8, name, "ArrowUp")) return .up;
+    if (std.mem.eql(u8, name, "ArrowDown")) return .down;
+    if (std.mem.eql(u8, name, "ArrowLeft")) return .left;
+    if (std.mem.eql(u8, name, "ArrowRight")) return .right;
+    if (std.mem.eql(u8, name, "Enter")) return .enter;
+    if (std.mem.eql(u8, name, "Escape")) return .escape;
+    if (std.mem.eql(u8, name, "z") or
+        std.mem.eql(u8, name, "Z")) return .z;
+    if (std.mem.eql(u8, name, "x") or
+        std.mem.eql(u8, name, "X")) return .x;
+    if (std.mem.eql(u8, name, "1")) return .one;
+    if (std.mem.eql(u8, name, "2")) return .two;
+    if (std.mem.eql(u8, name, "3")) return .three;
+    return null;
+}
+
+pub const RawKey = enum { up, down, left, right, enter, escape, z, x, one, two, three };
+
+/// Thread-safe single-slot key queue.  The stdin reader thread pushes raw keys;
+/// the game loop thread pops them one per tick.  Capacity is intentionally
+/// small — we only need to buffer a handful of keystrokes between ticks.
+pub const KeyQueue = struct {
+    buf: [64]RawKey = undefined,
+    head: usize = 0,
+    tail: usize = 0,
+    mu: std.Thread.Mutex = .{},
+
+    pub fn push(self: *KeyQueue, key: RawKey) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        const next = (self.tail + 1) % self.buf.len;
+        if (next == self.head) return; // full, drop
+        self.buf[self.tail] = key;
+        self.tail = next;
+    }
+
+    pub fn pop(self: *KeyQueue) ?RawKey {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.head == self.tail) return null;
+        const key = self.buf[self.head];
+        self.head = (self.head + 1) % self.buf.len;
+        return key;
+    }
+};
+
 pub const InputState = struct {
     cursor_col: u8 = 0,
     cursor_row: u8 = 0,
     is_our_turn: bool = false,
 
-    pub fn poll(self: *InputState) InputEvent {
+    /// Drain one key from the queue and convert to an InputEvent.
+    /// Only processes game-relevant keys when it is the player's turn.
+    pub fn poll(self: *InputState, queue: *KeyQueue) InputEvent {
+        const key = queue.pop() orelse return .none;
+
+        // Class selection and lobby keys are handled regardless of turn state
+        // by the caller (main.zig update_lobby / update_game).  Here we expose
+        // the raw key as an event only when it is our turn.
         if (!self.is_our_turn) return .none;
 
-        if (rl.isKeyPressed(.one)) return .select_attack;
-        if (rl.isKeyPressed(.two)) return .select_defend;
-
-        const dcol: i8 = if (rl.isKeyPressed(.right)) 1 else if (rl.isKeyPressed(.left)) -1 else 0;
-        const drow: i8 = if (rl.isKeyPressed(.down)) 1 else if (rl.isKeyPressed(.up)) -1 else 0;
-        if (dcol != 0 or drow != 0) {
-            return .{ .cursor_move = .{ .dcol = dcol, .drow = drow } };
-        }
-
-        if (rl.isKeyPressed(.enter) or rl.isKeyPressed(.z)) return .confirm;
-        if (rl.isKeyPressed(.escape) or rl.isKeyPressed(.x)) return .cancel;
-
-        return .none;
+        return switch (key) {
+            .one => .select_attack,
+            .two => .select_defend,
+            .right => .{ .cursor_move = .{ .dcol = 1, .drow = 0 } },
+            .left => .{ .cursor_move = .{ .dcol = -1, .drow = 0 } },
+            .down => .{ .cursor_move = .{ .dcol = 0, .drow = 1 } },
+            .up => .{ .cursor_move = .{ .dcol = 0, .drow = -1 } },
+            .enter, .z => .confirm,
+            .escape, .x => .cancel,
+            else => .none,
+        };
     }
 
     pub fn apply_cursor_move(self: *InputState, delta: CursorDelta, cols: u8, rows: u8) void {
@@ -56,5 +110,3 @@ pub const InputState = struct {
         return .{ .col = @intCast(self.cursor_col), .row = @intCast(self.cursor_row) };
     }
 };
-
-const std = @import("std");
