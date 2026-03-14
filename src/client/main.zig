@@ -332,18 +332,24 @@ pub fn main() !void {
     const stdin_thread = try std.Thread.spawn(.{}, stdin_reader, .{{}});
     stdin_thread.detach();
 
-    // Spin-wait for READY (typically < 1 s; bridge connects then signals us).
-    while (!g_ready.load(.acquire)) {
-        std.Thread.sleep(10 * std.time.ns_per_ms);
-    }
+    // Do NOT spin-wait for READY here.  The render loop runs from the moment
+    // the binary starts, emitting "connecting" phase frames so the browser
+    // shows the connecting screen immediately.  stdin_reader will set g_ready
+    // and call send_join() asynchronously once the server handshake arrives.
 
     const out = stdout_writer();
     var next_tick = std.time.nanoTimestamp();
 
     while (true) {
+        // Drain any inbound messages only once we're past the handshake; before
+        // that the queue is always empty, but calling it is harmless.
         process_recv();
 
         switch (g_state.phase) {
+            // Emit "connecting" frames immediately so the browser shows the
+            // connecting screen rather than a blank canvas while waiting for
+            // the server.  (g_ready being false just means we haven't sent
+            // join yet; it is safe to render the phase we're in.)
             .connecting => {},
             .lobby => update_lobby(),
             .game => update_game(),

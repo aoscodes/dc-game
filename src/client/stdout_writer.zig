@@ -101,7 +101,11 @@ fn write_render_inner(
 fn write_lobby(w: anytype, s: *const LobbyState) !void {
     try w.writeAll(",\"lobby\":{");
     try w.writeAll("\"join_code\":\"");
-    try w.writeAll(&s.update.join_code);
+    // join_code is a fixed [6]u8 zero-padded buffer; only emit the non-NUL prefix
+    // so that zero-initialised state produces valid JSON ("") rather than a string
+    // containing NUL bytes that breaks JSON.parse in both Node and the browser.
+    const jc_end = std.mem.indexOfScalar(u8, &s.update.join_code, 0) orelse s.update.join_code.len;
+    try write_escaped(w, s.update.join_code[0..jc_end]);
     try w.writeAll("\",\"our_player_id\":");
     try w.print("{}", .{s.update.your_player_id});
     try w.writeAll(",\"selected_class\":\"");
@@ -185,10 +189,20 @@ fn write_game(w: anytype, s: *const GameState) !void {
     try w.writeAll("]}");
 }
 
-/// Write a string with minimal JSON escaping (backslash and double-quote).
+/// Write a string with JSON escaping.
+/// Handles backslash, double-quote, and ASCII control characters (0x00–0x1F)
+/// using \uXXXX escapes so the output is always valid JSON.
 fn write_escaped(w: anytype, s: []const u8) !void {
     for (s) |b| {
-        if (b == '"' or b == '\\') try w.writeByte('\\');
-        try w.writeByte(b);
+        switch (b) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            // remaining control chars (excludes \n=0x0A, \r=0x0D, \t=0x09)
+            0x00...0x08, 0x0B...0x0C, 0x0E...0x1F => try w.print("\\u{x:0>4}", .{b}),
+            else => try w.writeByte(b),
+        }
     }
 }
