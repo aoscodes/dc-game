@@ -105,7 +105,7 @@ pub fn build(b: *std.Build) !void {
         // Export all symbols that index.html calls directly or that ws_glue.js
         // invokes as callbacks.  Without this list emscripten only exports main.
         emcc_settings.put("EXPORTED_FUNCTIONS",
-            \\["_main","_start_connect","_save_player_id","_wasm_alloc","_wasm_free","_on_ws_open","_on_ws_message","_on_ws_close","_g_server_url_buf"]
+            \\["_main","_start_connect","_save_player_id","_wasm_alloc","_wasm_free","_on_ws_open","_on_ws_message","_on_ws_close","_g_server_url_buf","_g_msg_buf"]
         ) catch @panic("OOM");
 
         // Export wasmMemory (for ws_glue.js) and ws_impl (so ws_glue.js can
@@ -118,6 +118,11 @@ pub fn build(b: *std.Build) !void {
         // Without this, page_allocator.alloc fails as soon as the heap is full
         // because memory.grow returns -1 and Emscripten does not resize.
         emcc_settings.put("ALLOW_MEMORY_GROWTH", "1") catch @panic("OOM");
+
+        // Increase the WASM call stack from the default 64 KB to 1 MB.
+        // Provides headroom for the full rAF → updateDrawFrame → net.poll
+        // call chain under ReleaseSafe builds.
+        emcc_settings.put("STACK_SIZE", "1048576") catch @panic("OOM");
 
         const emcc_step = rlz.emsdk.emccStep(b, raylib_wasm_artifact, wasm, .{
             .optimize = optimize,

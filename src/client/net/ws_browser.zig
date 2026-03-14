@@ -80,6 +80,15 @@ pub const WsBrowserTransport = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Static scratch buffer for incoming messages
+// ---------------------------------------------------------------------------
+
+/// JS writes raw message bytes here (via wasmMemory) before calling
+/// on_ws_message.  Avoids alloc/free across the WASM↔JS boundary.
+/// 4 KB is sufficient for all current protocol messages.
+export var g_msg_buf: [4096]u8 = [_]u8{0} ** 4096;
+
+// ---------------------------------------------------------------------------
 // WASM exports — called by JS glue when socket events fire
 // ---------------------------------------------------------------------------
 
@@ -89,9 +98,11 @@ export fn on_ws_open(handle: i32) void {
 }
 
 /// Called by JS when a binary message arrives.
-/// `ptr` points into WASM linear memory; the data is valid only for this call.
-export fn on_ws_message(handle: i32, ptr: [*]const u8, len: usize) void {
-    client_on_ws_message(handle, ptr[0..len]);
+/// JS must have written `len` bytes into `g_msg_buf` before calling this
+/// export.  No alloc/free crosses the WASM↔JS boundary.
+export fn on_ws_message(handle: i32, len: usize) void {
+    if (len > g_msg_buf.len) return;
+    client_on_ws_message(handle, g_msg_buf[0..len]);
 }
 
 /// Called by JS when the WebSocket `onclose` event fires.

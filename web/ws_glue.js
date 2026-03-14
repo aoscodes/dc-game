@@ -92,15 +92,19 @@ function createWsGlue() {
     while (eventQueue.length > 0) {
       const ev = eventQueue.shift();
       if (ev.type === 'open') {
+        console.log("[ws_glue] poll: open handle=" + ev.handle);
         mod._on_ws_open(ev.handle);
       } else if (ev.type === 'message') {
         const len = ev.data.length;
-        const ptr = mod._wasm_alloc(len);
-        if (!ptr) { console.error("ws_poll: wasm_alloc returned null, dropping message"); continue; }
-        writeBytes(ptr, ev.data);
-        mod._on_ws_message(ev.handle, ptr, len);
-        mod._wasm_free(ptr, len);
+        console.log("[ws_glue] poll: message handle=" + ev.handle + " len=" + len + " tag=0x" + (len > 0 ? ev.data[0].toString(16) : "?"));
+        const bufPtr = mod._g_msg_buf;
+        if (!bufPtr) { console.error("[ws_glue] g_msg_buf not exported, dropping message"); continue; }
+        writeBytes(bufPtr, ev.data);
+        console.log("[ws_glue] calling _on_ws_message handle=" + ev.handle + " len=" + len);
+        mod._on_ws_message(ev.handle, len);
+        console.log("[ws_glue] poll: message callback returned");
       } else if (ev.type === 'close') {
+        console.log("[ws_glue] poll: close handle=" + ev.handle);
         mod._on_ws_close(ev.handle);
       }
     }

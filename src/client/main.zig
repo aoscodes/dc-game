@@ -14,15 +14,23 @@ else
 
 const ClientPhase = enum { connecting, lobby, game, game_over };
 
+// On WASM (emscripten) there is no threading — callbacks fire from within the
+// rAF main loop so push/pop are always called on the same JS thread.  A Mutex
+// is not only unnecessary but actively broken: SingleThreadedImpl.lock() calls
+// unreachable (WASM trap) if the lock is already held, and the emscripten
+// target does not support Thread at all.  Guard with a comptime check so
+// native builds retain the mutex for their connect_loop thread.
+const is_wasm = @import("builtin").target.os.tag == .emscripten;
+
 const MsgQueue = struct {
     buf: [16384]u8 = undefined,
     len: usize = 0,
-    mu: std.Thread.Mutex = .{},
+    mu: if (is_wasm) void else std.Thread.Mutex = if (is_wasm) {} else .{},
 
     fn push(self: *MsgQueue, data: []const u8) void {
         if (data.len > 0xFFFF) return;
-        self.mu.lock();
-        defer self.mu.unlock();
+        if (!is_wasm) self.mu.lock();
+        defer if (!is_wasm) self.mu.unlock();
         const needed = 2 + data.len;
         if (self.len + needed > self.buf.len) {
             std.log.warn("msg queue full, dropping {} byte message", .{data.len});
@@ -35,8 +43,8 @@ const MsgQueue = struct {
     }
 
     fn pop(self: *MsgQueue, out: []u8) ?[]u8 {
-        self.mu.lock();
-        defer self.mu.unlock();
+        if (!is_wasm) self.mu.lock();
+        defer if (!is_wasm) self.mu.unlock();
         if (self.len < 2) return null;
         const msg_len: usize = @as(usize, self.buf[0]) | (@as(usize, self.buf[1]) << 8);
         if (self.len < 2 + msg_len) return null;
@@ -69,6 +77,7 @@ var g_state: ClientState = .{};
 // start_connect is called.  The buffer is large enough for any reasonable URL.
 // Exported directly so JS can write into it without pointer indirection.
 export var g_server_url_buf: [256]u8 = [_]u8{0} ** 256;
+
 var g_server_url: []const u8 = "ws://127.0.0.1:9001";
 
 var g_need_reconnect: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
@@ -107,7 +116,6 @@ fn on_ws_open(_: i32) void {
 }
 
 fn on_ws_message(_: i32, data: []const u8) void {
-    std.log.info("ws message: {} bytes, tag=0x{x}", .{ data.len, if (data.len > 0) data[0] else 0 });
     g_state.recv_queue.push(data);
 }
 
