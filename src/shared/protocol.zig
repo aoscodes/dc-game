@@ -21,6 +21,7 @@ pub const MsgTag = enum(u8) {
     ready_up = 0x03,
     choose_action = 0x04,
     reconnect = 0x05,
+    choose_position = 0x06,
 
     lobby_update = 0x10,
     game_start = 0x11,
@@ -38,6 +39,13 @@ pub const JoinLobby = struct {
 
 pub const ChooseClass = struct {
     class: components.ClassTag,
+};
+
+/// Player selects their starting grid cell in the lobby.
+/// col: 0–2, row: 0–1 (player grid only occupies rows 0–1).
+pub const ChoosePosition = struct {
+    col: u8,
+    row: u8,
 };
 
 pub const ActionTag = enum(u8) {
@@ -63,6 +71,9 @@ pub const PlayerInfo = struct {
     class: components.ClassTag,
     ready: bool,
     connected: bool,
+    /// Chosen lobby grid position (col 0–2, row 0–1).
+    grid_col: u8,
+    grid_row: u8,
 };
 
 pub const LobbyUpdate = struct {
@@ -143,6 +154,10 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
         .ready_up => {},
         .choose_action => try encode_choose_action(writer, payload),
         .reconnect => try writer.writeByte(payload.player_id),
+        .choose_position => {
+            try writer.writeByte(payload.col);
+            try writer.writeByte(payload.row);
+        },
 
         .lobby_update => try encode_lobby_update(writer, payload),
         .game_start => try encode_game_start(writer, payload),
@@ -177,6 +192,8 @@ fn encode_lobby_update(w: anytype, p: LobbyUpdate) !void {
         try w.writeByte(@intFromEnum(pl.class));
         try w.writeByte(if (pl.ready) 1 else 0);
         try w.writeByte(if (pl.connected) 1 else 0);
+        try w.writeByte(pl.grid_col);
+        try w.writeByte(pl.grid_row);
     }
 }
 
@@ -255,6 +272,10 @@ pub fn decode_reconnect(reader: anytype) !Reconnect {
     return .{ .player_id = try reader.readByte() };
 }
 
+pub fn decode_choose_position(reader: anytype) !ChoosePosition {
+    return .{ .col = try reader.readByte(), .row = try reader.readByte() };
+}
+
 pub fn decode_lobby_update(reader: anytype) !LobbyUpdate {
     var p: LobbyUpdate = undefined;
     _ = try reader.readAll(&p.join_code);
@@ -274,6 +295,8 @@ pub fn decode_lobby_update(reader: anytype) !LobbyUpdate {
             return DecodeError.InvalidClass;
         p.players[i].ready = (try reader.readByte()) != 0;
         p.players[i].connected = (try reader.readByte()) != 0;
+        p.players[i].grid_col = try reader.readByte();
+        p.players[i].grid_row = try reader.readByte();
     }
     return p;
 }

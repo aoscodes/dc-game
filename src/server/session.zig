@@ -62,6 +62,9 @@ pub const PlayerSlot = struct {
     name_len: u8 = 0,
     class: c.ClassTag = .fighter,
     ready: bool = false,
+    /// Chosen lobby grid position. Defaults to a unique cell per player_id so
+    /// spawn always has a valid position even if the player never moved the cursor.
+    grid_pos: c.GridPos = .{ .col = 0, .row = 0 },
     entity: ecs.Entity = std.math.maxInt(ecs.Entity),
     transport: ?shared.Transport = null,
     queue_lock: std.Thread.Mutex = .{},
@@ -97,10 +100,18 @@ pub const Session = struct {
     recorder: ?dbg.replay.Recorder(std.io.AnyWriter) = null,
 
     pub fn init(allocator: std.mem.Allocator, join_code: [6]u8) !Session {
+        // Default grid positions spread across the full 3×4 player spawn area
+        // so every slot has a unique valid cell without any user interaction.
+        const default_positions = [MAX_PLAYERS]c.GridPos{
+            .{ .col = 0, .row = 0 }, .{ .col = 1, .row = 1 },
+            .{ .col = 2, .row = 2 }, .{ .col = 0, .row = 3 },
+            .{ .col = 1, .row = 3 }, .{ .col = 2, .row = 3 },
+        };
         var players: [MAX_PLAYERS]PlayerSlot = undefined;
         for (&players, 0..) |*p, i| {
             p.* = PlayerSlot{
                 .player_id = @intCast(i),
+                .grid_pos = default_positions[i],
                 .allocator = allocator,
             };
         }
@@ -223,14 +234,9 @@ pub const Session = struct {
     }
 
     fn spawn_players(self: *Session) !void {
-        const positions = [6]c.GridPos{
-            .{ .col = 0, .row = 0 }, .{ .col = 1, .row = 0 }, .{ .col = 2, .row = 0 },
-            .{ .col = 0, .row = 1 }, .{ .col = 1, .row = 1 }, .{ .col = 2, .row = 1 },
-        };
-        var idx: u8 = 0;
         for (&self.players) |*p| {
             if (!p.occupied or !p.connected) continue;
-            const pos = positions[idx % 6];
+            const pos = p.grid_pos;
             const d = waves.class_defaults(p.class);
             const e = self.world.create_entity();
             p.entity = e;
@@ -248,7 +254,6 @@ pub const Session = struct {
             });
             self.world.add_component(e, c.ActionState{ .tag = .idle });
             try self.living.append(self.allocator, e);
-            idx += 1;
         }
     }
 
@@ -370,6 +375,33 @@ pub const Session = struct {
                     try self.broadcast_game_start("wave_01_basic");
                 }
             },
+            .choose_position => {
+                if (self.phase == .lobby) {
+                    const p = try proto.decode_choose_position(fbs.reader());
+                    // Clamp to valid 3-column × 2-row spawn area
+                    if (p.col < 3 and p.row < 4) {
+                        // Check no other connected player already occupies that cell
+                        var taken = false;
+                        for (&self.players) |*other| {
+                            if (!other.occupied or other.player_id == player_id) continue;
+                            if (other.grid_pos.col == @as(u2, @intCast(p.col)) and
+                                other.grid_pos.row == @as(u2, @intCast(p.row)))
+                            {
+                                taken = true;
+                                break;
+                            }
+                        }
+                        if (!taken) {
+                            self.players[player_id].grid_pos = .{
+                                .col = @intCast(p.col),
+                                .row = @intCast(p.row),
+                            };
+                            std.log.info("player {} position: col={} row={}", .{ player_id, p.col, p.row });
+                            try self.broadcast_lobby_update();
+                        }
+                    }
+                }
+            },
             .choose_action => {
                 const p = try proto.decode_choose_action(fbs.reader());
                 std.log.info("player {} action: {s} target={}", .{ player_id, @tagName(p.action), p.target_entity });
@@ -385,7 +417,7 @@ pub const Session = struct {
             if (!self.world.entity_manager.signatures[e].eql(ecs.Signature.initEmpty())) {
                 const as = self.world.get_component(e, c.ActionState);
                 const sp = self.world.get_component(e, c.Speed);
-                if (as.tag == .idle and sp.gauge >= 1.0) {
+                if ((as.tag == .idle or as.tag == .defending) and sp.gauge >= 1.0) {
                     as.tag = .charging;
                     const team = self.world.get_component(e, c.Team);
                     if (team.id == .players) {
@@ -811,6 +843,8 @@ pub const Session = struct {
             pi.class = slot.class;
             pi.ready = slot.ready;
             pi.connected = slot.connected;
+            pi.grid_col = slot.grid_pos.col;
+            pi.grid_row = slot.grid_pos.row;
         }
         for (&self.players) |*slot| {
             if (!slot.connected) continue;
@@ -916,7 +950,7 @@ pub const Session = struct {
 fn atb_step(world: *GameWorld, entity: ecs.Entity, sys: *AtbSystem) void {
     const sp = world.get_component(entity, c.Speed);
     const as = world.get_component(entity, c.ActionState);
-    if (as.tag == .idle) {
+    if (as.tag == .idle or as.tag == .defending) {
         _ = logic.tick_atb(sp, sys.dt);
     }
 }

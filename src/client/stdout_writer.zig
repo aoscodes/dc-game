@@ -61,6 +61,8 @@ pub const LobbyState = struct {
     our_player_id: u8 = 0xFF,
     selected_class: c.ClassTag = .fighter,
     ready: bool = false,
+    /// Cursor position in the lobby position-picker grid (col 0–2, row 0–1).
+    chosen_pos: c.GridPos = .{ .col = 0, .row = 0 },
 };
 
 pub const GameState = struct {
@@ -112,6 +114,10 @@ fn write_lobby(w: anytype, s: *const LobbyState) !void {
     try w.writeAll(@tagName(s.selected_class));
     try w.writeAll("\",\"ready\":");
     try w.writeAll(if (s.ready) "true" else "false");
+    try w.writeAll(",\"chosen_col\":");
+    try w.print("{}", .{s.chosen_pos.col});
+    try w.writeAll(",\"chosen_row\":");
+    try w.print("{}", .{s.chosen_pos.row});
     try w.writeAll(",\"players\":[");
     var i: u8 = 0;
     while (i < s.update.player_count) : (i += 1) {
@@ -127,6 +133,10 @@ fn write_lobby(w: anytype, s: *const LobbyState) !void {
         try w.writeAll(if (p.ready) "true" else "false");
         try w.writeAll(",\"connected\":");
         try w.writeAll(if (p.connected) "true" else "false");
+        try w.writeAll(",\"grid_col\":");
+        try w.print("{}", .{p.grid_col});
+        try w.writeAll(",\"grid_row\":");
+        try w.print("{}", .{p.grid_row});
         try w.writeByte('}');
     }
     try w.writeAll("]}");

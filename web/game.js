@@ -1,28 +1,10 @@
 "use strict";
 
-/**
- * Canvas renderer for the DragonCon game.
- *
- * Connects to the Node bridge WebSocket and renders each incoming
- * JSON render-frame onto a <canvas>.  Keyboard events are sent back
- * to the bridge so the Zig client can update its UI state.
- *
- * Layout mirrors the deleted render.zig:
- *   1024 × 768 px canvas
- *   ALLIES grid  — left side, origin (60, 180)
- *   ENEMIES grid — right side, mirrored
- *   3 cols × 4 rows, each cell 90 × 100 px with 6 px padding
- */
-
-// ---------------------------------------------------------------------------
-// Layout constants  (mirror render.zig)
-// ---------------------------------------------------------------------------
-
 const SW = 1024;
 const SH = 768;
 
-const CELL_W   = 90;
-const CELL_H   = 100;
+const CELL_W = 90;
+const CELL_H = 100;
 const CELL_PAD = 6;
 
 const PLAYER_GRID_X = 60;
@@ -31,64 +13,50 @@ const PLAYER_GRID_Y = 180;
 const ENEMY_GRID_X = SW - 60 - (CELL_W + CELL_PAD) * 3;
 const ENEMY_GRID_Y = 180;
 
-// ---------------------------------------------------------------------------
-// Colours
-// ---------------------------------------------------------------------------
-
-const C_BG          = "#14141e";
-const C_CELL_EMPTY  = "rgba(40,40,55,0.7)";
-const C_ATB_BG      = "rgba(30,30,30,0.78)";
-const C_ATB_FILL    = "rgba(255,220,50,0.9)";
-const C_HP_BG       = "rgba(30,10,10,0.78)";
-const C_HP_FILL     = "rgba(60,200,60,0.9)";
-const C_CURSOR      = "rgba(255,255,100,0.7)";
-const C_CHARGING    = "rgba(255,255,255,0.24)";
-const C_TEXT        = "rgba(230,230,230,1)";
-const C_HEADER      = "rgba(180,200,255,1)";
-const C_ENEMY_HDR   = "rgba(255,120,80,1)";
-const C_OWN_BORDER  = "rgba(255,255,60,0.78)";
-const C_MENU_BG     = "rgba(20,20,40,0.86)";
+const C_BG = "#14141e";
+const C_CELL_EMPTY = "rgba(40,40,55,0.7)";
+const C_ATB_BG = "rgba(30,30,30,0.78)";
+const C_ATB_FILL = "rgba(255,220,50,0.9)";
+const C_HP_BG = "rgba(30,10,10,0.78)";
+const C_HP_FILL = "rgba(60,200,60,0.9)";
+const C_CURSOR = "rgba(255,255,100,0.7)";
+const C_CHARGING = "rgba(255,255,255,0.24)";
+const C_TEXT = "rgba(230,230,230,1)";
+const C_HEADER = "rgba(180,200,255,1)";
+const C_ENEMY_HDR = "rgba(255,120,80,1)";
+const C_OWN_BORDER = "rgba(255,255,60,0.78)";
+const C_MENU_BG = "rgba(20,20,40,0.86)";
 const C_MENU_BORDER = C_HEADER;
-const C_SEL         = C_CURSOR;
+const C_SEL = C_CURSOR;
 
-/** @param {string} cls */
 function classColor(cls) {
   switch (cls) {
     case "fighter": return "rgba(60,120,200,0.86)";
-    case "mage":    return "rgba(180,60,200,0.86)";
-    case "healer":  return "rgba(60,200,120,0.86)";
-    case "grunt":   return "rgba(160,80,40,0.86)";
-    case "archer":  return "rgba(140,160,40,0.86)";
-    case "shaman":  return "rgba(200,100,60,0.86)";
-    case "boss":    return "rgba(200,20,20,1)";
-    default:        return "rgba(128,128,128,0.86)";
+    case "mage": return "rgba(180,60,200,0.86)";
+    case "healer": return "rgba(60,200,120,0.86)";
+    case "grunt": return "rgba(160,80,40,0.86)";
+    case "archer": return "rgba(140,160,40,0.86)";
+    case "shaman": return "rgba(200,100,60,0.86)";
+    case "boss": return "rgba(200,20,20,1)";
+    default: return "rgba(128,128,128,0.86)";
   }
 }
 
-/** Short class label, mirrors render.zig */
 function classLabel(cls) {
   switch (cls) {
     case "fighter": return "FTR";
-    case "mage":    return "MGE";
-    case "healer":  return "HLR";
-    case "grunt":   return "GRT";
-    case "archer":  return "ARC";
-    case "shaman":  return "SHA";
-    case "boss":    return "BOSS";
-    default:        return cls.slice(0, 3).toUpperCase();
+    case "mage": return "MGE";
+    case "healer": return "HLR";
+    case "grunt": return "GRT";
+    case "archer": return "ARC";
+    case "shaman": return "SHA";
+    case "boss": return "BOSS";
+    default: return cls.slice(0, 3).toUpperCase();
   }
 }
 
-// ---------------------------------------------------------------------------
-// Canvas setup
-// ---------------------------------------------------------------------------
-
 const canvas = document.getElementById("canvas");
-const ctx    = canvas.getContext("2d");
-
-// ---------------------------------------------------------------------------
-// Render functions
-// ---------------------------------------------------------------------------
+const ctx = canvas.getContext("2d");
 
 function clear() {
   ctx.fillStyle = C_BG;
@@ -108,11 +76,9 @@ function rect(x, y, w, h, color) {
 
 function rectStroke(x, y, w, h, lineW, color) {
   ctx.strokeStyle = color;
-  ctx.lineWidth   = lineW;
+  ctx.lineWidth = lineW;
   ctx.strokeRect(x + lineW / 2, y + lineW / 2, w - lineW, h - lineW);
 }
-
-// ---------------------------------------------------------------------------
 
 function drawConnecting() {
   clear();
@@ -123,6 +89,58 @@ function drawFull() {
   clear();
   text("Session full (max 6 players).", 40, SH / 2 - 16, 24, C_TEXT);
   text("Close another tab to free a slot.", 40, SH / 2 + 16, 18, C_TEXT);
+}
+
+// Draw the 3×2 lobby position-picker grid.
+// Columns are visually flipped so col 0 (front rank) is on the right, matching
+// the in-game ally grid orientation (closest to enemies = right edge).
+function drawLobbyGrid(lobby, ox, oy) {
+  const CW = 70, CH = 56, CP = 5;
+  const players = lobby.players || [];
+
+  // Build a lookup: "col,row" -> player info for occupied cells
+  const occupied = {};
+  for (const p of players) {
+    if (p.grid_col !== undefined && p.grid_row !== undefined) {
+      occupied[`${p.grid_col},${p.grid_row}`] = p;
+    }
+  }
+
+  for (let col = 0; col < 3; col++) {
+    for (let row = 0; row < 4; row++) {
+      // Flip columns: col 0 (front) renders at the right edge
+      const cx = ox + (2 - col) * (CW + CP);
+      const cy = oy + row * (CH + CP);
+
+      const key = `${col},${row}`;
+      const occ = occupied[key];
+      const isOurs = occ && occ.id === lobby.our_player_id;
+      const isCursor = col === (lobby.chosen_col ?? 0) && row === (lobby.chosen_row ?? 0);
+
+      // Cell background
+      let bg = C_CELL_EMPTY;
+      if (occ) bg = isOurs ? "rgba(80,160,80,0.86)" : "rgba(120,80,80,0.7)";
+      rect(cx, cy, CW, CH, bg);
+
+      // Cursor highlight
+      if (isCursor) rectStroke(cx, cy, CW, CH, 3, C_CURSOR);
+
+      // Player name or col label
+      if (occ) {
+        const nameColor = isOurs ? "rgba(255,255,100,1)" : C_TEXT;
+        text(occ.name.slice(0, 6), cx + 4, cy + 20, 13, nameColor);
+        text(occ.class.slice(0, 3).toUpperCase(), cx + 4, cy + 38, 12, C_TEXT);
+      }
+    }
+  }
+
+  // Column rank labels below the grid (front = right, back = left, matching flip)
+  const labelY = oy + 4 * (CH + CP) + 14;
+  for (let col = 0; col < 3; col++) {
+    const lx = ox + (2 - col) * (CW + CP) + CW / 2 - 14;
+    const label = col === 0 ? "FRONT" : col === 2 ? "BACK" : "";
+    if (label) text(label, lx, labelY, 11, "rgba(140,160,200,0.8)");
+  }
 }
 
 function drawLobby(lobby) {
@@ -138,7 +156,7 @@ function drawLobby(lobby) {
     const y = listY + i * 36 + 20;
     const color = p.id === lobby.our_player_id ? "rgba(255,255,100,1)" : C_TEXT;
     const ready = p.ready ? "[READY]" : "[     ]";
-    const conn  = p.connected ? "" : " (disconnected)";
+    const conn = p.connected ? "" : " (disconnected)";
     text(`${p.name}  ${p.class}  ${ready}${conn}`, 60, y, 20, color);
   });
 
@@ -147,6 +165,12 @@ function drawLobby(lobby) {
   text(`Selected: ${lobby.selected_class || "fighter"}`, 60, pickerY + 28, 18, C_HEADER);
   const readyLabel = lobby.ready ? "Press ENTER to un-ready" : "Press ENTER when ready";
   text(readyLabel, 60, pickerY + 60, 18, C_TEXT);
+
+  // Position picker
+  const gridX = SW - 290;
+  const gridY = 130;
+  text("Position  [Arrow keys]", gridX, gridY - 14, 14, "rgba(180,200,255,0.9)");
+  drawLobbyGrid(lobby, gridX, gridY);
 }
 
 function drawGrid(game, team, ox, oy) {
@@ -154,10 +178,14 @@ function drawGrid(game, team, ox, oy) {
     (team === "enemies" && game.is_our_turn && game.targeting_enemy) ||
     (team === "players" && game.is_our_turn && !game.targeting_enemy);
 
-  // Empty cell backgrounds
+  // Flip player columns so col 0 (front rank) renders on the right edge, facing enemies
+  const colX = (col) => team === "players"
+    ? ox + (2 - col) * (CELL_W + CELL_PAD)
+    : ox + col * (CELL_W + CELL_PAD);
+
   for (let col = 0; col < 3; col++) {
     for (let row = 0; row < 4; row++) {
-      const cx = ox + col * (CELL_W + CELL_PAD);
+      const cx = colX(col);
       const cy = oy + row * (CELL_H + CELL_PAD);
       rect(cx, cy, CELL_W, CELL_H, C_CELL_EMPTY);
     }
@@ -165,7 +193,7 @@ function drawGrid(game, team, ox, oy) {
 
   const entities = (game.entities || []).filter(e => e.team === team);
   for (const e of entities) {
-    const cx = ox + e.col * (CELL_W + CELL_PAD);
+    const cx = colX(e.col);
     const cy = oy + e.row * (CELL_H + CELL_PAD);
 
     // Class background
@@ -205,7 +233,7 @@ function drawGrid(game, team, ox, oy) {
   if (isTargeting && game.cursor) {
     const cc = game.cursor.col;
     const cr = game.cursor.row;
-    const cx = ox + cc * (CELL_W + CELL_PAD);
+    const cx = colX(cc);
     const cy = oy + cr * (CELL_H + CELL_PAD);
     rectStroke(cx, cy, CELL_W, CELL_H, 3, C_CURSOR);
   }
@@ -235,11 +263,11 @@ function drawGame(game) {
   const wave = game.wave || "";
   text(`Wave: ${wave}`, 40, 30 + 20, 20, C_HEADER);
 
-  text("ALLIES",  PLAYER_GRID_X, 155 + 18, 18, C_HEADER);
-  text("ENEMIES", ENEMY_GRID_X,  155 + 18, 18, C_ENEMY_HDR);
+  text("ALLIES", PLAYER_GRID_X, 155 + 18, 18, C_HEADER);
+  text("ENEMIES", ENEMY_GRID_X, 155 + 18, 18, C_ENEMY_HDR);
 
   drawGrid(game, "players", PLAYER_GRID_X, PLAYER_GRID_Y);
-  drawGrid(game, "enemies", ENEMY_GRID_X,  ENEMY_GRID_Y);
+  drawGrid(game, "enemies", ENEMY_GRID_X, ENEMY_GRID_Y);
 
   if (game.is_our_turn) {
     drawActionMenu(game);
@@ -251,23 +279,15 @@ function drawGameOver() {
   text("Game Over!  Press any key to return to lobby.", 40, SH / 2, 24, C_TEXT);
 }
 
-// ---------------------------------------------------------------------------
-// Frame dispatch
-// ---------------------------------------------------------------------------
-
 function renderFrame(msg) {
   switch (msg.phase) {
-    case "connecting": drawConnecting();      break;
-    case "lobby":      drawLobby(msg.lobby);  break;
-    case "game":       drawGame(msg.game);    break;
-    case "game_over":  drawGameOver();        break;
-    default:           drawConnecting();
+    case "connecting": drawConnecting(); break;
+    case "lobby": drawLobby(msg.lobby); break;
+    case "game": drawGame(msg.game); break;
+    case "game_over": drawGameOver(); break;
+    default: drawConnecting();
   }
 }
-
-// ---------------------------------------------------------------------------
-// WebSocket connection to bridge
-// ---------------------------------------------------------------------------
 
 let ws = null;
 
@@ -276,22 +296,18 @@ function connect() {
   const url = `${proto}//${location.host}/ws`;
   ws = new WebSocket(url);
 
-  ws.addEventListener("open",    ()    => console.log("[game] connected to bridge"));
-  ws.addEventListener("close",   ()    => setTimeout(connect, 1_000));
-  ws.addEventListener("error",   (e)   => console.error("[game] ws error", e));
-  ws.addEventListener("message", (ev)  => {
+  ws.addEventListener("open", () => console.log("[game] connected to bridge"));
+  ws.addEventListener("close", () => setTimeout(connect, 1_000));
+  ws.addEventListener("error", (e) => console.error("[game] ws error", e));
+  ws.addEventListener("message", (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
-    if      (msg.tag === "render") renderFrame(msg);
-    else if (msg.tag === "full")   drawFull();
+    if (msg.tag === "render") renderFrame(msg);
+    else if (msg.tag === "full") drawFull();
   });
 }
 
 connect();
-
-// ---------------------------------------------------------------------------
-// Keyboard input → bridge
-// ---------------------------------------------------------------------------
 
 const FORWARDED_KEYS = new Set([
   "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
