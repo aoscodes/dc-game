@@ -43,15 +43,15 @@ The Zig client is headless — no window, no GPU. It reads server messages and k
 
 ## Build targets
 
-| Command | Output |
-| --- | --- |
-| `zig build` | Headless client binary (`zig-out/bin/client`) |
-| `zig build run` | Build client + start Node bridge (opens on port 3000) |
-| `zig build server` | Game server (`zig-out/bin/server`) |
-| `zig build run-server` | Build + run server (listens on port 9001) |
-| `zig build test` | Unit + integration tests |
-| `zig build e2e` | Zig e2e test: spawn server + 2 bot clients, full game loop |
-| `zig build browser-e2e` | Playwright browser e2e (14 tests, requires Node.js) |
+| Command                 | Output                                                     |
+| ----------------------- | ---------------------------------------------------------- |
+| `zig build`             | Headless client binary (`zig-out/bin/client`)              |
+| `zig build run`         | Build client + start Node bridge (opens on port 3000)      |
+| `zig build server`      | Game server (`zig-out/bin/server`)                         |
+| `zig build run-server`  | Build + run server (listens on port 9001)                  |
+| `zig build test`        | Unit + integration tests                                   |
+| `zig build e2e`         | Zig e2e test: spawn server + 2 bot clients, full game loop |
+| `zig build browser-e2e` | Playwright browser e2e (14 tests, requires Node.js)        |
 
 ## Deploy to a VPS
 
@@ -70,6 +70,7 @@ This installs Nginx and Node.js, creates a `dragoncon` service user, writes two 
 After the script:
 
 1. **Add the deploy SSH key** — generate an ED25519 keypair:
+
    ```
    ssh-keygen -t ed25519 -f deploy_key
    cat deploy_key.pub >> /home/deploy/.ssh/authorized_keys   # on VPS
@@ -77,16 +78,17 @@ After the script:
    ```
 
 2. **Copy `waves.json`** to the VPS (managed separately, not deployed by CI):
+
    ```
    scp waves.json deploy@<vps-ip>:/opt/dragoncon/waves.json
    ```
 
 3. **Add GitHub Actions secrets** in your repo settings:
 
-   | Secret | Value |
-   | --- | --- |
-   | `VPS_HOST` | VPS IPv4 address |
-   | `VPS_USER` | `deploy` |
+   | Secret        | Value                                  |
+   | ------------- | -------------------------------------- |
+   | `VPS_HOST`    | VPS IPv4 address                       |
+   | `VPS_USER`    | `root`                                 |
    | `VPS_SSH_KEY` | Contents of `deploy_key` (private key) |
 
 ### CI/CD
@@ -123,22 +125,22 @@ The server hot-reloads `/opt/dragoncon/waves.json` at runtime (mtime polling). E
 
 **Lobby**
 
-| Key | Action |
-| --- | --- |
+| Key             | Action                              |
+| --------------- | ----------------------------------- |
 | `1` / `2` / `3` | Pick class: Fighter / Mage / Healer |
-| `Enter` | Toggle ready |
+| `Enter`         | Toggle ready                        |
 
 **Combat (ATB)**
 
 When your ATB bar fills the server sends `YourTurn`. Then:
 
-| Key | Action |
-| --- | --- |
-| Arrow keys | Move cursor |
-| `1` | Select Attack |
-| `2` | Select Defend |
-| `Enter` or `Z` | Confirm |
-| `Escape` or `X` | Cancel |
+| Key             | Action        |
+| --------------- | ------------- |
+| Arrow keys      | Move cursor   |
+| `1`             | Select Attack |
+| `2`             | Select Defend |
+| `Enter` or `Z`  | Confirm       |
+| `Escape` or `X` | Cancel        |
 
 - **Fighter** — single-target melee attack; Defend shields allies in the row behind.
 - **Mage** — 2×2 AoE on the enemy grid.
@@ -163,13 +165,13 @@ Wire protocol is binary, little-endian, no allocations on the hot path. See `src
 
 Stdio protocol between client and bridge:
 
-| Direction | Format | Meaning |
-| --- | --- | --- |
-| bridge → client stdin | `WIRE:<hex>\n` | Raw server message bytes, hex-encoded |
-| bridge → client stdin | `KEY:<name>\n` | Browser `KeyboardEvent.key` value |
-| bridge → client stdin | `READY\n` | Server WebSocket connected; send join |
-| client stdout → bridge | `{"tag":"render",...}\n` | Full UI snapshot for the browser |
-| client stdout → bridge | `{"tag":"send","bytes":"<hex>"}\n` | Forward bytes to server |
+| Direction              | Format                             | Meaning                               |
+| ---------------------- | ---------------------------------- | ------------------------------------- |
+| bridge → client stdin  | `WIRE:<hex>\n`                     | Raw server message bytes, hex-encoded |
+| bridge → client stdin  | `KEY:<name>\n`                     | Browser `KeyboardEvent.key` value     |
+| bridge → client stdin  | `READY\n`                          | Server WebSocket connected; send join |
+| client stdout → bridge | `{"tag":"render",...}\n`           | Full UI snapshot for the browser      |
+| client stdout → bridge | `{"tag":"send","bytes":"<hex>"}\n` | Forward bytes to server               |
 
 ## Project layout
 
