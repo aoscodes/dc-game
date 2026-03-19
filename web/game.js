@@ -266,7 +266,8 @@ function renderFrame(msg) {
 let ws = null;
 
 function connect() {
-  const url = `ws://${location.host}/ws`;
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const url = `${proto}//${location.host}/ws`;
   ws = new WebSocket(url);
 
   ws.addEventListener("open",    ()    => console.log("[game] connected to bridge"));
