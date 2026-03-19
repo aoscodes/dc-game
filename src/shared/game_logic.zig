@@ -52,6 +52,13 @@ pub fn fighter_defend_cells(
     return n;
 }
 
+/// Manhattan distance between two grid cells.
+pub fn grid_distance(a: c.GridPos, b: c.GridPos) u8 {
+    const dc = if (a.col > b.col) a.col - b.col else b.col - a.col;
+    const dr = if (a.row > b.row) a.row - b.row else b.row - a.row;
+    return dc + dr;
+}
+
 pub fn raw_damage(attack: u16, defense: u16) u16 {
     return if (attack > defense) attack - defense else 1;
 }

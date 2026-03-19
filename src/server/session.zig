@@ -542,6 +542,44 @@ pub const Session = struct {
         }
     }
 
+    /// AoE damage from an explicit origin cell targeting the *players* team.
+    /// Used by enemy archers; mirrors resolve_mage_aoe which targets enemies.
+    fn resolve_enemy_mage_aoe(
+        self: *Session,
+        actor: ecs.Entity,
+        actor_stats: *c.Stats,
+        origin: c.GridPos,
+    ) !void {
+        var cells: [4]c.GridPos = undefined;
+        const n = logic.aoe_cells_2x2(origin.col, origin.row, &cells);
+        for (cells[0..n]) |cell| {
+            const target = self.entity_at(cell, .players) orelse continue;
+            const tgt_stats = self.world.get_component(target, c.Stats);
+            const tgt_health = self.world.get_component(target, c.Health);
+            const raw = logic.raw_damage(actor_stats.attack, tgt_stats.defense);
+            const mit = logic.sum_mitigation(self.effects[target].effects[0..self.effects[target].count]);
+            const dmg = logic.mitigated_damage(raw, mit);
+            logic.apply_damage(tgt_health, dmg);
+            std.log.debug("archer entity {} -> entity {}: {} dmg (aoe origin {},{}) ", .{ actor, target, dmg, origin.col, origin.row });
+            try self.broadcast_action_result(.{
+                .tag = .damage,
+                .actor_entity = actor,
+                .target_entity = target,
+                .value = dmg,
+            });
+            if (logic.is_dead(tgt_health.*)) {
+                std.log.info("entity {} killed by archer entity {}", .{ target, actor });
+                try self.kill_entity(target);
+                try self.broadcast_action_result(.{
+                    .tag = .death,
+                    .actor_entity = actor,
+                    .target_entity = target,
+                    .value = 0,
+                });
+            }
+        }
+    }
+
     /// Player mage attack: AoE 2×2 centered on the targeted enemy's position.
     fn resolve_mage_attack(
         self: *Session,
@@ -718,8 +756,13 @@ pub const Session = struct {
             std.log.debug("AI entity {} ({s}) acting", .{ actor, @tagName(actor_class.tag) });
             switch (actor_class.tag) {
                 .shaman => try self.ai_shaman(actor, actor_stats, actor_pos.*),
-                .archer => try self.resolve_mage_aoe(actor, actor_stats, actor_pos.*),
-                else => try self.ai_attack_front_rank(actor, actor_stats),
+                .archer => {
+                    if (self.find_closest_player(actor_pos.*)) |target| {
+                        const tgt_pos = self.world.get_component(target, c.GridPos).*;
+                        try self.resolve_enemy_mage_aoe(actor, actor_stats, tgt_pos);
+                    }
+                },
+                else => try self.ai_attack_closest(actor, actor_stats, actor_pos.*),
             }
 
             if (self.find_living(actor) == null) continue;
@@ -728,19 +771,28 @@ pub const Session = struct {
         }
     }
 
-    fn ai_attack_front_rank(self: *Session, actor: ecs.Entity, actor_stats: *c.Stats) !void {
+    /// Returns the living player closest to `from` by Manhattan distance.
+    /// Ties are broken by lowest current HP.
+    fn find_closest_player(self: *Session, from: c.GridPos) ?ecs.Entity {
         var best: ?ecs.Entity = null;
-        var best_row: u8 = 255;
+        var best_dist: u8 = 255;
+        var best_hp: u16 = std.math.maxInt(u16);
         for (self.living.items) |e| {
-            const t = self.world.get_component(e, c.Team);
-            if (t.id != .players) continue;
+            if (self.world.get_component(e, c.Team).id != .players) continue;
             const p = self.world.get_component(e, c.GridPos);
-            if (p.row < best_row) {
-                best_row = p.row;
+            const dist = logic.grid_distance(from, p.*);
+            const hp = self.world.get_component(e, c.Health).current;
+            if (dist < best_dist or (dist == best_dist and hp < best_hp)) {
+                best_dist = dist;
+                best_hp = hp;
                 best = e;
             }
         }
-        if (best) |target| {
+        return best;
+    }
+
+    fn ai_attack_closest(self: *Session, actor: ecs.Entity, actor_stats: *c.Stats, actor_pos: c.GridPos) !void {
+        if (self.find_closest_player(actor_pos)) |target| {
             try self.resolve_fighter_attack(actor, actor_stats, target);
         }
     }
