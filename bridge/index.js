@@ -32,7 +32,12 @@ const { WebSocketServer, WebSocket } = require("ws");
 
 const PORT        = parseInt(process.env.PORT || "3000", 10);
 const SERVER_URL  = process.env.SERVER_URL || "ws://127.0.0.1:9001";
-const CLIENT_BIN  = path.resolve(__dirname, "../zig-out/bin/client");
+// Locally: zig build puts the binary at zig-out/bin/client (one level up from bridge/).
+// On the VPS: deploy installs it flat at /opt/dragoncon/client (same level as bridge/).
+// Try the flat path first; fall back to the local dev path.
+const _binFlat  = path.resolve(__dirname, "../client");
+const _binLocal = path.resolve(__dirname, "../zig-out/bin/client");
+const CLIENT_BIN = require("fs").existsSync(_binFlat) ? _binFlat : _binLocal;
 const WEB_DIR     = path.resolve(__dirname, "../web");
 
 const RECONNECT_INITIAL_MS = 1_000;
