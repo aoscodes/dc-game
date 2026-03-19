@@ -119,6 +119,12 @@ function drawConnecting() {
   text("Connecting to server...", 40, 60, 24, C_TEXT);
 }
 
+function drawFull() {
+  clear();
+  text("Session full (max 6 players).", 40, SH / 2 - 16, 24, C_TEXT);
+  text("Close another tab to free a slot.", 40, SH / 2 + 16, 18, C_TEXT);
+}
+
 function drawLobby(lobby) {
   clear();
   text("Dragoncon Game", 40, 52, 32, C_HEADER);
@@ -276,7 +282,8 @@ function connect() {
   ws.addEventListener("message", (ev)  => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.tag === "render") renderFrame(msg);
+    if      (msg.tag === "render") renderFrame(msg);
+    else if (msg.tag === "full")   drawFull();
   });
 }
 

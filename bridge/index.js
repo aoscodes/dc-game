@@ -3,14 +3,20 @@
 /**
  * Bridge between the Zig client binary and the browser canvas.
  *
- * Responsibilities:
+ * Each browser tab gets its own TabSession: a dedicated Zig client process
+ * and a dedicated WebSocket connection to the game server.  The server sees
+ * each tab as a distinct player.
+ *
+ * Responsibilities per TabSession:
  *   - Spawn ./zig-out/bin/client and manage its lifecycle
  *   - Connect to the game server WebSocket (owns reconnect loop)
  *   - Relay server frames → Zig stdin as  WIRE:<hex>\n
  *   - Relay Zig stdout send-frames → server WebSocket
- *   - Relay Zig stdout render-frames → all connected browser WS clients
+ *   - Relay Zig stdout render-frames → the tab's browser WebSocket only
  *   - Relay browser keydown events → Zig stdin as  KEY:<name>\n
- *   - Serve web/ directory as static files on HTTP port 3000
+ *
+ * Shared:
+ *   - HTTP static file server on port 3000 (serves web/)
  *
  * Stdio protocol (Zig ↔ bridge):
  *   Zig stdin  ← WIRE:<hex>\n   raw server message bytes, hex-encoded
@@ -42,6 +48,7 @@ const WEB_DIR     = path.resolve(__dirname, "../web");
 
 const RECONNECT_INITIAL_MS = 1_000;
 const RECONNECT_MAX_MS     = 16_000;
+const MAX_SESSIONS         = 6;
 
 // ---------------------------------------------------------------------------
 // Static file server
@@ -79,168 +86,201 @@ const httpServer = http.createServer((req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Per-tab session
+// ---------------------------------------------------------------------------
+
+/** @type {Set<TabSession>} */
+const activeSessions = new Set();
+
+class TabSession {
+  /** @param {WebSocket} tabWs */
+  constructor(tabWs) {
+    this.tabWs          = tabWs;
+    this.zigProc        = null;
+    this.zigWritable    = false;
+    this.serverWs       = null;
+    this.serverConnected = false;
+    this.lineBuf        = "";
+    this.closed         = false;
+    this.reconnectTimer = null;
+    this.reconnectDelay = RECONNECT_INITIAL_MS;
+  }
+
+  // ---- Zig stdin ----------------------------------------------------------
+
+  /** Write a line to this session's Zig stdin. */
+  writeToZig(line) {
+    if (this.zigProc && this.zigWritable) {
+      this.zigProc.stdin.write(line);
+    } else {
+      console.warn("[bridge] writeToZig: dropped (Zig not running):", line.trimEnd().slice(0, 60));
+    }
+  }
+
+  // ---- Server WebSocket ---------------------------------------------------
+
+  /** Send raw bytes to this session's game server connection. */
+  sendToServer(bytes) {
+    if (this.serverWs && this.serverConnected &&
+        this.serverWs.readyState === WebSocket.OPEN) {
+      this.serverWs.send(bytes);
+    } else {
+      console.warn(`[bridge] sendToServer: dropped ${bytes.length} bytes (not connected)`);
+    }
+  }
+
+  connectToServer() {
+    console.log(`[bridge] tab connecting to server ${SERVER_URL}`);
+    const ws = new WebSocket(SERVER_URL, { perMessageDeflate: false });
+    this.serverWs = ws;
+
+    ws.on("open", () => {
+      if (this.closed) { ws.close(); return; }
+      console.log("[bridge] tab server connected");
+      this.serverConnected = true;
+      this.reconnectDelay  = RECONNECT_INITIAL_MS;
+      // Tell Zig the server is ready so it sends join_lobby / reconnect.
+      this.writeToZig("READY\n");
+    });
+
+    ws.on("message", (data) => {
+      if (this.closed) return;
+      const hex = Buffer.from(data).toString("hex");
+      this.writeToZig(`WIRE:${hex}\n`);
+    });
+
+    ws.on("close", () => {
+      this.serverConnected = false;
+      this.serverWs = null;
+      if (this.closed) return;
+      console.warn(`[bridge] tab server disconnected; retry in ${this.reconnectDelay}ms`);
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        this.reconnectDelay = Math.min(this.reconnectDelay * 2, RECONNECT_MAX_MS);
+        if (!this.closed) this.connectToServer();
+      }, this.reconnectDelay);
+    });
+
+    ws.on("error", (err) => {
+      console.error("[bridge] tab server WS error:", err.message);
+      // 'close' fires after 'error' so reconnect is handled there.
+    });
+  }
+
+  // ---- Zig process --------------------------------------------------------
+
+  spawnZig() {
+    console.log(`[bridge] spawning ${CLIENT_BIN} for tab`);
+
+    const proc = spawn(CLIENT_BIN, [], { stdio: ["pipe", "pipe", "inherit"] });
+    this.zigProc     = proc;
+    this.zigWritable = true;
+
+    proc.on("error", (err) => {
+      console.error("[bridge] Zig spawn error:", err.message);
+      this.zigWritable = false;
+    });
+
+    proc.stdin.on("error", (err) => {
+      console.error("[bridge] Zig stdin error:", err.message);
+      this.zigWritable = false;
+    });
+
+    // Read Zig stdout line by line.
+    proc.stdout.on("data", (chunk) => {
+      this.lineBuf += chunk.toString();
+      let nl;
+      while ((nl = this.lineBuf.indexOf("\n")) !== -1) {
+        const line = this.lineBuf.slice(0, nl);
+        this.lineBuf = this.lineBuf.slice(nl + 1);
+        this.handleZigLine(line.trimEnd());
+      }
+    });
+
+    proc.on("exit", (code) => {
+      this.zigProc     = null;
+      this.zigWritable = false;
+      if (this.closed) return;
+      console.warn(`[bridge] Zig client exited (code=${code}); restarting in 1s`);
+      // Reset reconnect backoff so the next server attempt starts fresh.
+      this.reconnectDelay = RECONNECT_INITIAL_MS;
+      setTimeout(() => { if (!this.closed) this.spawnZig(); }, 1_000);
+    });
+  }
+
+  handleZigLine(line) {
+    if (!line) return;
+    let msg;
+    try { msg = JSON.parse(line); } catch {
+      console.error("[bridge] bad Zig stdout line (not JSON):", line.slice(0, 120));
+      return;
+    }
+
+    if (msg.tag === "render") {
+      // Send render frame only to this tab's browser WebSocket.
+      if (this.tabWs.readyState === WebSocket.OPEN) this.tabWs.send(line);
+    } else if (msg.tag === "send" && typeof msg.bytes === "string") {
+      const bytes = hexToBytes(msg.bytes);
+      if (bytes !== null) this.sendToServer(bytes);
+    } else {
+      console.warn("[bridge] unknown Zig frame tag:", msg.tag);
+    }
+  }
+
+  // ---- Lifecycle ----------------------------------------------------------
+
+  start() {
+    this.spawnZig();
+    this.connectToServer();
+  }
+
+  teardown() {
+    if (this.closed) return;
+    this.closed = true;
+    // Cancel any pending reconnect timer immediately.
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.zigProc)  { this.zigProc.kill();   this.zigProc  = null; }
+    if (this.serverWs) { this.serverWs.close(); this.serverWs = null; }
+    activeSessions.delete(this);
+    console.log(`[bridge] tab session torn down (${activeSessions.size} active)`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Browser WebSocket server  (/ws)
 // ---------------------------------------------------------------------------
 
 const browserWss = new WebSocketServer({ server: httpServer, path: "/ws" });
 
-/** @type {Set<WebSocket>} */
-const browserClients = new Set();
-
-browserWss.on("connection", (ws) => {
-  browserClients.add(ws);
-  ws.on("close", () => browserClients.delete(ws));
-  ws.on("message", (raw) => {
-    // Expect { key: "ArrowUp" } etc.
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-    if (typeof msg.key === "string") {
-      writeToZig(`KEY:${msg.key}\n`);
+browserWss.on("connection", (tabWs) => {
+  if (activeSessions.size >= MAX_SESSIONS) {
+    // Session is full — tell the browser before closing so it can render a
+    // "session full" screen instead of an empty reconnect loop.
+    if (tabWs.readyState === WebSocket.OPEN) {
+      tabWs.send(JSON.stringify({ tag: "full" }));
     }
-  });
-});
-
-/** Broadcast a string to all connected browser clients. */
-function broadcastToBrowser(text) {
-  for (const ws of browserClients) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(text);
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Zig client process
-// ---------------------------------------------------------------------------
-
-let zigProc = null;
-let zigStdinWritable = false;
-
-/** Write a line to Zig stdin; logs a warning if the process is not running. */
-function writeToZig(line) {
-  if (zigProc && zigStdinWritable) {
-    zigProc.stdin.write(line);
-  } else {
-    console.warn("[bridge] writeToZig: dropped (Zig not running):", line.trimEnd().slice(0, 60));
-  }
-}
-
-function spawnZig() {
-  console.log(`[bridge] spawning ${CLIENT_BIN}`);
-
-  zigProc = spawn(CLIENT_BIN, [], {
-    stdio: ["pipe", "pipe", "inherit"],
-  });
-
-  zigStdinWritable = true;
-
-  zigProc.on("error", (err) => {
-    console.error("[bridge] Zig spawn error:", err.message);
-    zigStdinWritable = false;
-  });
-
-  zigProc.stdin.on("error", (err) => {
-    console.error("[bridge] Zig stdin error:", err.message);
-    zigStdinWritable = false;
-  });
-
-  // Read Zig stdout line by line.
-  let lineBuf = "";
-  zigProc.stdout.on("data", (chunk) => {
-    lineBuf += chunk.toString();
-    let nl;
-    while ((nl = lineBuf.indexOf("\n")) !== -1) {
-      const line = lineBuf.slice(0, nl);
-      lineBuf = lineBuf.slice(nl + 1);
-      handleZigLine(line.trimEnd());
-    }
-  });
-
-  zigProc.on("exit", (code) => {
-    console.warn(`[bridge] Zig client exited (code=${code}); restarting in 1s`);
-    zigStdinWritable = false;
-    zigProc = null;
-    setTimeout(spawnZig, 1_000);
-  });
-}
-
-function handleZigLine(line) {
-  if (!line) return;
-  let msg;
-  try { msg = JSON.parse(line); } catch {
-    console.error("[bridge] bad Zig stdout line (not JSON):", line.slice(0, 120));
+    tabWs.close();
+    console.warn("[bridge] rejected tab: session full");
     return;
   }
 
-  if (msg.tag === "render") {
-    broadcastToBrowser(line);
-  } else if (msg.tag === "send" && typeof msg.bytes === "string") {
-    const bytes = hexToBytes(msg.bytes);
-    if (bytes !== null) sendToServer(bytes);
-  } else {
-    console.warn("[bridge] unknown Zig frame tag:", msg.tag);
-  }
-}
+  const session = new TabSession(tabWs);
+  activeSessions.add(session);
+  console.log(`[bridge] tab connected (${activeSessions.size} active)`);
 
-// ---------------------------------------------------------------------------
-// Game server WebSocket  (owns reconnect)
-// ---------------------------------------------------------------------------
+  tabWs.on("close", () => session.teardown());
 
-let serverWs = null;
-let serverConnected = false;
-let reconnectDelay = RECONNECT_INITIAL_MS;
-let firstConnect = true;
-
-function connectToServer() {
-  console.log(`[bridge] connecting to server ${SERVER_URL}`);
-  const ws = new WebSocket(SERVER_URL, { perMessageDeflate: false });
-  serverWs = ws;
-
-  ws.on("open", () => {
-    console.log("[bridge] server connected");
-    serverConnected = true;
-    reconnectDelay = RECONNECT_INITIAL_MS;
-
-    if (firstConnect) {
-      firstConnect = false;
-      // Tell Zig the server is ready so it sends join_lobby / reconnect.
-      writeToZig("READY\n");
-    } else {
-      // Re-open: Zig needs to re-send join/reconnect.
-      // Signal it by writing READY again — Zig's reconnect path in send_join
-      // will use the stored player_id.
-      writeToZig("READY\n");
-    }
+  tabWs.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if (typeof msg.key === "string") session.writeToZig(`KEY:${msg.key}\n`);
   });
 
-  ws.on("message", (data) => {
-    // data is a Buffer of raw binary bytes.
-    const hex = Buffer.from(data).toString("hex");
-    writeToZig(`WIRE:${hex}\n`);
-  });
-
-  ws.on("close", () => {
-    serverConnected = false;
-    serverWs = null;
-    console.warn(`[bridge] server disconnected; retry in ${reconnectDelay}ms`);
-    setTimeout(() => {
-      reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
-      connectToServer();
-    }, reconnectDelay);
-  });
-
-  ws.on("error", (err) => {
-    console.error("[bridge] server WS error:", err.message);
-    // 'close' fires after 'error' so reconnect is handled there.
-  });
-}
-
-/** Send raw bytes to the game server; logs a warning if not connected. */
-function sendToServer(bytes) {
-  if (serverWs && serverConnected && serverWs.readyState === WebSocket.OPEN) {
-    serverWs.send(bytes);
-  } else {
-    console.warn(`[bridge] sendToServer: dropped ${bytes.length} bytes (not connected)`);
-  }
-}
+  session.start();
+});
 
 // ---------------------------------------------------------------------------
 // Utilities
@@ -270,6 +310,3 @@ function hexToBytes(hex) {
 httpServer.listen(PORT, () => {
   console.log(`[bridge] listening on http://localhost:${PORT}`);
 });
-
-spawnZig();
-connectToServer();
