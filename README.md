@@ -1,11 +1,13 @@
 # DragonCon RPG
 
-Co-op RPG with ATB (Active Time Battle) combat. Up to 6 players vs scripted enemy waves. Authoritative Zig server; browser client compiled to WASM via Emscripten + Raylib.
+Co-op RPG with ATB (Active Time Battle) combat. Up to 6 players vs scripted enemy waves.
+
+Authoritative Zig server. Browser canvas renderer. Zig headless client ↔ Node bridge ↔ browser.
 
 ## Requirements
 
 - Zig 0.15.2
-- For WASM: Emscripten SDK (pulled in as a Zig package dep — no system install needed)
+- Node.js 18+ (for the bridge and browser e2e tests)
 
 ## Quick start (local)
 
@@ -15,35 +17,41 @@ Terminal 1 — server:
 zig build run-server
 ```
 
-Terminal 2 — native desktop client:
+Terminal 2 — bridge (builds client binary, then starts it + serves the browser UI):
 
 ```
 zig build run
 ```
 
-The client connects to `ws://127.0.0.1:9001`. Start the server first.
+Open `http://localhost:3000`.
 
-### Browser client locally
+### How it works
 
 ```
-zig build -Dtarget=wasm32-emscripten
-cp web/index.html web/ws_glue.js zig-out/web/
-cd zig-out/web && python3 -m http.server 8080
+browser (canvas)
+   ↕  WebSocket /ws
+Node bridge  (bridge/index.js)
+   ↕  stdin/stdout JSON frames
+Zig client binary  (zig-out/bin/client)
+   ↕  stdin/stdout WIRE: hex frames
+Node bridge
+   ↕  WebSocket
+Zig server  (zig-out/bin/server)
 ```
 
-Open `http://localhost:8080`. The page connects to `ws://localhost/ws` — to test locally you need Nginx (or a proxy) forwarding `/ws` to port 9001, or temporarily revert the server URL in `web/index.html` to `ws://localhost:9001` for local-only testing.
+The Zig client is headless — no window, no GPU. It reads server messages and key events from stdin, writes render frames and outbound server messages to stdout as newline-delimited JSON. The Node bridge owns the WebSocket connections to both the server and the browser.
 
 ## Build targets
 
 | Command | Output |
 | --- | --- |
-| `zig build` | Native desktop client (`zig-out/bin/client`) |
-| `zig build run` | Build + run native client |
+| `zig build` | Headless client binary (`zig-out/bin/client`) |
+| `zig build run` | Build client + start Node bridge (opens on port 3000) |
 | `zig build server` | Game server (`zig-out/bin/server`) |
-| `zig build run-server` | Build + run server |
-| `zig build -Dtarget=wasm32-emscripten` | WASM bundle → `zig-out/web/` |
+| `zig build run-server` | Build + run server (listens on port 9001) |
 | `zig build test` | Unit + integration tests |
-| `zig build e2e` | E2E test: spawn real server + 2 bot clients |
+| `zig build e2e` | Zig e2e test: spawn server + 2 bot clients, full game loop |
+| `zig build browser-e2e` | Playwright browser e2e (14 tests, requires Node.js) |
 
 ## Deploy to a VPS
 
@@ -57,7 +65,7 @@ SSH in as root and run the setup script:
 bash scripts/vps-setup.sh
 ```
 
-This installs Nginx, creates a `dragoncon` service user, writes the systemd unit, and configures Nginx to serve static files and proxy `/ws` to the game server.
+This installs Nginx and Node.js, creates a `dragoncon` service user, writes two systemd units (`dragoncon-server` and `dragoncon-bridge`), and configures Nginx to serve `web/` static files and proxy `/ws` to the bridge.
 
 After the script:
 
@@ -85,28 +93,31 @@ After the script:
 
 `.github/workflows/deploy.yml` runs on every push to `main`:
 
-1. Runs `zig build test` and `zig build e2e` — deploy aborts if either fails
+1. `zig build test` + `zig build e2e` — deploy aborts if either fails
 2. Builds `zig-out/bin/server` (`-Doptimize=ReleaseSafe`)
-3. Builds `zig-out/web/` (`-Dtarget=wasm32-emscripten -Doptimize=ReleaseSmall`)
-4. SCPs artifacts to the VPS and restarts `dragoncon-server.service`
+3. Builds `zig-out/bin/client` (`-Doptimize=ReleaseSafe`) and bundles it with `bridge/`
+4. Browser e2e (Playwright, 14 tests) — deploy aborts if any fail
+5. SCPs server binary → VPS, restarts `dragoncon-server.service`
+6. SCPs client binary + bridge → VPS, runs `npm ci`, restarts `dragoncon-bridge.service`
+7. SCPs `web/` static files → `/var/www/dragoncon/`
 
-First push after secrets are set will trigger a full deploy.
+Path filters skip jobs when unrelated files change (e.g. only `web/` changed → only `deploy-web` runs).
 
 ### TLS (HTTPS / WSS)
 
-The browser requires `wss://` when the page is served over HTTPS. After DNS is pointed at the VPS:
+The bridge WebSocket is `ws://` by default. After DNS is pointed at the VPS and Nginx is running:
 
 ```
 certbot --nginx -d <your-domain>
 ```
 
-Certbot edits the Nginx config to add `listen 443 ssl` and sets up auto-renew. The page then serves over HTTPS and the client automatically uses `wss://` (see `web/index.html`).
+Certbot adds `listen 443 ssl` and sets up auto-renew. `game.js` derives the WebSocket URL from `location.host`, so `wss://` is used automatically when the page is served over HTTPS.
 
-Until you have a domain, the game is playable over plain `http://` with `ws://`.
+Until you have a domain, the game is playable over plain `http://`.
 
 ### `waves.json`
 
-The server hot-reloads `/opt/dragoncon/waves.json` at runtime (mtime polling). Edit it on the VPS directly — changes take effect within 5 seconds without a restart. It is intentionally excluded from CI deploys so you can tune waves without triggering a full rebuild.
+The server hot-reloads `/opt/dragoncon/waves.json` at runtime (mtime polling). Edit it on the VPS directly — changes take effect within 5 seconds without a restart. Intentionally excluded from CI deploys so wave tuning doesn't trigger a full rebuild.
 
 ## Gameplay
 
@@ -124,10 +135,10 @@ When your ATB bar fills the server sends `YourTurn`. Then:
 | Key | Action |
 | --- | --- |
 | Arrow keys | Move cursor |
-| `A` | Select Attack |
-| `D` | Select Defend |
-| `Enter` | Confirm |
-| `Escape` | Cancel |
+| `1` | Select Attack |
+| `2` | Select Defend |
+| `Enter` or `Z` | Confirm |
+| `Escape` or `X` | Cancel |
 
 - **Fighter** — single-target melee attack; Defend shields allies in the row behind.
 - **Mage** — 2×2 AoE on the enemy grid.
@@ -138,22 +149,27 @@ Six scripted enemy waves (`wave_01_basic` through `wave_05_boss_plus_grunts`); c
 ## Architecture
 
 ```
-shared/          pure Zig: ECS components, ATB/combat math, wire protocol, wave scripts
-client/          Zig + Raylib → native binary or WASM via Emscripten
-  net/ws_native.zig   desktop WebSocket client
-  net/ws_browser.zig  extern JS bindings (WASM); Thread.spawn guarded for single-threaded target
-server/          Zig + websocket.zig (karlseguin) — authoritative game loop
-  session.zig    lobby state machine, ATB tick, AI, action resolution
-web/
-  index.html     WASM shell + name entry form; derives ws/wss URL from page origin
-  ws_glue.js     JS WebSocket ↔ WASM linear memory bridge (injected at instantiation time)
+shared/      pure Zig: ECS components, ATB/combat math, wire protocol, wave scripts
+client/      headless Zig stdio binary — game logic + UI state, no window/GPU
+server/      authoritative game loop, lobby state machine, AI, broadcasts
+bridge/      Node.js: spawns client, owns both WebSocket connections, serves web/
+web/         static HTML + JS canvas renderer (no build step)
+e2e/         Zig bot e2e (src/e2e/) + Playwright browser e2e (e2e/browser/)
 ```
 
-All game logic runs on the server. Clients send inputs only (`JoinLobby`, `ChooseClass`, `ReadyUp`, `ChooseAction`, `Reconnect`). The server broadcasts `LobbyUpdate`, `GameState` snapshots, `YourTurn`, `ActionResult`, and `GameOver`.
+All game logic runs on the server. Clients send inputs only (`JoinLobby`, `ChooseClass`, `ReadyUp`, `ChooseAction`, `Reconnect`). The server broadcasts `LobbyUpdate`, `GameState` snapshots, `YourTurn`, `ActionResult`, `GameOver`.
 
 Wire protocol is binary, little-endian, no allocations on the hot path. See `src/shared/protocol.zig`.
 
-WebSocket URL (`web/index.html`) is derived from the page origin at runtime — `wss://` when served over HTTPS, `ws://` otherwise. Path is always `/ws`, which Nginx proxies to `127.0.0.1:9001`.
+Stdio protocol between client and bridge:
+
+| Direction | Format | Meaning |
+| --- | --- | --- |
+| bridge → client stdin | `WIRE:<hex>\n` | Raw server message bytes, hex-encoded |
+| bridge → client stdin | `KEY:<name>\n` | Browser `KeyboardEvent.key` value |
+| bridge → client stdin | `READY\n` | Server WebSocket connected; send join |
+| client stdout → bridge | `{"tag":"render",...}\n` | Full UI snapshot for the browser |
+| client stdout → bridge | `{"tag":"send","bytes":"<hex>"}\n` | Forward bytes to server |
 
 ## Project layout
 
@@ -168,28 +184,32 @@ src/
     transport.zig        abstract Transport interface
     waves.zig            6 scripted enemy wave definitions
   client/
-    main.zig             entry point, ClientState, message dispatch
-    render.zig           lobby + game scene (colored rects, HP/ATB bars)
-    input.zig            keyboard → InputEvent
-    net/
-      ws_browser.zig     WASM extern JS WS bindings
-      ws_native.zig      native desktop WS client
+    main.zig             entry point, ClientState, stdin reader, game loop
+    stdout_writer.zig    JSON render/send frame serialiser
+    input.zig            key name → InputEvent
   server/
     main.zig             server entry point
-    session.zig          Session struct: lobby, tick, AI, broadcasts
+    session.zig          Session: lobby, ATB tick, AI, action resolution, broadcasts
     session_test.zig     13 in-process integration tests (no network)
-    net/
-      ws_server.zig      websocket.zig → Transport adapter
   e2e/
-    e2e_test.zig         end-to-end test (spawns server, 2 bots, full game loop)
-scripts/
-  vps-setup.sh           one-time VPS provisioning (Nginx, systemd, deploy user)
-specs/
-  game-plan.md           original milestone plan
-  next-steps.md          known gaps
-  deploy.md              deployment spec
+    e2e_test.zig         Zig e2e: spawns server + 2 bots, full game loop
+  debug/
+    debug.zig            debug/snapshot utilities (no Raylib dependency)
+bridge/
+  index.js               Node bridge: spawns client, WebSocket relay, static file server
 web/
-  index.html             WASM shell
-  ws_glue.js             JS WebSocket bridge
+  index.html             canvas shell
+  game.js                canvas renderer: connecting / lobby / game / game_over phases
+e2e/browser/
+  helpers.js             spawn helpers, Bot, frame collectors, pixel/frame assertions
+  playwright.config.js   Playwright config (headless Chromium)
+  tests/
+    canvas.test.js       canvas element, dimensions, frame rate, connecting screen
+    connecting.test.js   connecting phase before/after server comes up
+    lobby.test.js        lobby frame content, C_HEADER title colour, key round-trips
+    game.test.js         game phase entities, grid pixel checks, game_over
+scripts/
+  vps-setup.sh           one-time VPS provisioning (Nginx, Node.js, systemd, deploy user)
 .github/workflows/
-  deploy.yml             CI: test → build → deploy on push to main
+  deploy.yml             CI: test → build → browser-e2e → deploy on push to main
+```
