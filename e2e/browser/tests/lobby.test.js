@@ -1,6 +1,6 @@
 "use strict";
 /**
- * lobby.test.js — verify the browser reaches lobby phase.
+ * lobby.test.js — verify the browser reaches lobby phase with correct content.
  *
  * Ports: server=19110, bridge=19111
  *
@@ -8,14 +8,17 @@
  *   1. Spawn server + bridge.
  *   2. Open browser page — bridge connects, Zig client sends join_lobby,
  *      server replies with lobby_update, client emits lobby render frame.
- *   3. Assert canvas shows lobby content (non-blank, phase=lobby).
- *   4. Send key events via the bridge WS and confirm internal state updates.
+ *   3. Assert canvas shows lobby content (non-blank, correct colours, phase=lobby).
+ *   4. Assert lobby frame fields are well-formed (join_code, selected_class, etc.).
+ *   5. Send key events via the bridge WS and confirm internal state updates.
  */
 
 const { test, expect } = require("@playwright/test");
 const {
   spawnServer, spawnBridge, kill, waitForPort,
-  waitForCanvasContent,
+  waitForCanvasContent, canvasRegionHasColor,
+  openFrameCollector, waitForFramePhase,
+  assertLobbyFrame,
 } = require("../helpers");
 const WS = require("ws");
 
@@ -37,49 +40,48 @@ test.afterAll(async () => {
 });
 
 test("canvas renders lobby phase after server connection", async ({ page }) => {
-  // Track render phases via WS frame interception before navigating.
-  const phases = [];
-  page.on("websocket", (ws) => {
-    ws.on("framereceived", (frame) => {
-      try {
-        const msg = JSON.parse(frame.payload);
-        if (msg.tag === "render") phases.push(msg.phase);
-      } catch {}
-    });
-  });
+  const collector = openFrameCollector(BRIDGE_PORT);
+  await collector.ready;
+  try {
+    await page.goto(`http://localhost:${BRIDGE_PORT}/`);
 
-  await page.goto(`http://localhost:${BRIDGE_PORT}/`);
+    // Wait for lobby phase and grab the frame.
+    const frame = await waitForFramePhase(collector, "lobby", 10_000);
 
-  // Wait until we see a lobby-phase render frame.
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
-    if (phases.includes("lobby")) break;
-    await page.waitForTimeout(100);
+    // Verify the frame has well-formed lobby fields — not just a phase string.
+    assertLobbyFrame(frame);
+
+    // Canvas must have non-blank pixels.
+    await waitForCanvasContent(page, 5_000);
+  } finally {
+    collector.close();
   }
-  expect(phases).toContain("lobby");
-
-  // Canvas must have non-blank pixels.
-  await waitForCanvasContent(page, 5_000);
 });
 
-test("canvas shows 'Dragoncon Game' text region is painted", async ({ page }) => {
-  await page.goto(`http://localhost:${BRIDGE_PORT}/`);
-  await waitForCanvasContent(page, 10_000);
+test("canvas shows 'Dragoncon Game' title in C_HEADER colour", async ({ page }) => {
+  // C_HEADER = rgba(180,200,255,1) — the title text colour.
+  // drawLobby: text("Dragoncon Game", 40, 52, 32, C_HEADER)
+  // The text baseline is at y=52; with a 32px font glyphs extend up to ~y=20.
+  // Sample the region x=40..400, y=20..60.
+  const collector = openFrameCollector(BRIDGE_PORT);
+  await collector.ready;
+  try {
+    await page.goto(`http://localhost:${BRIDGE_PORT}/`);
+    await waitForFramePhase(collector, "lobby", 10_000);
+    await waitForCanvasContent(page, 5_000);
 
-  // The title is drawn at y≈20, large font.  Sample a horizontal strip
-  // at y=40 (below the title text baseline) and expect non-background pixels.
-  const hasTextPixels = await page.evaluate(() => {
-    const canvas = document.getElementById("canvas");
-    const ctx = canvas.getContext("2d");
-    // Sample the top region where the title is rendered (x: 40-400, y: 20-60)
-    const { data } = ctx.getImageData(40, 20, 360, 40);
-    for (let i = 0; i < data.length; i += 4) {
-      const r = data[i], g = data[i + 1], b = data[i + 2];
-      if (!(r <= 25 && g <= 25 && b <= 35)) return true;
-    }
-    return false;
-  });
-  expect(hasTextPixels).toBe(true);
+    // Check for C_HEADER-coloured pixels (near-blue-white).
+    // C_HEADER = rgb(180,200,255) — allow ±20 per channel for antialiasing.
+    const hasTitleColor = await canvasRegionHasColor(
+      page, 40, 20, 360, 40,
+      155, 210,  // r: 180 ± 25
+      175, 225,  // g: 200 ± 25
+      225, 255,  // b: 255 ± 30
+    );
+    expect(hasTitleColor).toBe(true);
+  } finally {
+    collector.close();
+  }
 });
 
 test("key event forwarding: KEY:2 reaches Zig and updates render frame", async ({ page }) => {
@@ -87,9 +89,6 @@ test("key event forwarding: KEY:2 reaches Zig and updates render frame", async (
   await waitForCanvasContent(page, 10_000);
 
   // Connect a second browser WS client to capture render frames directly.
-  const receivedPhases = [];
-  const receivedClasses = [];
-
   await page.evaluate((bridgePort) => {
     window.__testWs = new WebSocket(`ws://localhost:${bridgePort}/ws`);
     window.__testWs.onmessage = (ev) => {
@@ -104,7 +103,6 @@ test("key event forwarding: KEY:2 reaches Zig and updates render frame", async (
 
   // Wait for at least one lobby frame so we have a baseline.
   await page.waitForFunction(() => !!window.__lastClass, { timeout: 8_000 });
-  const before = await page.evaluate(() => window.__lastClass);
 
   // Press '2' in the browser — game.js forwards KEY:2 → bridge → Zig stdin.
   await page.keyboard.press("2");
@@ -114,9 +112,7 @@ test("key event forwarding: KEY:2 reaches Zig and updates render frame", async (
     () => window.__lastClass === "mage",
     { timeout: 5_000 },
   );
-  const after = await page.evaluate(() => window.__lastClass);
-  expect(after).toBe("mage");
-  void before; // before may be 'fighter' initially — just assert final state
+  expect(await page.evaluate(() => window.__lastClass)).toBe("mage");
 });
 
 test("Enter key toggles ready state", async ({ page }) => {
@@ -138,8 +134,7 @@ test("Enter key toggles ready state", async ({ page }) => {
 
   // Wait for a lobby frame.
   await page.waitForFunction(() => window.__ready !== undefined, { timeout: 8_000 });
-  const before = await page.evaluate(() => window.__ready);
-  expect(before).toBe(false);
+  expect(await page.evaluate(() => window.__ready)).toBe(false);
 
   // Press Enter — should toggle ready.
   await page.keyboard.press("Enter");

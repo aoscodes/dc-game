@@ -57,7 +57,11 @@ exports.spawnBridge = function spawnBridge(serverPort, bridgePort) {
     },
   );
   proc.on("error", (e) => console.error("[e2e] bridge spawn error:", e.message));
-  // Pipe stderr to test console for debug visibility.
+  // Pipe both stdout and stderr to the test console for debug visibility.
+  proc.stdout.on("data", (d) => {
+    const msg = d.toString().trim();
+    if (msg) console.log("[bridge]", msg);
+  });
   proc.stderr.on("data", (d) => {
     const msg = d.toString().trim();
     if (msg) console.error("[bridge]", msg);
@@ -283,4 +287,136 @@ exports.waitForCanvasContent = async function waitForCanvasContent(page, timeout
     await page.waitForTimeout(100);
   }
   throw new Error("canvas remained blank after " + timeoutMs + "ms");
+};
+
+/**
+ * Return true if the canvas region (x,y,w,h) contains at least one pixel
+ * whose r/g/b channels all fall within the given inclusive ranges.
+ *
+ * Use this to assert that a specific colour (e.g. C_HEADER, classColor) is
+ * present in a known screen area rather than just "some non-background pixel".
+ */
+exports.canvasRegionHasColor = async function canvasRegionHasColor(
+  page, x, y, w, h,
+  rMin, rMax, gMin, gMax, bMin, bMax,
+) {
+  return page.evaluate(
+    ({ x, y, w, h, rMin, rMax, gMin, gMax, bMin, bMax }) => {
+      const canvas = document.getElementById("canvas");
+      if (!canvas) return false;
+      const ctx = canvas.getContext("2d");
+      const { data } = ctx.getImageData(x, y, w, h);
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        if (r >= rMin && r <= rMax && g >= gMin && g <= gMax && b >= bMin && b <= bMax)
+          return true;
+      }
+      return false;
+    },
+    { x, y, w, h, rMin, rMax, gMin, gMax, bMin, bMax },
+  );
+};
+
+// ---------------------------------------------------------------------------
+// WS frame helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Open a Node.js WS connection to the bridge and collect render frames.
+ * Returns { frames, close } — call close() in afterAll/finally.
+ *
+ * Useful when you need to inspect frame *content* rather than just counting
+ * frames, since Playwright's framereceived can be unreliable for long tests.
+ */
+exports.openFrameCollector = function openFrameCollector(bridgePort) {
+  const WS = require("ws");
+  const frames = [];
+  const ws = new WS(`ws://127.0.0.1:${bridgePort}/ws`);
+  ws.on("message", (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.tag === "render") frames.push(msg);
+    } catch {}
+  });
+  ws.on("error", (e) => console.error("[e2e] frame collector WS error:", e.message));
+  const ready = new Promise((resolve, reject) => {
+    ws.once("open", resolve);
+    ws.once("error", reject);
+  });
+  return {
+    frames,
+    ready,
+    close: () => { try { ws.close(); } catch {} },
+  };
+};
+
+/**
+ * Wait until `collector.frames` contains a frame with the given phase.
+ * Returns the first matching frame.
+ */
+exports.waitForFramePhase = async function waitForFramePhase(collector, phase, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const f = collector.frames.find((m) => m.phase === phase);
+    if (f) return f;
+    await new Promise((r) => setTimeout(r, 80));
+  }
+  const seen = [...new Set(collector.frames.map((m) => m.phase))].join(",");
+  throw new Error(`phase "${phase}" not seen after ${timeoutMs}ms; got: ${seen || "(none)"}`);
+};
+
+// ---------------------------------------------------------------------------
+// Frame content assertions
+// ---------------------------------------------------------------------------
+
+const KNOWN_CLASSES = new Set(["fighter", "mage", "healer", "grunt", "archer", "shaman", "boss"]);
+const KNOWN_TEAMS   = new Set(["players", "enemies"]);
+
+/**
+ * Assert that a render frame in lobby phase has well-formed lobby fields.
+ * Throws with a descriptive message if anything is missing or wrong-typed.
+ */
+exports.assertLobbyFrame = function assertLobbyFrame(frame) {
+  if (!frame || frame.tag !== "render" || frame.phase !== "lobby")
+    throw new Error(`assertLobbyFrame: not a lobby frame: ${JSON.stringify(frame)}`);
+  const L = frame.lobby;
+  if (!L) throw new Error("assertLobbyFrame: frame.lobby is null/undefined");
+  if (typeof L.join_code !== "string")
+    throw new Error(`assertLobbyFrame: join_code not a string: ${JSON.stringify(L.join_code)}`);
+  if (!Array.isArray(L.players))
+    throw new Error("assertLobbyFrame: players is not an array");
+  if (!KNOWN_CLASSES.has(L.selected_class))
+    throw new Error(`assertLobbyFrame: unknown selected_class: ${L.selected_class}`);
+  if (typeof L.ready !== "boolean")
+    throw new Error(`assertLobbyFrame: ready not boolean: ${L.ready}`);
+};
+
+/**
+ * Assert that a render frame in game phase has well-formed game fields,
+ * including at least one entity with valid team/class/position fields.
+ * Throws with a descriptive message if anything is wrong.
+ */
+exports.assertGameFrame = function assertGameFrame(frame) {
+  if (!frame || frame.tag !== "render" || frame.phase !== "game")
+    throw new Error(`assertGameFrame: not a game frame: ${JSON.stringify(frame)}`);
+  const G = frame.game;
+  if (!G) throw new Error("assertGameFrame: frame.game is null/undefined");
+  if (!Array.isArray(G.entities) || G.entities.length === 0)
+    throw new Error("assertGameFrame: entities is empty or not an array");
+  for (const e of G.entities) {
+    if (typeof e.id !== "number")
+      throw new Error(`assertGameFrame: entity.id not a number: ${JSON.stringify(e)}`);
+    if (typeof e.col !== "number" || typeof e.row !== "number")
+      throw new Error(`assertGameFrame: entity col/row not numbers: ${JSON.stringify(e)}`);
+    if (typeof e.hp !== "number" || typeof e.hp_max !== "number")
+      throw new Error(`assertGameFrame: entity hp/hp_max not numbers: ${JSON.stringify(e)}`);
+    if (!KNOWN_TEAMS.has(e.team))
+      throw new Error(`assertGameFrame: unknown team: ${e.team}`);
+    if (!KNOWN_CLASSES.has(e.class))
+      throw new Error(`assertGameFrame: unknown class: ${e.class}`);
+  }
+  const hasPlayers = G.entities.some((e) => e.team === "players");
+  const hasEnemies = G.entities.some((e) => e.team === "enemies");
+  if (!hasPlayers) throw new Error("assertGameFrame: no player-team entities");
+  if (!hasEnemies) throw new Error("assertGameFrame: no enemy-team entities");
 };

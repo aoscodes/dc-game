@@ -109,10 +109,12 @@ function broadcastToBrowser(text) {
 let zigProc = null;
 let zigStdinWritable = false;
 
-/** Write a line to Zig stdin (silently drops if process not running). */
+/** Write a line to Zig stdin; logs a warning if the process is not running. */
 function writeToZig(line) {
   if (zigProc && zigStdinWritable) {
     zigProc.stdin.write(line);
+  } else {
+    console.warn("[bridge] writeToZig: dropped (Zig not running):", line.trimEnd().slice(0, 60));
   }
 }
 
@@ -125,7 +127,15 @@ function spawnZig() {
 
   zigStdinWritable = true;
 
-  zigProc.stdin.on("error", () => { zigStdinWritable = false; });
+  zigProc.on("error", (err) => {
+    console.error("[bridge] Zig spawn error:", err.message);
+    zigStdinWritable = false;
+  });
+
+  zigProc.stdin.on("error", (err) => {
+    console.error("[bridge] Zig stdin error:", err.message);
+    zigStdinWritable = false;
+  });
 
   // Read Zig stdout line by line.
   let lineBuf = "";
@@ -150,12 +160,18 @@ function spawnZig() {
 function handleZigLine(line) {
   if (!line) return;
   let msg;
-  try { msg = JSON.parse(line); } catch { return; }
+  try { msg = JSON.parse(line); } catch {
+    console.error("[bridge] bad Zig stdout line (not JSON):", line.slice(0, 120));
+    return;
+  }
 
   if (msg.tag === "render") {
     broadcastToBrowser(line);
   } else if (msg.tag === "send" && typeof msg.bytes === "string") {
-    sendToServer(hexToBytes(msg.bytes));
+    const bytes = hexToBytes(msg.bytes);
+    if (bytes !== null) sendToServer(bytes);
+  } else {
+    console.warn("[bridge] unknown Zig frame tag:", msg.tag);
   }
 }
 
@@ -212,10 +228,12 @@ function connectToServer() {
   });
 }
 
-/** Send raw bytes to the game server. */
+/** Send raw bytes to the game server; logs a warning if not connected. */
 function sendToServer(bytes) {
   if (serverWs && serverConnected && serverWs.readyState === WebSocket.OPEN) {
     serverWs.send(bytes);
+  } else {
+    console.warn(`[bridge] sendToServer: dropped ${bytes.length} bytes (not connected)`);
   }
 }
 
@@ -223,7 +241,15 @@ function sendToServer(bytes) {
 // Utilities
 // ---------------------------------------------------------------------------
 
+/**
+ * Decode a hex string to a Buffer.
+ * Returns null (and logs) if the input is odd-length or contains non-hex chars.
+ */
 function hexToBytes(hex) {
+  if (hex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(hex)) {
+    console.error("[bridge] hexToBytes: invalid hex string:", hex.slice(0, 40));
+    return null;
+  }
   const len = hex.length >> 1;
   const buf = Buffer.allocUnsafe(len);
   for (let i = 0; i < len; i++) {
