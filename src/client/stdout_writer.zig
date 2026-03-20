@@ -28,12 +28,11 @@ pub const Writer = struct {
         defer self.mu.unlock();
         // Stack-allocated frame buffer — large enough for all entity data.
         var frame_buf: [8192]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&frame_buf);
-        const w = fbs.writer();
-        write_render_inner(w, phase, lobby, game) catch return;
+        var w = std.io.Writer.fixed(&frame_buf);
+        write_render_inner(&w, phase, lobby, game) catch return;
         w.writeByte('\n') catch return;
         const out = std.fs.File.stdout();
-        out.writeAll(fbs.getWritten()) catch return;
+        out.writeAll(w.buffered()) catch return;
     }
 
     /// Emit a `send` frame carrying hex-encoded bytes for the bridge to
@@ -42,15 +41,12 @@ pub const Writer = struct {
         self.mu.lock();
         defer self.mu.unlock();
         var frame_buf: [2048]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&frame_buf);
-        const w = fbs.writer();
-        w.writeAll("{\"tag\":\"send\",\"bytes\":\"") catch return;
-        for (bytes) |b| {
-            w.print("{x:0>2}", .{b}) catch return;
-        }
-        w.writeAll("\"}\n") catch return;
+        var w = std.io.Writer.fixed(&frame_buf);
+        const frame = JsonSendFrame{ .tag = "send", .bytes = .{ .data = bytes } };
+        std.json.Stringify.value(frame, .{}, &w) catch return;
+        w.writeByte('\n') catch return;
         const out = std.fs.File.stdout();
-        out.writeAll(fbs.getWritten()) catch return;
+        out.writeAll(w.buffered()) catch return;
     }
 };
 
@@ -81,138 +77,171 @@ pub const GameState = struct {
 // ---------------------------------------------------------------------------
 
 fn write_render_inner(
-    w: anytype,
+    w: *std.io.Writer,
     phase: ClientPhaseTag,
     lobby: *const LobbyState,
     game: *const GameState,
 ) !void {
-    try w.writeAll("{\"tag\":\"render\",\"phase\":\"");
-    try w.writeAll(@tagName(phase));
-    try w.writeAll("\"");
+    const jc_end = std.mem.indexOfScalar(u8, &lobby.update.join_code, 0) orelse lobby.update.join_code.len;
 
-    switch (phase) {
-        .lobby => try write_lobby(w, lobby),
-        .game => try write_game(w, game),
-        .game_over => {},
-        .connecting => {},
+    var players_buf: [proto.MAX_PLAYERS]JsonPlayer = undefined;
+    for (0..lobby.update.player_count) |i| {
+        const p = lobby.update.players[i];
+        const name_end = p.name_len;
+        players_buf[i] = .{
+            .id = p.player_id,
+            .name = p.name[0..name_end],
+            .class = p.class,
+            .ready = p.ready,
+            .connected = p.connected,
+            .grid_col = p.grid_col,
+            .grid_row = p.grid_row,
+        };
     }
 
-    try w.writeByte('}');
+    var entities_buf: [proto.MAX_ENTITIES_WIRE]JsonEntity = undefined;
+    for (0..game.snapshot.entity_count) |i| {
+        const e = game.snapshot.entities[i];
+        entities_buf[i] = .{
+            .id = e.entity,
+            .col = e.grid_col,
+            .row = e.grid_row,
+            .hp = e.hp_current,
+            .hp_max = e.hp_max,
+            .atb = e.atb_gauge,
+            .state = e.action_state,
+            .class = e.class,
+            .team = e.team,
+            .owner = e.owner,
+        };
+    }
+
+    const frame = JsonRenderFrame{
+        .tag = "render",
+        .phase = phase,
+        .lobby = if (phase == .lobby) JsonLobby{
+            .join_code = lobby.update.join_code[0..jc_end],
+            .our_player_id = lobby.update.your_player_id,
+            .selected_class = lobby.selected_class,
+            .ready = lobby.ready,
+            .chosen_col = lobby.chosen_pos.col,
+            .chosen_row = lobby.chosen_pos.row,
+            .players = players_buf[0..lobby.update.player_count],
+        } else null,
+        .game = if (phase == .game) JsonGame{
+            .wave = game.wave_label[0..game.wave_label_len],
+            .our_player_id = game.our_player_id,
+            .our_entity = game.our_entity,
+            .is_our_turn = game.cursor.is_our_turn,
+            .action_selected = game.action_selected,
+            .targeting_enemy = game.targeting_enemy,
+            .cursor = .{ .col = game.cursor.cursor_col, .row = game.cursor.cursor_row },
+            .tick = game.snapshot.tick,
+            .entities = entities_buf[0..game.snapshot.entity_count],
+        } else null,
+    };
+
+    try std.json.Stringify.value(frame, .{ .emit_null_optional_fields = false }, w);
 }
 
-fn write_lobby(w: anytype, s: *const LobbyState) !void {
-    try w.writeAll(",\"lobby\":{");
-    try w.writeAll("\"join_code\":\"");
-    // join_code is a fixed [6]u8 zero-padded buffer; only emit the non-NUL prefix
-    // so that zero-initialised state produces valid JSON ("") rather than a string
-    // containing NUL bytes that breaks JSON.parse in both Node and the browser.
-    const jc_end = std.mem.indexOfScalar(u8, &s.update.join_code, 0) orelse s.update.join_code.len;
-    try write_escaped(w, s.update.join_code[0..jc_end]);
-    try w.writeAll("\",\"our_player_id\":");
-    try w.print("{}", .{s.update.your_player_id});
-    try w.writeAll(",\"selected_class\":\"");
-    try w.writeAll(@tagName(s.selected_class));
-    try w.writeAll("\",\"ready\":");
-    try w.writeAll(if (s.ready) "true" else "false");
-    try w.writeAll(",\"chosen_col\":");
-    try w.print("{}", .{s.chosen_pos.col});
-    try w.writeAll(",\"chosen_row\":");
-    try w.print("{}", .{s.chosen_pos.row});
-    try w.writeAll(",\"players\":[");
-    var i: u8 = 0;
-    while (i < s.update.player_count) : (i += 1) {
-        if (i > 0) try w.writeByte(',');
-        const p = s.update.players[i];
-        try w.writeAll("{\"id\":");
-        try w.print("{}", .{p.player_id});
-        try w.writeAll(",\"name\":\"");
-        try write_escaped(w, p.name[0..p.name_len]);
-        try w.writeAll("\",\"class\":\"");
-        try w.writeAll(@tagName(p.class));
-        try w.writeAll("\",\"ready\":");
-        try w.writeAll(if (p.ready) "true" else "false");
-        try w.writeAll(",\"connected\":");
-        try w.writeAll(if (p.connected) "true" else "false");
-        try w.writeAll(",\"grid_col\":");
-        try w.print("{}", .{p.grid_col});
-        try w.writeAll(",\"grid_row\":");
-        try w.print("{}", .{p.grid_row});
-        try w.writeByte('}');
-    }
-    try w.writeAll("]}");
-}
+// ---------------------------------------------------------------------------
+// JSON frame shapes — serialisation-only, private to this file.
+// ---------------------------------------------------------------------------
 
-fn write_game(w: anytype, s: *const GameState) !void {
-    try w.writeAll(",\"game\":{");
-    try w.writeAll("\"wave\":\"");
-    try write_escaped(w, s.wave_label[0..s.wave_label_len]);
-    try w.writeAll("\",\"our_player_id\":");
-    try w.print("{}", .{s.our_player_id});
-    try w.writeAll(",\"our_entity\":");
-    try w.print("{}", .{s.our_entity});
-    try w.writeAll(",\"is_our_turn\":");
-    try w.writeAll(if (s.cursor.is_our_turn) "true" else "false");
-    try w.writeAll(",\"action_selected\":");
-    if (s.action_selected) |act| {
-        try w.writeByte('"');
-        try w.writeAll(@tagName(act));
-        try w.writeByte('"');
-    } else {
-        try w.writeAll("null");
-    }
-    try w.writeAll(",\"targeting_enemy\":");
-    try w.writeAll(if (s.targeting_enemy) "true" else "false");
-    try w.writeAll(",\"cursor\":{\"col\":");
-    try w.print("{}", .{s.cursor.cursor_col});
-    try w.writeAll(",\"row\":");
-    try w.print("{}", .{s.cursor.cursor_row});
-    try w.writeByte('}');
-    try w.writeAll(",\"tick\":");
-    try w.print("{}", .{s.snapshot.tick});
-    try w.writeAll(",\"entities\":[");
-    var i: u8 = 0;
-    while (i < s.snapshot.entity_count) : (i += 1) {
-        if (i > 0) try w.writeByte(',');
-        const e = s.snapshot.entities[i];
-        try w.writeAll("{\"id\":");
-        try w.print("{}", .{e.entity});
-        try w.writeAll(",\"col\":");
-        try w.print("{}", .{e.grid_col});
-        try w.writeAll(",\"row\":");
-        try w.print("{}", .{e.grid_row});
-        try w.writeAll(",\"hp\":");
-        try w.print("{}", .{e.hp_current});
-        try w.writeAll(",\"hp_max\":");
-        try w.print("{}", .{e.hp_max});
-        try w.writeAll(",\"atb\":");
-        try w.print("{d:.3}", .{e.atb_gauge});
-        try w.writeAll(",\"state\":\"");
-        try w.writeAll(@tagName(e.action_state));
-        try w.writeAll("\",\"class\":\"");
-        try w.writeAll(@tagName(e.class));
-        try w.writeAll("\",\"team\":\"");
-        try w.writeAll(@tagName(e.team));
-        try w.writeAll("\",\"owner\":");
-        try w.print("{}", .{e.owner});
-        try w.writeByte('}');
-    }
-    try w.writeAll("]}");
-}
+const JsonSendFrame = struct {
+    tag: []const u8,
+    bytes: HexBytes,
+};
 
-/// Write a string with JSON escaping.
-/// Handles backslash, double-quote, and ASCII control characters (0x00–0x1F)
-/// using \uXXXX escapes so the output is always valid JSON.
-fn write_escaped(w: anytype, s: []const u8) !void {
-    for (s) |b| {
-        switch (b) {
-            '"' => try w.writeAll("\\\""),
-            '\\' => try w.writeAll("\\\\"),
-            '\n' => try w.writeAll("\\n"),
-            '\r' => try w.writeAll("\\r"),
-            '\t' => try w.writeAll("\\t"),
-            // remaining control chars (excludes \n=0x0A, \r=0x0D, \t=0x09)
-            0x00...0x08, 0x0B...0x0C, 0x0E...0x1F => try w.print("\\u{x:0>4}", .{b}),
-            else => try w.writeByte(b),
-        }
+const HexBytes = struct {
+    data: []const u8,
+
+    /// Emits the bytes as a hex-encoded JSON string without buffering the
+    /// full encoded form — writes directly to the underlying writer.
+    pub fn jsonStringify(self: HexBytes, jws: anytype) !void {
+        try jws.beginWriteRaw();
+        try jws.writer.writeByte('"');
+        for (self.data) |b| try jws.writer.print("{x:0>2}", .{b});
+        try jws.writer.writeByte('"');
+        jws.endWriteRaw();
     }
-}
+};
+
+const JsonRenderFrame = struct {
+    tag: []const u8,
+    phase: ClientPhaseTag,
+    lobby: ?JsonLobby,
+    game: ?JsonGame,
+};
+
+const JsonLobby = struct {
+    join_code: []const u8,
+    our_player_id: u8,
+    selected_class: c.ClassTag,
+    ready: bool,
+    chosen_col: u8,
+    chosen_row: u8,
+    players: []const JsonPlayer,
+};
+
+const JsonPlayer = struct {
+    id: u8,
+    name: []const u8,
+    class: c.ClassTag,
+    ready: bool,
+    connected: bool,
+    grid_col: u8,
+    grid_row: u8,
+};
+
+const JsonGame = struct {
+    wave: []const u8,
+    our_player_id: u8,
+    our_entity: u32,
+    is_our_turn: bool,
+    action_selected: ?proto.ActionTag,
+    targeting_enemy: bool,
+    cursor: struct { col: u8, row: u8 },
+    tick: u32,
+    entities: []const JsonEntity,
+};
+
+const JsonEntity = struct {
+    id: u32,
+    col: u8,
+    row: u8,
+    hp: u16,
+    hp_max: u16,
+    atb: f32,
+    state: c.ActionStateTag,
+    class: c.ClassTag,
+    team: c.TeamId,
+    owner: u8,
+
+    /// Custom serialiser: emits `atb` as a 3-decimal-place number rather than
+    /// the full float representation that `std.json.write` would produce.
+    pub fn jsonStringify(self: JsonEntity, jws: anytype) !void {
+        try jws.beginObject();
+        try jws.objectField("id");
+        try jws.write(self.id);
+        try jws.objectField("col");
+        try jws.write(self.col);
+        try jws.objectField("row");
+        try jws.write(self.row);
+        try jws.objectField("hp");
+        try jws.write(self.hp);
+        try jws.objectField("hp_max");
+        try jws.write(self.hp_max);
+        try jws.objectField("atb");
+        try jws.print("{d:.3}", .{self.atb});
+        try jws.objectField("state");
+        try jws.write(self.state);
+        try jws.objectField("class");
+        try jws.write(self.class);
+        try jws.objectField("team");
+        try jws.write(self.team);
+        try jws.objectField("owner");
+        try jws.write(self.owner);
+        try jws.endObject();
+    }
+};
