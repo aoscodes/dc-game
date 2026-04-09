@@ -54,8 +54,12 @@ pub fn fighter_defend_cells(
 
 /// Manhattan distance between two grid cells.
 pub fn grid_distance(a: c.GridPos, b: c.GridPos) u8 {
-    const dc = if (a.col > b.col) a.col - b.col else b.col - a.col;
-    const dr = if (a.row > b.row) a.row - b.row else b.row - a.row;
+    const ac: u8 = a.col;
+    const bc: u8 = b.col;
+    const ar: u8 = a.row;
+    const br: u8 = b.row;
+    const dc: u8 = if (ac > bc) ac - bc else bc - ac;
+    const dr: u8 = if (ar > br) ar - br else br - ar;
     return dc + dr;
 }
 

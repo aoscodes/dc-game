@@ -41,8 +41,6 @@ pub const ChooseClass = struct {
     class: components.ClassTag,
 };
 
-/// Player selects their starting grid cell in the lobby.
-/// col: 0–2, row: 0–1 (player grid only occupies rows 0–1).
 pub const ChoosePosition = struct {
     col: u8,
     row: u8,

@@ -66,6 +66,12 @@ pub const wave_01_basic = Wave{
         .{ .class = .grunt, .grid_col = 0, .grid_row = 0 },
         .{ .class = .grunt, .grid_col = 1, .grid_row = 0 },
         .{ .class = .grunt, .grid_col = 2, .grid_row = 0 },
+        .{ .class = .grunt, .grid_col = 0, .grid_row = 1 },
+        .{ .class = .grunt, .grid_col = 1, .grid_row = 1 },
+        .{ .class = .grunt, .grid_col = 2, .grid_row = 1 },
+        .{ .class = .grunt, .grid_col = 0, .grid_row = 2 },
+        .{ .class = .grunt, .grid_col = 1, .grid_row = 2 },
+        .{ .class = .grunt, .grid_col = 2, .grid_row = 2 },
     },
     .next_wave = null,
 };
