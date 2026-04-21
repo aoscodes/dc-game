@@ -70,6 +70,15 @@ pub const GameState = struct {
     action_selected: ?proto.ActionTag = null,
     wave_label: [32]u8 = [_]u8{0} ** 32,
     wave_label_len: u8 = 0,
+    pending_results: [8]proto.ActionResult = [_]proto.ActionResult{
+        .{
+            .tag = .damage,
+            .actor_entity = 0,
+            .target_entity = 0,
+            .value = 0,
+        },
+    },
+    prending_result_count: u8 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -116,6 +125,17 @@ fn write_render_inner(
         };
     }
 
+    var results_buf: [8]JsonActionResult = undefined;
+    for (0..game.prending_result_count) |i| {
+        const res = game.pending_results[i];
+        results_buf[i] = .{
+            .tag = res.tag,
+            .actor = res.actor_entity,
+            .traget = res.target_entity,
+            .value = res.value,
+        };
+    }
+
     const frame = JsonRenderFrame{
         .tag = "render",
         .phase = phase,
@@ -138,6 +158,7 @@ fn write_render_inner(
             .cursor = .{ .col = game.cursor.cursor_col, .row = game.cursor.cursor_row },
             .tick = game.snapshot.tick,
             .entities = entities_buf[0..game.snapshot.entity_count],
+            .action_results = results_buf[0..game.prending_result_count],
         } else null,
     };
 
@@ -204,6 +225,7 @@ const JsonGame = struct {
     cursor: struct { col: u8, row: u8 },
     tick: u32,
     entities: []const JsonEntity,
+    action_results: []const JsonActionResult,
 };
 
 const JsonEntity = struct {
@@ -244,4 +266,11 @@ const JsonEntity = struct {
         try jws.write(self.owner);
         try jws.endObject();
     }
+};
+
+const JsonActionResult = struct {
+    tag: proto.ActionResultTag,
+    actor: u32,
+    target: u32,
+    value: u16,
 };

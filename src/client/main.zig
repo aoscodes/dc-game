@@ -405,6 +405,7 @@ pub fn main() !void {
         }
 
         out.write_render(g_state.phase, &g_state.lobby, &g_state.game);
+        g_state.game.prending_result_count = 0;
 
         // Fixed-rate sleep: accumulate timing debt rather than drifting.
         next_tick += TICK_NS;
