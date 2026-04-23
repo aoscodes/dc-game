@@ -15,6 +15,7 @@ Files changed:
 ```
 
 Constraints:
+
 - Player entities: always 1×1 cell
 - Enemy entities: size per class, client-side lookup, top-left anchor
 - Placeholder colored frames only (no PNG assets)
@@ -64,6 +65,7 @@ The render loop runs at 60 Hz; the server sends events at 20 Hz. Multiple events
 can arrive between renders, so we need a small buffer — not a single slot.
 
 We use a fixed-size array of 8 rather than a dynamic list for two reasons:
+
 1. No allocation needed — `GameState` is stack-allocated.
 2. If more than 8 events arrive in one render window (extremely unlikely at 20 Hz
    server rate), dropping the excess is acceptable because these are cosmetic.
@@ -184,6 +186,7 @@ server messages. It runs every render tick, draining the `recv_queue` that the
 `stdin_reader` thread fills.
 
 The `action_result` branch currently decodes and throws away the result:
+
 ```zig
 .action_result => {
     _ = proto.decode_action_result(r) catch continue;
@@ -256,6 +259,7 @@ high-resolution timestamp (`now`, in milliseconds), which lets us compute
 `dt = now - lastFrameTime` — the exact elapsed time since the previous draw.
 
 The pattern is:
+
 - WS message handler stores the latest game state but doesn't render.
 - RAF loop runs at ~60 Hz, reads the latest stored state, advances animations
   by `dt`, then draws.
@@ -273,10 +277,14 @@ At the bottom of the file, find the WebSocket `message` listener:
 
 ```js
 ws.addEventListener("message", (ev) => {
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.tag === "render") renderFrame(msg);
-    else if (msg.tag === "full") drawFull();
+  let msg;
+  try {
+    msg = JSON.parse(ev.data);
+  } catch {
+    return;
+  }
+  if (msg.tag === "render") renderFrame(msg);
+  else if (msg.tag === "full") drawFull();
 });
 ```
 
@@ -286,10 +294,14 @@ Change to store the latest message instead of rendering immediately:
 let latestMsg = null;
 
 ws.addEventListener("message", (ev) => {
-    let msg;
-    try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.tag === "render") latestMsg = msg;
-    else if (msg.tag === "full") drawFull();
+  let msg;
+  try {
+    msg = JSON.parse(ev.data);
+  } catch {
+    return;
+  }
+  if (msg.tag === "render") latestMsg = msg;
+  else if (msg.tag === "full") drawFull();
 });
 ```
 
@@ -299,10 +311,10 @@ Replace the `connect()` call at the bottom with a RAF loop that wraps it:
 let lastFrameTime = performance.now();
 
 function gameLoop(now) {
-    const dt = now - lastFrameTime;
-    lastFrameTime = now;
-    if (latestMsg) renderFrame(latestMsg, dt);
-    requestAnimationFrame(gameLoop);
+  const dt = now - lastFrameTime;
+  lastFrameTime = now;
+  if (latestMsg) renderFrame(latestMsg, dt);
+  requestAnimationFrame(gameLoop);
 }
 
 connect();
@@ -313,13 +325,22 @@ Update `renderFrame` to accept and thread `dt` through:
 
 ```js
 function renderFrame(msg, dt = 0) {
-    switch (msg.phase) {
-        case "connecting": drawConnecting(); break;
-        case "lobby":      drawLobby(msg.lobby); break;
-        case "game":       drawGame(msg.game, dt); break;
-        case "game_over":  drawGameOver(); break;
-        default:           drawConnecting();
-    }
+  switch (msg.phase) {
+    case "connecting":
+      drawConnecting();
+      break;
+    case "lobby":
+      drawLobby(msg.lobby);
+      break;
+    case "game":
+      drawGame(msg.game, dt);
+      break;
+    case "game_over":
+      drawGameOver();
+      break;
+    default:
+      drawConnecting();
+  }
 }
 ```
 
@@ -360,30 +381,30 @@ Add near the top, after the existing constants:
 // Size in grid cells [cols_wide, rows_tall].
 // Players are always 1x1; only enemies may be multi-cell.
 const CLASS_SIZE = {
-    fighter: [1, 1],
-    mage:    [1, 1],
-    healer:  [1, 1],
-    grunt:   [1, 1],
-    archer:  [1, 1],
-    shaman:  [1, 1],
-    boss:    [2, 2],
+  fighter: [1, 1],
+  mage: [1, 1],
+  healer: [1, 1],
+  grunt: [1, 1],
+  archer: [1, 1],
+  shaman: [1, 1],
+  boss: [2, 2],
 };
 
 // Clip definitions. Placeholder rendering uses tinted rect overlays.
 const CLIPS = {
-    idle:   { frames: 4, fps: 6,  loop: true  },
-    attack: { frames: 4, fps: 12, loop: false },
-    hurt:   { frames: 3, fps: 10, loop: false },
-    die:    { frames: 6, fps: 8,  loop: false },
+  idle: { frames: 4, fps: 6, loop: true },
+  attack: { frames: 4, fps: 12, loop: false },
+  hurt: { frames: 3, fps: 10, loop: false },
+  die: { frames: 6, fps: 8, loop: false },
 };
 
 // Tint overlaid on the base classColor rect for non-idle clips.
 // null means no overlay (idle shows the base rect only).
 const CLIP_TINT = {
-    idle:   null,
-    attack: "rgba(255,200,50,0.45)",
-    hurt:   "rgba(255,40,40,0.55)",
-    die:    "rgba(80,80,80,0.70)",
+  idle: null,
+  attack: "rgba(255,200,50,0.45)",
+  hurt: "rgba(255,40,40,0.55)",
+  die: "rgba(80,80,80,0.70)",
 };
 ```
 
@@ -463,6 +484,7 @@ non-looping clips, it clamps at the last frame and sets `done = true`. Returns
 
 **`advanceAnimations`** orchestrates the per-frame advance for all entities.
 It also handles two bookkeeping concerns:
+
 - **Lazy init**: if a live entity has no `AnimState` yet (first time we've seen
   it), create one with `clip: "idle"`.
 - **Garbage collection**: entities that have left the snapshot (no longer in
@@ -481,6 +503,7 @@ to dying state in a single call. All other clips just mutate the existing
 
 **`processActionResults`** maps server combat events to clip triggers. The
 mapping is:
+
 - Any actor in a result → `"attack"` clip. (The actor did something.)
 - `"damage"` on target → `"hurt"` clip. (The target took a hit.)
 - `"death"` on target → `"die"` clip. (The target is being removed.)
@@ -507,100 +530,100 @@ Add these functions before `drawGrid`:
 ```js
 // Returns the pixel rect for an entity given a colX mapper and grid origin y.
 function entityPixelRect(e, colX, oy) {
-    const [cw, ch] = CLASS_SIZE[e.class] ?? [1, 1];
-    return {
-        x: colX(e.col),
-        y: oy + e.row * (CELL_H + CELL_PAD),
-        w: cw * CELL_W + (cw - 1) * CELL_PAD,
-        h: ch * CELL_H + (ch - 1) * CELL_PAD,
-    };
+  const [cw, ch] = CLASS_SIZE[e.class] ?? [1, 1];
+  return {
+    x: colX(e.col),
+    y: oy + e.row * (CELL_H + CELL_PAD),
+    w: cw * CELL_W + (cw - 1) * CELL_PAD,
+    h: ch * CELL_H + (ch - 1) * CELL_PAD,
+  };
 }
 
 // Returns a Set of "col,row" strings for every cell covered by multi-cell
 // entities. Used to skip drawing the empty cell background under them.
 function coveredCells(entities) {
-    const covered = new Set();
-    for (const e of entities) {
-        const [cw, ch] = CLASS_SIZE[e.class] ?? [1, 1];
-        for (let dc = 0; dc < cw; dc++) {
-            for (let dr = 0; dr < ch; dr++) {
-                covered.add(`${e.col + dc},${e.row + dr}`);
-            }
-        }
+  const covered = new Set();
+  for (const e of entities) {
+    const [cw, ch] = CLASS_SIZE[e.class] ?? [1, 1];
+    for (let dc = 0; dc < cw; dc++) {
+      for (let dr = 0; dr < ch; dr++) {
+        covered.add(`${e.col + dc},${e.row + dr}`);
+      }
     }
-    return covered;
+  }
+  return covered;
 }
 
 // Advance a single AnimState by dt milliseconds.
 // Returns true if the clip just finished (non-looping, last frame elapsed).
 function advanceAnim(anim, dt) {
-    if (anim.done) return false;
-    const clip = CLIPS[anim.clip];
-    anim.elapsed += dt;
-    const frameDur = 1000 / clip.fps;
-    if (anim.elapsed >= frameDur) {
-        anim.elapsed -= frameDur;  // subtract, don't reset — preserves overshoot
-        anim.frame++;
-        if (anim.frame >= clip.frames) {
-            if (clip.loop) {
-                anim.frame = 0;
-            } else {
-                anim.frame = clip.frames - 1;
-                anim.done = true;
-                return true;
-            }
-        }
+  if (anim.done) return false;
+  const clip = CLIPS[anim.clip];
+  anim.elapsed += dt;
+  const frameDur = 1000 / clip.fps;
+  if (anim.elapsed >= frameDur) {
+    anim.elapsed -= frameDur; // subtract, don't reset — preserves overshoot
+    anim.frame++;
+    if (anim.frame >= clip.frames) {
+      if (clip.loop) {
+        anim.frame = 0;
+      } else {
+        anim.frame = clip.frames - 1;
+        anim.done = true;
+        return true;
+      }
     }
-    return false;
+  }
+  return false;
 }
 
 // Advance all live and dying animations. Call once per game frame.
 function advanceAnimations(dt, liveIds) {
-    for (const id of liveIds) {
-        if (!animStates.has(id)) {
-            animStates.set(id, { clip: "idle", frame: 0, elapsed: 0, done: false });
-        }
-        const anim = animStates.get(id);
-        const finished = advanceAnim(anim, dt);
-        // Non-looping clip finished: return to idle.
-        if (finished && anim.clip !== "die") {
-            anim.clip = "idle";
-            anim.frame = 0;
-            anim.elapsed = 0;
-            anim.done = false;
-        }
-        // die clips are handled separately in dyingEntities — see triggerClip.
+  for (const id of liveIds) {
+    if (!animStates.has(id)) {
+      animStates.set(id, { clip: "idle", frame: 0, elapsed: 0, done: false });
     }
+    const anim = animStates.get(id);
+    const finished = advanceAnim(anim, dt);
+    // Non-looping clip finished: return to idle.
+    if (finished && anim.clip !== "die") {
+      anim.clip = "idle";
+      anim.frame = 0;
+      anim.elapsed = 0;
+      anim.done = false;
+    }
+    // die clips are handled separately in dyingEntities — see triggerClip.
+  }
 
-    for (const [id, dying] of dyingEntities) {
-        const finished = advanceAnim(dying.anim, dt);
-        if (finished) {
-            dyingEntities.delete(id);
-        }
+  for (const [id, dying] of dyingEntities) {
+    const finished = advanceAnim(dying.anim, dt);
+    if (finished) {
+      dyingEntities.delete(id);
     }
+  }
 
-    // Clean up animStates for entities that have left the snapshot entirely
-    // (and aren't in dyingEntities — those were moved there by triggerClip).
-    for (const id of animStates.keys()) {
-        if (!liveIds.has(id)) {
-            animStates.delete(id);
-        }
+  // Clean up animStates for entities that have left the snapshot entirely
+  // (and aren't in dyingEntities — those were moved there by triggerClip).
+  for (const id of animStates.keys()) {
+    if (!liveIds.has(id)) {
+      animStates.delete(id);
     }
+  }
 }
 
 // Trigger a clip on an entity. For "die", moves the entity's state to
 // dyingEntities so it keeps rendering after leaving the snapshot.
 // r is the pixel rect (only needed for "die").
 function triggerClip(id, clip, r, cls) {
-    const newAnim = { clip, frame: 0, elapsed: 0, done: false };
-    if (clip === "die") {
-        dyingEntities.set(id, { anim: newAnim, r, cls });
-        animStates.delete(id);
-    } else {
-        if (animStates.has(id)) {
-            Object.assign(animStates.get(id), newAnim);
-        }
+  const newAnim = { clip, frame: 0, elapsed: 0, done: false };
+  if (clip === "die") {
+    dyingEntities.set(id, { anim: newAnim, r, cls });
+    animStates.delete(id);
+  } else {
+    if (animStates.has(id)) {
+      Object.assign(animStates.get(id), newAnim);
     }
+  }
 }
 
 // Process action_results from the server, triggering appropriate clips.
@@ -608,91 +631,91 @@ function triggerClip(id, clip, r, cls) {
 // pixelRectForId is a function (id) => rect|null for looking up rects of
 // entities that may be dying (need the rect to keep drawing them).
 function processActionResults(results, pixelRectForId, classForId) {
-    if (!results) return;
-    for (const res of results) {
-        const actor = res.actor;
-        const target = res.target;
-        if (animStates.has(actor)) {
-            triggerClip(actor, "attack");
-        }
-        switch (res.tag) {
-            case "damage":
-                if (animStates.has(target)) {
-                    triggerClip(target, "hurt");
-                }
-                break;
-            case "death": {
-                // hurt first, then die on same frame is fine — die overwrites.
-                const r = pixelRectForId(target);
-                const cls = classForId(target);
-                if (r && cls) {
-                    triggerClip(target, "die", r, cls);
-                }
-                break;
-            }
-            // heal, defend, miss: no clip for now
-        }
+  if (!results) return;
+  for (const res of results) {
+    const actor = res.actor;
+    const target = res.target;
+    if (animStates.has(actor)) {
+      triggerClip(actor, "attack");
     }
+    switch (res.tag) {
+      case "damage":
+        if (animStates.has(target)) {
+          triggerClip(target, "hurt");
+        }
+        break;
+      case "death": {
+        // hurt first, then die on same frame is fine — die overwrites.
+        const r = pixelRectForId(target);
+        const cls = classForId(target);
+        if (r && cls) {
+          triggerClip(target, "die", r, cls);
+        }
+        break;
+      }
+      // heal, defend, miss: no clip for now
+    }
+  }
 }
 
 // Draw a single entity (live or dying) given its pixel rect and AnimState.
 function drawEntity(e_or_cls, r, anim, ownerId, ourPlayerId, isPlayer) {
-    const cls = typeof e_or_cls === "string" ? e_or_cls : e_or_cls.class;
-    const hp    = typeof e_or_cls === "string" ? null : e_or_cls;
-    const owner = typeof e_or_cls === "string" ? null : e_or_cls.owner;
-    const state = typeof e_or_cls === "string" ? null : e_or_cls.state;
-    const atb   = typeof e_or_cls === "string" ? null : e_or_cls.atb;
-    const hpCur = typeof e_or_cls === "string" ? null : e_or_cls.hp;
-    const hpMax = typeof e_or_cls === "string" ? null : e_or_cls.hp_max;
+  const cls = typeof e_or_cls === "string" ? e_or_cls : e_or_cls.class;
+  const hp = typeof e_or_cls === "string" ? null : e_or_cls;
+  const owner = typeof e_or_cls === "string" ? null : e_or_cls.owner;
+  const state = typeof e_or_cls === "string" ? null : e_or_cls.state;
+  const atb = typeof e_or_cls === "string" ? null : e_or_cls.atb;
+  const hpCur = typeof e_or_cls === "string" ? null : e_or_cls.hp;
+  const hpMax = typeof e_or_cls === "string" ? null : e_or_cls.hp_max;
 
-    // 1. Base class-colored rect.
-    rect(r.x, r.y, r.w, r.h, classColor(cls));
+  // 1. Base class-colored rect.
+  rect(r.x, r.y, r.w, r.h, classColor(cls));
 
-    // 2. Animation tint overlay.
-    const tint = CLIP_TINT[anim.clip];
-    if (tint) {
-        // Pulse opacity slightly per frame for visual interest.
-        ctx.save();
-        ctx.globalAlpha = 0.7 + 0.3 * ((anim.frame % 2 === 0) ? 1 : 0);
-        rect(r.x, r.y, r.w, r.h, tint);
-        ctx.restore();
-    }
+  // 2. Animation tint overlay.
+  const tint = CLIP_TINT[anim.clip];
+  if (tint) {
+    // Pulse opacity slightly per frame for visual interest.
+    ctx.save();
+    ctx.globalAlpha = 0.7 + 0.3 * (anim.frame % 2 === 0 ? 1 : 0);
+    rect(r.x, r.y, r.w, r.h, tint);
+    ctx.restore();
+  }
 
-    // 3. Placeholder frame indicator: small square top-right corner cycles hue.
-    //    This makes the animation clock visible without any real sprite assets.
-    //    Remove this once real sprites are in place.
-    const frameColors = ["#f00","#f80","#ff0","#0f0","#08f","#80f"];
-    const fc = frameColors[anim.frame % frameColors.length];
-    rect(r.x + r.w - 14, r.y + 2, 12, 12, fc);
+  // 3. Placeholder frame indicator: small square top-right corner cycles hue.
+  //    This makes the animation clock visible without any real sprite assets.
+  //    Remove this once real sprites are in place.
+  const frameColors = ["#f00", "#f80", "#ff0", "#0f0", "#08f", "#80f"];
+  const fc = frameColors[anim.frame % frameColors.length];
+  rect(r.x + r.w - 14, r.y + 2, 12, 12, fc);
 
-    if (hp === null) return; // dying entity — skip bars/labels
+  if (hp === null) return; // dying entity — skip bars/labels
 
-    // 4. Charging overlay.
-    if (state === "charging") {
-        rect(r.x, r.y, r.w, r.h, C_CHARGING);
-    }
+  // 4. Charging overlay.
+  if (state === "charging") {
+    rect(r.x, r.y, r.w, r.h, C_CHARGING);
+  }
 
-    // 5. HP bar (scaled to entity width).
-    const BAR_H_HP = 8;
-    const hpFrac = hpMax > 0 ? hpCur / hpMax : 0;
-    rect(r.x, r.y, r.w, BAR_H_HP, C_HP_BG);
-    rect(r.x, r.y, r.w * hpFrac, BAR_H_HP, C_HP_FILL);
+  // 5. HP bar (scaled to entity width).
+  const BAR_H_HP = 8;
+  const hpFrac = hpMax > 0 ? hpCur / hpMax : 0;
+  rect(r.x, r.y, r.w, BAR_H_HP, C_HP_BG);
+  rect(r.x, r.y, r.w * hpFrac, BAR_H_HP, C_HP_FILL);
 
-    // 6. ATB bar (scaled to entity width).
-    const BAR_H_ATB = 6;
-    const atbY = r.y + r.h - BAR_H_ATB;
-    const atbFrac = Math.max(0, Math.min(1, atb));
-    rect(r.x, atbY, r.w, BAR_H_ATB, C_ATB_BG);
-    rect(r.x, atbY, r.w * atbFrac, BAR_H_ATB, C_ATB_FILL);
+  // 6. ATB bar (scaled to entity width).
+  const BAR_H_ATB = 6;
+  const atbY = r.y + r.h - BAR_H_ATB;
+  const atbFrac = Math.max(0, Math.min(1, atb));
+  rect(r.x, atbY, r.w, BAR_H_ATB, C_ATB_BG);
+  rect(r.x, atbY, r.w * atbFrac, BAR_H_ATB, C_ATB_FILL);
 
-    // 7. Class label and HP number.
-    text(classLabel(cls), r.x + 4, r.y + 14 + 16, 16, C_TEXT);
-    text(String(hpCur), r.x + 4, r.y + 36 + 14, 14, C_TEXT);
+  // 7. Class label and HP number.
+  text(classLabel(cls), r.x + 4, r.y + 14 + 16, 16, C_TEXT);
+  text(String(hpCur), r.x + 4, r.y + 36 + 14, 14, C_TEXT);
 
-    // 8. Player-owned border.
-    if (isPlayer && owner === ourPlayerId) {
-        rectStroke(r.x, r.y, r.w, r.h, 2, C_OWN_BORDER);
-    }
+  // 8. Player-owned border.
+  if (isPlayer && owner === ourPlayerId) {
+    rectStroke(r.x, r.y, r.w, r.h, 2, C_OWN_BORDER);
+  }
 }
 ```
 
@@ -736,83 +759,84 @@ Replace the existing `drawGrid` function entirely:
 
 ```js
 function drawGrid(game, team, ox, oy, dt) {
-    const isTargeting =
-        (team === "enemies" && game.is_our_turn && game.targeting_enemy) ||
-        (team === "players" && game.is_our_turn && !game.targeting_enemy);
+  const isTargeting =
+    (team === "enemies" && game.is_our_turn && game.targeting_enemy) ||
+    (team === "players" && game.is_our_turn && !game.targeting_enemy);
 
-    const colX = (col) => team === "players"
-        ? ox + (2 - col) * (CELL_W + CELL_PAD)
-        : ox + col * (CELL_W + CELL_PAD);
+  const colX = (col) =>
+    team === "players"
+      ? ox + (2 - col) * (CELL_W + CELL_PAD)
+      : ox + col * (CELL_W + CELL_PAD);
 
-    const entities = (game.entities || []).filter(e => e.team === team);
+  const entities = (game.entities || []).filter((e) => e.team === team);
 
-    // Build covered-cell set for multi-cell entities so we can skip
-    // drawing the empty background behind them.
-    const covered = coveredCells(entities);
+  // Build covered-cell set for multi-cell entities so we can skip
+  // drawing the empty background behind them.
+  const covered = coveredCells(entities);
 
-    // 1. Empty cell backgrounds (skip cells covered by multi-cell entities).
-    for (let col = 0; col < 3; col++) {
-        for (let row = 0; row < 4; row++) {
-            if (covered.has(`${col},${row}`)) continue;
-            const cx = colX(col);
-            const cy = oy + row * (CELL_H + CELL_PAD);
-            rect(cx, cy, CELL_W, CELL_H, C_CELL_EMPTY);
-        }
+  // 1. Empty cell backgrounds (skip cells covered by multi-cell entities).
+  for (let col = 0; col < 3; col++) {
+    for (let row = 0; row < 4; row++) {
+      if (covered.has(`${col},${row}`)) continue;
+      const cx = colX(col);
+      const cy = oy + row * (CELL_H + CELL_PAD);
+      rect(cx, cy, CELL_W, CELL_H, C_CELL_EMPTY);
     }
+  }
 
-    // 2. Build lookup helpers for processActionResults.
-    const rectById = new Map(
-        entities.map(e => [e.id, entityPixelRect(e, colX, oy)])
+  // 2. Build lookup helpers for processActionResults.
+  const rectById = new Map(
+    entities.map((e) => [e.id, entityPixelRect(e, colX, oy)]),
+  );
+  const clsById = new Map(entities.map((e) => [e.id, e.class]));
+
+  // Process events only once (on the enemies pass to avoid double-trigger).
+  // Player entities don't need death rects since they're always 1x1 and
+  // the same logic applies; processing once is sufficient.
+  if (team === "enemies") {
+    processActionResults(
+      game.action_results,
+      (id) => rectById.get(id) ?? null,
+      (id) => clsById.get(id) ?? null,
     );
-    const clsById = new Map(entities.map(e => [e.id, e.class]));
+  }
 
-    // Process events only once (on the enemies pass to avoid double-trigger).
-    // Player entities don't need death rects since they're always 1x1 and
-    // the same logic applies; processing once is sufficient.
-    if (team === "enemies") {
-        processActionResults(
-            game.action_results,
-            id => rectById.get(id) ?? null,
-            id => clsById.get(id) ?? null,
-        );
+  // 3. Advance animations for this team's live entities.
+  const liveIds = new Set(entities.map((e) => e.id));
+  advanceAnimations(dt, liveIds);
+
+  // 4. Draw live entities.
+  for (const e of entities) {
+    const r = entityPixelRect(e, colX, oy);
+    // Ensure AnimState exists (advanceAnimations creates it but guard here).
+    if (!animStates.has(e.id)) {
+      animStates.set(e.id, { clip: "idle", frame: 0, elapsed: 0, done: false });
     }
+    const anim = animStates.get(e.id);
+    drawEntity(e, r, anim, e.owner, game.player_id, team === "players");
+  }
 
-    // 3. Advance animations for this team's live entities.
-    const liveIds = new Set(entities.map(e => e.id));
-    advanceAnimations(dt, liveIds);
-
-    // 4. Draw live entities.
-    for (const e of entities) {
-        const r = entityPixelRect(e, colX, oy);
-        // Ensure AnimState exists (advanceAnimations creates it but guard here).
-        if (!animStates.has(e.id)) {
-            animStates.set(e.id, { clip: "idle", frame: 0, elapsed: 0, done: false });
-        }
-        const anim = animStates.get(e.id);
-        drawEntity(e, r, anim, e.owner, game.our_player_id, team === "players");
+  // 5. Draw dying entities that belong to this team.
+  // We don't track team on dyingEntities so we draw all of them on both
+  // passes — they only exist briefly and the overdraw is harmless.
+  // Alternatively, store team in the dying entry if you want precision.
+  if (team === "enemies") {
+    ctx.save();
+    ctx.globalAlpha = 0.7;
+    for (const [, dying] of dyingEntities) {
+      drawEntity(dying.cls, dying.r, dying.anim, null, null, false);
     }
+    ctx.restore();
+  }
 
-    // 5. Draw dying entities that belong to this team.
-    // We don't track team on dyingEntities so we draw all of them on both
-    // passes — they only exist briefly and the overdraw is harmless.
-    // Alternatively, store team in the dying entry if you want precision.
-    if (team === "enemies") {
-        ctx.save();
-        ctx.globalAlpha = 0.7;
-        for (const [, dying] of dyingEntities) {
-            drawEntity(dying.cls, dying.r, dying.anim, null, null, false);
-        }
-        ctx.restore();
-    }
-
-    // 6. Cursor overlay.
-    if (isTargeting && game.cursor) {
-        const cc = game.cursor.col;
-        const cr = game.cursor.row;
-        const cx = colX(cc);
-        const cy = oy + cr * (CELL_H + CELL_PAD);
-        rectStroke(cx, cy, CELL_W, CELL_H, 3, C_CURSOR);
-    }
+  // 6. Cursor overlay.
+  if (isTargeting && game.cursor) {
+    const cc = game.cursor.col;
+    const cr = game.cursor.row;
+    const cx = colX(cc);
+    const cy = oy + cr * (CELL_H + CELL_PAD);
+    rectStroke(cx, cy, CELL_W, CELL_H, 3, C_CURSOR);
+  }
 }
 ```
 
@@ -835,20 +859,20 @@ Update the signature and calls:
 
 ```js
 function drawGame(game, dt) {
-    clear();
+  clear();
 
-    const wave = game.wave || "";
-    text(`Wave: ${wave}`, 40, 30 + 20, 20, C_HEADER);
+  const wave = game.wave || "";
+  text(`Wave: ${wave}`, 40, 30 + 20, 20, C_HEADER);
 
-    text("ALLIES", PLAYER_GRID_X, 155 + 18, 18, C_HEADER);
-    text("ENEMIES", ENEMY_GRID_X, 155 + 18, 18, C_ENEMY_HDR);
+  text("ALLIES", PLAYER_GRID_X, 155 + 18, 18, C_HEADER);
+  text("ENEMIES", ENEMY_GRID_X, 155 + 18, 18, C_ENEMY_HDR);
 
-    drawGrid(game, "players", PLAYER_GRID_X, PLAYER_GRID_Y, dt);
-    drawGrid(game, "enemies", ENEMY_GRID_X, ENEMY_GRID_Y, dt);
+  drawGrid(game, "players", PLAYER_GRID_X, PLAYER_GRID_Y, dt);
+  drawGrid(game, "enemies", ENEMY_GRID_X, ENEMY_GRID_Y, dt);
 
-    if (game.is_our_turn) {
-        drawActionMenu(game);
-    }
+  if (game.is_our_turn) {
+    drawActionMenu(game);
+  }
 }
 ```
 

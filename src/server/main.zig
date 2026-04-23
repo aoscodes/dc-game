@@ -113,10 +113,6 @@ fn tick_loop(_: void) void {
                 sess.tick(dt) catch |err| {
                     std.log.err("tick error: {}", .{err});
                 };
-                sess.tick_effects(dt);
-                sess.run_ai() catch |err| {
-                    std.log.err("AI error: {}", .{err});
-                };
             }
             g_session_lock.unlock();
         }

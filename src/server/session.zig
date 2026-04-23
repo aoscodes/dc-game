@@ -5,10 +5,21 @@
 //!   - The per-player connection transports
 //!   - The state machine (lobby → playing → ended)
 //!
-//! The game loop runs on a dedicated thread (spawned by main.zig) at a fixed
-//! tick rate (TICK_HZ).  All network I/O is non-blocking: incoming client
-//! messages are pushed into a per-player queue by the websocket handler
-//! thread and drained each tick.
+//! ## Round-based game loop
+//!
+//! All actors share a single countdown timer (`round_timer`).  During each
+//! round players submit an `ActionChoice` (damage / shield / heal) which is
+//! recorded in `action_pool`.  When the timer expires `resolve_round()` is
+//! called, which:
+//!   1. Applies the *player damage pool* to every living enemy.
+//!   2. Applies the *player shield pool* to every living player (flat HP).
+//!   3. Applies the *player heal pool* to every living player.
+//!   4. Applies *enemy intent* (via `compute_enemy_intent`) to every living
+//!      player, first absorbing from shield, then HP.
+//!   5. Broadcasts all action results and checks win/loss.
+//!
+//! The round timer duration is configurable per session (`round_duration`) and
+//! is sent to clients at game start so they can display a countdown.
 
 const std = @import("std");
 const ecs = @import("ecs_zig");
@@ -22,37 +33,23 @@ const dbg = @import("debug_zig");
 const ws_server = @import("net/ws_server.zig");
 
 /// Zones measured by the per-session tick profiler.
-pub const TickZones = enum { drain, atb, notify, effects, ai, broadcast, check_win };
+pub const TickZones = enum { drain, round, broadcast, check_win };
 
 pub const GameWorld = ecs.World(
     .{
-        .grid_pos = c.GridPos,
         .health = c.Health,
-        .speed = c.Speed,
         .class = c.Class,
         .team = c.Team,
         .owner = c.Owner,
         .stats = c.Stats,
-        .action_state = c.ActionState,
     },
-    .{
-        .atb = AtbSystem,
-        .ai = AiSystem,
-        .effect = EffectSystem,
-    },
+    .{},
 );
 
-pub const AtbSystem = struct { dt: f32 = 0 };
-pub const AiSystem = struct {};
-pub const EffectSystem = struct { dt: f32 = 0 };
-
-pub const MAX_EFFECTS_PER_ENTITY: usize = 4;
-pub const EffectSlot = struct {
-    effects: [MAX_EFFECTS_PER_ENTITY]c.ActiveEffect = undefined,
-    count: usize = 0,
-};
-
 pub const MAX_PLAYERS = proto.MAX_PLAYERS;
+
+/// Cosmetic grid position stored in the lobby (no gameplay effect).
+pub const LobbyGridPos = struct { col: u2 = 0, row: u2 = 0 };
 
 pub const PlayerSlot = struct {
     occupied: bool = false,
@@ -62,9 +59,8 @@ pub const PlayerSlot = struct {
     name_len: u8 = 0,
     class: c.ClassTag = .fighter,
     ready: bool = false,
-    /// Chosen lobby grid position. Defaults to a unique cell per player_id so
-    /// spawn always has a valid position even if the player never moved the cursor.
-    grid_pos: c.GridPos = .{ .col = 0, .row = 0 },
+    /// Cosmetic lobby grid position — no gameplay effect.
+    grid_pos: LobbyGridPos = .{},
     entity: ecs.Entity = std.math.maxInt(ecs.Entity),
     transport: ?shared.Transport = null,
     queue_lock: std.Thread.Mutex = .{},
@@ -81,28 +77,33 @@ pub const Session = struct {
     player_count: u8 = 0,
     phase: SessionPhase = .lobby,
     world: GameWorld,
-    effects: [ecs.MAX_ENTITIES]EffectSlot,
+
+    /// Per-entity shield HP (flat damage absorption). Indexed by ECS entity ID.
+    shield: [ecs.MAX_ENTITIES]u16,
+
     tick_count: u32 = 0,
     current_wave: ?*const waves.Wave = null,
     living: std.ArrayListUnmanaged(ecs.Entity) = .empty,
 
-    /// Per-tick timing profiler.  Enabled by default; call
-    /// `sess.profiler.report(writer, "tick")` to flush.
+    /// Countdown timer for the current round (seconds remaining).
+    round_timer: f32 = logic.ROUND_DURATION_DEFAULT_S,
+
+    /// Duration of each round in seconds. Configurable in lobby; sent to
+    /// clients at game start so they can display the countdown.
+    round_duration: f32 = logic.ROUND_DURATION_DEFAULT_S,
+
+    /// Per-player action submitted this round.  Null = player hasn't acted yet.
+    /// Overwritten freely until the round ends.
+    action_pool: [MAX_PLAYERS]?c.ActionChoice,
+
+    /// Per-tick timing profiler.
     profiler: dbg.Profiler(TickZones) = dbg.Profiler(TickZones).init(),
 
-    /// Optional GameState replay recorder.  Set to a non-null value before
-    /// starting a game to record all broadcast frames.  Caller owns the
-    /// underlying writer and must call `recorder.finish()` when done.
-    ///
-    /// Usage:
-    ///   var file = try std.fs.cwd().createFile("replay.bin", .{});
-    ///   sess.recorder = try dbg.replay.Recorder(std.io.AnyWriter).init(file.writer().any());
+    /// Optional GameState replay recorder.
     recorder: ?dbg.replay.Recorder(std.io.AnyWriter) = null,
 
     pub fn init(allocator: std.mem.Allocator, join_code: [6]u8) !Session {
-        // Default grid positions spread across the full 3×4 player spawn area
-        // so every slot has a unique valid cell without any user interaction.
-        const default_positions = [MAX_PLAYERS]c.GridPos{
+        const default_positions = [MAX_PLAYERS]LobbyGridPos{
             .{ .col = 0, .row = 0 }, .{ .col = 1, .row = 1 },
             .{ .col = 2, .row = 2 }, .{ .col = 0, .row = 3 },
             .{ .col = 1, .row = 3 }, .{ .col = 2, .row = 3 },
@@ -120,7 +121,8 @@ pub const Session = struct {
             .join_code = join_code,
             .players = players,
             .world = try GameWorld.init(allocator),
-            .effects = [_]EffectSlot{.{}} ** ecs.MAX_ENTITIES,
+            .shield = [_]u16{0} ** ecs.MAX_ENTITIES,
+            .action_pool = [_]?c.ActionChoice{null} ** MAX_PLAYERS,
         };
     }
 
@@ -204,45 +206,30 @@ pub const Session = struct {
     }
 
     pub fn start_game_wave(self: *Session, wave: *const waves.Wave) !void {
+        // Destroy all entities from any previous game so state is clean.
+        self.living.clearRetainingCapacity();
+        self.world.deinit();
+        self.world = try GameWorld.init(self.allocator);
+        @memset(&self.shield, 0);
+        for (&self.action_pool) |*a| a.* = null;
+        self.tick_count = 0;
+
         self.phase = .playing;
         self.current_wave = wave;
-        std.log.info("game start — wave: {s}", .{wave.label});
+        self.round_timer = self.round_duration;
+        std.log.info("game start — wave: {s} round_duration={d:.1}s", .{ wave.label, self.round_duration });
         try self.spawn_players();
         try self.spawn_wave(wave);
-        self.register_system_signatures();
-    }
-
-    fn register_system_signatures(self: *Session) void {
-        {
-            var sig = ecs.Signature.initEmpty();
-            sig.set(GameWorld.component_type(c.Speed));
-            sig.set(GameWorld.component_type(c.ActionState));
-            self.world.set_system_signature(AtbSystem, sig);
-        }
-        {
-            var sig = ecs.Signature.initEmpty();
-            sig.set(GameWorld.component_type(c.Team));
-            sig.set(GameWorld.component_type(c.ActionState));
-            sig.set(GameWorld.component_type(c.Class));
-            self.world.set_system_signature(AiSystem, sig);
-        }
-        {
-            var sig = ecs.Signature.initEmpty();
-            sig.set(GameWorld.component_type(c.Health));
-            self.world.set_system_signature(EffectSystem, sig);
-        }
     }
 
     fn spawn_players(self: *Session) !void {
+        var slot_idx: u8 = 0;
         for (&self.players) |*p| {
             if (!p.occupied or !p.connected) continue;
-            const pos = p.grid_pos;
             const d = waves.class_defaults(p.class);
             const e = self.world.create_entity();
             p.entity = e;
-            self.world.add_component(e, c.GridPos{ .col = pos.col, .row = pos.row });
             self.world.add_component(e, c.Health{ .current = d.max_hp, .max = d.max_hp });
-            self.world.add_component(e, c.Speed{ .gauge = 0, .rate = d.speed_base });
             self.world.add_component(e, c.Class{ .tag = p.class });
             self.world.add_component(e, c.Team{ .id = .players });
             self.world.add_component(e, c.Owner{ .player_id = p.player_id });
@@ -252,19 +239,18 @@ pub const Session = struct {
                 .speed_base = d.speed_base,
                 .max_hp = d.max_hp,
             });
-            self.world.add_component(e, c.ActionState{ .tag = .idle });
+            self.shield[e] = 0;
             try self.living.append(self.allocator, e);
+            slot_idx += 1;
         }
     }
 
     fn spawn_wave(self: *Session, wave: *const waves.Wave) !void {
         std.log.info("spawning wave: {s} ({} enemies)", .{ wave.label, wave.entries.len });
-        for (wave.entries) |entry| {
+        for (wave.entries, 0..) |entry, i| {
             const d = waves.resolve_stats(entry.class, entry.stats);
             const e = self.world.create_entity();
-            self.world.add_component(e, c.GridPos{ .col = entry.grid_col, .row = entry.grid_row });
             self.world.add_component(e, c.Health{ .current = d.max_hp, .max = d.max_hp });
-            self.world.add_component(e, c.Speed{ .gauge = 0, .rate = d.speed_base });
             self.world.add_component(e, c.Class{ .tag = entry.class });
             self.world.add_component(e, c.Team{ .id = .enemies });
             self.world.add_component(e, c.Stats{
@@ -273,8 +259,9 @@ pub const Session = struct {
                 .speed_base = d.speed_base,
                 .max_hp = d.max_hp,
             });
-            self.world.add_component(e, c.ActionState{ .tag = .idle });
+            self.shield[e] = 0;
             try self.living.append(self.allocator, e);
+            _ = i; // slot index unused for enemies (no owner component)
         }
     }
 
@@ -287,23 +274,13 @@ pub const Session = struct {
 
         self.tick_count += 1;
 
-        self.profiler.begin(.atb);
-        self.world.get_system(AtbSystem).dt = dt;
-        self.world.each(AtbSystem, atb_step);
-        self.profiler.end(.atb);
-
-        self.profiler.begin(.notify);
-        try self.notify_ready_actors();
-        self.profiler.end(.notify);
-
-        self.profiler.begin(.effects);
-        self.world.get_system(EffectSystem).dt = dt;
-        self.world.each(EffectSystem, effect_step_trampoline);
-        self.profiler.end(.effects);
-
-        self.profiler.begin(.ai);
-        self.world.each(AiSystem, ai_step_trampoline);
-        self.profiler.end(.ai);
+        self.profiler.begin(.round);
+        self.round_timer -= dt;
+        if (self.round_timer <= 0.0) {
+            try self.resolve_round();
+            self.reset_round();
+        }
+        self.profiler.end(.round);
 
         self.profiler.begin(.broadcast);
         try self.broadcast_game_state();
@@ -313,10 +290,15 @@ pub const Session = struct {
         try self.check_win();
         self.profiler.end(.check_win);
 
-        // Log profiler report every 200 ticks (~10 s at 20 Hz).
         if (self.profiler.should_report(200)) {
             self.profiler.report_stderr("session tick");
         }
+    }
+
+    /// Clear the action pool and reset the round timer for the next round.
+    fn reset_round(self: *Session) void {
+        for (&self.action_pool) |*a| a.* = null;
+        self.round_timer = self.round_duration;
     }
 
     fn drain_queues(self: *Session) !void {
@@ -378,9 +360,7 @@ pub const Session = struct {
             .choose_position => {
                 if (self.phase == .lobby) {
                     const p = try proto.decode_choose_position(fbs.reader());
-                    // Clamp to valid 3-column × 2-row spawn area
                     if (p.col < 3 and p.row < 4) {
-                        // Check no other connected player already occupies that cell
                         var taken = false;
                         for (&self.players) |*other| {
                             if (!other.occupied or other.player_id == player_id) continue;
@@ -392,7 +372,7 @@ pub const Session = struct {
                             }
                         }
                         if (!taken) {
-                            self.players[player_id].grid_pos = .{
+                            self.players[player_id].grid_pos = LobbyGridPos{
                                 .col = @intCast(p.col),
                                 .row = @intCast(p.row),
                             };
@@ -403,303 +383,148 @@ pub const Session = struct {
                 }
             },
             .choose_action => {
-                const p = try proto.decode_choose_action(fbs.reader());
-                std.log.info("player {} action: {s} target={}", .{ player_id, @tagName(p.action), p.target_entity });
-                try self.resolve_action(player_id, p);
+                if (self.phase == .playing and player_id < MAX_PLAYERS) {
+                    const p = try proto.decode_choose_action(fbs.reader());
+                    self.action_pool[player_id] = p.action;
+                    std.log.debug("player {} action: {s}", .{ player_id, @tagName(p.action) });
+                }
             },
             .reconnect => {},
             else => {},
         }
     }
 
-    fn notify_ready_actors(self: *Session) !void {
+    // -------------------------------------------------------------------------
+    // Round resolution
+    // -------------------------------------------------------------------------
+
+    fn resolve_round(self: *Session) !void {
+        // Count player actions.
+        var damage_pool: u16 = 0;
+        var shield_pool: u16 = 0;
+        var heal_pool: u16 = 0;
+        for (&self.action_pool) |maybe_action| {
+            const action = maybe_action orelse continue;
+            switch (action) {
+                .damage => damage_pool += 1,
+                .shield => shield_pool += 1,
+                .heal => heal_pool += 1,
+            }
+        }
+        std.log.info("round resolve — dmg={} shld={} heal={}", .{ damage_pool, shield_pool, heal_pool });
+
+        // Collect living enemies and players (snapshot to avoid mutation during iteration).
+        var enemy_buf: [64]ecs.Entity = undefined;
+        var player_buf: [MAX_PLAYERS]ecs.Entity = undefined;
+        var n_enemies: usize = 0;
+        var n_players: usize = 0;
         for (self.living.items) |e| {
-            if (!self.world.entity_manager.signatures[e].eql(ecs.Signature.initEmpty())) {
-                const as = self.world.get_component(e, c.ActionState);
-                const sp = self.world.get_component(e, c.Speed);
-                if ((as.tag == .idle or as.tag == .defending) and sp.gauge >= 1.0) {
-                    as.tag = .charging;
-                    const team = self.world.get_component(e, c.Team);
-                    if (team.id == .players) {
-                        const owner = self.world.get_component(e, c.Owner);
-                        try self.send_your_turn(owner.player_id, e);
-                    }
-                }
+            const team = self.world.get_component(e, c.Team);
+            switch (team.id) {
+                .enemies => if (n_enemies < enemy_buf.len) {
+                    enemy_buf[n_enemies] = e;
+                    n_enemies += 1;
+                },
+                .players => if (n_players < player_buf.len) {
+                    player_buf[n_players] = e;
+                    n_players += 1;
+                },
             }
         }
-    }
 
-    fn send_your_turn(self: *Session, player_id: u8, entity: ecs.Entity) !void {
-        if (player_id >= MAX_PLAYERS) return;
-        const slot = &self.players[player_id];
-        const t = slot.transport orelse return;
-        var buf: [16]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        try proto.encode(fbs.writer(), .your_turn, proto.YourTurn{ .entity = entity });
-        try t.send(fbs.getWritten());
-    }
-
-    fn resolve_action(self: *Session, player_id: u8, msg: proto.ChooseAction) !void {
-        const slot = &self.players[player_id];
-        const actor = slot.entity;
-        if (actor == std.math.maxInt(ecs.Entity)) return;
-
-        const as = self.world.get_component(actor, c.ActionState);
-        if (as.tag != .charging) return; // not this player's turn
-
-        logic.reset_atb(self.world.get_component(actor, c.Speed));
-        as.tag = .idle;
-
-        const actor_stats = self.world.get_component(actor, c.Stats);
-        const actor_class = self.world.get_component(actor, c.Class);
-        const actor_pos = self.world.get_component(actor, c.GridPos);
-
-        switch (msg.action) {
-            .attack => {
-                switch (actor_class.tag) {
-                    .fighter => try self.resolve_fighter_attack(actor, actor_stats, msg.target_entity),
-                    .mage => try self.resolve_mage_attack(actor, actor_stats, msg.target_entity),
-                    .healer => try self.resolve_healer_heal(actor, actor_stats, msg.target_entity),
-                    else => {},
-                }
-            },
-            .defend => {
-                try self.resolve_defend(actor, actor_class.tag, actor_pos.*);
-            },
-        }
-    }
-
-    fn resolve_fighter_attack(
-        self: *Session,
-        actor: ecs.Entity,
-        actor_stats: *c.Stats,
-        target_entity: u32,
-    ) !void {
-        const target = self.find_living(target_entity) orelse return;
-        const tgt_stats = self.world.get_component(target, c.Stats);
-        const tgt_health = self.world.get_component(target, c.Health);
-
-        const raw = logic.raw_damage(actor_stats.attack, tgt_stats.defense);
-        const mit = logic.sum_mitigation(self.effects[target].effects[0..self.effects[target].count]);
-        const dmg = logic.mitigated_damage(raw, mit);
-        logic.apply_damage(tgt_health, dmg);
-        std.log.debug("entity {} -> entity {}: {} dmg (raw={} mit={})", .{ actor, target, dmg, raw, mit });
-
-        try self.broadcast_action_result(.{
-            .tag = .damage,
-            .actor_entity = actor,
-            .target_entity = target,
-            .value = dmg,
-        });
-
-        if (logic.is_dead(tgt_health.*)) {
-            std.log.info("entity {} killed by entity {}", .{ target, actor });
-            try self.kill_entity(target);
-            try self.broadcast_action_result(.{
-                .tag = .death,
-                .actor_entity = actor,
-                .target_entity = target,
-                .value = 0,
-            });
-        }
-    }
-
-    /// AoE damage from an explicit origin cell.  Used by both the player mage
-    /// (origin = targeted enemy's position) and the archer AI (origin = self).
-    fn resolve_mage_aoe(
-        self: *Session,
-        actor: ecs.Entity,
-        actor_stats: *c.Stats,
-        origin: c.GridPos,
-    ) !void {
-        var cells: [4]c.GridPos = undefined;
-        const n = logic.aoe_cells_2x2(origin.col, origin.row, &cells);
-        for (cells[0..n]) |cell| {
-            const target = self.entity_at(cell, .enemies) orelse continue;
-            const tgt_stats = self.world.get_component(target, c.Stats);
-            const tgt_health = self.world.get_component(target, c.Health);
-            const raw = logic.raw_damage(actor_stats.attack, tgt_stats.defense);
-            const mit = logic.sum_mitigation(self.effects[target].effects[0..self.effects[target].count]);
-            const dmg = logic.mitigated_damage(raw, mit);
-            logic.apply_damage(tgt_health, dmg);
-            std.log.debug("mage entity {} -> entity {}: {} dmg (aoe origin {},{}) ", .{ actor, target, dmg, origin.col, origin.row });
-            try self.broadcast_action_result(.{
-                .tag = .damage,
-                .actor_entity = actor,
-                .target_entity = target,
-                .value = dmg,
-            });
-            if (logic.is_dead(tgt_health.*)) {
-                std.log.info("entity {} killed by mage entity {}", .{ target, actor });
-                try self.kill_entity(target);
+        // 1. Damage pool → each living enemy.
+        if (damage_pool > 0) {
+            for (enemy_buf[0..n_enemies]) |e| {
+                const hp = self.world.get_component(e, c.Health);
+                const dealt = logic.resolve_damage_pool(hp, &self.shield[e], damage_pool);
                 try self.broadcast_action_result(.{
-                    .tag = .death,
-                    .actor_entity = actor,
-                    .target_entity = target,
-                    .value = 0,
+                    .tag = .damage,
+                    .actor_entity = std.math.maxInt(u32),
+                    .target_entity = e,
+                    .value = dealt,
                 });
-            }
-        }
-    }
-
-    /// AoE damage from an explicit origin cell targeting the *players* team.
-    /// Used by enemy archers; mirrors resolve_mage_aoe which targets enemies.
-    fn resolve_enemy_mage_aoe(
-        self: *Session,
-        actor: ecs.Entity,
-        actor_stats: *c.Stats,
-        origin: c.GridPos,
-    ) !void {
-        var cells: [4]c.GridPos = undefined;
-        const n = logic.aoe_cells_2x2(origin.col, origin.row, &cells);
-        for (cells[0..n]) |cell| {
-            const target = self.entity_at(cell, .players) orelse continue;
-            const tgt_stats = self.world.get_component(target, c.Stats);
-            const tgt_health = self.world.get_component(target, c.Health);
-            const raw = logic.raw_damage(actor_stats.attack, tgt_stats.defense);
-            const mit = logic.sum_mitigation(self.effects[target].effects[0..self.effects[target].count]);
-            const dmg = logic.mitigated_damage(raw, mit);
-            logic.apply_damage(tgt_health, dmg);
-            std.log.debug("archer entity {} -> entity {}: {} dmg (aoe origin {},{}) ", .{ actor, target, dmg, origin.col, origin.row });
-            try self.broadcast_action_result(.{
-                .tag = .damage,
-                .actor_entity = actor,
-                .target_entity = target,
-                .value = dmg,
-            });
-            if (logic.is_dead(tgt_health.*)) {
-                std.log.info("entity {} killed by archer entity {}", .{ target, actor });
-                try self.kill_entity(target);
-                try self.broadcast_action_result(.{
-                    .tag = .death,
-                    .actor_entity = actor,
-                    .target_entity = target,
-                    .value = 0,
-                });
-            }
-        }
-    }
-
-    /// Player mage attack: AoE 2×2 centered on the targeted enemy's position.
-    fn resolve_mage_attack(
-        self: *Session,
-        actor: ecs.Entity,
-        actor_stats: *c.Stats,
-        target_entity: u32,
-    ) !void {
-        const origin: c.GridPos = blk: {
-            if (self.find_living(target_entity)) |t| {
-                break :blk self.world.get_component(t, c.GridPos).*;
-            }
-            // Fallback: first living enemy (handles stale target IDs).
-            for (self.living.items) |e| {
-                if (self.world.get_component(e, c.Team).id == .enemies)
-                    break :blk self.world.get_component(e, c.GridPos).*;
-            }
-            return; // no enemies left
-        };
-        return self.resolve_mage_aoe(actor, actor_stats, origin);
-    }
-
-    /// Player healer: AoE 2×2 heal centered on the targeted ally's position.
-    fn resolve_healer_heal(
-        self: *Session,
-        actor: ecs.Entity,
-        actor_stats: *c.Stats,
-        target_entity: u32,
-    ) !void {
-        const origin: c.GridPos = blk: {
-            if (self.find_living(target_entity)) |t| {
-                break :blk self.world.get_component(t, c.GridPos).*;
-            }
-            // Fallback: first living player.
-            for (self.living.items) |e| {
-                if (self.world.get_component(e, c.Team).id == .players)
-                    break :blk self.world.get_component(e, c.GridPos).*;
-            }
-            return; // no players left
-        };
-        var cells: [4]c.GridPos = undefined;
-        const n = logic.aoe_cells_2x2(origin.col, origin.row, &cells);
-        for (cells[0..n]) |cell| {
-            const target = self.entity_at(cell, .players) orelse continue;
-            const tgt_health = self.world.get_component(target, c.Health);
-            const amount: u16 = actor_stats.attack;
-            logic.apply_heal(tgt_health, amount);
-            std.log.debug("healer entity {} -> entity {}: +{} hp (origin {},{}) ", .{ actor, target, amount, origin.col, origin.row });
-            try self.broadcast_action_result(.{
-                .tag = .heal,
-                .actor_entity = actor,
-                .target_entity = target,
-                .value = amount,
-            });
-        }
-    }
-
-    fn resolve_defend(
-        self: *Session,
-        actor: ecs.Entity,
-        class: c.ClassTag,
-        actor_pos: c.GridPos,
-    ) !void {
-        const as = self.world.get_component(actor, c.ActionState);
-        as.tag = .defending;
-        try self.broadcast_action_result(.{
-            .tag = .defend,
-            .actor_entity = actor,
-            .target_entity = actor,
-            .value = 0,
-        });
-
-        switch (class) {
-            .fighter => {
-                var cells: [3]c.GridPos = undefined;
-                const n = logic.fighter_defend_cells(actor_pos.col, actor_pos.row, &cells);
-                for (cells[0..n]) |cell| {
-                    const target = self.entity_at(cell, .players) orelse continue;
-                    self.add_effect(target, .{
-                        .tag = .mitigation,
-                        .duration = c.DEFEND_DURATION_S,
-                        .magnitude = c.DEFEND_MITIGATION,
+                if (logic.is_dead(hp.*)) {
+                    std.log.info("enemy entity {} killed by damage pool", .{e});
+                    try self.kill_entity(e);
+                    try self.broadcast_action_result(.{
+                        .tag = .death,
+                        .actor_entity = std.math.maxInt(u32),
+                        .target_entity = e,
+                        .value = 0,
                     });
                 }
-                self.add_effect(actor, .{
-                    .tag = .mitigation,
-                    .duration = c.DEFEND_DURATION_S,
-                    .magnitude = c.DEFEND_MITIGATION,
+            }
+        }
+
+        // 2. Shield pool → each living player.
+        if (shield_pool > 0) {
+            for (player_buf[0..n_players]) |e| {
+                if (self.find_living(e) == null) continue;
+                logic.resolve_shield_pool(&self.shield[e], shield_pool);
+                try self.broadcast_action_result(.{
+                    .tag = .shield,
+                    .actor_entity = std.math.maxInt(u32),
+                    .target_entity = e,
+                    .value = shield_pool * logic.ACTION_EFFECT_VALUE,
                 });
-            },
-            .mage, .healer => {
-                self.add_effect(actor, .{
-                    .tag = .mitigation,
-                    .duration = c.DEFEND_DURATION_S,
-                    .magnitude = c.DEFEND_MITIGATION,
+            }
+        }
+
+        // 3. Heal pool → each living player.
+        if (heal_pool > 0) {
+            for (player_buf[0..n_players]) |e| {
+                if (self.find_living(e) == null) continue;
+                const hp = self.world.get_component(e, c.Health);
+                logic.resolve_heal_pool(hp, heal_pool);
+                try self.broadcast_action_result(.{
+                    .tag = .heal,
+                    .actor_entity = std.math.maxInt(u32),
+                    .target_entity = e,
+                    .value = heal_pool * logic.ACTION_EFFECT_VALUE,
                 });
-            },
-            else => {},
+            }
+        }
+
+        // 4. Enemy intent → each living player.
+        // Each living enemy deals 1 damage per player per round.
+        const living_enemy_count: u16 = blk: {
+            var count: u16 = 0;
+            for (self.living.items) |e| {
+                if (self.world.get_component(e, c.Team).id == .enemies) count += 1;
+            }
+            break :blk count;
+        };
+        if (living_enemy_count > 0) {
+            const intent = logic.compute_enemy_intent(living_enemy_count);
+            for (player_buf[0..n_players]) |e| {
+                if (self.find_living(e) == null) continue;
+                const hp = self.world.get_component(e, c.Health);
+                const hp_dmg = logic.apply_enemy_intent(hp, &self.shield[e], intent);
+                if (hp_dmg > 0) {
+                    try self.broadcast_action_result(.{
+                        .tag = .damage,
+                        .actor_entity = std.math.maxInt(u32),
+                        .target_entity = e,
+                        .value = hp_dmg,
+                    });
+                }
+                if (logic.is_dead(hp.*)) {
+                    std.log.info("player entity {} killed by enemies", .{e});
+                    try self.kill_entity(e);
+                    try self.broadcast_action_result(.{
+                        .tag = .death,
+                        .actor_entity = std.math.maxInt(u32),
+                        .target_entity = e,
+                        .value = 0,
+                    });
+                }
+            }
         }
     }
 
-    fn add_effect(self: *Session, entity: ecs.Entity, effect: c.ActiveEffect) void {
-        const slot = &self.effects[entity];
-        if (slot.count < MAX_EFFECTS_PER_ENTITY) {
-            slot.effects[slot.count] = effect;
-            slot.count += 1;
-        }
-    }
-
-    fn find_living(self: *Session, entity_id: u32) ?ecs.Entity {
+    fn find_living(self: *Session, entity: ecs.Entity) ?ecs.Entity {
         for (self.living.items) |e| {
-            if (e == entity_id) return e;
-        }
-        return null;
-    }
-
-    fn entity_at(self: *Session, pos: c.GridPos, team: c.TeamId) ?ecs.Entity {
-        for (self.living.items) |e| {
-            const ep = self.world.get_component(e, c.GridPos);
-            const et = self.world.get_component(e, c.Team);
-            if (ep.col == pos.col and ep.row == pos.row and et.id == team) return e;
+            if (e == entity) return e;
         }
         return null;
     }
@@ -711,132 +536,8 @@ pub const Session = struct {
                 break;
             }
         }
-        self.effects[entity].count = 0;
+        self.shield[entity] = 0;
         self.world.destroy_entity(entity);
-    }
-
-    fn effect_step_trampoline(world: *GameWorld, entity: ecs.Entity, _: *EffectSystem) void {
-        _ = world;
-        _ = entity;
-    }
-
-    pub fn tick_effects(self: *Session, dt: f32) void {
-        for (self.living.items) |e| {
-            const slot = &self.effects[e];
-            slot.count = logic.tick_effects(slot.effects[0..slot.count], dt);
-        }
-    }
-
-    fn ai_step_trampoline(world: *GameWorld, entity: ecs.Entity, _: *AiSystem) void {
-        _ = world;
-        _ = entity;
-    }
-
-    pub fn run_ai(self: *Session) !void {
-        var actors: [32]ecs.Entity = undefined;
-        var n_actors: usize = 0;
-        for (self.living.items) |e| {
-            const team = self.world.get_component(e, c.Team);
-            if (team.id != .enemies) continue;
-            const as = self.world.get_component(e, c.ActionState);
-            if (as.tag != .charging) continue;
-            if (n_actors < actors.len) {
-                actors[n_actors] = e;
-                n_actors += 1;
-            }
-        }
-
-        for (actors[0..n_actors]) |actor| {
-            if (self.find_living(actor) == null) continue;
-
-            const actor_class = self.world.get_component(actor, c.Class);
-            const actor_stats = self.world.get_component(actor, c.Stats);
-            const actor_pos = self.world.get_component(actor, c.GridPos);
-
-            std.log.debug("AI entity {} ({s}) acting", .{ actor, @tagName(actor_class.tag) });
-            switch (actor_class.tag) {
-                .shaman => try self.ai_shaman(actor, actor_stats, actor_pos.*),
-                .archer => {
-                    if (self.find_closest_player(actor_pos.*)) |target| {
-                        const tgt_pos = self.world.get_component(target, c.GridPos).*;
-                        try self.resolve_enemy_mage_aoe(actor, actor_stats, tgt_pos);
-                    }
-                },
-                else => try self.ai_attack_closest(actor, actor_stats, actor_pos.*),
-            }
-
-            if (self.find_living(actor) == null) continue;
-            logic.reset_atb(self.world.get_component(actor, c.Speed));
-            self.world.get_component(actor, c.ActionState).tag = .idle;
-        }
-    }
-
-    /// Returns the living player closest to `from` by Manhattan distance.
-    /// Ties are broken by lowest current HP.
-    fn find_closest_player(self: *Session, from: c.GridPos) ?ecs.Entity {
-        var best: ?ecs.Entity = null;
-        var best_dist: u8 = 255;
-        var best_hp: u16 = std.math.maxInt(u16);
-        for (self.living.items) |e| {
-            if (self.world.get_component(e, c.Team).id != .players) continue;
-            const p = self.world.get_component(e, c.GridPos);
-            const dist = logic.grid_distance(from, p.*);
-            const hp = self.world.get_component(e, c.Health).current;
-            if (dist < best_dist or (dist == best_dist and hp < best_hp)) {
-                best_dist = dist;
-                best_hp = hp;
-                best = e;
-            }
-        }
-        return best;
-    }
-
-    fn ai_attack_closest(self: *Session, actor: ecs.Entity, actor_stats: *c.Stats, actor_pos: c.GridPos) !void {
-        if (self.find_closest_player(actor_pos)) |target| {
-            try self.resolve_fighter_attack(actor, actor_stats, target);
-        }
-    }
-
-    fn ai_shaman(self: *Session, actor: ecs.Entity, actor_stats: *c.Stats, actor_pos: c.GridPos) !void {
-        var lowest: ?ecs.Entity = null;
-        var lowest_frac: f32 = 0.5; // only heal if below 50%
-        for (self.living.items) |e| {
-            const t = self.world.get_component(e, c.Team);
-            if (t.id != .enemies) continue;
-            const h = self.world.get_component(e, c.Health);
-            const frac = @as(f32, @floatFromInt(h.current)) / @as(f32, @floatFromInt(h.max));
-            if (frac < lowest_frac) {
-                lowest_frac = frac;
-                lowest = e;
-            }
-        }
-        if (lowest != null) {
-            try self.resolve_enemy_heal(actor, actor_stats, actor_pos);
-        } else {
-            try self.resolve_mage_aoe(actor, actor_stats, actor_pos);
-        }
-    }
-
-    fn resolve_enemy_heal(
-        self: *Session,
-        actor: ecs.Entity,
-        actor_stats: *c.Stats,
-        actor_pos: c.GridPos,
-    ) !void {
-        var cells: [4]c.GridPos = undefined;
-        const n = logic.aoe_cells_2x2(actor_pos.col, actor_pos.row, &cells);
-        for (cells[0..n]) |cell| {
-            const target = self.entity_at(cell, .enemies) orelse continue;
-            const tgt_health = self.world.get_component(target, c.Health);
-            const amount: u16 = actor_stats.attack;
-            logic.apply_heal(tgt_health, amount);
-            try self.broadcast_action_result(.{
-                .tag = .heal,
-                .actor_entity = actor,
-                .target_entity = target,
-                .value = amount,
-            });
-        }
     }
 
     fn check_win(self: *Session) !void {
@@ -872,19 +573,27 @@ pub const Session = struct {
 
     fn end_game(self: *Session, winner: proto.WinnerId) !void {
         std.log.info("game over — winner: {s}", .{@tagName(winner)});
-        self.phase = .ended;
+        self.phase = .lobby;
+        // Reset ready flags so players must opt-in to the next game.
+        for (&self.players) |*p| p.ready = false;
         var buf: [8]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
         try proto.encode(fbs.writer(), .game_over, proto.GameOver{ .winner = winner });
         try self.broadcast_raw(fbs.getWritten());
+        try self.broadcast_lobby_update();
     }
+
+    // -------------------------------------------------------------------------
+    // Broadcast helpers
+    // -------------------------------------------------------------------------
 
     pub fn broadcast_lobby_update(self: *Session) !void {
         var base = proto.LobbyUpdate{
             .join_code = self.join_code,
             .player_count = self.player_count,
             .players = [_]proto.PlayerInfo{std.mem.zeroes(proto.PlayerInfo)} ** proto.MAX_PLAYERS,
-            .your_player_id = 0xFF,
+            .player_id = 0xFF,
+            .round_duration = self.round_duration,
         };
         for (&self.players) |*slot| {
             if (!slot.occupied) continue;
@@ -902,7 +611,7 @@ pub const Session = struct {
             if (!slot.connected) continue;
             const t = slot.transport orelse continue;
             var msg = base;
-            msg.your_player_id = slot.player_id;
+            msg.player_id = slot.player_id;
             var buf: [512]u8 = undefined;
             var fbs = std.io.fixedBufferStream(&buf);
             try proto.encode(fbs.writer(), .lobby_update, msg);
@@ -919,7 +628,8 @@ pub const Session = struct {
             var gs_msg = proto.GameStart{
                 .wave_label = [_]u8{0} ** 32,
                 .wave_label_len = @intCast(@min(wave_label.len, 32)),
-                .your_player_id = slot.player_id,
+                .player_id = slot.player_id,
+                .round_duration = self.round_duration,
             };
             @memcpy(gs_msg.wave_label[0..gs_msg.wave_label_len], wave_label[0..gs_msg.wave_label_len]);
             try proto.encode(fbs.writer(), .game_start, gs_msg);
@@ -930,18 +640,16 @@ pub const Session = struct {
     fn broadcast_game_state(self: *Session) !void {
         var snap = proto.GameState{
             .tick = self.tick_count,
+            .round_timer = @max(self.round_timer, 0.0),
             .entity_count = 0,
             .entities = [_]proto.EntitySnapshot{std.mem.zeroes(proto.EntitySnapshot)} ** proto.MAX_ENTITIES_WIRE,
         };
 
-        for (self.living.items) |e| {
+        for (self.living.items, 0..) |e, slot_idx| {
             if (snap.entity_count >= proto.MAX_ENTITIES_WIRE) break;
-            const pos = self.world.get_component(e, c.GridPos);
             const hp = self.world.get_component(e, c.Health);
-            const sp = self.world.get_component(e, c.Speed);
             const cl = self.world.get_component(e, c.Class);
             const tm = self.world.get_component(e, c.Team);
-            const as = self.world.get_component(e, c.ActionState);
             const own: u8 = if (self.world.component_arrays.owner.has(e))
                 self.world.get_component(e, c.Owner).player_id
             else
@@ -949,12 +657,10 @@ pub const Session = struct {
 
             snap.entities[snap.entity_count] = .{
                 .entity = e,
-                .grid_col = pos.col,
-                .grid_row = pos.row,
+                .slot = @intCast(@min(slot_idx, 0xFF)),
                 .hp_current = hp.current,
                 .hp_max = hp.max,
-                .atb_gauge = sp.gauge,
-                .action_state = as.tag,
+                .shield_hp = self.shield[e],
                 .class = cl.tag,
                 .team = tm.id,
                 .owner = own,
@@ -967,7 +673,6 @@ pub const Session = struct {
         try proto.encode(fbs.writer(), .game_state, snap);
         try self.broadcast_raw(fbs.getWritten());
 
-        // Record frame if a recorder is attached.
         if (self.recorder) |*rec| {
             rec.record(snap) catch |err| {
                 std.log.warn("replay recorder error: {}", .{err});
@@ -986,7 +691,7 @@ pub const Session = struct {
         for (&self.players) |*slot| {
             if (!slot.connected) continue;
             const t = slot.transport orelse continue;
-            t.send(data) catch {}; // don't abort broadcast on one broken connection
+            t.send(data) catch {};
         }
     }
 
@@ -998,11 +703,3 @@ pub const Session = struct {
         slot.msg_queue.appendSlice(slot.allocator, data) catch {};
     }
 };
-
-fn atb_step(world: *GameWorld, entity: ecs.Entity, sys: *AtbSystem) void {
-    const sp = world.get_component(entity, c.Speed);
-    const as = world.get_component(entity, c.ActionState);
-    if (as.tag == .idle or as.tag == .defending) {
-        _ = logic.tick_atb(sp, sys.dt);
-    }
-}

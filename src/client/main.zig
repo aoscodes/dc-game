@@ -17,7 +17,6 @@ const GameState = sw.GameState;
 
 /// Inbound server messages are hex-encoded lines prefixed with "WIRE:".
 /// Key events arrive as lines prefixed with "KEY:".
-/// Both are written by the Node bridge to our stdin.
 const WIRE_PREFIX = "WIRE:";
 const KEY_PREFIX = "KEY:";
 
@@ -67,7 +66,7 @@ const ClientState = struct {
     phase: ClientPhaseTag = .connecting,
     lobby: LobbyState = .{},
     game: GameState = .{},
-    our_player_id: u8 = 0xFF,
+    player_id: u8 = 0xFF,
     send_buf: [512]u8 = undefined,
     recv_queue: MsgQueue = .{},
     recv_scratch: [4096]u8 = undefined,
@@ -90,10 +89,6 @@ fn stdout_writer() sw.Writer {
 // ---------------------------------------------------------------------------
 // Stdin reader thread
 // ---------------------------------------------------------------------------
-//
-// Reads newline-delimited lines from stdin forever.  Each line is either:
-//   WIRE:<hex>   — server message bytes, hex-encoded, no spaces
-//   KEY:<name>   — browser keydown event name
 
 fn stdin_reader(_: void) void {
     var stdin_file = std.fs.File.stdin();
@@ -103,7 +98,7 @@ fn stdin_reader(_: void) void {
 
     while (true) {
         const line = stdin.readUntilDelimiter(&line_buf, '\n') catch |err| {
-            if (err == error.EndOfStream) return; // bridge closed stdin
+            if (err == error.EndOfStream) return;
             std.log.err("stdin read error: {}", .{err});
             std.Thread.sleep(10 * std.time.ns_per_ms);
             continue;
@@ -140,20 +135,14 @@ fn emit_send(bytes: []const u8) void {
 fn send_join() void {
     var fbs = std.io.fixedBufferStream(&g_state.send_buf);
     const w = fbs.writer();
-    if (g_state.our_player_id != 0xFF) {
-        proto.encode(w, .reconnect, proto.Reconnect{ .player_id = g_state.our_player_id }) catch return;
+    if (g_state.player_id != 0xFF) {
+        proto.encode(w, .reconnect, proto.Reconnect{ .player_id = g_state.player_id }) catch return;
     } else {
         const name = "Player";
         var p = proto.JoinLobby{ .name = [_]u8{0} ** 16, .name_len = @intCast(name.len) };
         @memcpy(p.name[0..name.len], name);
         proto.encode(w, .join_lobby, p) catch return;
     }
-    emit_send(fbs.getWritten());
-}
-
-fn send_choose_class(class: c.ClassTag) void {
-    var fbs = std.io.fixedBufferStream(&g_state.send_buf);
-    proto.encode(fbs.writer(), .choose_class, proto.ChooseClass{ .class = class }) catch return;
     emit_send(fbs.getWritten());
 }
 
@@ -169,12 +158,9 @@ fn send_ready_up() void {
     emit_send(fbs.getWritten());
 }
 
-fn send_action(action: proto.ActionTag, target: u32) void {
+fn send_action(action: c.ActionChoice) void {
     var fbs = std.io.fixedBufferStream(&g_state.send_buf);
-    proto.encode(fbs.writer(), .choose_action, proto.ChooseAction{
-        .action = action,
-        .target_entity = target,
-    }) catch return;
+    proto.encode(fbs.writer(), .choose_action, proto.ChooseAction{ .action = action }) catch return;
     emit_send(fbs.getWritten());
 }
 
@@ -197,17 +183,17 @@ fn process_recv() void {
                     std.log.err("decode lobby_update: {}", .{err});
                     continue;
                 };
-                if (p.your_player_id != 0xFF) {
-                    g_state.our_player_id = p.your_player_id;
+                if (p.player_id != 0xFF) {
+                    g_state.player_id = p.player_id;
                 }
                 g_state.lobby.update = p;
-                g_state.lobby.our_player_id = g_state.our_player_id;
-                // Sync local cursor to the server-authoritative position for our player.
+                g_state.lobby.player_id = g_state.player_id;
+                // Sync local cursor to the server-authoritative position.
                 for (p.players[0..p.player_count]) |pi| {
-                    if (pi.player_id == g_state.our_player_id) {
+                    if (pi.player_id == g_state.player_id) {
                         g_state.lobby.chosen_pos = .{
-                            .col = @intCast(pi.grid_col),
-                            .row = @intCast(pi.grid_row),
+                            .col = pi.grid_col,
+                            .row = pi.grid_row,
                         };
                         break;
                     }
@@ -216,9 +202,11 @@ fn process_recv() void {
             },
             .game_start => {
                 const p = proto.decode_game_start(r) catch continue;
-                g_state.our_player_id = p.your_player_id;
+                g_state.player_id = p.player_id;
                 g_state.game = .{};
-                g_state.game.our_player_id = p.your_player_id;
+                g_state.game.player_id = p.player_id;
+                g_state.game.round_timer = p.round_duration;
+                g_state.game.round_duration = p.round_duration;
                 g_state.game.wave_label_len = p.wave_label_len;
                 @memcpy(g_state.game.wave_label[0..p.wave_label_len], p.wave_label[0..p.wave_label_len]);
                 g_state.phase = .game;
@@ -226,19 +214,7 @@ fn process_recv() void {
             .game_state => {
                 const p = proto.decode_game_state(r) catch continue;
                 g_state.game.snapshot = p;
-            },
-            .your_turn => {
-                const p = proto.decode_your_turn(r) catch continue;
-                for (g_state.game.snapshot.entities[0..g_state.game.snapshot.entity_count]) |e| {
-                    if (e.entity == p.entity and e.owner == g_state.game.our_player_id) {
-                        g_state.game.cursor.is_our_turn = true;
-                        g_state.game.cursor.cursor_col = 0;
-                        g_state.game.cursor.cursor_row = 0;
-                        g_state.game.action_selected = null;
-                        g_state.game.our_entity = p.entity;
-                        break;
-                    }
-                }
+                g_state.game.round_timer = p.round_timer;
             },
             .game_over => {
                 _ = proto.decode_game_over(r) catch continue;
@@ -256,33 +232,14 @@ fn process_recv() void {
 // Update logic
 // ---------------------------------------------------------------------------
 
-fn is_our_class(gs: *const GameState, class: c.ClassTag) bool {
-    for (gs.snapshot.entities[0..gs.snapshot.entity_count]) |e| {
-        if (e.owner == gs.our_player_id) return e.class == class;
-    }
-    return false;
-}
-
 fn update_lobby() void {
     const key = g_key_queue.pop() orelse return;
     switch (key) {
-        .one => {
-            g_state.lobby.selected_class = .fighter;
-            send_choose_class(.fighter);
-        },
-        .two => {
-            g_state.lobby.selected_class = .mage;
-            send_choose_class(.mage);
-        },
-        .three => {
-            g_state.lobby.selected_class = .healer;
-            send_choose_class(.healer);
-        },
         .enter => {
             g_state.lobby.ready = !g_state.lobby.ready;
             send_ready_up();
         },
-        // Arrow keys move the position cursor; each move immediately sends the chosen cell.
+        // Arrow keys move the cosmetic position cursor in the lobby.
         .up => {
             if (g_state.lobby.chosen_pos.row > 0) {
                 g_state.lobby.chosen_pos.row -= 1;
@@ -295,8 +252,6 @@ fn update_lobby() void {
                 send_choose_position(g_state.lobby.chosen_pos.col, g_state.lobby.chosen_pos.row);
             }
         },
-        // Left/right are inverted relative to col index because the grid is
-        // visually flipped: col 0 (front rank) renders on the right edge.
         .left => {
             if (g_state.lobby.chosen_pos.col < 2) {
                 g_state.lobby.chosen_pos.col += 1;
@@ -315,43 +270,20 @@ fn update_lobby() void {
 
 fn update_game() void {
     const gs = &g_state.game;
-    const ev = gs.cursor.poll(&g_key_queue);
-
+    const ev = inp.poll(&g_key_queue);
     switch (ev) {
         .none => {},
-        .cursor_move => |delta| {
-            gs.cursor.apply_cursor_move(delta, 3, 4);
+        .damage => {
+            gs.pending_action = .damage;
+            send_action(.damage);
         },
-        .select_attack => {
-            gs.action_selected = .attack;
-            gs.targeting_enemy = !is_our_class(gs, .healer);
+        .shield => {
+            gs.pending_action = .shield;
+            send_action(.shield);
         },
-        .select_defend => {
-            gs.action_selected = .defend;
-        },
-        .confirm => {
-            if (gs.action_selected) |action| {
-                var target: u32 = 0;
-                if (action == .attack) {
-                    const target_team: c.TeamId = if (gs.targeting_enemy) .enemies else .players;
-                    const cur = gs.cursor.grid_pos();
-                    for (gs.snapshot.entities[0..gs.snapshot.entity_count]) |e| {
-                        if (e.team == target_team and
-                            e.grid_col == cur.col and
-                            e.grid_row == cur.row)
-                        {
-                            target = e.entity;
-                            break;
-                        }
-                    }
-                }
-                send_action(action, target);
-                gs.cursor.is_our_turn = false;
-                gs.action_selected = null;
-            }
-        },
-        .cancel => {
-            gs.action_selected = null;
+        .heal => {
+            gs.pending_action = .heal;
+            send_action(.heal);
         },
     }
 }
@@ -359,10 +291,6 @@ fn update_game() void {
 // ---------------------------------------------------------------------------
 // Bridge handshake
 // ---------------------------------------------------------------------------
-//
-// The bridge writes "READY\n" once the game server WebSocket opens.
-// stdin_reader handles this line and sets g_ready; main blocks until then
-// so the first render frame doesn't race with send_join.
 
 var g_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
@@ -371,33 +299,20 @@ var g_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 // ---------------------------------------------------------------------------
 
 pub fn main() !void {
-    // stdin_reader owns all stdin I/O, including the initial READY handshake.
     const stdin_thread = try std.Thread.spawn(.{}, stdin_reader, .{{}});
     stdin_thread.detach();
-
-    // Do NOT spin-wait for READY here.  The render loop runs from the moment
-    // the binary starts, emitting "connecting" phase frames so the browser
-    // shows the connecting screen immediately.  stdin_reader will set g_ready
-    // and call send_join() asynchronously once the server handshake arrives.
 
     const out = stdout_writer();
     var next_tick = std.time.nanoTimestamp();
 
     while (true) {
-        // Drain any inbound messages only once we're past the handshake; before
-        // that the queue is always empty, but calling it is harmless.
         process_recv();
 
         switch (g_state.phase) {
-            // Emit "connecting" frames immediately so the browser shows the
-            // connecting screen rather than a blank canvas while waiting for
-            // the server.  (g_ready being false just means we haven't sent
-            // join yet; it is safe to render the phase we're in.)
             .connecting => {},
             .lobby => update_lobby(),
             .game => update_game(),
             .game_over => {
-                // Any key returns to lobby; bridge will reconnect.
                 if (g_key_queue.pop() != null) {
                     g_state.phase = .lobby;
                 }
@@ -406,13 +321,11 @@ pub fn main() !void {
 
         out.write_render(g_state.phase, &g_state.lobby, &g_state.game);
 
-        // Fixed-rate sleep: accumulate timing debt rather than drifting.
         next_tick += TICK_NS;
         const now = std.time.nanoTimestamp();
         if (next_tick > now) {
             std.Thread.sleep(@intCast(next_tick - now));
         } else {
-            // We're behind; reset rather than spinning.
             next_tick = std.time.nanoTimestamp();
         }
     }

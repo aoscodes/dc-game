@@ -4,26 +4,20 @@ const c = shared.components;
 
 pub const InputEventTag = enum {
     none,
-    cursor_move,
-    confirm,
-    cancel,
-    select_attack,
-    select_defend,
+    damage,
+    shield,
+    heal,
 };
-
-pub const CursorDelta = struct { dcol: i8, drow: i8 };
 
 pub const InputEvent = union(InputEventTag) {
     none: void,
-    cursor_move: CursorDelta,
-    confirm: void,
-    cancel: void,
-    select_attack: void,
-    select_defend: void,
+    damage: void,
+    shield: void,
+    heal: void,
 };
 
-/// Map a browser key name (as sent by JS KeyboardEvent.key) to a raw key token
-/// understood by InputState.poll.  Returns null for unrecognised keys.
+/// Map a browser key name (as sent by JS KeyboardEvent.key) to a raw key token.
+/// Returns null for unrecognised keys.
 pub fn parse_key_name(name: []const u8) ?RawKey {
     if (std.mem.eql(u8, name, "ArrowUp")) return .up;
     if (std.mem.eql(u8, name, "ArrowDown")) return .down;
@@ -43,9 +37,7 @@ pub fn parse_key_name(name: []const u8) ?RawKey {
 
 pub const RawKey = enum { up, down, left, right, enter, escape, z, x, one, two, three };
 
-/// Thread-safe single-slot key queue.  The stdin reader thread pushes raw keys;
-/// the game loop thread pops them one per tick.  Capacity is intentionally
-/// small — we only need to buffer a handful of keystrokes between ticks.
+/// Thread-safe ring-buffer key queue.
 pub const KeyQueue = struct {
     buf: [64]RawKey = undefined,
     head: usize = 0,
@@ -71,42 +63,14 @@ pub const KeyQueue = struct {
     }
 };
 
-pub const InputState = struct {
-    cursor_col: u8 = 0,
-    cursor_row: u8 = 0,
-    is_our_turn: bool = false,
-
-    /// Drain one key from the queue and convert to an InputEvent.
-    /// Only processes game-relevant keys when it is the player's turn.
-    pub fn poll(self: *InputState, queue: *KeyQueue) InputEvent {
-        const key = queue.pop() orelse return .none;
-
-        // Class selection and lobby keys are handled regardless of turn state
-        // by the caller (main.zig update_lobby / update_game).  Here we expose
-        // the raw key as an event only when it is our turn.
-        if (!self.is_our_turn) return .none;
-
-        return switch (key) {
-            .one => .select_attack,
-            .two => .select_defend,
-            .right => .{ .cursor_move = .{ .dcol = 1, .drow = 0 } },
-            .left => .{ .cursor_move = .{ .dcol = -1, .drow = 0 } },
-            .down => .{ .cursor_move = .{ .dcol = 0, .drow = 1 } },
-            .up => .{ .cursor_move = .{ .dcol = 0, .drow = -1 } },
-            .enter, .z => .confirm,
-            .escape, .x => .cancel,
-            else => .none,
-        };
-    }
-
-    pub fn apply_cursor_move(self: *InputState, delta: CursorDelta, cols: u8, rows: u8) void {
-        const new_col = @as(i16, self.cursor_col) + delta.dcol;
-        const new_row = @as(i16, self.cursor_row) + delta.drow;
-        self.cursor_col = @intCast(std.math.clamp(new_col, 0, @as(i16, cols) - 1));
-        self.cursor_row = @intCast(std.math.clamp(new_row, 0, @as(i16, rows) - 1));
-    }
-
-    pub fn grid_pos(self: InputState) c.GridPos {
-        return .{ .col = @intCast(self.cursor_col), .row = @intCast(self.cursor_row) };
-    }
-};
+/// Drain one key from the queue and convert it to a game InputEvent.
+/// Keys 1/2/3 map to damage/shield/heal.  Always active during the game phase.
+pub fn poll(queue: *KeyQueue) InputEvent {
+    const key = queue.pop() orelse return .none;
+    return switch (key) {
+        .one => .damage,
+        .two => .shield,
+        .three => .heal,
+        else => .none,
+    };
+}

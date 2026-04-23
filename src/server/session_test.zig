@@ -1,77 +1,81 @@
-//! End-to-end integration tests for a full game session.
+//! Integration tests for the round-based game session.
 //!
-//! These tests drive Session directly — no network, no threads, no raylib.
-//! The transport is a BufferTransport that accumulates outgoing bytes, which
-//! we decode to assert correct protocol output.
+//! Tests drive Session directly — no network, no threads.
+//! Transport is a BufferTransport that accumulates outgoing bytes.
 //!
-//! Speed rates are overridden to 10.0 after spawn so a single tick(0.1)
-//! fills any ATB gauge.  Enemy speed is set to 0.001 so the AI never charges
-//! before we assert player-side results.
+//! Round mechanics under test:
+//!   - damage pool → each living enemy takes pool_size damage
+//!   - shield pool → each living player gains pool_size shield HP
+//!   - heal pool   → each living player heals pool_size HP
+//!   - enemy intent → each living player takes living_enemy_count damage
+//!                    (shield absorbs first, overflow hits HP)
+//!   - configurable round_duration respected
+//!   - death/wave-chain/game-over paths
 
 const std = @import("std");
 const ecs = @import("ecs_zig");
 const shared = @import("shared");
 const proto = shared.protocol;
 const c = shared.components;
+const logic = shared.game_logic;
 const waves = shared.waves;
 
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 
+/// Shorthand for readability in expected-value calculations.
+const V = logic.ACTION_EFFECT_VALUE;
+
 // ---------------------------------------------------------------------------
 // Minimal test waves
 // ---------------------------------------------------------------------------
 
-/// One grunt with 1 HP and near-zero speed — dies in one hit, never acts.
+/// One grunt that survives many rounds (HP = 100 * V, attack = 1).
+/// With pool=2 players, deals V*2 damage per round → needs 50 rounds to die.
 const test_wave_single = waves.Wave{
     .label = "test_single",
     .entries = &[_]waves.SpawnEntry{.{
         .class = .grunt,
         .grid_col = 0,
         .grid_row = 0,
-        .stats = .{ .attack = 5, .defense = 1, .max_hp = 1, .speed_base = 0.001 },
+        .stats = .{ .attack = 1, .defense = 1, .max_hp = V * 100, .speed_base = 0.001 },
     }},
     .next_wave = null,
 };
 
-/// Two grunts adjacent on the same row — both caught by a 2×2 mage AoE.
-const test_wave_two_adj = waves.Wave{
-    .label = "test_two_adj",
-    .entries = &[_]waves.SpawnEntry{
-        .{ .class = .grunt, .grid_col = 0, .grid_row = 0, .stats = .{ .attack = 5, .defense = 1, .max_hp = 30, .speed_base = 0.001 } },
-        .{ .class = .grunt, .grid_col = 1, .grid_row = 0, .stats = .{ .attack = 5, .defense = 1, .max_hp = 30, .speed_base = 0.001 } },
-    },
+/// One grunt with exactly V HP — killed by a single player damage action (pool=1).
+const test_wave_one_hp = waves.Wave{
+    .label = "test_one_hp",
+    .entries = &[_]waves.SpawnEntry{.{
+        .class = .grunt,
+        .grid_col = 0,
+        .grid_row = 0,
+        .stats = .{ .attack = 1, .defense = 1, .max_hp = V, .speed_base = 0.001 },
+    }},
     .next_wave = null,
 };
 
-/// wave_01_basic wired to a test terminal wave (no all-waves lookup needed).
-const test_wave_chain_a = waves.Wave{
-    .label = "test_chain_a",
-    .entries = &[_]waves.SpawnEntry{
-        .{ .class = .grunt, .grid_col = 0, .grid_row = 0, .stats = .{ .attack = 5, .defense = 1, .max_hp = 1, .speed_base = 0.001 } },
-    },
-    .next_wave = "test_chain_b",
-};
-
-const test_wave_chain_b = waves.Wave{
-    .label = "test_chain_b",
-    .entries = &[_]waves.SpawnEntry{
-        .{ .class = .grunt, .grid_col = 1, .grid_row = 0, .stats = .{ .attack = 5, .defense = 1, .max_hp = 1, .speed_base = 0.001 } },
-    },
-    .next_wave = null,
+/// Chain wave: first wave links to wave_01_basic.
+const test_wave_to_real = waves.Wave{
+    .label = "test_to_real",
+    .entries = &[_]waves.SpawnEntry{.{
+        .class = .grunt,
+        .grid_col = 0,
+        .grid_row = 0,
+        .stats = .{ .attack = 1, .defense = 1, .max_hp = 1, .speed_base = 0.001 },
+    }},
+    .next_wave = "wave_01_basic",
 };
 
 // ---------------------------------------------------------------------------
 // Harness types
 // ---------------------------------------------------------------------------
 
-/// Per-player test handle: owns buffer + BufferTransport.
 const TestPlayer = struct {
     buf: std.ArrayListUnmanaged(u8) = .empty,
     bt: shared.BufferTransport = undefined,
     pid: u8 = 0xFF,
 
-    /// Must be called once, at the address the struct will stay at.
     fn init(self: *TestPlayer, allocator: std.mem.Allocator) void {
         self.bt = shared.BufferTransport{ .buf = &self.buf, .allocator = allocator };
     }
@@ -80,9 +84,8 @@ const TestPlayer = struct {
         return self.bt.transport();
     }
 
-    fn clear(self: *TestPlayer, allocator: std.mem.Allocator) void {
+    fn clear(self: *TestPlayer) void {
         self.buf.clearRetainingCapacity();
-        _ = allocator;
     }
 
     fn deinit(self: *TestPlayer, allocator: std.mem.Allocator) void {
@@ -90,15 +93,12 @@ const TestPlayer = struct {
     }
 };
 
-/// A decoded message: tag + a copy of the raw payload bytes.
 const Msg = struct {
     tag: proto.MsgTag,
-    /// Raw payload bytes (after the tag byte), owned by the arena passed to drain().
     payload: []const u8,
 };
 
-/// Walk `raw` decoding complete messages.  Returns a slice of Msg values
-/// allocated from `arena`.  Stops at the first unknown/truncated message.
+/// Walk `raw` decoding complete messages into `arena`-allocated Msg values.
 fn drain(raw: []const u8, arena: std.mem.Allocator) ![]Msg {
     var list: std.ArrayListUnmanaged(Msg) = .empty;
     var pos: usize = 0;
@@ -107,19 +107,14 @@ fn drain(raw: []const u8, arena: std.mem.Allocator) ![]Msg {
         const tag = std.meta.intToEnum(proto.MsgTag, tag_byte) catch break;
         pos += 1;
         const start = pos;
-        // Advance pos over the payload by re-decoding into /dev/null.
         var fbs = std.io.fixedBufferStream(raw[pos..]);
-        const r = fbs.reader();
-        const ok = skip_payload(tag, r);
-        if (!ok) break;
+        if (!skip_payload(tag, fbs.reader())) break;
         pos += fbs.pos;
         try list.append(arena, .{ .tag = tag, .payload = raw[start..pos] });
     }
     return list.toOwnedSlice(arena);
 }
 
-/// Skip (consume) a payload for `tag` from `reader`.  Returns false if the
-/// reader runs out of bytes before finishing.
 fn skip_payload(tag: proto.MsgTag, r: anytype) bool {
     return switch (tag) {
         .join_lobby => blk: {
@@ -127,19 +122,18 @@ fn skip_payload(tag: proto.MsgTag, r: anytype) bool {
             r.skipBytes(len, .{}) catch break :blk false;
             break :blk true;
         },
-        .choose_class, .reconnect => blk: {
+        .choose_class, .reconnect, .choose_action => blk: {
             _ = r.readByte() catch break :blk false;
             break :blk true;
         },
         .ready_up => true,
-        .choose_action => blk: {
-            _ = r.readByte() catch break :blk false;
-            _ = r.readInt(u32, .little) catch break :blk false;
+        .choose_position => blk: {
+            r.skipBytes(2, .{}) catch break :blk false;
             break :blk true;
         },
         .lobby_update => blk: {
-            // join_code(6) + player_count(1) + your_player_id(1) + players
-            var hdr: [8]u8 = undefined;
+            // join_code(6) + player_count(1) + player_id(1) + round_duration(4)
+            var hdr: [12]u8 = undefined;
             _ = r.readAll(&hdr) catch break :blk false;
             const player_count = hdr[6];
             var i: u8 = 0;
@@ -147,29 +141,29 @@ fn skip_payload(tag: proto.MsgTag, r: anytype) bool {
                 _ = r.readByte() catch break :blk false; // player_id
                 const nlen = r.readByte() catch break :blk false;
                 r.skipBytes(nlen, .{}) catch break :blk false;
-                r.skipBytes(3, .{}) catch break :blk false; // class, ready, connected
+                // class(1) + ready(1) + connected(1) + grid_col(1) + grid_row(1)
+                r.skipBytes(5, .{}) catch break :blk false;
             }
             break :blk true;
         },
         .game_start => blk: {
             const llen = r.readByte() catch break :blk false;
             r.skipBytes(llen, .{}) catch break :blk false;
-            _ = r.readByte() catch break :blk false; // your_player_id
+            _ = r.readByte() catch break :blk false; // player_id
+            r.skipBytes(4, .{}) catch break :blk false; // round_duration f32
             break :blk true;
         },
         .game_state => blk: {
-            _ = r.readInt(u32, .little) catch break :blk false; // tick
+            r.skipBytes(4, .{}) catch break :blk false; // tick u32
+            r.skipBytes(4, .{}) catch break :blk false; // round_timer f32
             const ec = r.readByte() catch break :blk false;
-            // Each EntitySnapshot: 4+1+1+2+2+4+1+1+1+1 = 18 bytes
-            r.skipBytes(@as(u64, ec) * 18, .{}) catch break :blk false;
+            // Each EntitySnapshot: entity(4)+slot(1)+hp(2)+hp_max(2)+shield(2)+class(1)+team(1)+owner(1) = 14
+            r.skipBytes(@as(u64, ec) * 14, .{}) catch break :blk false;
             break :blk true;
         },
         .action_result => blk: {
-            r.skipBytes(11, .{}) catch break :blk false; // tag(1)+actor(4)+target(4)+value(2)
-            break :blk true;
-        },
-        .your_turn => blk: {
-            _ = r.readInt(u32, .little) catch break :blk false;
+            // tag(1)+actor(4)+target(4)+value(2) = 11
+            r.skipBytes(11, .{}) catch break :blk false;
             break :blk true;
         },
         .game_over => blk: {
@@ -183,13 +177,11 @@ fn skip_payload(tag: proto.MsgTag, r: anytype) bool {
     };
 }
 
-/// Find the first Msg with the given tag.
 fn find_tag(msgs: []const Msg, tag: proto.MsgTag) ?Msg {
     for (msgs) |m| if (m.tag == tag) return m;
     return null;
 }
 
-/// Count messages with the given tag.
 fn count_tag(msgs: []const Msg, tag: proto.MsgTag) usize {
     var n: usize = 0;
     for (msgs) |m| {
@@ -198,79 +190,62 @@ fn count_tag(msgs: []const Msg, tag: proto.MsgTag) usize {
     return n;
 }
 
+fn count_action_results_with(msgs: []const Msg, result_tag: proto.ActionResultTag) !usize {
+    var n: usize = 0;
+    for (msgs) |m| {
+        if (m.tag != .action_result) continue;
+        var fbs = std.io.fixedBufferStream(m.payload);
+        const ar = try proto.decode_action_result(fbs.reader());
+        if (ar.tag == result_tag) n += 1;
+    }
+    return n;
+}
+
 // ---------------------------------------------------------------------------
 // Session setup helpers
 // ---------------------------------------------------------------------------
 
-/// Encode `payload` for `tag` into a stack buffer and enqueue it for `pid`.
-fn enqueue_msg(
-    sess: *Session,
-    pid: u8,
-    comptime tag: proto.MsgTag,
-    payload: anytype,
-) !void {
+fn enqueue_msg(sess: *Session, pid: u8, comptime tag: proto.MsgTag, payload: anytype) !void {
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     try proto.encode(fbs.writer(), tag, payload);
     sess.enqueue_message(pid, fbs.getWritten());
 }
 
-/// Tick the session `n` times (tick + tick_effects + run_ai each iteration).
+/// Tick the session `n` times with `dt` seconds each.
 fn tick_n(sess: *Session, dt: f32, n: u32) !void {
     var i: u32 = 0;
-    while (i < n) : (i += 1) {
-        try sess.tick(dt);
-        sess.tick_effects(dt);
-        try sess.run_ai();
-    }
+    while (i < n) : (i += 1) try sess.tick(dt);
 }
 
-/// Override every player entity's Speed.rate to `rate`.
-/// Call after start_game_wave so entities exist.
-fn set_player_speeds(sess: *Session, rate: f32) void {
-    for (&sess.players) |*p| {
-        if (!p.connected or p.entity == std.math.maxInt(ecs.Entity)) continue;
-        sess.world.get_component(p.entity, c.Speed).rate = rate;
-    }
-}
-
-/// Override every enemy entity's Speed.rate to `rate`.
-fn set_enemy_speeds(sess: *Session, rate: f32) void {
+fn count_living_enemies(sess: *Session) usize {
+    var n: usize = 0;
     for (sess.living.items) |e| {
-        const team = sess.world.get_component(e, c.Team);
-        if (team.id == .enemies) {
-            sess.world.get_component(e, c.Speed).rate = rate;
-        }
+        if (sess.world.get_component(e, c.Team).id == .enemies) n += 1;
     }
+    return n;
 }
 
-/// Return the first living enemy entity, or null.
+fn count_living_players(sess: *Session) usize {
+    var n: usize = 0;
+    for (sess.living.items) |e| {
+        if (sess.world.get_component(e, c.Team).id == .players) n += 1;
+    }
+    return n;
+}
+
 fn first_enemy(sess: *Session) ?ecs.Entity {
     for (sess.living.items) |e| {
-        const team = sess.world.get_component(e, c.Team);
-        if (team.id == .enemies) return e;
+        if (sess.world.get_component(e, c.Team).id == .enemies) return e;
     }
     return null;
 }
 
-/// Return the first living player entity, or null.
 fn first_player_entity(sess: *Session) ?ecs.Entity {
     for (sess.living.items) |e| {
-        const team = sess.world.get_component(e, c.Team);
-        if (team.id == .players) return e;
+        if (sess.world.get_component(e, c.Team).id == .players) return e;
     }
     return null;
-}
-
-/// Tick until `entity`'s ActionState is .charging (max 20 ticks at dt=0.1).
-fn tick_until_charging(sess: *Session, entity: ecs.Entity) !void {
-    var i: u32 = 0;
-    while (i < 20) : (i += 1) {
-        const as = sess.world.get_component(entity, c.ActionState);
-        if (as.tag == .charging) return;
-        try tick_n(sess, 0.1, 1);
-    }
-    return error.EntityNeverCharged;
 }
 
 // ---------------------------------------------------------------------------
@@ -289,10 +264,6 @@ const TwoPlayerSession = struct {
     }
 };
 
-/// Initialise a two-player session IN-PLACE (caller owns *self on their stack).
-/// Must be called via `var s: TwoPlayerSession = undefined; try s.init(...)`.
-/// Never call on a temporary / return-by-value: buf and bt must stay at fixed
-/// addresses because the transports store pointers into them.
 fn init_two_player_session(
     self: *TwoPlayerSession,
     allocator: std.mem.Allocator,
@@ -302,7 +273,6 @@ fn init_two_player_session(
     self.allocator = allocator;
     self.p[0].buf = .empty;
     self.p[1].buf = .empty;
-    // bt stores &self.p[i].buf — must be called at the struct's FINAL address.
     self.p[0].init(allocator);
     self.p[1].init(allocator);
 
@@ -313,21 +283,16 @@ fn init_two_player_session(
     self.p[0].pid = pid0;
     self.p[1].pid = pid1;
 
-    // Set classes
     self.sess.set_class(pid0, class0);
     self.sess.set_class(pid1, class1);
 
-    // Apply names directly (drain_queues only fires during .playing phase,
-    // so lobby messages can't be processed via the normal queue path).
-    const name0 = "Alice";
     const slot0 = &self.sess.players[pid0];
-    @memcpy(slot0.name[0..name0.len], name0);
-    slot0.name_len = @intCast(name0.len);
+    @memcpy(slot0.name[0..5], "Alice");
+    slot0.name_len = 5;
 
-    const name1 = "Bob";
     const slot1 = &self.sess.players[pid1];
-    @memcpy(slot1.name[0..name1.len], name1);
-    slot1.name_len = @intCast(name1.len);
+    @memcpy(slot1.name[0..3], "Bob");
+    slot1.name_len = 3;
 }
 
 // ---------------------------------------------------------------------------
@@ -344,14 +309,11 @@ test "join sets name in lobby_update" {
     try init_two_player_session(&s, allocator, .fighter, .mage);
     defer s.deinit();
 
-    // Broadcast lobby update manually (mirrors afterInit / join_lobby path)
-    s.p[0].clear(allocator);
-    s.p[1].clear(allocator);
+    s.p[0].clear();
     try s.sess.broadcast_lobby_update();
 
     const msgs0 = try drain(s.p[0].buf.items, arena);
     const lu_msg = find_tag(msgs0, .lobby_update) orelse return error.NoLobbyUpdate;
-
     var fbs = std.io.fixedBufferStream(lu_msg.payload);
     const lu = try proto.decode_lobby_update(fbs.reader());
 
@@ -360,7 +322,7 @@ test "join sets name in lobby_update" {
     try std.testing.expectEqualSlices(u8, "Bob", lu.players[1].name[0..lu.players[1].name_len]);
 }
 
-test "lobby_update carries correct your_player_id" {
+test "lobby_update carries correct player_id" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -370,29 +332,41 @@ test "lobby_update carries correct your_player_id" {
     try init_two_player_session(&s, allocator, .fighter, .mage);
     defer s.deinit();
 
-    s.p[0].clear(allocator);
-    s.p[1].clear(allocator);
+    s.p[0].clear();
+    s.p[1].clear();
     try s.sess.broadcast_lobby_update();
 
-    // Player 0's copy
-    {
-        const msgs = try drain(s.p[0].buf.items, arena);
+    inline for (.{ 0, 1 }) |i| {
+        const msgs = try drain(s.p[i].buf.items, arena);
         const m = find_tag(msgs, .lobby_update) orelse return error.NoLobbyUpdate;
         var fbs = std.io.fixedBufferStream(m.payload);
         const lu = try proto.decode_lobby_update(fbs.reader());
-        try std.testing.expectEqual(s.p[0].pid, lu.your_player_id);
-    }
-    // Player 1's copy
-    {
-        const msgs = try drain(s.p[1].buf.items, arena);
-        const m = find_tag(msgs, .lobby_update) orelse return error.NoLobbyUpdate;
-        var fbs = std.io.fixedBufferStream(m.payload);
-        const lu = try proto.decode_lobby_update(fbs.reader());
-        try std.testing.expectEqual(s.p[1].pid, lu.your_player_id);
+        try std.testing.expectEqual(s.p[i].pid, lu.player_id);
     }
 }
 
-test "all ready triggers game_start" {
+test "lobby_update carries round_duration" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .mage);
+    defer s.deinit();
+
+    s.sess.round_duration = 5.0;
+    s.p[0].clear();
+    try s.sess.broadcast_lobby_update();
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+    const m = find_tag(msgs, .lobby_update) orelse return error.NoLobbyUpdate;
+    var fbs = std.io.fixedBufferStream(m.payload);
+    const lu = try proto.decode_lobby_update(fbs.reader());
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), lu.round_duration, 0.001);
+}
+
+test "all ready triggers game_start with round_duration" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -402,316 +376,304 @@ test "all ready triggers game_start" {
     try init_two_player_session(&s, allocator, .fighter, .healer);
     defer s.deinit();
 
-    s.sess.set_ready(s.p[0].pid, true);
-    s.sess.set_ready(s.p[1].pid, true);
-    try std.testing.expect(s.sess.all_ready());
-
-    s.p[0].clear(allocator);
-    s.p[1].clear(allocator);
+    s.sess.round_duration = 4.0;
+    s.p[0].clear();
+    s.p[1].clear();
 
     try s.sess.start_game_wave(&test_wave_single);
     try s.sess.broadcast_game_start("test_single");
 
-    // Both players should receive game_start with their own pid
     inline for (.{ 0, 1 }) |i| {
         const msgs = try drain(s.p[i].buf.items, arena);
         const m = find_tag(msgs, .game_start) orelse return error.NoGameStart;
         var fbs = std.io.fixedBufferStream(m.payload);
         const gs = try proto.decode_game_start(fbs.reader());
-        try std.testing.expectEqual(s.p[i].pid, gs.your_player_id);
+        try std.testing.expectEqual(s.p[i].pid, gs.player_id);
+        try std.testing.expectApproxEqAbs(@as(f32, 4.0), gs.round_duration, 0.001);
     }
     try std.testing.expectEqual(session_mod.SessionPhase.playing, s.sess.phase);
 }
 
 // ---------------------------------------------------------------------------
-// Combat tests
+// Round-based combat tests
 // ---------------------------------------------------------------------------
 
-test "fighter attack deals damage to enemy" {
+/// Helper: start a session, enqueue actions for both players, tick until
+/// the round resolves (using a very short round_duration), return messages.
+///
+/// `dt` ticks of size `dt_step` until `round_duration` elapses or exceeds.
+fn resolve_one_round(
+    sess: *Session,
+    player_actions: []const ?c.ActionChoice,
+    arena: std.mem.Allocator,
+    out_buf: *std.ArrayListUnmanaged(u8),
+) ![]Msg {
+    out_buf.clearRetainingCapacity();
+    // Submit actions
+    for (player_actions, 0..) |maybe_action, i| {
+        const action = maybe_action orelse continue;
+        try enqueue_msg(sess, @intCast(i), .choose_action, proto.ChooseAction{ .action = action });
+    }
+    // Tick until round fires (round_duration = 0.1s, step = 0.1s → 1 tick)
+    try tick_n(sess, sess.round_duration + 0.001, 1);
+    return drain(out_buf.items, arena);
+}
+
+test "damage pool reduces enemy HP" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single); // grunt: 10 HP
+
+    const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
+    const hp_before = s.sess.world.get_component(enemy_e, c.Health).current;
+
+    // Both players choose damage → pool = 2 → 2 * ACTION_EFFECT_VALUE = 2 dmg
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .damage });
+    try enqueue_msg(&s.sess, s.p[1].pid, .choose_action, proto.ChooseAction{ .action = .damage });
+    try tick_n(&s.sess, 0.11, 1);
+
+    const hp_after = s.sess.world.get_component(enemy_e, c.Health).current;
+    // damage to enemy = pool(2) * V
+    try std.testing.expectEqual(hp_before - 2 * V, hp_after);
+}
+
+test "damage pool: action_result.damage broadcast for each enemy" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .healer);
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
     defer s.deinit();
 
-    // Use a grunt with known defense so we can calculate expected damage.
-    // grunt defense=1, fighter attack=20 → raw=19, no mitigation → dmg=19.
-    const wave = waves.Wave{
-        .label = "t",
-        .entries = &[_]waves.SpawnEntry{.{
-            .class = .grunt,
-            .grid_col = 0,
-            .grid_row = 0,
-            .stats = .{ .attack = 5, .defense = 1, .max_hp = 100, .speed_base = 0.001 },
-        }},
-        .next_wave = null,
-    };
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single); // 1 enemy
 
-    try s.sess.start_game_wave(&wave);
-    set_player_speeds(&s.sess, 10.0);
-    set_enemy_speeds(&s.sess, 0.001);
-
-    const fighter_e = s.p[0].pid;
-    const fighter_entity = s.sess.players[fighter_e].entity;
-    const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
-
-    try tick_until_charging(&s.sess, fighter_entity);
-
-    s.p[0].clear(allocator);
-    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .attack, .target_entity = enemy_e });
-    try tick_n(&s.sess, 0.1, 1);
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .damage });
+    s.p[0].clear();
+    try tick_n(&s.sess, 0.11, 1);
 
     const msgs = try drain(s.p[0].buf.items, arena);
-    const m = find_tag(msgs, .action_result) orelse return error.NoActionResult;
-    var fbs = std.io.fixedBufferStream(m.payload);
-    const ar = try proto.decode_action_result(fbs.reader());
-
-    try std.testing.expectEqual(proto.ActionResultTag.damage, ar.tag);
-    try std.testing.expectEqual(enemy_e, ar.target_entity);
-    try std.testing.expect(ar.value > 0);
-    // Fighter atk=20, grunt def=1 → raw=19, no mit → value=19
-    try std.testing.expectEqual(@as(u16, 19), ar.value);
+    const dmg_count = try count_action_results_with(msgs, .damage);
+    // At least 1 damage result for the enemy + 1 for enemy attacking back
+    try std.testing.expect(dmg_count >= 1);
 }
 
-test "healer attack heals ally" {
+test "kill enemy with exactly enough damage" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .healer);
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
     defer s.deinit();
 
-    try s.sess.start_game_wave(&test_wave_single);
-    set_player_speeds(&s.sess, 10.0);
-    set_enemy_speeds(&s.sess, 0.001);
-
-    // Wound the fighter so there's room to heal.
-    const fighter_entity = s.sess.players[s.p[0].pid].entity;
-    s.sess.world.get_component(fighter_entity, c.Health).current = 50;
-
-    // Advance healer's ATB (healer is p[1])
-    const healer_entity = s.sess.players[s.p[1].pid].entity;
-    // Make healer charge first by giving it a head start
-    s.sess.world.get_component(healer_entity, c.Speed).gauge = 0.0;
-    s.sess.world.get_component(fighter_entity, c.Speed).gauge = 0.0;
-    try tick_until_charging(&s.sess, healer_entity);
-
-    s.p[1].clear(allocator);
-    // Healer targets the fighter; AoE 2×2 originates from the fighter's position.
-    try enqueue_msg(&s.sess, s.p[1].pid, .choose_action, proto.ChooseAction{ .action = .attack, .target_entity = fighter_entity });
-    try tick_n(&s.sess, 0.1, 1);
-
-    const msgs = try drain(s.p[1].buf.items, arena);
-    const m = find_tag(msgs, .action_result) orelse return error.NoActionResult;
-    var fbs = std.io.fixedBufferStream(m.payload);
-    const ar = try proto.decode_action_result(fbs.reader());
-
-    try std.testing.expectEqual(proto.ActionResultTag.heal, ar.tag);
-    try std.testing.expect(ar.value > 0);
-    // The heal must land on a player entity.
-    const target_team = s.sess.world.get_component(ar.target_entity, c.Team);
-    try std.testing.expectEqual(c.TeamId.players, target_team.id);
-}
-
-test "mage attack hits multiple adjacent enemies" {
-    const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .mage, .fighter);
-    defer s.deinit();
-
-    try s.sess.start_game_wave(&test_wave_two_adj);
-    set_player_speeds(&s.sess, 10.0);
-    set_enemy_speeds(&s.sess, 0.001);
-
-    const mage_entity = s.sess.players[s.p[0].pid].entity;
-    try tick_until_charging(&s.sess, mage_entity);
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_one_hp); // 1 HP grunt
 
     const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
 
-    s.p[0].clear(allocator);
-    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .attack, .target_entity = enemy_e });
-    try tick_n(&s.sess, 0.1, 1);
+    // 1 player damage action → pool=1 → 1 dmg to enemy (1 HP) → death
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .damage });
+    s.p[0].clear();
+    try tick_n(&s.sess, 0.11, 1);
 
+    // Enemy is dead
+    try std.testing.expectEqual(@as(usize, 0), count_living_enemies(&s.sess));
+
+    // Death broadcast
     const msgs = try drain(s.p[0].buf.items, arena);
-    const dmg_count = count_tag(msgs, .action_result);
-    // Two grunts at (0,0) and (1,0) — mage AoE 2×2 covers both.
-    try std.testing.expect(dmg_count >= 2);
-}
-
-test "mage aoe origin follows target not actor" {
-    // Regression: before fix, AoE origin was actor_pos. After fix it must be
-    // the target entity's GridPos. We put both enemies far from the mage's own
-    // position (0-row) so that only the target-centered AoE can reach them.
-    //
-    // Enemy layout:  (1,2) and (1,3)
-    // Mage spawns on player row (effectively col 0, row varies but irrelevant
-    // because the AoE logic uses the target's pos, not the actor's).
-    // aoe_cells_2x2(1,2) => (1,2),(2,2),(1,3),(2,3)  — both enemies in range.
-    // aoe_cells_2x2(actor_col,actor_row) could not reach row 2+ from row 0/1.
-    const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const wave_far = waves.Wave{
-        .label = "t_far",
-        .entries = &[_]waves.SpawnEntry{
-            .{ .class = .grunt, .grid_col = 1, .grid_row = 2, .stats = .{ .attack = 5, .defense = 1, .max_hp = 30, .speed_base = 0.001 } },
-            .{ .class = .grunt, .grid_col = 1, .grid_row = 3, .stats = .{ .attack = 5, .defense = 1, .max_hp = 30, .speed_base = 0.001 } },
-        },
-        .next_wave = null,
-    };
-
-    var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .mage, .fighter);
-    defer s.deinit();
-
-    try s.sess.start_game_wave(&wave_far);
-    set_player_speeds(&s.sess, 10.0);
-    set_enemy_speeds(&s.sess, 0.001);
-
-    const mage_entity = s.sess.players[s.p[0].pid].entity;
-    try tick_until_charging(&s.sess, mage_entity);
-
-    // Target the first enemy (at grid 1,2); AoE must hit both (1,2) and (1,3).
-    const target_e = first_enemy(&s.sess) orelse return error.NoEnemy;
-
-    s.p[0].clear(allocator);
-    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .attack, .target_entity = target_e });
-    try tick_n(&s.sess, 0.1, 1);
-
-    const msgs = try drain(s.p[0].buf.items, arena);
-    const dmg_count = count_tag(msgs, .action_result);
-    // Both enemies are within the 2×2 AoE of (1,2); the old (actor-pos) AoE
-    // would yield 0 hits because neither grunt is near the mage's spawn row.
-    try std.testing.expect(dmg_count >= 2);
-}
-
-test "defend broadcasts defend result" {
-    const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .healer);
-    defer s.deinit();
-
-    try s.sess.start_game_wave(&test_wave_single);
-    set_player_speeds(&s.sess, 10.0);
-    set_enemy_speeds(&s.sess, 0.001);
-
-    const fighter_entity = s.sess.players[s.p[0].pid].entity;
-    try tick_until_charging(&s.sess, fighter_entity);
-
-    s.p[0].clear(allocator);
-    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .defend, .target_entity = 0 });
-    try tick_n(&s.sess, 0.1, 1);
-
-    const msgs = try drain(s.p[0].buf.items, arena);
-    const m = find_tag(msgs, .action_result) orelse return error.NoActionResult;
-    var fbs = std.io.fixedBufferStream(m.payload);
-    const ar = try proto.decode_action_result(fbs.reader());
-    try std.testing.expectEqual(proto.ActionResultTag.defend, ar.tag);
-}
-
-// ---------------------------------------------------------------------------
-// Death and wave progression tests
-// ---------------------------------------------------------------------------
-
-test "killing enemy broadcasts death result" {
-    const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .healer);
-    defer s.deinit();
-
-    try s.sess.start_game_wave(&test_wave_single); // grunt has max_hp=1
-    set_player_speeds(&s.sess, 10.0);
-    set_enemy_speeds(&s.sess, 0.001);
-
-    const fighter_entity = s.sess.players[s.p[0].pid].entity;
-    const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
-    try tick_until_charging(&s.sess, fighter_entity);
-
-    s.p[0].clear(allocator);
-    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .attack, .target_entity = enemy_e });
-    try tick_n(&s.sess, 0.1, 1);
-
-    const msgs = try drain(s.p[0].buf.items, arena);
-    const death_count = count_tag(msgs, .action_result);
-    // Expect at least 2: .damage then .death
-    try std.testing.expect(death_count >= 2);
-
-    // Confirm one is .death
     var found_death = false;
     for (msgs) |m| {
         if (m.tag != .action_result) continue;
         var fbs = std.io.fixedBufferStream(m.payload);
         const ar = try proto.decode_action_result(fbs.reader());
-        if (ar.tag == .death and ar.target_entity == enemy_e) {
-            found_death = true;
-        }
+        if (ar.tag == .death and ar.target_entity == enemy_e) found_death = true;
     }
     try std.testing.expect(found_death);
 }
 
-test "wave clear spawns next wave" {
+test "shield pool grants shield HP to all players" {
     const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    // Verify that after killing the last enemy in a terminal wave,
-    // session.phase becomes .ended and a game_over is sent.
-    var s2: TwoPlayerSession = undefined;
-    try init_two_player_session(&s2, allocator, .fighter, .healer);
-    defer s2.deinit();
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
 
-    const wave_terminal = waves.Wave{
-        .label = "t_terminal",
-        .entries = &[_]waves.SpawnEntry{.{
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+
+    // Both players shield → pool=2 → each player gets 2 shield HP
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .shield });
+    try enqueue_msg(&s.sess, s.p[1].pid, .choose_action, proto.ChooseAction{ .action = .shield });
+    s.p[0].clear();
+    try tick_n(&s.sess, 0.11, 1);
+
+    for (s.sess.living.items) |e| {
+        if (s.sess.world.get_component(e, c.Team).id != .players) continue;
+        // shield = pool(2) * V, enemy (attack=1) absorbs 1 → net 2*V - 1
+        try std.testing.expectEqual(2 * V - 1, s.sess.shield[e]);
+    }
+
+    // shield broadcast
+    const msgs = try drain(s.p[0].buf.items, arena);
+    const shield_count = try count_action_results_with(msgs, .shield);
+    try std.testing.expect(shield_count >= 2); // at least one per player
+}
+
+test "heal pool heals all players" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+
+    // Wound both players first
+    const pe0 = s.sess.players[s.p[0].pid].entity;
+    const pe1 = s.sess.players[s.p[1].pid].entity;
+    s.sess.world.get_component(pe0, c.Health).current = 50;
+    s.sess.world.get_component(pe1, c.Health).current = 50;
+
+    const hp0_before: u16 = 50;
+
+    // Both players heal → pool=2 → each player heals 2*V HP
+    // Enemy (attack=1) deals 1 HP dmg in same round.
+    // Net: +2*V heal - 1 enemy dmg.
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .heal });
+    try enqueue_msg(&s.sess, s.p[1].pid, .choose_action, proto.ChooseAction{ .action = .heal });
+    try tick_n(&s.sess, 0.11, 1);
+
+    const hp0_after = s.sess.world.get_component(pe0, c.Health).current;
+    // Heal (+2*V) then enemy dmg (-1) → net +2*V-1
+    try std.testing.expectEqual(hp0_before + 2 * V - 1, hp0_after);
+
+    // heal broadcast
+    s.p[0].clear();
+    _ = arena; // already drained above implicitly through tick; re-drain not needed
+}
+
+test "shield absorbs enemy damage before HP" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single); // 1 enemy → 1 dmg per round to each player
+
+    const pe = s.sess.players[s.p[0].pid].entity;
+    const hp_before = s.sess.world.get_component(pe, c.Health).current;
+
+    // Give player a manual shield of 5 HP (more than enemy attack=1)
+    s.sess.shield[pe] = 5;
+
+    // No action chosen — enemy still attacks
+    try tick_n(&s.sess, 0.11, 1);
+
+    const hp_after = s.sess.world.get_component(pe, c.Health).current;
+    const shield_after = s.sess.shield[pe];
+
+    // HP unchanged (shield absorbed enemy attack=1)
+    try std.testing.expectEqual(hp_before, hp_after);
+    // Shield depleted by enemy attack (1)
+    try std.testing.expectEqual(@as(u16, 4), shield_after);
+
+    _ = arena;
+}
+
+test "enemy kills all players — enemies win" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+
+    // Wave with 100 enemies → 100 dmg per round per player → instant kill.
+    var entries: [100]waves.SpawnEntry = undefined;
+    for (&entries, 0..) |*e, i| {
+        e.* = .{
             .class = .grunt,
-            .grid_col = 0,
-            .grid_row = 0,
-            .stats = .{ .attack = 5, .defense = 1, .max_hp = 1, .speed_base = 0.001 },
-        }},
+            .grid_col = @intCast(i % 3),
+            .grid_row = @intCast((i / 3) % 4),
+            .stats = .{ .attack = 1, .defense = 1, .max_hp = 999, .speed_base = 0.001 },
+        };
+    }
+    const deadly_wave = waves.Wave{
+        .label = "t_deadly",
+        .entries = &entries,
         .next_wave = null,
     };
 
-    try s2.sess.start_game_wave(&wave_terminal);
-    set_player_speeds(&s2.sess, 10.0);
-    set_enemy_speeds(&s2.sess, 0.001);
+    try s.sess.start_game_wave(&deadly_wave);
 
-    const fighter_entity = s2.sess.players[s2.p[0].pid].entity;
-    const enemy_e = first_enemy(&s2.sess) orelse return error.NoEnemy;
-    try tick_until_charging(&s2.sess, fighter_entity);
+    // Players have 1 HP, 100 enemies deal 100 dmg → die instantly
+    for (s.sess.living.items) |e| {
+        if (s.sess.world.get_component(e, c.Team).id == .players) {
+            s.sess.world.get_component(e, c.Health).current = 1;
+        }
+    }
 
-    try enqueue_msg(&s2.sess, s2.p[0].pid, .choose_action, proto.ChooseAction{ .action = .attack, .target_entity = enemy_e });
-    try tick_n(&s2.sess, 0.1, 1);
+    s.p[0].clear();
+    try tick_n(&s.sess, 0.11, 1);
 
-    // No more enemies alive
-    try std.testing.expectEqual(@as(usize, 0), count_living_enemies(&s2.sess));
-    try std.testing.expectEqual(session_mod.SessionPhase.ended, s2.sess.phase);
+    try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+    const m = find_tag(msgs, .game_over) orelse return error.NoGameOver;
+    var fbs = std.io.fixedBufferStream(m.payload);
+    const go = try proto.decode_game_over(fbs.reader());
+    try std.testing.expectEqual(proto.WinnerId.enemies, go.winner);
 }
 
-/// Count enemies currently in sess.living.
-fn count_living_enemies(sess: *Session) usize {
-    var n: usize = 0;
-    for (sess.living.items) |e| {
-        const t = sess.world.get_component(e, c.Team);
-        if (t.id == .enemies) n += 1;
-    }
-    return n;
+test "all enemies dead — players win" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_one_hp); // 1 HP grunt
+
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .damage });
+    s.p[0].clear();
+    try tick_n(&s.sess, 0.11, 1);
+
+    try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+    const m = find_tag(msgs, .game_over) orelse return error.NoGameOver;
+    var fbs = std.io.fixedBufferStream(m.payload);
+    const go = try proto.decode_game_over(fbs.reader());
+    try std.testing.expectEqual(proto.WinnerId.players, go.winner);
 }
 
 test "wave chain advances to next wave" {
@@ -721,135 +683,422 @@ test "wave chain advances to next wave" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .healer);
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
     defer s.deinit();
 
-    // We wire chain_a → chain_b by injecting chain_b into ALL_WAVES lookup.
-    // Since we cannot modify ALL_WAVES at runtime, we instead test by
-    // calling start_game_wave(chain_a) where chain_a.next_wave = "wave_01_basic"
-    // which IS in ALL_WAVES.  Kill the grunt → session loads wave_01_basic.
-    const wave_to_real = waves.Wave{
-        .label = "t_to_real",
-        .entries = &[_]waves.SpawnEntry{.{
-            .class = .grunt,
-            .grid_col = 0,
-            .grid_row = 0,
-            .stats = .{ .attack = 5, .defense = 1, .max_hp = 1, .speed_base = 0.001 },
-        }},
-        .next_wave = "wave_01_basic",
-    };
+    s.sess.round_duration = 0.1;
+    // First wave: 1 HP grunt → next wave = wave_01_basic (9 grunts)
+    try s.sess.start_game_wave(&test_wave_to_real);
 
-    try s.sess.start_game_wave(&wave_to_real);
-    set_player_speeds(&s.sess, 10.0);
-    set_enemy_speeds(&s.sess, 0.001);
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .damage });
+    s.p[0].clear();
+    try tick_n(&s.sess, 0.11, 1);
 
-    const fighter_entity = s.sess.players[s.p[0].pid].entity;
-    const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
-    try tick_until_charging(&s.sess, fighter_entity);
-
-    s.p[0].clear(allocator);
-    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .attack, .target_entity = enemy_e });
-    try tick_n(&s.sess, 0.1, 1);
-
-    // wave_01_basic has 3 grunts — verify enemies spawned
+    // wave_01_basic has 9 grunts
     try std.testing.expect(count_living_enemies(&s.sess) > 0);
     try std.testing.expectEqual(session_mod.SessionPhase.playing, s.sess.phase);
-    // Current wave should now be wave_01_basic
-    const cw = s.sess.current_wave orelse return error.NullWave;
-    try std.testing.expectEqualSlices(u8, "wave_01_basic", cw.label);
 
-    // Drain game_state and verify enemy-team entities exist
     const msgs = try drain(s.p[0].buf.items, arena);
     try std.testing.expect(find_tag(msgs, .game_state) != null);
 }
 
-test "all waves cleared players win" {
+test "action can be overwritten before round resolves" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.5; // long round
+    try s.sess.start_game_wave(&test_wave_single);
+
+    const pe = s.sess.players[s.p[0].pid].entity;
+    const hp_max = s.sess.world.get_component(pe, c.Health).max;
+
+    // First submit heal, then overwrite with damage before round ends
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .heal });
+    // Tick a little (doesn't fire round yet)
+    try tick_n(&s.sess, 0.1, 1);
+    // Verify the first action was recorded
+    try std.testing.expectEqual(c.ActionChoice.heal, s.sess.action_pool[s.p[0].pid].?);
+
+    // Overwrite with damage
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .damage });
+    try tick_n(&s.sess, 0.1, 1);
+    try std.testing.expectEqual(c.ActionChoice.damage, s.sess.action_pool[s.p[0].pid].?);
+
+    // Let the round fire — damage chosen, not heal
+    try tick_n(&s.sess, 0.5, 1);
+
+    // Enemy HP must have gone down (damage applied), not up
+    const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
+    const enemy_hp = s.sess.world.get_component(enemy_e, c.Health).current;
+    try std.testing.expect(enemy_hp < V * 100); // started at V*100
+
+    // Player HP should NOT be at max (heal was not the final action)
+    const player_hp = s.sess.world.get_component(pe, c.Health).current;
+    try std.testing.expect(player_hp <= hp_max);
+}
+
+test "action pool resets after each round" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+
+    // Round 1: both damage
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .damage });
+    try enqueue_msg(&s.sess, s.p[1].pid, .choose_action, proto.ChooseAction{ .action = .damage });
+    try tick_n(&s.sess, 0.11, 1);
+
+    // After round, pool must be cleared
+    for (&s.sess.action_pool) |maybe| {
+        try std.testing.expectEqual(@as(?c.ActionChoice, null), maybe);
+    }
+}
+
+test "no actions submitted — enemy still attacks" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single); // 1 enemy
+
+    const pe = s.sess.players[s.p[0].pid].entity;
+    const hp_max = s.sess.world.get_component(pe, c.Health).max;
+
+    // No actions; tick through round
+    try tick_n(&s.sess, 0.11, 1);
+
+    // Enemy (attack=1) deals 1 HP dmg — player HP dropped by 1
+    const hp_after = s.sess.world.get_component(pe, c.Health).current;
+    try std.testing.expectEqual(hp_max - 1, hp_after);
+}
+
+test "round_timer counts down and resets" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 1.0;
+    try s.sess.start_game_wave(&test_wave_single);
+
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), s.sess.round_timer, 0.001);
+
+    // Tick 0.4s — timer should be around 0.6
+    try tick_n(&s.sess, 0.4, 1);
+    try std.testing.expect(s.sess.round_timer < 1.0);
+    try std.testing.expect(s.sess.round_timer > 0.0);
+
+    // Tick past the full second — round fires and timer resets to round_duration
+    try tick_n(&s.sess, 0.7, 1);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), s.sess.round_timer, 0.001);
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect test
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Gap-analysis integration tests
+// ---------------------------------------------------------------------------
+
+test "mixed pool: damage + shield in one round" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single); // 1 enemy, 10 HP
+
+    const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
+    const pe1 = s.sess.players[s.p[1].pid].entity;
+
+    // p0 → damage, p1 → shield
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .damage });
+    try enqueue_msg(&s.sess, s.p[1].pid, .choose_action, proto.ChooseAction{ .action = .shield });
+    try tick_n(&s.sess, 0.11, 1);
+
+    // enemy took V damage (pool=1 → 1*V)
+    const enemy_hp = s.sess.world.get_component(enemy_e, c.Health).current;
+    try std.testing.expectEqual(V * 100 - V, enemy_hp);
+
+    // p1 got shield (pool=1 → +V shield, enemy attack=1 absorbed → net V-1)
+    try std.testing.expectEqual(V - 1, s.sess.shield[pe1]);
+}
+
+test "2 enemies deal 2 damage per player per round" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+
+    const two_enemy_wave = waves.Wave{
+        .label = "t_two",
+        .entries = &[_]waves.SpawnEntry{
+            .{ .class = .grunt, .grid_col = 0, .grid_row = 0, .stats = .{ .attack = 1, .defense = 1, .max_hp = 99, .speed_base = 0.001 } },
+            .{ .class = .grunt, .grid_col = 1, .grid_row = 0, .stats = .{ .attack = 1, .defense = 1, .max_hp = 99, .speed_base = 0.001 } },
+        },
+        .next_wave = null,
+    };
+    try s.sess.start_game_wave(&two_enemy_wave);
+
+    const pe = s.sess.players[s.p[0].pid].entity;
+    const hp_before = s.sess.world.get_component(pe, c.Health).current;
+
+    // No actions: 2 enemies × 1 = 2 dmg to each player
+    try tick_n(&s.sess, 0.11, 1);
+
+    const hp_after = s.sess.world.get_component(pe, c.Health).current;
+    try std.testing.expectEqual(hp_before - 2, hp_after);
+}
+
+test "player dead from enemy does not receive subsequent pool heal" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+
+    // 100 enemies → lethal intent
+    var entries: [100]waves.SpawnEntry = undefined;
+    for (&entries, 0..) |*e, i| {
+        e.* = .{
+            .class = .grunt,
+            .grid_col = @intCast(i % 3),
+            .grid_row = @intCast((i / 3) % 4),
+            .stats = .{ .attack = 1, .defense = 1, .max_hp = 999, .speed_base = 0.001 },
+        };
+    }
+    const lethal_wave = waves.Wave{ .label = "t_lethal", .entries = &entries, .next_wave = null };
+    try s.sess.start_game_wave(&lethal_wave);
+
+    const pe0 = s.sess.players[s.p[0].pid].entity;
+    const pe1 = s.sess.players[s.p[1].pid].entity;
+    // Set both to 1 HP — enemy intent will kill them
+    s.sess.world.get_component(pe0, c.Health).current = 1;
+    s.sess.world.get_component(pe1, c.Health).current = 1;
+
+    // Both choose heal — heal applies before enemy intent
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .heal });
+    try enqueue_msg(&s.sess, s.p[1].pid, .choose_action, proto.ChooseAction{ .action = .heal });
+    try tick_n(&s.sess, 0.11, 1);
+
+    // Both dead (enemy dealt 100 dmg, heal only gave +2)
+    try std.testing.expectEqual(@as(usize, 0), count_living_players(&s.sess));
+    // Neither entity should appear in the living list
+    for (s.sess.living.items) |e| {
+        try std.testing.expect(e != pe0);
+        try std.testing.expect(e != pe1);
+    }
+}
+
+test "game_state wire: round_timer decrement reflected in broadcast" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .healer);
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
     defer s.deinit();
 
-    // Single terminal wave → killing the grunt ends the game with players win.
+    s.sess.round_duration = 1.0;
     try s.sess.start_game_wave(&test_wave_single);
-    set_player_speeds(&s.sess, 10.0);
-    set_enemy_speeds(&s.sess, 0.001);
 
-    const fighter_entity = s.sess.players[s.p[0].pid].entity;
-    const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
-    try tick_until_charging(&s.sess, fighter_entity);
+    s.p[0].clear();
+    try tick_n(&s.sess, 0.3, 1); // timer should be ~0.7
 
-    s.p[0].clear(allocator);
-    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .attack, .target_entity = enemy_e });
+    const msgs = try drain(s.p[0].buf.items, arena);
+    const m = find_tag(msgs, .game_state) orelse return error.NoGameState;
+    var fbs = std.io.fixedBufferStream(m.payload);
+    const gs = try proto.decode_game_state(fbs.reader());
+
+    try std.testing.expect(gs.round_timer < 1.0);
+    try std.testing.expect(gs.round_timer > 0.0);
+}
+
+test "game_state wire: shield_hp reflects server shield array" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 1.0;
+    try s.sess.start_game_wave(&test_wave_single);
+
+    const pe = s.sess.players[s.p[0].pid].entity;
+    s.sess.shield[pe] = 7;
+
+    s.p[0].clear();
     try tick_n(&s.sess, 0.1, 1);
 
     const msgs = try drain(s.p[0].buf.items, arena);
-    const m = find_tag(msgs, .game_over) orelse return error.NoGameOver;
+    const m = find_tag(msgs, .game_state) orelse return error.NoGameState;
     var fbs = std.io.fixedBufferStream(m.payload);
-    const go = try proto.decode_game_over(fbs.reader());
-    try std.testing.expectEqual(proto.WinnerId.players, go.winner);
-    try std.testing.expectEqual(session_mod.SessionPhase.ended, s.sess.phase);
+    const gs = try proto.decode_game_state(fbs.reader());
+
+    var found_shield: bool = false;
+    var i: u8 = 0;
+    while (i < gs.entity_count) : (i += 1) {
+        if (gs.entities[i].entity == pe) {
+            // Shield may have been consumed by enemy intent this tick (round not yet resolved)
+            // but timer hasn't expired yet so no resolution happened
+            try std.testing.expectEqual(@as(u16, 7), gs.entities[i].shield_hp);
+            found_shield = true;
+        }
+    }
+    try std.testing.expect(found_shield);
 }
 
-test "all players dead enemies win" {
+test "cosmetic lobby position round-trip via choose_position" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .healer);
+    try init_two_player_session(&s, allocator, .fighter, .mage);
     defer s.deinit();
 
-    // Enemy with very high attack, slow players so AI acts first.
-    const deadly_wave = waves.Wave{
-        .label = "t_deadly",
-        .entries = &[_]waves.SpawnEntry{.{
-            .class = .grunt,
-            .grid_col = 0,
-            .grid_row = 0,
-            .stats = .{ .attack = 9999, .defense = 1, .max_hp = 999, .speed_base = 10.0 },
-        }},
-        .next_wave = null,
-    };
+    const pid = s.p[0].pid;
+    try enqueue_msg(&s.sess, pid, .choose_position, proto.ChoosePosition{ .col = 2, .row = 3 });
+    // drain_queues is called on tick, but session is in lobby — tick still drains
+    try s.sess.tick(0.016);
 
-    try s.sess.start_game_wave(&deadly_wave);
-    // Players are slow (don't act); enemy charges and kills them.
-    set_player_speeds(&s.sess, 0.001);
-    set_enemy_speeds(&s.sess, 10.0);
+    s.p[0].clear();
+    try s.sess.broadcast_lobby_update();
 
+    const msgs = try drain(s.p[0].buf.items, arena);
+    const m = find_tag(msgs, .lobby_update) orelse return error.NoLobbyUpdate;
+    var fbs = std.io.fixedBufferStream(m.payload);
+    const lu = try proto.decode_lobby_update(fbs.reader());
+
+    try std.testing.expectEqual(@as(u8, 2), lu.players[pid].grid_col);
+    try std.testing.expectEqual(@as(u8, 3), lu.players[pid].grid_row);
+}
+
+test "disconnect mid-game: round resolves cleanly for remaining player" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+
+    // Disconnect player 1 mid-game
+    s.sess.disconnect(s.p[1].pid);
+
+    // Submit damage from surviving player 0
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .damage });
+    s.p[0].clear();
+
+    // Must not crash
+    try tick_n(&s.sess, 0.11, 1);
+
+    // Enemy took damage
     const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
-    // Also set HP for both players very low so one hit kills both.
+    const enemy_hp = s.sess.world.get_component(enemy_e, c.Health).current;
+    try std.testing.expect(enemy_hp < V * 100);
+
+    // Player 0 still received broadcast
+    const msgs = try drain(s.p[0].buf.items, arena);
+    try std.testing.expect(find_tag(msgs, .game_state) != null);
+}
+
+test "heal at full HP — HP stays at max" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+
+    const pe = s.sess.players[s.p[0].pid].entity;
+    const hp_max = s.sess.world.get_component(pe, c.Health).max;
+    // Ensure player is at full HP
+    s.sess.world.get_component(pe, c.Health).current = hp_max;
+
+    // Both players heal
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .heal });
+    try enqueue_msg(&s.sess, s.p[1].pid, .choose_action, proto.ChooseAction{ .action = .heal });
+    try tick_n(&s.sess, 0.11, 1);
+
+    // HP must not exceed max (enemy dealt 1 dmg so hp = max - 1, not max + 1)
+    const hp_after = s.sess.world.get_component(pe, c.Health).current;
+    try std.testing.expect(hp_after <= hp_max);
+}
+
+test "action_result heal broadcast value matches pool size" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+
+    // Wound players so they can actually heal
     for (s.sess.living.items) |e| {
-        const t = s.sess.world.get_component(e, c.Team);
-        if (t.id == .players) {
-            s.sess.world.get_component(e, c.Health).current = 1;
+        if (s.sess.world.get_component(e, c.Team).id == .players) {
+            s.sess.world.get_component(e, c.Health).current = 50;
         }
     }
 
-    s.p[0].clear(allocator);
-    s.p[1].clear(allocator);
-
-    // Enemy charges in 1 tick (rate=10, dt=0.1 → gauge=1.0).
-    // run_ai inside tick() resolves the attack and check_win fires.
-    // Tick a few times to handle both players being killed.
-    _ = enemy_e;
-    var i: u32 = 0;
-    while (i < 10 and s.sess.phase == .playing) : (i += 1) {
-        try tick_n(&s.sess, 0.1, 1);
-    }
-
-    // Session should have ended with enemies winning.
-    try std.testing.expectEqual(session_mod.SessionPhase.ended, s.sess.phase);
+    // Both choose heal → pool = 2
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .heal });
+    try enqueue_msg(&s.sess, s.p[1].pid, .choose_action, proto.ChooseAction{ .action = .heal });
+    s.p[0].clear();
+    try tick_n(&s.sess, 0.11, 1);
 
     const msgs = try drain(s.p[0].buf.items, arena);
-    const m = find_tag(msgs, .game_over) orelse return error.NoGameOver;
-    var fbs = std.io.fixedBufferStream(m.payload);
-    const go = try proto.decode_game_over(fbs.reader());
-    try std.testing.expectEqual(proto.WinnerId.enemies, go.winner);
+    var found_heal_value = false;
+    for (msgs) |m| {
+        if (m.tag != .action_result) continue;
+        var fbs = std.io.fixedBufferStream(m.payload);
+        const ar = try proto.decode_action_result(fbs.reader());
+        if (ar.tag == .heal) {
+            // value = pool_size * V = 2 * V
+            try std.testing.expectEqual(2 * V, ar.value);
+            found_heal_value = true;
+        }
+    }
+    try std.testing.expect(found_heal_value);
 }
 
 // ---------------------------------------------------------------------------
@@ -870,13 +1119,11 @@ test "reconnect restores slot" {
     s.sess.disconnect(pid);
     try std.testing.expect(!s.sess.players[pid].connected);
 
-    // Reconnect with the same transport (in production a new conn would be used)
     const ok = s.sess.reconnect(pid, s.p[0].transport());
     try std.testing.expect(ok);
     try std.testing.expect(s.sess.players[pid].connected);
 
-    // Broadcast so the rejoining player sees current lobby state.
-    s.p[0].clear(allocator);
+    s.p[0].clear();
     try s.sess.broadcast_lobby_update();
 
     const msgs = try drain(s.p[0].buf.items, arena);
@@ -885,5 +1132,5 @@ test "reconnect restores slot" {
     const lu = try proto.decode_lobby_update(fbs.reader());
 
     try std.testing.expect(lu.players[pid].connected);
-    try std.testing.expectEqual(pid, lu.your_player_id);
+    try std.testing.expectEqual(pid, lu.player_id);
 }

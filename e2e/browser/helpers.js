@@ -12,8 +12,8 @@
  */
 
 const { spawn } = require("child_process");
-const path      = require("path");
-const net       = require("net");
+const path = require("path");
+const net = require("net");
 
 const ROOT = path.resolve(__dirname, "../..");
 
@@ -50,7 +50,7 @@ exports.spawnBridge = function spawnBridge(serverPort, bridgePort) {
       env: {
         ...process.env,
         SERVER_URL: `ws://127.0.0.1:${serverPort}`,
-        PORT:       String(bridgePort),
+        PORT: String(bridgePort),
       },
       stdio: ["ignore", "pipe", "pipe"],
       cwd: ROOT,
@@ -78,7 +78,7 @@ exports.kill = function kill(proc) {
     proc.once("exit", resolve);
     proc.kill("SIGTERM");
     // Force-kill after 2 s.
-    setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 2_000);
+    setTimeout(() => { try { proc.kill("SIGKILL"); } catch { } }, 2_000);
   });
 };
 
@@ -96,7 +96,7 @@ exports.waitForPort = function waitForPort(port, timeoutMs = 5_000) {
       const sock = new net.Socket();
       sock.setTimeout(200);
       sock.once("connect", () => { sock.destroy(); resolve(); });
-      sock.once("error",   () => { sock.destroy(); retry(); });
+      sock.once("error", () => { sock.destroy(); retry(); });
       sock.once("timeout", () => { sock.destroy(); retry(); });
       sock.connect(port, "127.0.0.1");
     }
@@ -130,21 +130,21 @@ const WS = require("ws");
 class Bot {
   constructor(serverPort, name) {
     this.serverPort = serverPort;
-    this.name       = name;
-    this._ws        = null;
-    this._enemies   = [];
-    this._sentJoin  = false;
+    this.name = name;
+    this._ws = null;
+    this._enemies = [];
+    this._sentJoin = false;
     this._sentReady = false;
-    this._inGame    = false;
+    this._inGame = false;
     this._gameOverResolve = null;
-    this._gameOverReject  = null;
+    this._gameOverReject = null;
   }
 
   connect() {
     return new Promise((resolve, reject) => {
       const ws = new WS(`ws://127.0.0.1:${this.serverPort}`);
       this._ws = ws;
-      ws.once("open",  resolve);
+      ws.once("open", resolve);
       ws.once("error", reject);
       ws.on("message", (raw) => this._onMessage(Buffer.from(raw)));
     });
@@ -153,12 +153,12 @@ class Bot {
   waitForGameOver(timeoutMs = 25_000) {
     return new Promise((resolve, reject) => {
       this._gameOverResolve = resolve;
-      this._gameOverReject  = reject;
+      this._gameOverReject = reject;
       setTimeout(() => reject(new Error(`${this.name}: game_over timeout`)), timeoutMs);
     });
   }
 
-  close() { try { this._ws.close(); } catch {} }
+  close() { try { this._ws.close(); } catch { } }
 
   _send(bytes) {
     if (this._ws.readyState === WS.OPEN) this._ws.send(bytes);
@@ -190,7 +190,7 @@ class Bot {
   _onLobbyUpdate(payload) {
     if (this._inGame) return;
     let off = 0;
-    // join_code(6), player_count(1), your_player_id(1)
+    // join_code(6), player_count(1), player_id(1)
     const playerCount = payload[6];
     if (!this._sentJoin) {
       this._sendJoin();
@@ -336,7 +336,7 @@ exports.openFrameCollector = function openFrameCollector(bridgePort) {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.tag === "render") frames.push(msg);
-    } catch {}
+    } catch { }
   });
   ws.on("error", (e) => console.error("[e2e] frame collector WS error:", e.message));
   const ready = new Promise((resolve, reject) => {
@@ -346,7 +346,7 @@ exports.openFrameCollector = function openFrameCollector(bridgePort) {
   return {
     frames,
     ready,
-    close: () => { try { ws.close(); } catch {} },
+    close: () => { try { ws.close(); } catch { } },
   };
 };
 
@@ -370,7 +370,7 @@ exports.waitForFramePhase = async function waitForFramePhase(collector, phase, t
 // ---------------------------------------------------------------------------
 
 const KNOWN_CLASSES = new Set(["fighter", "mage", "healer", "grunt", "archer", "shaman", "boss"]);
-const KNOWN_TEAMS   = new Set(["players", "enemies"]);
+const KNOWN_TEAMS = new Set(["players", "enemies"]);
 
 /**
  * Assert that a render frame in lobby phase has well-formed lobby fields.

@@ -114,7 +114,7 @@ function drawLobbyGrid(lobby, ox, oy) {
 
       const key = `${col},${row}`;
       const occ = occupied[key];
-      const isOurs = occ && occ.id === lobby.our_player_id;
+      const isOurs = occ && occ.id === lobby.player_id;
       const isCursor = col === (lobby.chosen_col ?? 0) && row === (lobby.chosen_row ?? 0);
 
       // Cell background
@@ -154,17 +154,15 @@ function drawLobby(lobby) {
   const players = lobby.players || [];
   players.forEach((p, i) => {
     const y = listY + i * 36 + 20;
-    const color = p.id === lobby.our_player_id ? "rgba(255,255,100,1)" : C_TEXT;
+    const color = p.id === lobby.player_id ? "rgba(255,255,100,1)" : C_TEXT;
     const ready = p.ready ? "[READY]" : "[     ]";
     const conn = p.connected ? "" : " (disconnected)";
     text(`${p.name}  ${p.class}  ${ready}${conn}`, 60, y, 20, color);
   });
 
   const pickerY = listY + 6 * 36 + 20;
-  text("Class:  [1] Fighter   [2] Mage   [3] Healer", 60, pickerY, 18, C_TEXT);
-  text(`Selected: ${lobby.selected_class || "fighter"}`, 60, pickerY + 28, 18, C_HEADER);
   const readyLabel = lobby.ready ? "Press ENTER to un-ready" : "Press ENTER when ready";
-  text(readyLabel, 60, pickerY + 60, 18, C_TEXT);
+  text(readyLabel, 60, pickerY, 18, C_TEXT);
 
   // Position picker
   const gridX = SW - 290;
@@ -174,87 +172,79 @@ function drawLobby(lobby) {
 }
 
 function drawGrid(game, team, ox, oy) {
-  const isTargeting =
-    (team === "enemies" && game.is_our_turn && game.targeting_enemy) ||
-    (team === "players" && game.is_our_turn && !game.targeting_enemy);
-
   // Flip player columns so col 0 (front rank) renders on the right edge, facing enemies
   const colX = (col) => team === "players"
     ? ox + (2 - col) * (CELL_W + CELL_PAD)
     : ox + col * (CELL_W + CELL_PAD);
 
+  // Draw empty cells
   for (let col = 0; col < 3; col++) {
     for (let row = 0; row < 4; row++) {
-      const cx = colX(col);
-      const cy = oy + row * (CELL_H + CELL_PAD);
-      rect(cx, cy, CELL_W, CELL_H, C_CELL_EMPTY);
+      rect(colX(col), oy + row * (CELL_H + CELL_PAD), CELL_W, CELL_H, C_CELL_EMPTY);
     }
   }
 
   const entities = (game.entities || []).filter(e => e.team === team);
   for (const e of entities) {
-    const cx = colX(e.col);
-    const cy = oy + e.row * (CELL_H + CELL_PAD);
+    // Derive grid position from slot (spawn order): col = slot % 3, row = slot / 3
+    const col = e.slot % 3;
+    const row = Math.floor(e.slot / 3);
+    const cx = colX(col);
+    const cy = oy + row * (CELL_H + CELL_PAD);
 
     // Class background
     rect(cx, cy, CELL_W, CELL_H, classColor(e.class));
 
-    // Charging overlay
-    if (e.state === "charging") {
-      rect(cx, cy, CELL_W, CELL_H, C_CHARGING);
-    }
-
     // HP bar
-    const BAR_H_HP = 8;
+    const BAR_H = 8;
     const hpFrac = e.hp_max > 0 ? e.hp / e.hp_max : 0;
-    rect(cx, cy, CELL_W, BAR_H_HP, C_HP_BG);
-    rect(cx, cy, CELL_W * hpFrac, BAR_H_HP, C_HP_FILL);
+    rect(cx, cy, CELL_W, BAR_H, C_HP_BG);
+    rect(cx, cy, CELL_W * hpFrac, BAR_H, C_HP_FILL);
 
-    // ATB bar
-    const BAR_H_ATB = 6;
-    const atbY = cy + CELL_H - BAR_H_ATB;
-    const atbFrac = Math.max(0, Math.min(1, e.atb));
-    rect(cx, atbY, CELL_W, BAR_H_ATB, C_ATB_BG);
-    rect(cx, atbY, CELL_W * atbFrac, BAR_H_ATB, C_ATB_FILL);
+    // Shield bar (below HP bar, blue)
+    if (e.shield_hp > 0) {
+      const shieldFrac = Math.min(1, e.shield_hp / e.hp_max);
+      rect(cx, cy + BAR_H, CELL_W, BAR_H, "rgba(30,30,120,0.6)");
+      rect(cx, cy + BAR_H, CELL_W * shieldFrac, BAR_H, "rgba(80,160,255,0.9)");
+    }
 
     // Class abbreviation
-    text(classLabel(e.class), cx + 4, cy + 14 + 16, 16, C_TEXT);
+    text(classLabel(e.class), cx + 4, cy + 20 + 16, 16, C_TEXT);
 
     // HP number
-    text(String(e.hp), cx + 4, cy + 36 + 14, 14, C_TEXT);
+    text(String(e.hp), cx + 4, cy + 44 + 14, 14, C_TEXT);
 
     // Player-owned entity border
-    if (e.owner === game.our_player_id && team === "players") {
+    if (e.owner === game.player_id && team === "players") {
       rectStroke(cx, cy, CELL_W, CELL_H, 2, C_OWN_BORDER);
     }
-  }
-
-  // Cursor overlay
-  if (isTargeting && game.cursor) {
-    const cc = game.cursor.col;
-    const cr = game.cursor.row;
-    const cx = colX(cc);
-    const cy = oy + cr * (CELL_H + CELL_PAD);
-    rectStroke(cx, cy, CELL_W, CELL_H, 3, C_CURSOR);
   }
 }
 
 function drawActionMenu(game) {
-  const mx = SW / 2 - 120;
-  const my = SH - 130;
-  const mw = 240;
-  const mh = 110;
+  const mx = SW / 2 - 160;
+  const my = SH - 110;
+  const mw = 320;
+  const mh = 90;
 
   rect(mx, my, mw, mh, C_MENU_BG);
   rectStroke(mx, my, mw, mh, 2, C_MENU_BORDER);
 
-  text("Your Turn!", mx + 10, my + 8 + 18, 18, C_HEADER);
+  const pending = game.pending_action;
+  const dColor = pending === "damage" ? C_SEL : C_TEXT;
+  const sColor = pending === "shield" ? C_SEL : C_TEXT;
+  const hColor = pending === "heal"   ? C_SEL : C_TEXT;
+  text("[1] Damage", mx + 10,        my + 14 + 16, 16, dColor);
+  text("[2] Shield", mx + 10 + 106,  my + 14 + 16, 16, sColor);
+  text("[3] Heal",   mx + 10 + 212,  my + 14 + 16, 16, hColor);
 
-  const atkColor = game.action_selected === "attack" ? C_SEL : C_TEXT;
-  const defColor = game.action_selected === "defend" ? C_SEL : C_TEXT;
-  text("[1] Attack", mx + 10, my + 36 + 16, 16, atkColor);
-  text("[2] Defend", mx + 10, my + 60 + 16, 16, defColor);
-  text("[Enter] Confirm  [X] Cancel", mx + 10, my + 86 + 13, 13, C_TEXT);
+  // Round timer bar
+  const timerFrac = game.round_duration > 0
+    ? Math.max(0, Math.min(1, game.round_timer / game.round_duration))
+    : 0;
+  rect(mx + 10, my + 50, mw - 20, 10, "rgba(30,30,30,0.8)");
+  rect(mx + 10, my + 50, (mw - 20) * timerFrac, 10, "rgba(255,200,50,0.9)");
+  text(`Round: ${game.round_timer !== undefined ? game.round_timer.toFixed(1) : "?"}s`, mx + 10, my + 78, 13, C_TEXT);
 }
 
 function drawGame(game) {
@@ -269,9 +259,7 @@ function drawGame(game) {
   drawGrid(game, "players", PLAYER_GRID_X, PLAYER_GRID_Y);
   drawGrid(game, "enemies", ENEMY_GRID_X, ENEMY_GRID_Y);
 
-  if (game.is_our_turn) {
-    drawActionMenu(game);
-  }
+  drawActionMenu(game);
 }
 
 function drawGameOver() {

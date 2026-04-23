@@ -5,19 +5,9 @@
 //! Neither client nor server may define additional game-state components
 //! outside this file.
 
-pub const GridPos = struct {
-    col: u2, // 0–2
-    row: u2, // 0–3
-};
-
 pub const Health = struct {
     current: u16,
     max: u16,
-};
-
-pub const Speed = struct {
-    gauge: f32 = 0.0,
-    rate: f32,
 };
 
 pub const ClassTag = enum(u8) {
@@ -54,33 +44,9 @@ pub const Stats = struct {
     max_hp: u16,
 };
 
-pub const ActionStateTag = enum(u8) {
-    idle = 0, // ATB filling
-    charging = 1, // ATB full; waiting for player input (or AI decision)
-    acting = 2, // action in flight (brief window; server resolves)
-    defending = 3, // committed to defend stance; persists until next turn
+/// The action a player chooses to contribute to the shared pool each round.
+pub const ActionChoice = enum(u8) {
+    damage = 0,
+    shield = 1,
+    heal = 2,
 };
-
-pub const ActionState = struct {
-    tag: ActionStateTag = .idle,
-};
-
-pub const EffectTag = enum(u8) {
-    mitigation = 0,
-};
-
-pub const ActiveEffect = struct {
-    tag: EffectTag,
-    duration: f32,
-    magnitude: f32,
-};
-
-pub const MAX_MITIGATION: f32 = 0.75;
-
-pub const FIGHTER_DEFEND_DEPTH: u2 = 3;
-
-pub const AOE_SIZE: u2 = 2;
-
-pub const DEFEND_MITIGATION: f32 = 0.30;
-
-pub const DEFEND_DURATION_S: f32 = 4.0;

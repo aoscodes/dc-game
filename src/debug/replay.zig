@@ -142,50 +142,47 @@ pub fn player(reader: anytype) !Player(@TypeOf(reader)) {
 // ---------------------------------------------------------------------------
 
 test "replay: record then play back" {
-    const components = @import("shared").components;
     var buf: [65536]u8 = undefined;
     var fbs_w = std.io.fixedBufferStream(&buf);
 
     var rec = try recorder(fbs_w.writer());
 
-    // Build two dummy GameState frames
+    // Build two dummy GameState frames.
     var gs1 = proto.GameState{
         .tick = 1,
+        .round_timer = 3.0,
         .entity_count = 1,
         .entities = [_]proto.EntitySnapshot{std.mem.zeroes(proto.EntitySnapshot)} ** proto.MAX_ENTITIES_WIRE,
     };
     gs1.entities[0] = .{
         .entity = 0,
-        .grid_col = 1,
-        .grid_row = 0,
+        .slot = 0,
         .hp_current = 100,
         .hp_max = 100,
-        .atb_gauge = 0.5,
-        .action_state = .idle,
+        .shield_hp = 0,
         .class = .fighter,
         .team = .players,
         .owner = 0,
     };
     var gs2 = gs1;
     gs2.tick = 2;
-    gs2.entities[0].atb_gauge = 0.75;
+    gs2.round_timer = 2.0;
 
     try rec.record(gs1);
     try rec.record(gs2);
     try rec.finish();
 
-    // Play back
+    // Play back.
     var fbs_r = std.io.fixedBufferStream(fbs_w.getWritten());
     var play = try player(fbs_r.reader());
 
     const f1 = (try play.next()) orelse return error.ExpectedFrame;
     try std.testing.expectEqual(@as(u32, 1), f1.tick);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), f1.entities[0].atb_gauge, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), f1.round_timer, 0.001);
 
     const f2 = (try play.next()) orelse return error.ExpectedFrame;
     try std.testing.expectEqual(@as(u32, 2), f2.tick);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.75), f2.entities[0].atb_gauge, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), f2.round_timer, 0.001);
 
     try std.testing.expect((try play.next()) == null);
-    _ = components; // suppress unused import warning
 }

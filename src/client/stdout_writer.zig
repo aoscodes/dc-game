@@ -13,7 +13,6 @@ const c = @import("shared").components;
 const inp = @import("input.zig");
 
 /// Writer wraps stdout with a mutex so stdin-reader and game loop don't race.
-/// Uses a local stack buffer to batch writes into a single syscall per frame.
 pub const Writer = struct {
     mu: *std.Thread.Mutex,
 
@@ -26,7 +25,6 @@ pub const Writer = struct {
     ) void {
         self.mu.lock();
         defer self.mu.unlock();
-        // Stack-allocated frame buffer — large enough for all entity data.
         var frame_buf: [8192]u8 = undefined;
         var w = std.io.Writer.fixed(&frame_buf);
         write_render_inner(&w, phase, lobby, game) catch return;
@@ -54,20 +52,21 @@ pub const ClientPhaseTag = enum { connecting, lobby, game, game_over };
 
 pub const LobbyState = struct {
     update: proto.LobbyUpdate = std.mem.zeroes(proto.LobbyUpdate),
-    our_player_id: u8 = 0xFF,
-    selected_class: c.ClassTag = .fighter,
+    player_id: u8 = 0xFF,
     ready: bool = false,
-    /// Cursor position in the lobby position-picker grid (col 0–2, row 0–1).
-    chosen_pos: c.GridPos = .{ .col = 0, .row = 0 },
+    /// Cosmetic lobby position cursor (col 0–2, row 0–3).
+    chosen_pos: struct { col: u8 = 0, row: u8 = 0 } = .{},
 };
 
 pub const GameState = struct {
     snapshot: proto.GameState = std.mem.zeroes(proto.GameState),
-    our_player_id: u8 = 0xFF,
-    our_entity: u32 = std.math.maxInt(u32),
-    cursor: inp.InputState = .{},
-    targeting_enemy: bool = true,
-    action_selected: ?proto.ActionTag = null,
+    player_id: u8 = 0xFF,
+    /// The action the local player has chosen this round (overwritten on each
+    /// key press; null = not yet chosen).
+    pending_action: ?c.ActionChoice = null,
+    round_timer: f32 = 0.0,
+    /// Full duration of each round (seconds). Set once from game_start.
+    round_duration: f32 = 0.0,
     wave_label: [32]u8 = [_]u8{0} ** 32,
     wave_label_len: u8 = 0,
 };
@@ -87,10 +86,9 @@ fn write_render_inner(
     var players_buf: [proto.MAX_PLAYERS]JsonPlayer = undefined;
     for (0..lobby.update.player_count) |i| {
         const p = lobby.update.players[i];
-        const name_end = p.name_len;
         players_buf[i] = .{
             .id = p.player_id,
-            .name = p.name[0..name_end],
+            .name = p.name[0..p.name_len],
             .class = p.class,
             .ready = p.ready,
             .connected = p.connected,
@@ -104,12 +102,10 @@ fn write_render_inner(
         const e = game.snapshot.entities[i];
         entities_buf[i] = .{
             .id = e.entity,
-            .col = e.grid_col,
-            .row = e.grid_row,
+            .slot = e.slot,
             .hp = e.hp_current,
             .hp_max = e.hp_max,
-            .atb = e.atb_gauge,
-            .state = e.action_state,
+            .shield_hp = e.shield_hp,
             .class = e.class,
             .team = e.team,
             .owner = e.owner,
@@ -121,21 +117,19 @@ fn write_render_inner(
         .phase = phase,
         .lobby = if (phase == .lobby) JsonLobby{
             .join_code = lobby.update.join_code[0..jc_end],
-            .our_player_id = lobby.update.your_player_id,
-            .selected_class = lobby.selected_class,
+            .player_id = lobby.update.player_id,
             .ready = lobby.ready,
             .chosen_col = lobby.chosen_pos.col,
             .chosen_row = lobby.chosen_pos.row,
+            .round_duration = lobby.update.round_duration,
             .players = players_buf[0..lobby.update.player_count],
         } else null,
         .game = if (phase == .game) JsonGame{
             .wave = game.wave_label[0..game.wave_label_len],
-            .our_player_id = game.our_player_id,
-            .our_entity = game.our_entity,
-            .is_our_turn = game.cursor.is_our_turn,
-            .action_selected = game.action_selected,
-            .targeting_enemy = game.targeting_enemy,
-            .cursor = .{ .col = game.cursor.cursor_col, .row = game.cursor.cursor_row },
+            .player_id = game.player_id,
+            .pending_action = game.pending_action,
+            .round_timer = game.round_timer,
+            .round_duration = game.round_duration,
             .tick = game.snapshot.tick,
             .entities = entities_buf[0..game.snapshot.entity_count],
         } else null,
@@ -156,8 +150,6 @@ const JsonSendFrame = struct {
 const HexBytes = struct {
     data: []const u8,
 
-    /// Emits the bytes as a hex-encoded JSON string without buffering the
-    /// full encoded form — writes directly to the underlying writer.
     pub fn jsonStringify(self: HexBytes, jws: anytype) !void {
         try jws.beginWriteRaw();
         try jws.writer.writeByte('"');
@@ -176,11 +168,11 @@ const JsonRenderFrame = struct {
 
 const JsonLobby = struct {
     join_code: []const u8,
-    our_player_id: u8,
-    selected_class: c.ClassTag,
+    player_id: u8,
     ready: bool,
     chosen_col: u8,
     chosen_row: u8,
+    round_duration: f32,
     players: []const JsonPlayer,
 };
 
@@ -196,52 +188,21 @@ const JsonPlayer = struct {
 
 const JsonGame = struct {
     wave: []const u8,
-    our_player_id: u8,
-    our_entity: u32,
-    is_our_turn: bool,
-    action_selected: ?proto.ActionTag,
-    targeting_enemy: bool,
-    cursor: struct { col: u8, row: u8 },
+    player_id: u8,
+    pending_action: ?c.ActionChoice,
+    round_timer: f32,
+    round_duration: f32,
     tick: u32,
     entities: []const JsonEntity,
 };
 
 const JsonEntity = struct {
     id: u32,
-    col: u8,
-    row: u8,
+    slot: u8,
     hp: u16,
     hp_max: u16,
-    atb: f32,
-    state: c.ActionStateTag,
+    shield_hp: u16,
     class: c.ClassTag,
     team: c.TeamId,
     owner: u8,
-
-    /// Custom serialiser: emits `atb` as a 3-decimal-place number rather than
-    /// the full float representation that `std.json.write` would produce.
-    pub fn jsonStringify(self: JsonEntity, jws: anytype) !void {
-        try jws.beginObject();
-        try jws.objectField("id");
-        try jws.write(self.id);
-        try jws.objectField("col");
-        try jws.write(self.col);
-        try jws.objectField("row");
-        try jws.write(self.row);
-        try jws.objectField("hp");
-        try jws.write(self.hp);
-        try jws.objectField("hp_max");
-        try jws.write(self.hp_max);
-        try jws.objectField("atb");
-        try jws.print("{d:.3}", .{self.atb});
-        try jws.objectField("state");
-        try jws.write(self.state);
-        try jws.objectField("class");
-        try jws.write(self.class);
-        try jws.objectField("team");
-        try jws.write(self.team);
-        try jws.objectField("owner");
-        try jws.write(self.owner);
-        try jws.endObject();
-    }
 };

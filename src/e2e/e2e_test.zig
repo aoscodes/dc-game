@@ -211,8 +211,7 @@ fn run_bot_inner(ctx: *BotCtx) !void {
             .game_state => {
                 // Decode the entity snapshot and collect living enemy IDs.
                 var fbs = std.io.fixedBufferStream(payload);
-                const r = fbs.reader();
-                const gs = proto.decode_game_state(r) catch continue;
+                const gs = proto.decode_game_state(fbs.reader()) catch continue;
                 enemy_count = 0;
                 var i: u8 = 0;
                 while (i < gs.entity_count) : (i += 1) {
@@ -224,17 +223,11 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                         }
                     }
                 }
-            },
-
-            .your_turn => {
-                // It's our turn — attack the first living enemy.
-                var fbs = std.io.fixedBufferStream(payload);
-                const yt = proto.decode_your_turn(fbs.reader()) catch continue;
-                _ = yt; // entity ID of our character; not needed for attack
-
-                const target: u32 = if (enemy_count > 0) enemies[0] else 0;
-                std.debug.print("[e2e] {s} acting → attack entity {}\n", .{ ctx.name, target });
-                try send_choose_action(&client, .attack, target);
+                // Bots always choose damage each round.
+                if (in_game and enemy_count > 0) {
+                    std.debug.print("[e2e] {s} submitting damage action\n", .{ctx.name});
+                    try send_choose_action(&client, .damage);
+                }
             },
 
             .action_result => {
@@ -289,13 +282,10 @@ fn send_ready_up(client: *ws.Client) !void {
     try client.writeBin(fbs.getWritten());
 }
 
-fn send_choose_action(client: *ws.Client, action: proto.ActionTag, target: u32) !void {
-    var buf: [16]u8 = undefined;
+fn send_choose_action(client: *ws.Client, action: shared.components.ActionChoice) !void {
+    var buf: [4]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    try proto.encode(fbs.writer(), .choose_action, proto.ChooseAction{
-        .action = action,
-        .target_entity = target,
-    });
+    try proto.encode(fbs.writer(), .choose_action, proto.ChooseAction{ .action = action });
     try client.writeBin(fbs.getWritten());
 }
 

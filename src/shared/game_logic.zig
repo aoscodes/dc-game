@@ -1,78 +1,21 @@
-//! Pure game logic: combat math, grid queries, ATB rules.
+//! Pure game logic: combat math and round resolution.
 //!
 //! All functions are stateless and take component values by value or pointer.
-//! No ECS World import here — callers pass in the data they need.  This keeps
-//! the logic testable without a full World instance.
+//! No ECS World import here — callers pass in the data they need.
 
 const std = @import("std");
 const c = @import("components.zig");
 
-pub const GRID_COLS: u8 = 3;
-pub const GRID_ROWS: u8 = 4;
+/// Default round duration in seconds. Overridden per-session via lobby config.
+pub const ROUND_DURATION_DEFAULT_S: f32 = 3.0;
 
-pub fn grid_valid(col: u8, row: u8) bool {
-    return col < GRID_COLS and row < GRID_ROWS;
-}
+/// Effect value of a single player action contribution (damage dealt,
+/// shield HP granted, or HP healed).
+pub const ACTION_EFFECT_VALUE: u16 = 10;
 
-pub fn aoe_cells_2x2(
-    col: u8,
-    row: u8,
-    out: *[4]c.GridPos,
-) u8 {
-    var n: u8 = 0;
-    var dc: u8 = 0;
-    while (dc < c.AOE_SIZE) : (dc += 1) {
-        var dr: u8 = 0;
-        while (dr < c.AOE_SIZE) : (dr += 1) {
-            const gc = col + dc;
-            const gr = row + dr;
-            if (grid_valid(gc, gr)) {
-                out[n] = .{ .col = @intCast(gc), .row = @intCast(gr) };
-                n += 1;
-            }
-        }
-    }
-    return n;
-}
-
-pub fn fighter_defend_cells(
-    col: u8,
-    row: u8,
-    out: *[3]c.GridPos,
-) u8 {
-    var n: u8 = 0;
-    var d: u8 = 1;
-    while (d <= c.FIGHTER_DEFEND_DEPTH) : (d += 1) {
-        const gr = row + d;
-        if (grid_valid(col, gr)) {
-            out[n] = .{ .col = @intCast(col), .row = @intCast(gr) };
-            n += 1;
-        }
-    }
-    return n;
-}
-
-/// Manhattan distance between two grid cells.
-pub fn grid_distance(a: c.GridPos, b: c.GridPos) u8 {
-    const ac: u8 = a.col;
-    const bc: u8 = b.col;
-    const ar: u8 = a.row;
-    const br: u8 = b.row;
-    const dc: u8 = if (ac > bc) ac - bc else bc - ac;
-    const dr: u8 = if (ar > br) ar - br else br - ar;
-    return dc + dr;
-}
-
-pub fn raw_damage(attack: u16, defense: u16) u16 {
-    return if (attack > defense) attack - defense else 1;
-}
-
-pub fn mitigated_damage(raw: u16, total_mitigation: f32) u16 {
-    const clamped = std.math.clamp(total_mitigation, 0.0, c.MAX_MITIGATION);
-    const reduced = @as(f32, @floatFromInt(raw)) * (1.0 - clamped);
-    const result: u16 = @intFromFloat(@floor(reduced));
-    return if (result == 0) 1 else result;
-}
+// ---------------------------------------------------------------------------
+// Core health mutations
+// ---------------------------------------------------------------------------
 
 pub fn apply_damage(health: *c.Health, damage: u16) void {
     health.current = if (health.current > damage) health.current - damage else 0;
@@ -87,60 +30,77 @@ pub fn is_dead(health: c.Health) bool {
     return health.current == 0;
 }
 
-pub fn tick_atb(speed: *c.Speed, dt: f32) bool {
-    if (speed.gauge >= 1.0) return false; // already full; don't double-fire
-    speed.gauge = @min(speed.gauge + speed.rate * dt, 1.0);
-    return speed.gauge >= 1.0;
-}
+// ---------------------------------------------------------------------------
+// Pool resolution — player action pools applied at round end
+// ---------------------------------------------------------------------------
 
-pub fn reset_atb(speed: *c.Speed) void {
-    speed.gauge = 0.0;
-}
-
-pub fn tick_effects(effects: []c.ActiveEffect, dt: f32) usize {
-    var i: usize = 0;
-    var len: usize = effects.len;
-    while (i < len) {
-        effects[i].duration -= dt;
-        if (effects[i].duration <= 0.0) {
-            effects[i] = effects[len - 1];
-            len -= 1;
-        } else {
-            i += 1;
-        }
-    }
-    return len;
-}
-
-pub fn sum_mitigation(effects: []const c.ActiveEffect) f32 {
-    var total: f32 = 0.0;
-    for (effects) |eff| {
-        if (eff.tag == .mitigation) total += eff.magnitude;
-    }
+/// Apply accumulated damage pool to a single target's health.
+/// Returns actual damage dealt (after shield absorption).
+/// `shield_hp` is modified in place; overflow hits `health`.
+pub fn resolve_damage_pool(
+    health: *c.Health,
+    shield_hp: *u16,
+    pool_size: u16,
+) u16 {
+    const total = pool_size * ACTION_EFFECT_VALUE;
+    if (total == 0) return 0;
+    const absorbed = @min(shield_hp.*, total);
+    shield_hp.* -= absorbed;
+    const remaining = total - absorbed;
+    apply_damage(health, remaining);
     return total;
 }
 
-test "raw_damage: normal" {
-    try std.testing.expectEqual(@as(u16, 5), raw_damage(15, 10));
+/// Grant flat shield HP to a single entity from the shield pool.
+pub fn resolve_shield_pool(shield_hp: *u16, pool_size: u16) void {
+    shield_hp.* +|= pool_size * ACTION_EFFECT_VALUE;
 }
 
-test "raw_damage: floored at 1" {
-    try std.testing.expectEqual(@as(u16, 1), raw_damage(5, 20));
-    try std.testing.expectEqual(@as(u16, 1), raw_damage(10, 10));
+/// Apply heal pool to a single entity's health.
+pub fn resolve_heal_pool(health: *c.Health, pool_size: u16) void {
+    apply_heal(health, pool_size * ACTION_EFFECT_VALUE);
 }
 
-test "mitigated_damage: 30% reduction" {
-    try std.testing.expectEqual(@as(u16, 14), mitigated_damage(20, 0.30));
+// ---------------------------------------------------------------------------
+// Enemy intent abstraction
+//
+// `EnemyIntent` is the authoritative description of what the enemy side does
+// each round.  Callers use only this struct — never raw enemy counts — so
+// future AI extensions only need to change `compute_enemy_intent`.
+// ---------------------------------------------------------------------------
+
+pub const EnemyIntent = struct {
+    /// Total damage dealt to each living player this round.
+    damage_per_player: u16,
+};
+
+/// Compute the enemy intent for the current round.
+///
+/// Each living enemy deals exactly 1 damage per player, so
+/// `damage_per_player = living_enemy_count`.
+pub fn compute_enemy_intent(living_enemy_count: u16) EnemyIntent {
+    return .{ .damage_per_player = living_enemy_count };
 }
 
-test "mitigated_damage: capped at MAX_MITIGATION" {
-    const dmg = mitigated_damage(100, 0.99);
-    try std.testing.expectEqual(@as(u16, 25), dmg);
+/// Apply enemy intent damage to a single player, absorbing from shield first.
+/// Returns the raw HP damage that landed (post-shield).
+pub fn apply_enemy_intent(
+    health: *c.Health,
+    shield_hp: *u16,
+    intent: EnemyIntent,
+) u16 {
+    const total = intent.damage_per_player;
+    if (total == 0) return 0;
+    const absorbed = @min(shield_hp.*, total);
+    shield_hp.* -= absorbed;
+    const remaining = total - absorbed;
+    apply_damage(health, remaining);
+    return remaining;
 }
 
-test "mitigated_damage: floor at 1" {
-    try std.testing.expectEqual(@as(u16, 1), mitigated_damage(1, 0.30));
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 test "apply_damage: no underflow" {
     var h = c.Health{ .current = 5, .max = 100 };
@@ -154,35 +114,105 @@ test "apply_heal: no overflow" {
     try std.testing.expectEqual(@as(u16, 100), h.current);
 }
 
-test "tick_atb: fires exactly once" {
-    var s = c.Speed{ .gauge = 0.0, .rate = 1.0 };
-    try std.testing.expect(tick_atb(&s, 1.0)); // gauge → 1.0, fires
-    try std.testing.expect(!tick_atb(&s, 1.0)); // already full, no re-fire
+test "resolve_damage_pool: no shield" {
+    // pool=1 deals ACTION_EFFECT_VALUE total; all hits hp
+    const V = ACTION_EFFECT_VALUE;
+    var h = c.Health{ .current = V * 10, .max = V * 10 };
+    var shield: u16 = 0;
+    const dealt = resolve_damage_pool(&h, &shield, 1);
+    try std.testing.expectEqual(V, dealt);
+    try std.testing.expectEqual(V * 9, h.current);
+    try std.testing.expectEqual(@as(u16, 0), shield);
 }
 
-test "aoe_cells_2x2: centre of grid" {
-    var out: [4]c.GridPos = undefined;
-    const n = aoe_cells_2x2(1, 1, &out);
-    try std.testing.expectEqual(@as(u8, 4), n);
+test "resolve_damage_pool: shield fully absorbs" {
+    // pool=1, shield >= V: hp untouched, shield reduced by V
+    const V = ACTION_EFFECT_VALUE;
+    var h = c.Health{ .current = V * 10, .max = V * 10 };
+    var shield: u16 = V + 5;
+    const dealt = resolve_damage_pool(&h, &shield, 1);
+    try std.testing.expectEqual(V, dealt);
+    try std.testing.expectEqual(V * 10, h.current); // hp untouched
+    try std.testing.expectEqual(@as(u16, 5), shield); // only excess remains
 }
 
-test "aoe_cells_2x2: corner clips" {
-    var out: [4]c.GridPos = undefined;
-    const n = aoe_cells_2x2(2, 3, &out); // col 2+1 and row 3+1 both OOB
-    try std.testing.expectEqual(@as(u8, 1), n);
+test "resolve_damage_pool: shield partially absorbs" {
+    // pool=2, shield=V/2 (round down): shield absorbs V/2, rest hits hp
+    const V = ACTION_EFFECT_VALUE;
+    const partial: u16 = V / 2;
+    var h = c.Health{ .current = V * 10, .max = V * 10 };
+    var shield: u16 = partial;
+    const total = 2 * V;
+    const dealt = resolve_damage_pool(&h, &shield, 2);
+    try std.testing.expectEqual(total, dealt);
+    try std.testing.expectEqual(V * 10 - (total - partial), h.current);
+    try std.testing.expectEqual(@as(u16, 0), shield);
 }
 
-test "fighter_defend_cells: front rank" {
-    var out: [3]c.GridPos = undefined;
-    const n = fighter_defend_cells(1, 0, &out);
-    try std.testing.expectEqual(@as(u8, 3), n);
-    try std.testing.expectEqual(c.GridPos{ .col = 1, .row = 1 }, out[0]);
-    try std.testing.expectEqual(c.GridPos{ .col = 1, .row = 2 }, out[1]);
-    try std.testing.expectEqual(c.GridPos{ .col = 1, .row = 3 }, out[2]);
+test "resolve_shield_pool: grants shield" {
+    // pool=1 grants ACTION_EFFECT_VALUE shield HP
+    const V = ACTION_EFFECT_VALUE;
+    var shield: u16 = 3;
+    resolve_shield_pool(&shield, 1);
+    try std.testing.expectEqual(@as(u16, 3 + V), shield);
 }
 
-test "fighter_defend_cells: back rank clips" {
-    var out: [3]c.GridPos = undefined;
-    const n = fighter_defend_cells(0, 3, &out); // row 3 is last; no rows behind
-    try std.testing.expectEqual(@as(u8, 0), n);
+test "resolve_heal_pool: heals" {
+    // pool=1 heals ACTION_EFFECT_VALUE HP
+    const V = ACTION_EFFECT_VALUE;
+    var h = c.Health{ .current = 5, .max = V * 10 };
+    resolve_heal_pool(&h, 1);
+    try std.testing.expectEqual(@as(u16, 5 + V), h.current);
+}
+
+test "compute_enemy_intent: 1 dmg per living enemy" {
+    const intent = compute_enemy_intent(42);
+    try std.testing.expectEqual(@as(u16, 42), intent.damage_per_player);
+}
+
+test "apply_enemy_intent: shield absorbs first" {
+    // intent deals 15 damage; 7 shield absorbs first → 8 hp damage
+    var h = c.Health{ .current = 100, .max = 100 };
+    var shield: u16 = 7;
+    const intent = EnemyIntent{ .damage_per_player = 15 };
+    const hp_dmg = apply_enemy_intent(&h, &shield, intent);
+    try std.testing.expectEqual(@as(u16, 8), hp_dmg);
+    try std.testing.expectEqual(@as(u16, 92), h.current);
+    try std.testing.expectEqual(@as(u16, 0), shield);
+}
+
+test "resolve_damage_pool: zero pool — no change" {
+    var h = c.Health{ .current = 10, .max = 10 };
+    var shield: u16 = 3;
+    const dealt = resolve_damage_pool(&h, &shield, 0);
+    try std.testing.expectEqual(@as(u16, 0), dealt);
+    try std.testing.expectEqual(@as(u16, 10), h.current);
+    try std.testing.expectEqual(@as(u16, 3), shield);
+}
+
+test "resolve_shield_pool: saturation — no overflow past maxInt(u16)" {
+    var shield: u16 = std.math.maxInt(u16) - 2;
+    resolve_shield_pool(&shield, 5); // would overflow without saturating add
+    try std.testing.expectEqual(@as(u16, std.math.maxInt(u16)), shield);
+}
+
+test "apply_enemy_intent: zero damage — no change" {
+    var h = c.Health{ .current = 8, .max = 10 };
+    var shield: u16 = 4;
+    const intent = EnemyIntent{ .damage_per_player = 0 };
+    const hp_dmg = apply_enemy_intent(&h, &shield, intent);
+    try std.testing.expectEqual(@as(u16, 0), hp_dmg);
+    try std.testing.expectEqual(@as(u16, 8), h.current);
+    try std.testing.expectEqual(@as(u16, 4), shield);
+}
+
+test "resolve_heal_pool: at max HP — no overflow" {
+    var h = c.Health{ .current = 100, .max = 100 };
+    resolve_heal_pool(&h, 10);
+    try std.testing.expectEqual(@as(u16, 100), h.current);
+}
+
+test "compute_enemy_intent: zero enemies — zero damage" {
+    const intent = compute_enemy_intent(0);
+    try std.testing.expectEqual(@as(u16, 0), intent.damage_per_player);
 }
