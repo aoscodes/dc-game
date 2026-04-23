@@ -24,41 +24,76 @@ const KEY_PREFIX = "KEY:";
 const RENDER_HZ: u64 = 60;
 const TICK_NS: u64 = std.time.ns_per_s / RENDER_HZ;
 
+/// Lock-protected, length-prefixed ring-buffer message queue.
+///
+/// Each enqueued message is stored as [u16-le length][payload bytes].
+/// `head` and `tail` are byte offsets into `buf` that wrap at `buf.len`.
+/// Invariant: `used() == (tail - head + buf.len) % buf.len`.
 const MsgQueue = struct {
     buf: [16384]u8 = undefined,
-    len: usize = 0,
+    head: usize = 0,
+    tail: usize = 0,
     mu: std.Thread.Mutex = .{},
+
+    fn used(self: *const MsgQueue) usize {
+        return (self.tail + self.buf.len - self.head) % self.buf.len;
+    }
+
+    fn free(self: *const MsgQueue) usize {
+        // One slot kept empty to distinguish full from empty.
+        return self.buf.len - 1 - self.used();
+    }
 
     fn push(self: *MsgQueue, data: []const u8) void {
         if (data.len > 0xFFFF) return;
         self.mu.lock();
         defer self.mu.unlock();
         const needed = 2 + data.len;
-        if (self.len + needed > self.buf.len) {
+        if (needed > self.free()) {
             std.log.warn("msg queue full, dropping {} bytes", .{data.len});
             return;
         }
-        self.buf[self.len] = @intCast(data.len & 0xFF);
-        self.buf[self.len + 1] = @intCast(data.len >> 8);
-        @memcpy(self.buf[self.len + 2 .. self.len + 2 + data.len], data);
-        self.len += needed;
+        // Write 2-byte little-endian length header.
+        self.write_byte(@intCast(data.len & 0xFF));
+        self.write_byte(@intCast(data.len >> 8));
+        for (data) |b| self.write_byte(b);
     }
 
     fn pop(self: *MsgQueue, out: []u8) ?[]u8 {
         self.mu.lock();
         defer self.mu.unlock();
-        if (self.len < 2) return null;
-        const msg_len: usize = @as(usize, self.buf[0]) | (@as(usize, self.buf[1]) << 8);
-        if (self.len < 2 + msg_len) return null;
+        if (self.used() < 2) return null;
+        const lo = self.peek_byte(0);
+        const hi = self.peek_byte(1);
+        const msg_len: usize = @as(usize, lo) | (@as(usize, hi) << 8);
+        if (self.used() < 2 + msg_len) return null;
+        // Advance past the length header.
+        self.head = (self.head + 2) % self.buf.len;
         if (msg_len > out.len) {
-            std.mem.copyForwards(u8, self.buf[0..], self.buf[2 + msg_len .. self.len]);
-            self.len -= 2 + msg_len;
+            // Message too large for caller's buffer — discard and warn.
+            std.log.warn("msg queue: message {} bytes too large for scratch, discarding", .{msg_len});
+            self.head = (self.head + msg_len) % self.buf.len;
             return null;
         }
-        @memcpy(out[0..msg_len], self.buf[2 .. 2 + msg_len]);
-        std.mem.copyForwards(u8, self.buf[0..], self.buf[2 + msg_len .. self.len]);
-        self.len -= 2 + msg_len;
+        for (out[0..msg_len]) |*b| {
+            b.* = self.read_byte();
+        }
         return out[0..msg_len];
+    }
+
+    inline fn write_byte(self: *MsgQueue, b: u8) void {
+        self.buf[self.tail] = b;
+        self.tail = (self.tail + 1) % self.buf.len;
+    }
+
+    inline fn read_byte(self: *MsgQueue) u8 {
+        const b = self.buf[self.head];
+        self.head = (self.head + 1) % self.buf.len;
+        return b;
+    }
+
+    inline fn peek_byte(self: *const MsgQueue, offset: usize) u8 {
+        return self.buf[(self.head + offset) % self.buf.len];
     }
 };
 
@@ -217,7 +252,8 @@ fn process_recv() void {
                 g_state.game.round_timer = p.round_timer;
             },
             .game_over => {
-                _ = proto.decode_game_over(r) catch continue;
+                const p = proto.decode_game_over(r) catch continue;
+                g_state.game.winner = p.winner;
                 g_state.phase = .game_over;
             },
             .action_result => {

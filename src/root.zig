@@ -370,5 +370,11 @@ pub fn World(
             }
             @compileError("System not in World: " ++ @typeName(S));
         }
+
+        /// Public comptime accessor for the index of system S.
+        /// Use to address `system_entity_sets` without going through `each`.
+        pub fn system_index_of(comptime S: type) usize {
+            return comptime system_index(S);
+        }
     };
 }

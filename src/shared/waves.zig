@@ -11,11 +11,14 @@
 const components = @import("components.zig");
 const ClassTag = components.ClassTag;
 
+/// Per-field overrides for a spawned entity's stats.  Null = use class default.
+/// Using optionals avoids the zero-sentinel bug where explicitly setting a
+/// stat to 0 would be indistinguishable from "not overridden".
 pub const StatOverride = struct {
-    attack: u16 = 0,
-    defense: u16 = 0,
-    speed_base: f32 = 0.0,
-    max_hp: u16 = 0,
+    attack: ?u16 = null,
+    defense: ?u16 = null,
+    speed_base: ?f32 = null,
+    max_hp: ?u16 = null,
 };
 
 pub const SpawnEntry = struct {
@@ -53,10 +56,10 @@ pub fn class_defaults(tag: ClassTag) DefaultStats {
 pub fn resolve_stats(class: ClassTag, override: StatOverride) DefaultStats {
     const d = class_defaults(class);
     return .{
-        .attack = if (override.attack != 0) override.attack else d.attack,
-        .defense = if (override.defense != 0) override.defense else d.defense,
-        .speed_base = if (override.speed_base != 0.0) override.speed_base else d.speed_base,
-        .max_hp = if (override.max_hp != 0) override.max_hp else d.max_hp,
+        .attack = override.attack orelse d.attack,
+        .defense = override.defense orelse d.defense,
+        .speed_base = override.speed_base orelse d.speed_base,
+        .max_hp = override.max_hp orelse d.max_hp,
     };
 }
 

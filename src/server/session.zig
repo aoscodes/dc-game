@@ -5,6 +5,17 @@
 //!   - The per-player connection transports
 //!   - The state machine (lobby → playing → ended)
 //!
+//! ## ECS layout
+//!
+//! Components: Health, Shield, Class, Team, Owner
+//! Systems:
+//!   - PlayerTeam  — tracks every living entity whose Team.id == .players
+//!   - EnemyTeam   — tracks every living entity whose Team.id == .enemies
+//!
+//! System signatures are set at world-init time in `start_game_wave`.
+//! Entities are added/removed from system sets automatically by the world
+//! when components are added/removed.
+//!
 //! ## Round-based game loop
 //!
 //! All actors share a single countdown timer (`round_timer`).  During each
@@ -35,15 +46,34 @@ const ws_server = @import("net/ws_server.zig");
 /// Zones measured by the per-session tick profiler.
 pub const TickZones = enum { drain, round, broadcast, check_win };
 
+// ---------------------------------------------------------------------------
+// ECS system marker types
+//
+// A "system" in this ECS is a plain struct whose presence in World(...)
+// causes a DynamicBitSet to be maintained for all matching entities.
+// The struct itself carries no state; the World owns the entity set.
+// ---------------------------------------------------------------------------
+
+/// Tracks all living entities belonging to the players team.
+pub const PlayerTeam = struct {};
+
+/// Tracks all living entities belonging to the enemies team.
+pub const EnemyTeam = struct {};
+
 pub const GameWorld = ecs.World(
     .{
         .health = c.Health,
+        .shield = c.Shield,
         .class = c.Class,
         .team = c.Team,
         .owner = c.Owner,
-        .stats = c.Stats,
+        .player_marker = c.PlayerMarker,
+        .enemy_marker = c.EnemyMarker,
     },
-    .{},
+    .{
+        .player_team = PlayerTeam,
+        .enemy_team = EnemyTeam,
+    },
 );
 
 pub const MAX_PLAYERS = proto.MAX_PLAYERS;
@@ -78,12 +108,8 @@ pub const Session = struct {
     phase: SessionPhase = .lobby,
     world: GameWorld,
 
-    /// Per-entity shield HP (flat damage absorption). Indexed by ECS entity ID.
-    shield: [ecs.MAX_ENTITIES]u16,
-
     tick_count: u32 = 0,
     current_wave: ?*const waves.Wave = null,
-    living: std.ArrayListUnmanaged(ecs.Entity) = .empty,
 
     /// Countdown timer for the current round (seconds remaining).
     round_timer: f32 = logic.ROUND_DURATION_DEFAULT_S,
@@ -116,19 +142,20 @@ pub const Session = struct {
                 .allocator = allocator,
             };
         }
+        var world = try GameWorld.init(allocator);
+        // System signatures set once here; maintained automatically by world.
+        set_world_system_signatures(&world);
         return Session{
             .allocator = allocator,
             .join_code = join_code,
             .players = players,
-            .world = try GameWorld.init(allocator),
-            .shield = [_]u16{0} ** ecs.MAX_ENTITIES,
+            .world = world,
             .action_pool = [_]?c.ActionChoice{null} ** MAX_PLAYERS,
         };
     }
 
     pub fn deinit(self: *Session) void {
         self.world.deinit();
-        self.living.deinit(self.allocator);
         for (&self.players) |*p| {
             p.queue_lock.lock();
             p.msg_queue.deinit(p.allocator);
@@ -207,10 +234,9 @@ pub const Session = struct {
 
     pub fn start_game_wave(self: *Session, wave: *const waves.Wave) !void {
         // Destroy all entities from any previous game so state is clean.
-        self.living.clearRetainingCapacity();
         self.world.deinit();
         self.world = try GameWorld.init(self.allocator);
-        @memset(&self.shield, 0);
+        set_world_system_signatures(&self.world);
         for (&self.action_pool) |*a| a.* = null;
         self.tick_count = 0;
 
@@ -223,45 +249,30 @@ pub const Session = struct {
     }
 
     fn spawn_players(self: *Session) !void {
-        var slot_idx: u8 = 0;
         for (&self.players) |*p| {
             if (!p.occupied or !p.connected) continue;
             const d = waves.class_defaults(p.class);
             const e = self.world.create_entity();
             p.entity = e;
             self.world.add_component(e, c.Health{ .current = d.max_hp, .max = d.max_hp });
+            self.world.add_component(e, c.Shield{ .hp = 0 });
             self.world.add_component(e, c.Class{ .tag = p.class });
             self.world.add_component(e, c.Team{ .id = .players });
             self.world.add_component(e, c.Owner{ .player_id = p.player_id });
-            self.world.add_component(e, c.Stats{
-                .attack = d.attack,
-                .defense = d.defense,
-                .speed_base = d.speed_base,
-                .max_hp = d.max_hp,
-            });
-            self.shield[e] = 0;
-            try self.living.append(self.allocator, e);
-            slot_idx += 1;
+            self.world.add_component(e, c.PlayerMarker{});
         }
     }
 
     fn spawn_wave(self: *Session, wave: *const waves.Wave) !void {
         std.log.info("spawning wave: {s} ({} enemies)", .{ wave.label, wave.entries.len });
-        for (wave.entries, 0..) |entry, i| {
+        for (wave.entries) |entry| {
             const d = waves.resolve_stats(entry.class, entry.stats);
             const e = self.world.create_entity();
             self.world.add_component(e, c.Health{ .current = d.max_hp, .max = d.max_hp });
+            self.world.add_component(e, c.Shield{ .hp = 0 });
             self.world.add_component(e, c.Class{ .tag = entry.class });
             self.world.add_component(e, c.Team{ .id = .enemies });
-            self.world.add_component(e, c.Stats{
-                .attack = d.attack,
-                .defense = d.defense,
-                .speed_base = d.speed_base,
-                .max_hp = d.max_hp,
-            });
-            self.shield[e] = 0;
-            try self.living.append(self.allocator, e);
-            _ = i; // slot index unused for enemies (no owner component)
+            self.world.add_component(e, c.EnemyMarker{});
         }
     }
 
@@ -413,22 +424,27 @@ pub const Session = struct {
         }
         std.log.info("round resolve — dmg={} shld={} heal={}", .{ damage_pool, shield_pool, heal_pool });
 
-        // Collect living enemies and players (snapshot to avoid mutation during iteration).
+        // Snapshot living entity IDs into stack buffers before any mutation.
         var enemy_buf: [64]ecs.Entity = undefined;
         var player_buf: [MAX_PLAYERS]ecs.Entity = undefined;
         var n_enemies: usize = 0;
         var n_players: usize = 0;
-        for (self.living.items) |e| {
-            const team = self.world.get_component(e, c.Team);
-            switch (team.id) {
-                .enemies => if (n_enemies < enemy_buf.len) {
-                    enemy_buf[n_enemies] = e;
+        {
+            var it = self.world.system_entity_sets[comptime GameWorld.system_index_of(EnemyTeam)].iterator(.{});
+            while (it.next()) |u| {
+                if (n_enemies < enemy_buf.len) {
+                    enemy_buf[n_enemies] = @intCast(u);
                     n_enemies += 1;
-                },
-                .players => if (n_players < player_buf.len) {
-                    player_buf[n_players] = e;
+                }
+            }
+        }
+        {
+            var it = self.world.system_entity_sets[comptime GameWorld.system_index_of(PlayerTeam)].iterator(.{});
+            while (it.next()) |u| {
+                if (n_players < player_buf.len) {
+                    player_buf[n_players] = @intCast(u);
                     n_players += 1;
-                },
+                }
             }
         }
 
@@ -436,7 +452,8 @@ pub const Session = struct {
         if (damage_pool > 0) {
             for (enemy_buf[0..n_enemies]) |e| {
                 const hp = self.world.get_component(e, c.Health);
-                const dealt = logic.resolve_damage_pool(hp, &self.shield[e], damage_pool);
+                const sh = self.world.get_component(e, c.Shield);
+                const dealt = logic.resolve_damage_pool(hp, sh, damage_pool);
                 try self.broadcast_action_result(.{
                     .tag = .damage,
                     .actor_entity = std.math.maxInt(u32),
@@ -445,7 +462,7 @@ pub const Session = struct {
                 });
                 if (logic.is_dead(hp.*)) {
                     std.log.info("enemy entity {} killed by damage pool", .{e});
-                    try self.kill_entity(e);
+                    self.kill_entity(e);
                     try self.broadcast_action_result(.{
                         .tag = .death,
                         .actor_entity = std.math.maxInt(u32),
@@ -456,11 +473,12 @@ pub const Session = struct {
             }
         }
 
-        // 2. Shield pool → each living player.
+        // 2. Shield pool → each still-living player.
         if (shield_pool > 0) {
             for (player_buf[0..n_players]) |e| {
-                if (self.find_living(e) == null) continue;
-                logic.resolve_shield_pool(&self.shield[e], shield_pool);
+                if (!self.entity_is_alive(e)) continue;
+                const sh = self.world.get_component(e, c.Shield);
+                logic.resolve_shield_pool(sh, shield_pool);
                 try self.broadcast_action_result(.{
                     .tag = .shield,
                     .actor_entity = std.math.maxInt(u32),
@@ -470,10 +488,10 @@ pub const Session = struct {
             }
         }
 
-        // 3. Heal pool → each living player.
+        // 3. Heal pool → each still-living player.
         if (heal_pool > 0) {
             for (player_buf[0..n_players]) |e| {
-                if (self.find_living(e) == null) continue;
+                if (!self.entity_is_alive(e)) continue;
                 const hp = self.world.get_component(e, c.Health);
                 logic.resolve_heal_pool(hp, heal_pool);
                 try self.broadcast_action_result(.{
@@ -485,21 +503,21 @@ pub const Session = struct {
             }
         }
 
-        // 4. Enemy intent → each living player.
+        // 4. Enemy intent → each still-living player.
         // Each living enemy deals 1 damage per player per round.
         const living_enemy_count: u16 = blk: {
             var count: u16 = 0;
-            for (self.living.items) |e| {
-                if (self.world.get_component(e, c.Team).id == .enemies) count += 1;
-            }
+            var it = self.world.system_entity_sets[comptime GameWorld.system_index_of(EnemyTeam)].iterator(.{});
+            while (it.next()) |_| count += 1;
             break :blk count;
         };
         if (living_enemy_count > 0) {
             const intent = logic.compute_enemy_intent(living_enemy_count);
             for (player_buf[0..n_players]) |e| {
-                if (self.find_living(e) == null) continue;
+                if (!self.entity_is_alive(e)) continue;
                 const hp = self.world.get_component(e, c.Health);
-                const hp_dmg = logic.apply_enemy_intent(hp, &self.shield[e], intent);
+                const sh = self.world.get_component(e, c.Shield);
+                const hp_dmg = logic.apply_enemy_intent(hp, sh, intent);
                 if (hp_dmg > 0) {
                     try self.broadcast_action_result(.{
                         .tag = .damage,
@@ -510,7 +528,7 @@ pub const Session = struct {
                 }
                 if (logic.is_dead(hp.*)) {
                     std.log.info("player entity {} killed by enemies", .{e});
-                    try self.kill_entity(e);
+                    self.kill_entity(e);
                     try self.broadcast_action_result(.{
                         .tag = .death,
                         .actor_entity = std.math.maxInt(u32),
@@ -522,34 +540,21 @@ pub const Session = struct {
         }
     }
 
-    fn find_living(self: *Session, entity: ecs.Entity) ?ecs.Entity {
-        for (self.living.items) |e| {
-            if (e == entity) return e;
-        }
-        return null;
+    /// Returns true if `entity` is tracked by a team system (i.e. still alive).
+    fn entity_is_alive(self: *const Session, entity: ecs.Entity) bool {
+        return self.world.system_entity_sets[comptime GameWorld.system_index_of(PlayerTeam)].isSet(entity) or
+            self.world.system_entity_sets[comptime GameWorld.system_index_of(EnemyTeam)].isSet(entity);
     }
 
-    fn kill_entity(self: *Session, entity: ecs.Entity) !void {
-        for (self.living.items, 0..) |e, i| {
-            if (e == entity) {
-                _ = self.living.swapRemove(i);
-                break;
-            }
-        }
-        self.shield[entity] = 0;
+    fn kill_entity(self: *Session, entity: ecs.Entity) void {
         self.world.destroy_entity(entity);
     }
 
     fn check_win(self: *Session) !void {
-        var players_alive: u8 = 0;
-        var enemies_alive: u8 = 0;
-        for (self.living.items) |e| {
-            const t = self.world.get_component(e, c.Team);
-            switch (t.id) {
-                .players => players_alive += 1,
-                .enemies => enemies_alive += 1,
-            }
-        }
+        const pi = comptime GameWorld.system_index_of(PlayerTeam);
+        const ei = comptime GameWorld.system_index_of(EnemyTeam);
+        const players_alive = self.world.system_entity_sets[pi].count();
+        const enemies_alive = self.world.system_entity_sets[ei].count();
 
         if (enemies_alive == 0) {
             if (self.current_wave) |wave| {
@@ -645,9 +650,12 @@ pub const Session = struct {
             .entities = [_]proto.EntitySnapshot{std.mem.zeroes(proto.EntitySnapshot)} ** proto.MAX_ENTITIES_WIRE,
         };
 
-        for (self.living.items, 0..) |e, slot_idx| {
+        // Iterate all component arrays directly — both teams.
+        const health_arr = &self.world.component_arrays.health;
+        for (health_arr.index_to_entity[0..health_arr.size]) |e| {
             if (snap.entity_count >= proto.MAX_ENTITIES_WIRE) break;
             const hp = self.world.get_component(e, c.Health);
+            const sh = self.world.get_component(e, c.Shield);
             const cl = self.world.get_component(e, c.Class);
             const tm = self.world.get_component(e, c.Team);
             const own: u8 = if (self.world.component_arrays.owner.has(e))
@@ -657,10 +665,10 @@ pub const Session = struct {
 
             snap.entities[snap.entity_count] = .{
                 .entity = e,
-                .slot = @intCast(@min(slot_idx, 0xFF)),
+                .slot = snap.entity_count,
                 .hp_current = hp.current,
                 .hp_max = hp.max,
-                .shield_hp = self.shield[e],
+                .shield_hp = sh.hp,
                 .class = cl.tag,
                 .team = tm.id,
                 .owner = own,
@@ -703,3 +711,33 @@ pub const Session = struct {
         slot.msg_queue.appendSlice(slot.allocator, data) catch {};
     }
 };
+
+// ---------------------------------------------------------------------------
+// Internal helpers — comptime world configuration
+// ---------------------------------------------------------------------------
+
+fn set_world_system_signatures(world: *GameWorld) void {
+    // PlayerTeam: requires PlayerMarker, which only player entities carry.
+    // EnemyTeam:  requires EnemyMarker, which only enemy entities carry.
+    // The two marker components are mutually exclusive, so the sets are
+    // disjoint despite all entities sharing Health/Shield/Class/Team.
+    {
+        var sig = @import("ecs_zig").Signature.initEmpty();
+        sig.set(GameWorld.component_type(c.Health));
+        sig.set(GameWorld.component_type(c.Shield));
+        sig.set(GameWorld.component_type(c.Class));
+        sig.set(GameWorld.component_type(c.Team));
+        sig.set(GameWorld.component_type(c.Owner));
+        sig.set(GameWorld.component_type(c.PlayerMarker));
+        world.set_system_signature(PlayerTeam, sig);
+    }
+    {
+        var sig = @import("ecs_zig").Signature.initEmpty();
+        sig.set(GameWorld.component_type(c.Health));
+        sig.set(GameWorld.component_type(c.Shield));
+        sig.set(GameWorld.component_type(c.Class));
+        sig.set(GameWorld.component_type(c.Team));
+        sig.set(GameWorld.component_type(c.EnemyMarker));
+        world.set_system_signature(EnemyTeam, sig);
+    }
+}

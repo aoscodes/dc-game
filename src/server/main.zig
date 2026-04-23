@@ -10,7 +10,6 @@ const std = @import("std");
 const ws = @import("websocket");
 const shared = @import("shared");
 const proto = shared.protocol;
-const c = shared.components;
 const dbg = @import("debug_zig");
 
 const session_mod = @import("session.zig");
@@ -26,18 +25,13 @@ var g_ta: dbg.TrackingAllocator = undefined;
 var g_session: ?Session = null;
 var g_session_lock: std.Thread.Mutex = .{};
 
-const App = struct {
-    allocator: std.mem.Allocator,
-};
-
 const Handler = struct {
     conn: *ws.Conn,
     player_id: u8 = 0xFF,
-    app: *App,
 
-    pub fn init(hs: *ws.Handshake, conn: *ws.Conn, app: *App) !Handler {
+    pub fn init(hs: *ws.Handshake, conn: *ws.Conn, _: void) !Handler {
         _ = hs;
-        return Handler{ .conn = conn, .app = app };
+        return Handler{ .conn = conn };
     }
 
     pub fn afterInit(self: *Handler) !void {
@@ -102,7 +96,10 @@ const Handler = struct {
 };
 
 fn tick_loop(_: void) void {
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = std.time.Timer.start() catch |err| {
+        std.log.err("tick_loop: failed to start timer: {}", .{err});
+        return;
+    };
     while (true) {
         const start = timer.read();
 
@@ -154,10 +151,9 @@ pub fn main() !void {
     const tick_thread = try std.Thread.spawn(.{}, tick_loop, .{{}});
     tick_thread.detach();
 
-    var app = App{ .allocator = allocator };
     var server = try ws.Server(Handler).init(allocator, .{
         .port = port,
         .address = "0.0.0.0",
     });
-    try server.listen(&app);
+    try server.listen({});
 }

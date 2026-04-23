@@ -95,83 +95,52 @@ const TestPlayer = struct {
 
 const Msg = struct {
     tag: proto.MsgTag,
+    /// Slice into the original `raw` buffer covering only the payload bytes
+    /// (after the tag byte). Valid for the lifetime of the source buffer.
     payload: []const u8,
 };
 
 /// Walk `raw` decoding complete messages into `arena`-allocated Msg values.
+/// Uses the canonical `proto.decode_*` functions so that any wire-format
+/// change is caught here at compile time rather than via a hand-written
+/// byte-offset table.
 fn drain(raw: []const u8, arena: std.mem.Allocator) ![]Msg {
     var list: std.ArrayListUnmanaged(Msg) = .empty;
-    var pos: usize = 0;
-    while (pos < raw.len) {
-        const tag_byte = raw[pos];
-        const tag = std.meta.intToEnum(proto.MsgTag, tag_byte) catch break;
-        pos += 1;
-        const start = pos;
-        var fbs = std.io.fixedBufferStream(raw[pos..]);
-        if (!skip_payload(tag, fbs.reader())) break;
-        pos += fbs.pos;
-        try list.append(arena, .{ .tag = tag, .payload = raw[start..pos] });
+    var fbs = std.io.fixedBufferStream(raw);
+    const r = fbs.reader();
+
+    while (fbs.pos < raw.len) {
+        const tag = proto.read_tag(r) catch break;
+        const payload_start = fbs.pos;
+
+        // Consume the payload using the canonical decoder; discard the result.
+        // An error means the stream is truncated or corrupt — stop iterating.
+        const ok = consume_payload(tag, r);
+        if (!ok) break;
+
+        try list.append(arena, .{ .tag = tag, .payload = raw[payload_start..fbs.pos] });
     }
     return list.toOwnedSlice(arena);
 }
 
-fn skip_payload(tag: proto.MsgTag, r: anytype) bool {
+/// Consume one message payload from `r` using the canonical proto decoders.
+/// Returns false if decoding fails (truncated stream).
+fn consume_payload(tag: proto.MsgTag, r: anytype) bool {
     return switch (tag) {
-        .join_lobby => blk: {
-            const len = r.readByte() catch break :blk false;
-            r.skipBytes(len, .{}) catch break :blk false;
-            break :blk true;
-        },
-        .choose_class, .reconnect, .choose_action => blk: {
-            _ = r.readByte() catch break :blk false;
-            break :blk true;
-        },
-        .ready_up => true,
-        .choose_position => blk: {
-            r.skipBytes(2, .{}) catch break :blk false;
-            break :blk true;
-        },
-        .lobby_update => blk: {
-            // join_code(6) + player_count(1) + player_id(1) + round_duration(4)
-            var hdr: [12]u8 = undefined;
-            _ = r.readAll(&hdr) catch break :blk false;
-            const player_count = hdr[6];
-            var i: u8 = 0;
-            while (i < player_count) : (i += 1) {
-                _ = r.readByte() catch break :blk false; // player_id
-                const nlen = r.readByte() catch break :blk false;
-                r.skipBytes(nlen, .{}) catch break :blk false;
-                // class(1) + ready(1) + connected(1) + grid_col(1) + grid_row(1)
-                r.skipBytes(5, .{}) catch break :blk false;
-            }
-            break :blk true;
-        },
-        .game_start => blk: {
-            const llen = r.readByte() catch break :blk false;
-            r.skipBytes(llen, .{}) catch break :blk false;
-            _ = r.readByte() catch break :blk false; // player_id
-            r.skipBytes(4, .{}) catch break :blk false; // round_duration f32
-            break :blk true;
-        },
-        .game_state => blk: {
-            r.skipBytes(4, .{}) catch break :blk false; // tick u32
-            r.skipBytes(4, .{}) catch break :blk false; // round_timer f32
-            const ec = r.readByte() catch break :blk false;
-            // Each EntitySnapshot: entity(4)+slot(1)+hp(2)+hp_max(2)+shield(2)+class(1)+team(1)+owner(1) = 14
-            r.skipBytes(@as(u64, ec) * 14, .{}) catch break :blk false;
-            break :blk true;
-        },
-        .action_result => blk: {
-            // tag(1)+actor(4)+target(4)+value(2) = 11
-            r.skipBytes(11, .{}) catch break :blk false;
-            break :blk true;
-        },
-        .game_over => blk: {
-            _ = r.readByte() catch break :blk false;
-            break :blk true;
-        },
+        .join_lobby => if (proto.decode_join_lobby(r)) |_| true else |_| false,
+        .choose_class => if (proto.decode_choose_class(r)) |_| true else |_| false,
+        .choose_action => if (proto.decode_choose_action(r)) |_| true else |_| false,
+        .reconnect => if (proto.decode_reconnect(r)) |_| true else |_| false,
+        .choose_position => if (proto.decode_choose_position(r)) |_| true else |_| false,
+        .ready_up => true, // zero-payload message
+        .lobby_update => if (proto.decode_lobby_update(r)) |_| true else |_| false,
+        .game_start => if (proto.decode_game_start(r)) |_| true else |_| false,
+        .game_state => if (proto.decode_game_state(r)) |_| true else |_| false,
+        .action_result => if (proto.decode_action_result(r)) |_| true else |_| false,
+        .game_over => if (proto.decode_game_over(r)) |_| true else |_| false,
         .@"error" => blk: {
-            r.skipBytes(64, .{}) catch break :blk false;
+            var buf: [64]u8 = undefined;
+            _ = r.readAll(&buf) catch break :blk false;
             break :blk true;
         },
     };
@@ -219,32 +188,22 @@ fn tick_n(sess: *Session, dt: f32, n: u32) !void {
 }
 
 fn count_living_enemies(sess: *Session) usize {
-    var n: usize = 0;
-    for (sess.living.items) |e| {
-        if (sess.world.get_component(e, c.Team).id == .enemies) n += 1;
-    }
-    return n;
+    return sess.world.system_entity_sets[comptime session_mod.GameWorld.system_index_of(session_mod.EnemyTeam)].count();
 }
 
 fn count_living_players(sess: *Session) usize {
-    var n: usize = 0;
-    for (sess.living.items) |e| {
-        if (sess.world.get_component(e, c.Team).id == .players) n += 1;
-    }
-    return n;
+    return sess.world.system_entity_sets[comptime session_mod.GameWorld.system_index_of(session_mod.PlayerTeam)].count();
 }
 
 fn first_enemy(sess: *Session) ?ecs.Entity {
-    for (sess.living.items) |e| {
-        if (sess.world.get_component(e, c.Team).id == .enemies) return e;
-    }
+    var it = sess.world.system_entity_sets[comptime session_mod.GameWorld.system_index_of(session_mod.EnemyTeam)].iterator(.{});
+    if (it.next()) |u| return @intCast(u);
     return null;
 }
 
 fn first_player_entity(sess: *Session) ?ecs.Entity {
-    for (sess.living.items) |e| {
-        if (sess.world.get_component(e, c.Team).id == .players) return e;
-    }
+    var it = sess.world.system_entity_sets[comptime session_mod.GameWorld.system_index_of(session_mod.PlayerTeam)].iterator(.{});
+    if (it.next()) |u| return @intCast(u);
     return null;
 }
 
@@ -519,10 +478,13 @@ test "shield pool grants shield HP to all players" {
     s.p[0].clear();
     try tick_n(&s.sess, 0.11, 1);
 
-    for (s.sess.living.items) |e| {
-        if (s.sess.world.get_component(e, c.Team).id != .players) continue;
-        // shield = pool(2) * V, enemy (attack=1) absorbs 1 → net 2*V - 1
-        try std.testing.expectEqual(2 * V - 1, s.sess.shield[e]);
+    {
+        var it = s.sess.world.system_entity_sets[comptime session_mod.GameWorld.system_index_of(session_mod.PlayerTeam)].iterator(.{});
+        while (it.next()) |u| {
+            const e: ecs.Entity = @intCast(u);
+            // shield = pool(2) * V, enemy (attack=1) absorbs 1 → net 2*V - 1
+            try std.testing.expectEqual(2 * V - 1, s.sess.world.get_component(e, c.Shield).hp);
+        }
     }
 
     // shield broadcast
@@ -533,9 +495,6 @@ test "shield pool grants shield HP to all players" {
 
 test "heal pool heals all players" {
     const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator, .fighter, .fighter);
@@ -563,16 +522,11 @@ test "heal pool heals all players" {
     // Heal (+2*V) then enemy dmg (-1) → net +2*V-1
     try std.testing.expectEqual(hp0_before + 2 * V - 1, hp0_after);
 
-    // heal broadcast
     s.p[0].clear();
-    _ = arena; // already drained above implicitly through tick; re-drain not needed
 }
 
 test "shield absorbs enemy damage before HP" {
     const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator, .fighter, .fighter);
@@ -585,20 +539,18 @@ test "shield absorbs enemy damage before HP" {
     const hp_before = s.sess.world.get_component(pe, c.Health).current;
 
     // Give player a manual shield of 5 HP (more than enemy attack=1)
-    s.sess.shield[pe] = 5;
+    s.sess.world.get_component(pe, c.Shield).hp = 5;
 
     // No action chosen — enemy still attacks
     try tick_n(&s.sess, 0.11, 1);
 
     const hp_after = s.sess.world.get_component(pe, c.Health).current;
-    const shield_after = s.sess.shield[pe];
+    const shield_after = s.sess.world.get_component(pe, c.Shield).hp;
 
     // HP unchanged (shield absorbed enemy attack=1)
     try std.testing.expectEqual(hp_before, hp_after);
     // Shield depleted by enemy attack (1)
     try std.testing.expectEqual(@as(u16, 4), shield_after);
-
-    _ = arena;
 }
 
 test "enemy kills all players — enemies win" {
@@ -632,9 +584,10 @@ test "enemy kills all players — enemies win" {
     try s.sess.start_game_wave(&deadly_wave);
 
     // Players have 1 HP, 100 enemies deal 100 dmg → die instantly
-    for (s.sess.living.items) |e| {
-        if (s.sess.world.get_component(e, c.Team).id == .players) {
-            s.sess.world.get_component(e, c.Health).current = 1;
+    {
+        var it = s.sess.world.system_entity_sets[comptime session_mod.GameWorld.system_index_of(session_mod.PlayerTeam)].iterator(.{});
+        while (it.next()) |u| {
+            s.sess.world.get_component(@intCast(u), c.Health).current = 1;
         }
     }
 
@@ -704,8 +657,6 @@ test "wave chain advances to next wave" {
 
 test "action can be overwritten before round resolves" {
     const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator, .fighter, .fighter);
@@ -765,8 +716,6 @@ test "action pool resets after each round" {
 
 test "no actions submitted — enemy still attacks" {
     const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator, .fighter, .fighter);
@@ -839,7 +788,7 @@ test "mixed pool: damage + shield in one round" {
     try std.testing.expectEqual(V * 100 - V, enemy_hp);
 
     // p1 got shield (pool=1 → +V shield, enemy attack=1 absorbed → net V-1)
-    try std.testing.expectEqual(V - 1, s.sess.shield[pe1]);
+    try std.testing.expectEqual(V - 1, s.sess.world.get_component(pe1, c.Shield).hp);
 }
 
 test "2 enemies deal 2 damage per player per round" {
@@ -906,11 +855,9 @@ test "player dead from enemy does not receive subsequent pool heal" {
 
     // Both dead (enemy dealt 100 dmg, heal only gave +2)
     try std.testing.expectEqual(@as(usize, 0), count_living_players(&s.sess));
-    // Neither entity should appear in the living list
-    for (s.sess.living.items) |e| {
-        try std.testing.expect(e != pe0);
-        try std.testing.expect(e != pe1);
-    }
+    // Neither entity should be alive in the ECS
+    try std.testing.expect(!s.sess.world.system_entity_sets[comptime session_mod.GameWorld.system_index_of(session_mod.PlayerTeam)].isSet(pe0));
+    try std.testing.expect(!s.sess.world.system_entity_sets[comptime session_mod.GameWorld.system_index_of(session_mod.PlayerTeam)].isSet(pe1));
 }
 
 test "game_state wire: round_timer decrement reflected in broadcast" {
@@ -952,7 +899,7 @@ test "game_state wire: shield_hp reflects server shield array" {
     try s.sess.start_game_wave(&test_wave_single);
 
     const pe = s.sess.players[s.p[0].pid].entity;
-    s.sess.shield[pe] = 7;
+    s.sess.world.get_component(pe, c.Shield).hp = 7;
 
     s.p[0].clear();
     try tick_n(&s.sess, 0.1, 1);
@@ -1074,9 +1021,10 @@ test "action_result heal broadcast value matches pool size" {
     try s.sess.start_game_wave(&test_wave_single);
 
     // Wound players so they can actually heal
-    for (s.sess.living.items) |e| {
-        if (s.sess.world.get_component(e, c.Team).id == .players) {
-            s.sess.world.get_component(e, c.Health).current = 50;
+    {
+        var it = s.sess.world.system_entity_sets[comptime session_mod.GameWorld.system_index_of(session_mod.PlayerTeam)].iterator(.{});
+        while (it.next()) |u| {
+            s.sess.world.get_component(@intCast(u), c.Health).current = 50;
         }
     }
 
@@ -1099,6 +1047,99 @@ test "action_result heal broadcast value matches pool size" {
         }
     }
     try std.testing.expect(found_heal_value);
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect test
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Lobby disconnect tests
+// ---------------------------------------------------------------------------
+
+test "disconnect in lobby: slot freed and player_count decremented" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .mage);
+    defer s.deinit();
+
+    try std.testing.expectEqual(@as(u8, 2), s.sess.player_count);
+
+    const pid = s.p[0].pid;
+    s.sess.disconnect(pid);
+
+    // Slot must be freed and count decremented
+    try std.testing.expect(!s.sess.players[pid].occupied);
+    try std.testing.expect(!s.sess.players[pid].connected);
+    try std.testing.expectEqual(@as(u8, 1), s.sess.player_count);
+
+    // Remaining player still sees only themselves in lobby_update
+    s.p[1].clear();
+    try s.sess.broadcast_lobby_update();
+    const msgs = try drain(s.p[1].buf.items, arena);
+    const m = find_tag(msgs, .lobby_update) orelse return error.NoLobbyUpdate;
+    var fbs = std.io.fixedBufferStream(m.payload);
+    const lu = try proto.decode_lobby_update(fbs.reader());
+    try std.testing.expectEqual(@as(u8, 1), lu.player_count);
+}
+
+test "choose_class: class reflected in next lobby_update" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    const pid = s.p[0].pid;
+    try enqueue_msg(&s.sess, pid, .choose_class, proto.ChooseClass{ .class = .mage });
+    // tick to drain queue (still in lobby)
+    try s.sess.tick(0.016);
+
+    s.p[0].clear();
+    try s.sess.broadcast_lobby_update();
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+    const m = find_tag(msgs, .lobby_update) orelse return error.NoLobbyUpdate;
+    var fbs = std.io.fixedBufferStream(m.payload);
+    const lu = try proto.decode_lobby_update(fbs.reader());
+
+    try std.testing.expectEqual(c.ClassTag.mage, lu.players[pid].class);
+}
+
+test "reconnect to lobby slot: slot re-occupied without join" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .healer);
+    defer s.deinit();
+
+    const pid = s.p[0].pid;
+    // Disconnect while in lobby — slot freed
+    s.sess.disconnect(pid);
+    try std.testing.expectEqual(@as(u8, 1), s.sess.player_count);
+
+    // Reconnect to the same slot — lobby reconnect path
+    const ok = s.sess.reconnect(pid, s.p[0].transport());
+    try std.testing.expect(ok);
+    try std.testing.expect(s.sess.players[pid].occupied);
+    try std.testing.expect(s.sess.players[pid].connected);
+    try std.testing.expectEqual(@as(u8, 2), s.sess.player_count);
+
+    // Should receive lobby_update on next broadcast
+    s.p[0].clear();
+    try s.sess.broadcast_lobby_update();
+    const msgs = try drain(s.p[0].buf.items, arena);
+    try std.testing.expect(find_tag(msgs, .lobby_update) != null);
 }
 
 // ---------------------------------------------------------------------------

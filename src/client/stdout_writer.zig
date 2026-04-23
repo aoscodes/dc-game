@@ -69,6 +69,8 @@ pub const GameState = struct {
     round_duration: f32 = 0.0,
     wave_label: [32]u8 = [_]u8{0} ** 32,
     wave_label_len: u8 = 0,
+    /// Set when the server sends game_over; null while the game is running.
+    winner: ?proto.WinnerId = null,
 };
 
 // ---------------------------------------------------------------------------
@@ -133,6 +135,7 @@ fn write_render_inner(
             .tick = game.snapshot.tick,
             .entities = entities_buf[0..game.snapshot.entity_count],
         } else null,
+        .winner = if (phase == .game_over) game.winner else null,
     };
 
     try std.json.Stringify.value(frame, .{ .emit_null_optional_fields = false }, w);
@@ -164,6 +167,8 @@ const JsonRenderFrame = struct {
     phase: ClientPhaseTag,
     lobby: ?JsonLobby,
     game: ?JsonGame,
+    /// Present only when phase == .game_over.
+    winner: ?proto.WinnerId,
 };
 
 const JsonLobby = struct {

@@ -21,7 +21,7 @@
 //!     ]
 //!   }
 //!
-//! Stat overrides are optional; zero values mean "use class default".
+//! Stat override fields are optional in JSON; omitted fields use class defaults.
 //!
 //! Usage:
 //!

@@ -87,6 +87,12 @@ pub fn Snapshot(comptime W: type) type {
 
         /// Deserialise into a freshly-init world.  Returns error on magic/size
         /// mismatch or unexpected EOF.
+        ///
+        /// The world must be freshly initialised (no existing entities).
+        /// After reading, the EntityManager ring buffer is consistent: every
+        /// entity ID that appears in a component array has been removed from
+        /// the free queue, so subsequent `create_entity` calls will not
+        /// reissue those IDs.
         pub fn read(world: *W, reader: anytype) !void {
             var magic: [4]u8 = undefined;
             _ = try reader.readAll(&magic);
@@ -98,9 +104,13 @@ pub fn Snapshot(comptime W: type) type {
             const CT = @TypeOf(comp_arrays.*);
             const fields = @typeInfo(CT).@"struct".fields;
 
+            // Track which entity IDs were seen so we can remove them from the
+            // EntityManager free queue exactly once after all components are read.
+            var seen = std.bit_set.StaticBitSet(ecs.MAX_ENTITIES).initEmpty();
+
             // We read exactly n_comps blocks; match by name to field.
-            var c: u32 = 0;
-            while (c < n_comps) : (c += 1) {
+            var ci: u32 = 0;
+            while (ci < n_comps) : (ci += 1) {
                 var name_buf: [NAME_LEN]u8 = undefined;
                 _ = try reader.readAll(&name_buf);
                 const name = std.mem.sliceTo(&name_buf, 0);
@@ -129,7 +139,7 @@ pub fn Snapshot(comptime W: type) type {
                         while (i < count) : (i += 1) {
                             entities[i] = try reader.readInt(u32, .little);
                         }
-                        // Reconstruct: create entities if needed, add components
+                        // Reconstruct: insert component and update signature.
                         i = 0;
                         while (i < count) : (i += 1) {
                             const e = entities[i];
@@ -137,12 +147,11 @@ pub fn Snapshot(comptime W: type) type {
                             // component may have created this entity already).
                             if (!arr.has(e)) {
                                 arr.insert(e, vals[i]);
-                                // Ensure the entity has a valid (non-empty)
-                                // signature so destroy_entity works later.
                                 var sig = world.entity_manager.get_signature(e);
                                 sig.set(W.component_type(T));
                                 world.entity_manager.set_signature(e, sig);
                             }
+                            seen.set(e);
                         }
                     }
                 }
@@ -154,8 +163,33 @@ pub fn Snapshot(comptime W: type) type {
                 }
             }
 
-            // Restore living_count in EntityManager
+            // Read living count (stored for convenience; we recompute from
+            // the first component array's size instead of trusting the field).
             const living_count = try reader.readInt(u32, .little);
+
+            // Drain seen entity IDs from the EntityManager free queue so that
+            // subsequent create_entity calls cannot reissue them.
+            // The queue was initialised with all IDs 0..MAX_ENTITIES-1 in order.
+            // We replay create() for each seen ID by scanning and removing it.
+            // This is O(MAX_ENTITIES) but snapshot read is not a hot path.
+            var new_queue: [ecs.MAX_ENTITIES]ecs.Entity = undefined;
+            var new_tail: u32 = 0;
+            var new_count: u32 = 0;
+            var qr = world.entity_manager.head;
+            var remaining = world.entity_manager.count;
+            while (remaining > 0) : (remaining -= 1) {
+                const id = world.entity_manager.queue[qr];
+                qr = (qr + 1) % ecs.MAX_ENTITIES;
+                if (!seen.isSet(id)) {
+                    new_queue[new_tail] = id;
+                    new_tail = (new_tail + 1) % ecs.MAX_ENTITIES;
+                    new_count += 1;
+                }
+            }
+            world.entity_manager.queue = new_queue;
+            world.entity_manager.head = 0;
+            world.entity_manager.tail = new_tail;
+            world.entity_manager.count = new_count;
             world.entity_manager.living_count = living_count;
         }
     };

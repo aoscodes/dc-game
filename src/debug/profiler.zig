@@ -45,12 +45,12 @@ pub fn Profiler(comptime ZoneEnum: type) type {
         /// intervening `end` overwrites the start time (last-call wins).
         pub fn begin(self: *Self, comptime zone: ZoneEnum) void {
             const i = @intFromEnum(zone);
-            self.zones[i].start_ns = @intCast(std.time.nanoTimestamp());
+            self.zones[i].start_ns = @intCast(@max(0, std.time.nanoTimestamp()));
         }
 
         /// Close a zone and record the elapsed time.
         pub fn end(self: *Self, comptime zone: ZoneEnum) void {
-            const now: u64 = @intCast(std.time.nanoTimestamp());
+            const now: u64 = @intCast(@max(0, std.time.nanoTimestamp()));
             const i = @intFromEnum(zone);
             const z = &self.zones[i];
             if (z.start_ns == 0) return; // begin was never called

@@ -168,7 +168,7 @@ fn encode_lobby_update(w: anytype, p: LobbyUpdate) !void {
     try w.writeAll(&p.join_code);
     try w.writeByte(p.player_count);
     try w.writeByte(p.player_id);
-    try w.writeAll(std.mem.asBytes(&p.round_duration));
+    try w.writeInt(u32, @bitCast(p.round_duration), .little);
     var i: u8 = 0;
     while (i < p.player_count) : (i += 1) {
         const pl = p.players[i];
@@ -187,12 +187,12 @@ fn encode_game_start(w: anytype, p: GameStart) !void {
     try w.writeByte(p.wave_label_len);
     try w.writeAll(p.wave_label[0..p.wave_label_len]);
     try w.writeByte(p.player_id);
-    try w.writeAll(std.mem.asBytes(&p.round_duration));
+    try w.writeInt(u32, @bitCast(p.round_duration), .little);
 }
 
 fn encode_game_state(w: anytype, p: GameState) !void {
     try w.writeInt(u32, p.tick, .little);
-    try w.writeAll(std.mem.asBytes(&p.round_timer));
+    try w.writeInt(u32, @bitCast(p.round_timer), .little);
     try w.writeByte(p.entity_count);
     var i: u8 = 0;
     while (i < p.entity_count) : (i += 1) {
@@ -267,9 +267,7 @@ pub fn decode_lobby_update(reader: anytype) !LobbyUpdate {
     p.player_count = try reader.readByte();
     p.player_id = try reader.readByte();
     if (p.player_count > MAX_PLAYERS) return DecodeError.TooManyEntities;
-    var rd_bytes: [4]u8 = undefined;
-    _ = try reader.readAll(&rd_bytes);
-    p.round_duration = std.mem.bytesToValue(f32, &rd_bytes);
+    p.round_duration = @bitCast(try reader.readInt(u32, .little));
     var i: u8 = 0;
     while (i < p.player_count) : (i += 1) {
         p.players[i].player_id = try reader.readByte();
@@ -296,18 +294,14 @@ pub fn decode_game_start(reader: anytype) !GameStart {
     p.wave_label_len = llen;
     _ = try reader.readAll(p.wave_label[0..llen]);
     p.player_id = try reader.readByte();
-    var rd_bytes: [4]u8 = undefined;
-    _ = try reader.readAll(&rd_bytes);
-    p.round_duration = std.mem.bytesToValue(f32, &rd_bytes);
+    p.round_duration = @bitCast(try reader.readInt(u32, .little));
     return p;
 }
 
 pub fn decode_game_state(reader: anytype) !GameState {
     var p: GameState = undefined;
     p.tick = try reader.readInt(u32, .little);
-    var rt_bytes: [4]u8 = undefined;
-    _ = try reader.readAll(&rt_bytes);
-    p.round_timer = std.mem.bytesToValue(f32, &rt_bytes);
+    p.round_timer = @bitCast(try reader.readInt(u32, .little));
     p.entity_count = try reader.readByte();
     if (p.entity_count > MAX_ENTITIES_WIRE) return DecodeError.TooManyEntities;
     var i: u8 = 0;

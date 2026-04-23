@@ -11,7 +11,6 @@ pub const game_logic = @import("game_logic.zig");
 
 pub const Transport = transport.Transport;
 pub const BufferTransport = transport.BufferTransport;
-pub const GridPos = components.GridPos;
 pub const ClassTag = components.ClassTag;
 pub const TeamId = components.TeamId;
 pub const MsgTag = protocol.MsgTag;

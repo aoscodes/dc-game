@@ -10,6 +10,11 @@ pub const Health = struct {
     max: u16,
 };
 
+/// Flat damage absorption. Depleted before HP takes damage.
+pub const Shield = struct {
+    hp: u16,
+};
+
 pub const ClassTag = enum(u8) {
     fighter = 0,
     mage = 1,
@@ -33,15 +38,16 @@ pub const Team = struct {
     id: TeamId,
 };
 
+/// Zero-size marker component. Present only on player-team entities.
+/// Distinguishes the PlayerTeam system signature from EnemyTeam.
+pub const PlayerMarker = struct {};
+
+/// Zero-size marker component. Present only on enemy-team entities.
+/// Distinguishes the EnemyTeam system signature from PlayerTeam.
+pub const EnemyMarker = struct {};
+
 pub const Owner = struct {
     player_id: u8,
-};
-
-pub const Stats = struct {
-    attack: u16,
-    defense: u16,
-    speed_base: f32,
-    max_hp: u16,
 };
 
 /// The action a player chooses to contribute to the shared pool each round.

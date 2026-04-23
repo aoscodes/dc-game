@@ -60,6 +60,34 @@ test "snapshot round-trip: component values preserved" {
     try std.testing.expectEqual(@as(u32, 2), world2.entity_manager.living_count);
 }
 
+test "snapshot read: EntityManager ring buffer excludes restored entities" {
+    // After reading a snapshot, create_entity must not reissue an entity ID
+    // that was restored from the snapshot.
+    var world = try TestWorld.init(std.testing.allocator);
+    defer world.deinit();
+
+    const e0 = world.create_entity();
+    world.add_component(e0, Pos{ .x = 1.0, .y = 2.0 });
+
+    const living = [_]ecs.Entity{e0};
+    var buf: [8192]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try snapshot.Snapshot(TestWorld).write(&world, fbs.writer(), &living);
+
+    var world2 = try TestWorld.init(std.testing.allocator);
+    defer world2.deinit();
+    fbs.reset();
+    try snapshot.Snapshot(TestWorld).read(&world2, fbs.reader());
+
+    // All newly created entities must differ from e0
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const new_e = world2.create_entity();
+        try std.testing.expect(new_e != e0);
+        world2.destroy_entity(new_e);
+    }
+}
+
 test "snapshot: bad magic returns error" {
     var buf = [_]u8{ 'X', 'X', 'X', 'X', 0, 0, 0, 0 };
     var fbs = std.io.fixedBufferStream(&buf);
