@@ -213,6 +213,30 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(session_tests).step);
 
+    // Bot harness tests — inject bots into player slots, configurable profiles.
+    const bot_debug_mod = b.addModule("debug_zig_bot_test", .{
+        .root_source_file = b.path("src/debug/debug.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "ecs_zig", .module = ecs_mod },
+            .{ .name = "shared", .module = shared_mod },
+        },
+    });
+    const bot_harness_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/server/bot_harness_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ecs_zig", .module = ecs_mod },
+                .{ .name = "shared", .module = shared_mod },
+                .{ .name = "debug_zig", .module = bot_debug_mod },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(bot_harness_tests).step);
+
     // -----------------------------------------------------------------------
     // Browser e2e  (Playwright + headless Chromium)
     //
