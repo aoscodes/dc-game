@@ -133,10 +133,13 @@ fn consume_payload(tag: proto.MsgTag, r: anytype) bool {
         .reconnect => if (proto.decode_reconnect(r)) |_| true else |_| false,
         .choose_position => if (proto.decode_choose_position(r)) |_| true else |_| false,
         .ready_up => true, // zero-payload message
+        .choose_combo => if (proto.decode_choose_combo(r)) |_| true else |_| false,
+        .cancel_combo => true, // zero-payload message
         .lobby_update => if (proto.decode_lobby_update(r)) |_| true else |_| false,
         .game_start => if (proto.decode_game_start(r)) |_| true else |_| false,
         .game_state => if (proto.decode_game_state(r)) |_| true else |_| false,
         .action_result => if (proto.decode_action_result(r)) |_| true else |_| false,
+        .round_reset => true, // zero-payload message
         .game_over => if (proto.decode_game_over(r)) |_| true else |_| false,
         .@"error" => blk: {
             var buf: [64]u8 = undefined;
@@ -672,13 +675,14 @@ test "action can be overwritten before round resolves" {
     try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .heal });
     // Tick a little (doesn't fire round yet)
     try tick_n(&s.sess, 0.1, 1);
-    // Verify the first action was recorded
-    try std.testing.expectEqual(c.ActionChoice.heal, s.sess.action_pool[s.p[0].pid].?);
+    // Verify the first action was recorded (single-action combo wraps as len=1)
+    try std.testing.expectEqual(c.ActionChoice.heal, s.sess.action_pool[s.p[0].pid].?.actions[0]);
+    try std.testing.expectEqual(@as(u8, 1), s.sess.action_pool[s.p[0].pid].?.len);
 
     // Overwrite with damage
     try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .damage });
     try tick_n(&s.sess, 0.1, 1);
-    try std.testing.expectEqual(c.ActionChoice.damage, s.sess.action_pool[s.p[0].pid].?);
+    try std.testing.expectEqual(c.ActionChoice.damage, s.sess.action_pool[s.p[0].pid].?.actions[0]);
 
     // Let the round fire — damage chosen, not heal
     try tick_n(&s.sess, 0.5, 1);
@@ -710,7 +714,7 @@ test "action pool resets after each round" {
 
     // After round, pool must be cleared
     for (&s.sess.action_pool) |maybe| {
-        try std.testing.expectEqual(@as(?c.ActionChoice, null), maybe);
+        try std.testing.expectEqual(@as(?c.ActionCombo, null), maybe);
     }
 }
 
@@ -1174,4 +1178,197 @@ test "reconnect restores slot" {
 
     try std.testing.expect(lu.players[pid].connected);
     try std.testing.expectEqual(pid, lu.player_id);
+}
+
+// ---------------------------------------------------------------------------
+// Combo tests
+// ---------------------------------------------------------------------------
+
+fn make_combo(comptime actions: []const c.ActionChoice) c.ActionCombo {
+    var combo = c.ActionCombo{
+        .actions = [_]c.ActionChoice{.damage} ** c.MAX_COMBO_LEN,
+        .len = @intCast(actions.len),
+    };
+    @memcpy(combo.actions[0..actions.len], actions);
+    return combo;
+}
+
+fn enqueue_combo(sess: *Session, pid: u8, combo: c.ActionCombo) !void {
+    var buf: [16]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try proto.encode(fbs.writer(), .choose_combo, proto.ChooseCombo{ .combo = combo });
+    sess.enqueue_message(pid, fbs.getWritten());
+}
+
+fn enqueue_cancel(sess: *Session, pid: u8) !void {
+    var buf: [4]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try proto.encode(fbs.writer(), .cancel_combo, {});
+    sess.enqueue_message(pid, fbs.getWritten());
+}
+
+test "combo [dmg,dmg] → damage_pool = 2" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+
+    const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
+    const hp_before = s.sess.world.get_component(enemy_e, c.Health).current;
+
+    // p0 submits combo [dmg, dmg] → contributes 2 to damage pool
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ActionChoice{ .damage, .damage }));
+    try tick_n(&s.sess, 0.11, 1);
+
+    const hp_after = s.sess.world.get_component(enemy_e, c.Health).current;
+    // pool=2 → 2*V damage to enemy, then enemy_intent=1 → net enemy loss = 2*V
+    try std.testing.expectEqual(hp_before - 2 * V, hp_after);
+}
+
+test "combo [dmg,shld,heal,dmg] → all three pools receive correct counts" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+
+    const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
+    const hp_before = s.sess.world.get_component(enemy_e, c.Health).current;
+
+    // Wound p0 so heal has room
+    const pe0 = s.sess.players[s.p[0].pid].entity;
+    s.sess.world.get_component(pe0, c.Health).current = 50;
+
+    // combo: dmg=2, shld=1, heal=1
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ActionChoice{ .damage, .shield, .heal, .damage }));
+    try tick_n(&s.sess, 0.11, 1);
+
+    // enemy took 2*V damage (pool=2)
+    const hp_after = s.sess.world.get_component(enemy_e, c.Health).current;
+    try std.testing.expectEqual(hp_before - 2 * V, hp_after);
+
+    // p0 shld pool=1 → +V shield, then enemy_intent=1 absorbed → net V-1
+    try std.testing.expectEqual(V - 1, s.sess.world.get_component(pe0, c.Shield).hp);
+}
+
+test "combo overwrite before round fires — latest combo wins" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.5;
+    try s.sess.start_game_wave(&test_wave_single);
+
+    const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
+    const hp_max = s.sess.world.get_component(enemy_e, c.Health).current;
+
+    // First submit a heal-only combo (no damage to enemy)
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ActionChoice{.heal}));
+    try tick_n(&s.sess, 0.1, 1);
+    try std.testing.expectEqual(@as(u8, 1), s.sess.action_pool[s.p[0].pid].?.len);
+
+    // Overwrite with a damage combo before round fires
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ActionChoice{ .damage, .damage }));
+    try tick_n(&s.sess, 0.1, 1);
+    try std.testing.expectEqual(@as(u8, 2), s.sess.action_pool[s.p[0].pid].?.len);
+
+    // Let round fire
+    try tick_n(&s.sess, 0.5, 1);
+
+    // Enemy took 2*V damage (damage combo resolved, not the heal)
+    const hp_after = s.sess.world.get_component(enemy_e, c.Health).current;
+    try std.testing.expect(hp_after < hp_max);
+    try std.testing.expectEqual(hp_max - 2 * V, hp_after);
+}
+
+test "cancel_combo nulls the pool slot" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.5;
+    try s.sess.start_game_wave(&test_wave_single);
+
+    // Submit combo then cancel it
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ActionChoice{ .damage, .damage }));
+    try tick_n(&s.sess, 0.1, 1);
+    try std.testing.expect(s.sess.action_pool[s.p[0].pid] != null);
+
+    try enqueue_cancel(&s.sess, s.p[0].pid);
+    try tick_n(&s.sess, 0.1, 1);
+    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.action_pool[s.p[0].pid]);
+}
+
+test "choose_action + choose_combo from different players — both contribute" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+
+    const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
+    const hp_before = s.sess.world.get_component(enemy_e, c.Health).current;
+
+    // p0: single choose_action (combo-of-1) → +1 to damage pool
+    try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .damage });
+    // p1: combo [dmg, dmg] → +2 to damage pool
+    try enqueue_combo(&s.sess, s.p[1].pid, make_combo(&[_]c.ActionChoice{ .damage, .damage }));
+    try tick_n(&s.sess, 0.11, 1);
+
+    // total damage_pool = 3 → enemy loses 3*V HP
+    const hp_after = s.sess.world.get_component(enemy_e, c.Health).current;
+    try std.testing.expectEqual(hp_before - 3 * V, hp_after);
+}
+
+test "round_reset broadcast after resolve_round" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+
+    s.p[0].clear();
+    try tick_n(&s.sess, 0.11, 1); // trigger round resolution
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+    try std.testing.expect(find_tag(msgs, .round_reset) != null);
+}
+
+test "action pool resets after combo round" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ActionChoice{ .damage, .shield }));
+    try enqueue_combo(&s.sess, s.p[1].pid, make_combo(&[_]c.ActionChoice{.heal}));
+    try tick_n(&s.sess, 0.11, 1);
+
+    for (&s.sess.action_pool) |maybe| {
+        try std.testing.expectEqual(@as(?c.ActionCombo, null), maybe);
+    }
 }

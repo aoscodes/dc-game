@@ -163,9 +163,15 @@ fn send_ready_up() void {
     emit_send(fbs.getWritten());
 }
 
-fn send_action(action: c.ActionChoice) void {
+fn send_combo(combo: *const inp.ComboBuffer) void {
     var fbs = std.io.fixedBufferStream(&g_state.send_buf);
-    proto.encode(fbs.writer(), .choose_action, proto.ChooseAction{ .action = action }) catch return;
+    proto.encode(fbs.writer(), .choose_combo, proto.ChooseCombo{ .combo = combo.to_combo() }) catch return;
+    emit_send(fbs.getWritten());
+}
+
+fn send_cancel_combo() void {
+    var fbs = std.io.fixedBufferStream(&g_state.send_buf);
+    proto.encode(fbs.writer(), .cancel_combo, {}) catch return;
     emit_send(fbs.getWritten());
 }
 
@@ -222,7 +228,32 @@ fn process_recv() void {
                 g_state.phase = .game_over;
             },
             .action_result => {
-                _ = proto.decode_action_result(r) catch continue;
+                const p = proto.decode_action_result(r) catch continue;
+                const anim: c.ActionAnimation = switch (p.tag) {
+                    .damage, .shield, .heal => .attack,
+                    .death => .die,
+                };
+                // Record actor animation (pool actions have no specific actor).
+                if (p.actor_entity != 0xFFFFFFFF) {
+                    const idx = g_state.game.last_action_count;
+                    if (idx < proto.MAX_ENTITIES_WIRE) {
+                        g_state.game.last_actions[idx] = .{ .entity = p.actor_entity, .anim = anim };
+                        g_state.game.last_action_count += 1;
+                    }
+                }
+                // Record die on target for death events.
+                if (p.tag == .death) {
+                    const idx = g_state.game.last_action_count;
+                    if (idx < proto.MAX_ENTITIES_WIRE) {
+                        g_state.game.last_actions[idx] = .{ .entity = p.target_entity, .anim = .die };
+                        g_state.game.last_action_count += 1;
+                    }
+                }
+            },
+            .round_reset => {
+                // Server round fired — clear pending combo so the browser
+                // sees an empty array in the next render frame.
+                g_state.game.pending_combo.clear();
             },
             else => {},
         }
@@ -267,20 +298,13 @@ fn update_lobby() void {
 
 fn update_game() void {
     const gs = &g_state.game;
-    const ev = inp.poll(&g_key_queue);
-    switch (ev) {
-        .none => {},
-        .damage => {
-            gs.pending_action = .damage;
-            send_action(.damage);
-        },
-        .shield => {
-            gs.pending_action = .shield;
-            send_action(.shield);
-        },
-        .heal => {
-            gs.pending_action = .heal;
-            send_action(.heal);
+    const result = inp.drain_into_combo(&g_key_queue, &gs.pending_combo);
+    switch (result) {
+        .unchanged => {},
+        .appended => send_combo(&gs.pending_combo),
+        .cancelled => {
+            gs.pending_combo.clear();
+            send_cancel_combo();
         },
     }
 }

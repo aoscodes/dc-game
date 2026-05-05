@@ -5,22 +5,15 @@ const SH = 768;
 
 const CELL_W = 90;
 const CELL_H = 100;
-const CELL_PAD = 6;
 
-const PLAYER_GRID_X = 60;
-const PLAYER_GRID_Y = 180;
-
-const ENEMY_GRID_X = SW - 60 - (CELL_W + CELL_PAD) * 3;
-const ENEMY_GRID_Y = 180;
+// Team placement zones (soft boundaries — no hard grid).
+const PLAYER_ZONE = { x0: 20,  x1: 330, y0: 180, y1: 660 };
+const ENEMY_ZONE  = { x0: 694, x1: 1004, y0: 180, y1: 660 };
 
 const C_BG = "#14141e";
-const C_CELL_EMPTY = "rgba(40,40,55,0.7)";
-const C_ATB_BG = "rgba(30,30,30,0.78)";
-const C_ATB_FILL = "rgba(255,220,50,0.9)";
 const C_HP_BG = "rgba(30,10,10,0.78)";
 const C_HP_FILL = "rgba(60,200,60,0.9)";
 const C_CURSOR = "rgba(255,255,100,0.7)";
-const C_CHARGING = "rgba(255,255,255,0.24)";
 const C_TEXT = "rgba(230,230,230,1)";
 const C_HEADER = "rgba(180,200,255,1)";
 const C_ENEMY_HDR = "rgba(255,120,80,1)";
@@ -29,31 +22,140 @@ const C_MENU_BG = "rgba(20,20,40,0.86)";
 const C_MENU_BORDER = C_HEADER;
 const C_SEL = C_CURSOR;
 
-function classColor(cls) {
-  switch (cls) {
-    case "fighter": return "rgba(60,120,200,0.86)";
-    case "mage": return "rgba(180,60,200,0.86)";
-    case "healer": return "rgba(60,200,120,0.86)";
-    case "grunt": return "rgba(160,80,40,0.86)";
-    case "archer": return "rgba(140,160,40,0.86)";
-    case "shaman": return "rgba(200,100,60,0.86)";
-    case "boss": return "rgba(200,20,20,1)";
-    default: return "rgba(128,128,128,0.86)";
-  }
+// ---------------------------------------------------------------------------
+// Asset loading
+// ---------------------------------------------------------------------------
+
+const CLASSES = ["fighter", "mage", "healer", "grunt", "archer", "shaman", "boss"];
+
+/** @type {Map<string, { img: HTMLImageElement, meta: { frame_w: number, frame_h: number, clips: Record<string,{row:number,frames:number,fps:number,loop:boolean}> } }>} */
+const sprites = new Map();
+
+async function loadAssets() {
+  await Promise.all(CLASSES.map(async cls => {
+    const [meta, img] = await Promise.all([
+      fetch(`assets/${cls}.json`).then(r => r.json()),
+      new Promise((res, rej) => {
+        const i = new Image();
+        i.onload = () => res(i);
+        i.onerror = rej;
+        i.src = `assets/${cls}.png`;
+      }),
+    ]);
+    sprites.set(cls, { img, meta });
+  }));
 }
 
-function classLabel(cls) {
-  switch (cls) {
-    case "fighter": return "FTR";
-    case "mage": return "MGE";
-    case "healer": return "HLR";
-    case "grunt": return "GRT";
-    case "archer": return "ARC";
-    case "shaman": return "SHA";
-    case "boss": return "BOSS";
-    default: return cls.slice(0, 3).toUpperCase();
+// ---------------------------------------------------------------------------
+// Per-entity animator state
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {{ clip: string, frame: number, elapsed: number, locked: boolean }} AnimState
+ * locked = true while a non-looping clip is playing; cleared when it finishes.
+ */
+
+/** @type {Map<number, AnimState>} */
+const animState = new Map();
+
+/**
+ * Advance the animator for one entity and return its current {clip, frame}.
+ * Call once per entity per rendered frame.
+ *
+ * @param {number} id          - entity id
+ * @param {string} cls         - class name (key into sprites map)
+ * @param {string|null} lastAction - "attack"|"die"|null from server this tick
+ * @param {number} dt          - seconds since last frame
+ */
+function tickAnimator(id, cls, lastAction, dt) {
+  const sp = sprites.get(cls);
+  if (!sp) return { clip: "idle", frame: 0 };
+  const { clips } = sp.meta;
+
+  let s = animState.get(id);
+  if (!s) {
+    s = { clip: "idle", frame: 0, elapsed: 0, locked: false };
+    animState.set(id, s);
   }
+
+  // Transition: a new last_action from the server overrides the current clip
+  // (unless we're mid-die, which must never be interrupted).
+  if (lastAction && lastAction !== s.clip && s.clip !== "die") {
+    s.clip = lastAction;
+    s.frame = 0;
+    s.elapsed = 0;
+    s.locked = !clips[lastAction]?.loop;
+  }
+
+  const clip = clips[s.clip] ?? clips["idle"];
+  const spf = 1 / clip.fps; // seconds per frame
+
+  s.elapsed += dt;
+  while (s.elapsed >= spf) {
+    s.elapsed -= spf;
+    s.frame++;
+    if (s.frame >= clip.frames) {
+      if (clip.loop) {
+        s.frame = 0;
+      } else {
+        // Hold last frame; unlock so idle can resume next tick.
+        s.frame = clip.frames - 1;
+        s.locked = false;
+        // Revert to idle unless this is die (stay dead).
+        if (s.clip !== "die") {
+          s.clip = "idle";
+          s.frame = 0;
+          s.elapsed = 0;
+        }
+        break;
+      }
+    }
+  }
+
+  return { clip: s.clip, frame: s.frame };
 }
+
+// ---------------------------------------------------------------------------
+// Entity positions — assigned once on first sight, persist until cleared.
+// ---------------------------------------------------------------------------
+
+/** @type {Map<number, {x: number, y: number}>} */
+const entityPositions = new Map();
+
+/**
+ * Pick a random non-overlapping position within a zone for a new entity.
+ * Uses rejection sampling; falls back to an unvalidated position after
+ * MAX_TRIES attempts so crowded zones never deadlock.
+ *
+ * @param {{ x0:number, x1:number, y0:number, y1:number }} zone
+ * @returns {{ x: number, y: number }}
+ */
+function assignPosition(zone) {
+  const MAX_TRIES = 50;
+  const SEP = CELL_W + 8; // minimum centre-to-centre distance
+  const existing = [...entityPositions.values()];
+
+  for (let i = 0; i < MAX_TRIES; i++) {
+    const x = zone.x0 + Math.random() * (zone.x1 - zone.x0 - CELL_W);
+    const y = zone.y0 + Math.random() * (zone.y1 - zone.y0 - CELL_H);
+    const ok = existing.every(p => Math.abs(p.x - x) >= SEP || Math.abs(p.y - y) >= SEP);
+    if (ok) return { x, y };
+  }
+  // Fallback: place without collision check.
+  return {
+    x: zone.x0 + Math.random() * (zone.x1 - zone.x0 - CELL_W),
+    y: zone.y0 + Math.random() * (zone.y1 - zone.y0 - CELL_H),
+  };
+}
+
+function clearEntityState() {
+  entityPositions.clear();
+  animState.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Canvas
+// ---------------------------------------------------------------------------
 
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
@@ -79,6 +181,10 @@ function rectStroke(x, y, w, h, lineW, color) {
   ctx.lineWidth = lineW;
   ctx.strokeRect(x + lineW / 2, y + lineW / 2, w - lineW, h - lineW);
 }
+
+// ---------------------------------------------------------------------------
+// Screen helpers
+// ---------------------------------------------------------------------------
 
 function drawConnecting() {
   clear();
@@ -118,7 +224,7 @@ function drawLobbyGrid(lobby, ox, oy) {
       const isCursor = col === (lobby.chosen_col ?? 0) && row === (lobby.chosen_row ?? 0);
 
       // Cell background
-      let bg = C_CELL_EMPTY;
+      let bg = "rgba(40,40,55,0.7)";
       if (occ) bg = isOurs ? "rgba(80,160,80,0.86)" : "rgba(120,80,80,0.7)";
       rect(cx, cy, CW, CH, bg);
 
@@ -171,29 +277,60 @@ function drawLobby(lobby) {
   drawLobbyGrid(lobby, gridX, gridY);
 }
 
-function drawGrid(game, team, ox, oy) {
-  // Flip player columns so col 0 (front rank) renders on the right edge, facing enemies
-  const colX = (col) => team === "players"
-    ? ox + (2 - col) * (CELL_W + CELL_PAD)
-    : ox + col * (CELL_W + CELL_PAD);
+/**
+ * Draw one entity's sprite into its cell, scaled to CELL_W × CELL_H.
+ * Enemies are flipped horizontally so they face the player team.
+ *
+ * @param {object} e   - entity from game.entities
+ * @param {number} cx  - cell top-left x
+ * @param {number} cy  - cell top-left y
+ * @param {string} lastAction - "attack"|"die"|null
+ * @param {number} dt  - seconds since last frame
+ * @param {boolean} flip - mirror horizontally (enemies)
+ */
+function drawEntitySprite(e, cx, cy, lastAction, dt, flip) {
+  const sp = sprites.get(e.class);
+  if (!sp) return;
 
-  // Draw empty cells
-  for (let col = 0; col < 3; col++) {
-    for (let row = 0; row < 4; row++) {
-      rect(colX(col), oy + row * (CELL_H + CELL_PAD), CELL_W, CELL_H, C_CELL_EMPTY);
-    }
+  const { img, meta } = sp;
+  const { frame_w, frame_h, clips } = meta;
+  const { frame } = tickAnimator(e.id, e.class, lastAction, dt);
+  const clip = clips[animState.get(e.id)?.clip ?? "idle"] ?? clips["idle"];
+
+  const srcX = frame * frame_w;
+  const srcY = clip.row * frame_h;
+
+  ctx.save();
+  ctx.imageSmoothingEnabled = false;
+
+  if (flip) {
+    // Flip around the cell's horizontal centre.
+    ctx.translate(cx + CELL_W, cy);
+    ctx.scale(-1, 1);
+    ctx.drawImage(img, srcX, srcY, frame_w, frame_h, 0, 0, CELL_W, CELL_H);
+  } else {
+    ctx.drawImage(img, srcX, srcY, frame_w, frame_h, cx, cy, CELL_W, CELL_H);
   }
+
+  ctx.restore();
+}
+
+function drawTeam(game, team, dt) {
+  const zone = team === "players" ? PLAYER_ZONE : ENEMY_ZONE;
+  const flip = team === "enemies";
 
   const entities = (game.entities || []).filter(e => e.team === team);
   for (const e of entities) {
-    // Derive grid position from slot (spawn order): col = slot % 3, row = slot / 3
-    const col = e.slot % 3;
-    const row = Math.floor(e.slot / 3);
-    const cx = colX(col);
-    const cy = oy + row * (CELL_H + CELL_PAD);
+    if (e.hp <= 0) continue;
 
-    // Class background
-    rect(cx, cy, CELL_W, CELL_H, classColor(e.class));
+    // Assign position on first sight; never move it.
+    if (!entityPositions.has(e.id)) {
+      entityPositions.set(e.id, assignPosition(zone));
+    }
+    const { x: cx, y: cy } = entityPositions.get(e.id);
+
+    // Sprite
+    drawEntitySprite(e, cx, cy, e.last_action ?? null, dt, flip);
 
     // HP bar
     const BAR_H = 8;
@@ -208,18 +345,47 @@ function drawGrid(game, team, ox, oy) {
       rect(cx, cy + BAR_H, CELL_W * shieldFrac, BAR_H, "rgba(80,160,255,0.9)");
     }
 
-    // Class abbreviation
-    text(classLabel(e.class), cx + 4, cy + 20 + 16, 16, C_TEXT);
-
-    // HP number
-    text(String(e.hp), cx + 4, cy + 44 + 14, 14, C_TEXT);
+    // HP number (over sprite)
+    text(String(e.hp), cx + 4, cy + CELL_H - 6, 13, C_TEXT);
 
     // Player-owned entity border
     if (e.owner === game.player_id && team === "players") {
       rectStroke(cx, cy, CELL_W, CELL_H, 2, C_OWN_BORDER);
     }
+
+    // Combo slot row under every player entity, sourced from per-entity
+    // snapshot so all players' combos are visible, not just the local one.
+    if (team === "players") {
+      const entityCombo = e.combo ?? [];
+      const SLOT_W = 18;
+      const MAX_SLOTS = 4;
+      const rowW = MAX_SLOTS * SLOT_W;
+      const rowX = cx + (CELL_W - rowW) / 2;
+      const rowY = cy + CELL_H + 4;
+
+      for (let i = 0; i < MAX_SLOTS; i++) {
+        const slotX = rowX + i * SLOT_W;
+        const action = entityCombo[i];
+        if (action) {
+          text(ACTION_CHAR[action] ?? "?", slotX, rowY + 13, 14,
+               ACTION_COLOR[action] ?? C_TEXT);
+        } else {
+          text("·", slotX, rowY + 13, 14, "rgba(120,120,140,0.5)");
+        }
+      }
+    }
   }
 }
+
+/** Map ActionChoice enum string → display character. */
+const ACTION_CHAR = { damage: "a", shield: "s", heal: "h" };
+
+/** Map ActionChoice enum string → highlight colour. */
+const ACTION_COLOR = {
+  damage: "rgba(255,100,100,1)",
+  shield: "rgba(80,160,255,1)",
+  heal:   "rgba(100,220,100,1)",
+};
 
 function drawActionMenu(game) {
   const mx = SW / 2 - 160;
@@ -230,34 +396,31 @@ function drawActionMenu(game) {
   rect(mx, my, mw, mh, C_MENU_BG);
   rectStroke(mx, my, mw, mh, 2, C_MENU_BORDER);
 
-  const pending = game.pending_action;
-  const dColor = pending === "damage" ? C_SEL : C_TEXT;
-  const sColor = pending === "shield" ? C_SEL : C_TEXT;
-  const hColor = pending === "heal"   ? C_SEL : C_TEXT;
-  text("[1] Damage", mx + 10,        my + 14 + 16, 16, dColor);
-  text("[2] Shield", mx + 10 + 106,  my + 14 + 16, 16, sColor);
-  text("[3] Heal",   mx + 10 + 212,  my + 14 + 16, 16, hColor);
+  text("[1] Atk", mx + 10,        my + 14 + 16, 16, C_TEXT);
+  text("[2] Shld", mx + 10 + 106, my + 14 + 16, 16, C_TEXT);
+  text("[3] Heal", mx + 10 + 212, my + 14 + 16, 16, C_TEXT);
+  text("[Esc] Cancel", mx + 10,   my + 14 + 34, 12, "rgba(180,180,180,0.8)");
 
   // Round timer bar
   const timerFrac = game.round_duration > 0
     ? Math.max(0, Math.min(1, game.round_timer / game.round_duration))
     : 0;
-  rect(mx + 10, my + 50, mw - 20, 10, "rgba(30,30,30,0.8)");
-  rect(mx + 10, my + 50, (mw - 20) * timerFrac, 10, "rgba(255,200,50,0.9)");
-  text(`Round: ${game.round_timer !== undefined ? game.round_timer.toFixed(1) : "?"}s`, mx + 10, my + 78, 13, C_TEXT);
+  rect(mx + 10, my + 58, mw - 20, 10, "rgba(30,30,30,0.8)");
+  rect(mx + 10, my + 58, (mw - 20) * timerFrac, 10, "rgba(255,200,50,0.9)");
+  text(`Round: ${game.round_timer !== undefined ? game.round_timer.toFixed(1) : "?"}s`, mx + 10, my + 82, 13, C_TEXT);
 }
 
-function drawGame(game) {
+function drawGame(game, dt) {
   clear();
 
   const wave = game.wave || "";
   text(`Wave: ${wave}`, 40, 30 + 20, 20, C_HEADER);
 
-  text("ALLIES", PLAYER_GRID_X, 155 + 18, 18, C_HEADER);
-  text("ENEMIES", ENEMY_GRID_X, 155 + 18, 18, C_ENEMY_HDR);
+  text("ALLIES",   PLAYER_ZONE.x0, 155 + 18, 18, C_HEADER);
+  text("ENEMIES",  ENEMY_ZONE.x0,  155 + 18, 18, C_ENEMY_HDR);
 
-  drawGrid(game, "players", PLAYER_GRID_X, PLAYER_GRID_Y);
-  drawGrid(game, "enemies", ENEMY_GRID_X, ENEMY_GRID_Y);
+  drawTeam(game, "players", dt);
+  drawTeam(game, "enemies", dt);
 
   drawActionMenu(game);
 }
@@ -267,15 +430,38 @@ function drawGameOver() {
   text("Game Over!  Press any key to return to lobby.", 40, SH / 2, 24, C_TEXT);
 }
 
-function renderFrame(msg) {
+// ---------------------------------------------------------------------------
+// Render loop
+// ---------------------------------------------------------------------------
+
+let latestMsg = null;
+let lastTs = null;
+let lastPhase = null;
+
+function renderFrame(msg, dt) {
+  // Clear per-entity state whenever we leave the game phase.
+  if (lastPhase === "game" && msg.phase !== "game") clearEntityState();
+  lastPhase = msg.phase;
+
   switch (msg.phase) {
     case "connecting": drawConnecting(); break;
-    case "lobby": drawLobby(msg.lobby); break;
-    case "game": drawGame(msg.game); break;
+    case "lobby":     drawLobby(msg.lobby); break;
+    case "game":      drawGame(msg.game, dt); break;
     case "game_over": drawGameOver(); break;
-    default: drawConnecting();
+    default:          drawConnecting();
   }
 }
+
+function gameLoop(ts) {
+  const dt = lastTs !== null ? (ts - lastTs) / 1000 : 0;
+  lastTs = ts;
+  if (latestMsg) renderFrame(latestMsg, dt);
+  requestAnimationFrame(gameLoop);
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket
+// ---------------------------------------------------------------------------
 
 let ws = null;
 
@@ -290,12 +476,14 @@ function connect() {
   ws.addEventListener("message", (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.tag === "render") renderFrame(msg);
+    if (msg.tag === "render") latestMsg = msg;
     else if (msg.tag === "full") drawFull();
   });
 }
 
-connect();
+// ---------------------------------------------------------------------------
+// Input forwarding
+// ---------------------------------------------------------------------------
 
 const FORWARDED_KEYS = new Set([
   "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
@@ -310,4 +498,18 @@ document.addEventListener("keydown", (e) => {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ key: e.key }));
   }
+});
+
+// ---------------------------------------------------------------------------
+// Boot: load assets, then start loop and connect
+// ---------------------------------------------------------------------------
+
+loadAssets().then(() => {
+  requestAnimationFrame(gameLoop);
+  connect();
+}).catch(err => {
+  console.error("[game] asset load failed", err);
+  // Start anyway so the connecting screen shows.
+  requestAnimationFrame(gameLoop);
+  connect();
 });

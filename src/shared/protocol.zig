@@ -22,11 +22,14 @@ pub const MsgTag = enum(u8) {
     choose_action = 0x04,
     reconnect = 0x05,
     choose_position = 0x06, // cosmetic lobby position only
+    choose_combo = 0x07,    // submit/overwrite current action combo (1–4 actions)
+    cancel_combo = 0x08,    // cancel pending combo; server nulls the pool slot
 
     lobby_update = 0x10,
     game_start = 0x11,
     game_state = 0x12,
     action_result = 0x13,
+    round_reset = 0x14,     // server→client: round just fired, clear pending combo
     game_over = 0x15,
     @"error" = 0x1F,
 };
@@ -47,6 +50,12 @@ pub const ChoosePosition = struct {
 
 pub const ChooseAction = struct {
     action: components.ActionChoice,
+};
+
+/// Ordered sequence of 1–4 actions submitted as a combo for the current round.
+/// Wire: [len: u8][action_0]..[action_N-1]
+pub const ChooseCombo = struct {
+    combo: components.ActionCombo,
 };
 
 pub const Reconnect = struct {
@@ -93,6 +102,10 @@ pub const EntitySnapshot = struct {
     class: components.ClassTag,
     team: components.TeamId,
     owner: u8,
+    /// Number of actions in this entity's owning player's pending combo (0 = none).
+    /// Always 0 for enemy entities.
+    combo_len: u8,
+    combo_actions: [components.MAX_COMBO_LEN]components.ActionChoice,
 };
 
 pub const MAX_ENTITIES_WIRE: u16 = 64;
@@ -149,6 +162,13 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
             try writer.writeByte(payload.col);
             try writer.writeByte(payload.row);
         },
+        .choose_combo => {
+            try writer.writeByte(payload.combo.len);
+            for (payload.combo.actions[0..payload.combo.len]) |a|
+                try writer.writeByte(@intFromEnum(a));
+        },
+        .cancel_combo => {},
+        .round_reset => {},
 
         .lobby_update => try encode_lobby_update(writer, payload),
         .game_start => try encode_game_start(writer, payload),
@@ -205,6 +225,10 @@ fn encode_game_state(w: anytype, p: GameState) !void {
         try w.writeByte(@intFromEnum(e.class));
         try w.writeByte(@intFromEnum(e.team));
         try w.writeByte(e.owner);
+        try w.writeByte(e.combo_len);
+        var j: u8 = 0;
+        while (j < e.combo_len) : (j += 1)
+            try w.writeByte(@intFromEnum(e.combo_actions[j]));
     }
 }
 
@@ -224,6 +248,7 @@ pub const DecodeError = error{
     InvalidWinner,
     NameTooLong,
     TooManyEntities,
+    InvalidComboLen,
 };
 
 pub fn read_tag(reader: anytype) !MsgTag {
@@ -251,6 +276,22 @@ pub fn decode_choose_action(reader: anytype) !ChooseAction {
     const action = std.meta.intToEnum(components.ActionChoice, byte) catch
         return DecodeError.InvalidActionChoice;
     return .{ .action = action };
+}
+
+pub fn decode_choose_combo(reader: anytype) !ChooseCombo {
+    const len = try reader.readByte();
+    if (len == 0 or len > components.MAX_COMBO_LEN) return DecodeError.InvalidComboLen;
+    var combo = components.ActionCombo{
+        .actions = [_]components.ActionChoice{.damage} ** components.MAX_COMBO_LEN,
+        .len = len,
+    };
+    var i: u8 = 0;
+    while (i < len) : (i += 1) {
+        const byte = try reader.readByte();
+        combo.actions[i] = std.meta.intToEnum(components.ActionChoice, byte) catch
+            return DecodeError.InvalidActionChoice;
+    }
+    return .{ .combo = combo };
 }
 
 pub fn decode_reconnect(reader: anytype) !Reconnect {
@@ -319,6 +360,15 @@ pub fn decode_game_state(reader: anytype) !GameState {
         e.team = std.meta.intToEnum(components.TeamId, team_byte) catch
             return DecodeError.InvalidTeam;
         e.owner = try reader.readByte();
+        e.combo_len = try reader.readByte();
+        if (e.combo_len > components.MAX_COMBO_LEN) return DecodeError.InvalidComboLen;
+        e.combo_actions = [_]components.ActionChoice{.damage} ** components.MAX_COMBO_LEN;
+        var j: u8 = 0;
+        while (j < e.combo_len) : (j += 1) {
+            const ab = try reader.readByte();
+            e.combo_actions[j] = std.meta.intToEnum(components.ActionChoice, ab) catch
+                return DecodeError.InvalidActionChoice;
+        }
         p.entities[i] = e;
     }
     return p;
@@ -404,6 +454,8 @@ test "round-trip: game_state — round_timer and shield_hp survive" {
         .class = .fighter,
         .team = .players,
         .owner = 0,
+        .combo_len = 2,
+        .combo_actions = [_]components.ActionChoice{ .damage, .shield, .damage, .damage },
     };
 
     try encode(fbs.writer(), .game_state, gs);
@@ -417,6 +469,9 @@ test "round-trip: game_state — round_timer and shield_hp survive" {
     try std.testing.expectEqual(@as(u8, 1), decoded.entity_count);
     try std.testing.expectEqual(@as(u16, 5), decoded.entities[0].shield_hp);
     try std.testing.expectEqual(@as(u16, 80), decoded.entities[0].hp_current);
+    try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].combo_len);
+    try std.testing.expectEqual(components.ActionChoice.damage, decoded.entities[0].combo_actions[0]);
+    try std.testing.expectEqual(components.ActionChoice.shield, decoded.entities[0].combo_actions[1]);
 }
 
 test "round-trip: lobby_update — round_duration survives" {
@@ -473,6 +528,76 @@ test "round-trip: game_start — round_duration survives" {
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), decoded.round_duration, 0.001);
     try std.testing.expectEqual(@as(u8, 3), decoded.player_id);
     try std.testing.expectEqualSlices(u8, label, decoded.wave_label[0..decoded.wave_label_len]);
+}
+
+test "round-trip: choose_combo [damage, shield, heal]" {
+    var buf: [16]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    var combo = components.ActionCombo{
+        .actions = [_]components.ActionChoice{.damage} ** components.MAX_COMBO_LEN,
+        .len = 3,
+    };
+    combo.actions[0] = .damage;
+    combo.actions[1] = .shield;
+    combo.actions[2] = .heal;
+
+    try encode(fbs.writer(), .choose_combo, ChooseCombo{ .combo = combo });
+    fbs.reset();
+    const tag = try read_tag(fbs.reader());
+    try std.testing.expectEqual(MsgTag.choose_combo, tag);
+    const decoded = try decode_choose_combo(fbs.reader());
+    try std.testing.expectEqual(@as(u8, 3), decoded.combo.len);
+    try std.testing.expectEqual(components.ActionChoice.damage, decoded.combo.actions[0]);
+    try std.testing.expectEqual(components.ActionChoice.shield, decoded.combo.actions[1]);
+    try std.testing.expectEqual(components.ActionChoice.heal, decoded.combo.actions[2]);
+}
+
+test "round-trip: choose_combo len=4 all damage" {
+    var buf: [16]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    const combo = components.ActionCombo{
+        .actions = [_]components.ActionChoice{.damage} ** components.MAX_COMBO_LEN,
+        .len = 4,
+    };
+    try encode(fbs.writer(), .choose_combo, ChooseCombo{ .combo = combo });
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    const decoded = try decode_choose_combo(fbs.reader());
+    try std.testing.expectEqual(@as(u8, 4), decoded.combo.len);
+    for (decoded.combo.actions[0..4]) |a|
+        try std.testing.expectEqual(components.ActionChoice.damage, a);
+}
+
+test "decode_choose_combo: len=0 returns InvalidComboLen" {
+    var buf: [2]u8 = .{ 0x00, 0x00 };
+    var fbs = std.io.fixedBufferStream(&buf);
+    try std.testing.expectError(DecodeError.InvalidComboLen, decode_choose_combo(fbs.reader()));
+}
+
+test "decode_choose_combo: len=5 returns InvalidComboLen" {
+    var buf: [2]u8 = .{ 0x05, 0x00 };
+    var fbs = std.io.fixedBufferStream(&buf);
+    try std.testing.expectError(DecodeError.InvalidComboLen, decode_choose_combo(fbs.reader()));
+}
+
+test "round-trip: cancel_combo (zero payload)" {
+    var buf: [4]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try encode(fbs.writer(), .cancel_combo, {});
+    fbs.reset();
+    const tag = try read_tag(fbs.reader());
+    try std.testing.expectEqual(MsgTag.cancel_combo, tag);
+}
+
+test "round-trip: round_reset (zero payload)" {
+    var buf: [4]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try encode(fbs.writer(), .round_reset, {});
+    fbs.reset();
+    const tag = try read_tag(fbs.reader());
+    try std.testing.expectEqual(MsgTag.round_reset, tag);
 }
 
 test "round-trip: action_result shield tag" {

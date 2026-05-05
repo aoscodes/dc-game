@@ -54,3 +54,21 @@ pub const ActionChoice = enum(u8) {
     shield = 1,
     heal = 2,
 };
+
+pub const MAX_COMBO_LEN: u8 = 4;
+
+/// An ordered sequence of 1–4 actions submitted by a player for one round.
+/// Every slot in `actions[0..len]` contributes independently to the shared
+/// action pools when the round resolves.
+pub const ActionCombo = struct {
+    actions: [MAX_COMBO_LEN]ActionChoice,
+    len: u8, // 1..MAX_COMBO_LEN
+};
+
+/// Animation to play on an entity, signalled by the server via action_result
+/// and forwarded to the browser in the render JSON.  Extend by adding variants.
+pub const ActionAnimation = enum(u8) {
+    attack = 0,
+    hurt = 1,
+    die = 2,
+};

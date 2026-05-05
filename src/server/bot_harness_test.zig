@@ -426,9 +426,11 @@ test "profile cycles correctly across rounds" {
         //    expiring the round timer (round_timer > 0 after reset).
         try h.session.tick(0.0);
         // 3. Verify the pool was set correctly before round resolution fires.
+        // Bots submit via choose_action → wrapped as combo-of-1.
         const pid = h.bot_states[0].player_id;
         const got = h.session.action_pool[pid] orelse return error.NoAction;
-        try std.testing.expectEqual(want, got);
+        try std.testing.expectEqual(@as(u8, 1), got.len);
+        try std.testing.expectEqual(want, got.actions[0]);
         // 4. Fire round resolution by ticking past the timer, then advance h.round.
         try h.session.tick(h.session.round_duration + 0.001);
         h.round += 1;

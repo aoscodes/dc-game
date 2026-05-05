@@ -116,9 +116,10 @@ pub const Session = struct {
     /// clients at game start so they can display the countdown.
     round_duration: f32 = logic.ROUND_DURATION_DEFAULT_S,
 
-    /// Per-player action submitted this round.  Null = player hasn't acted yet.
-    /// Overwritten freely until the round ends.
-    action_pool: [MAX_PLAYERS]?c.ActionChoice,
+    /// Per-player combo submitted this round.  Null = player hasn't acted yet.
+    /// Overwritten freely until the round ends via choose_combo/choose_action;
+    /// nulled by cancel_combo.
+    action_pool: [MAX_PLAYERS]?c.ActionCombo,
 
     /// Per-tick timing profiler.
     profiler: dbg.Profiler(TickZones) = dbg.Profiler(TickZones).init(),
@@ -148,7 +149,7 @@ pub const Session = struct {
             .join_code = join_code,
             .players = players,
             .world = world,
-            .action_pool = [_]?c.ActionChoice{null} ** MAX_PLAYERS,
+            .action_pool = [_]?c.ActionCombo{null} ** MAX_PLAYERS,
         };
     }
 
@@ -235,7 +236,7 @@ pub const Session = struct {
         self.world.deinit();
         self.world = try GameWorld.init(self.allocator);
         set_world_system_signatures(&self.world);
-        for (&self.action_pool) |*a| a.* = null;
+        for (&self.action_pool) |*a| a.* = @as(?c.ActionCombo, null);
         self.tick_count = 0;
 
         self.phase = .playing;
@@ -304,10 +305,15 @@ pub const Session = struct {
         }
     }
 
-    /// Clear the action pool and reset the round timer for the next round.
+    /// Clear the action pool, reset the round timer, and tell all clients to
+    /// clear their pending combos.
     fn reset_round(self: *Session) void {
         for (&self.action_pool) |*a| a.* = null;
         self.round_timer = self.round_duration;
+        var buf: [2]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        proto.encode(fbs.writer(), .round_reset, {}) catch return;
+        self.broadcast_raw(fbs.getWritten()) catch {};
     }
 
     fn drain_queues(self: *Session) !void {
@@ -394,8 +400,26 @@ pub const Session = struct {
             .choose_action => {
                 if (self.phase == .playing and player_id < MAX_PLAYERS) {
                     const p = try proto.decode_choose_action(fbs.reader());
-                    self.action_pool[player_id] = p.action;
-                    std.log.debug("player {} action: {s}", .{ player_id, @tagName(p.action) });
+                    var combo = c.ActionCombo{
+                        .actions = [_]c.ActionChoice{.damage} ** c.MAX_COMBO_LEN,
+                        .len = 1,
+                    };
+                    combo.actions[0] = p.action;
+                    self.action_pool[player_id] = combo;
+                    std.log.debug("player {} action (single): {s}", .{ player_id, @tagName(p.action) });
+                }
+            },
+            .choose_combo => {
+                if (self.phase == .playing and player_id < MAX_PLAYERS) {
+                    const p = try proto.decode_choose_combo(fbs.reader());
+                    self.action_pool[player_id] = p.combo;
+                    std.log.debug("player {} combo len={}", .{ player_id, p.combo.len });
+                }
+            },
+            .cancel_combo => {
+                if (self.phase == .playing and player_id < MAX_PLAYERS) {
+                    self.action_pool[player_id] = null;
+                    std.log.debug("player {} cancelled combo", .{player_id});
                 }
             },
             .reconnect => {},
@@ -404,16 +428,18 @@ pub const Session = struct {
     }
 
     fn resolve_round(self: *Session) !void {
-        // Count player actions.
+        // Count player actions — each slot in every player's combo contributes.
         var damage_pool: u16 = 0;
         var shield_pool: u16 = 0;
         var heal_pool: u16 = 0;
-        for (&self.action_pool) |maybe_action| {
-            const action = maybe_action orelse continue;
-            switch (action) {
-                .damage => damage_pool += 1,
-                .shield => shield_pool += 1,
-                .heal => heal_pool += 1,
+        for (&self.action_pool) |maybe_combo| {
+            const combo = maybe_combo orelse continue;
+            for (combo.actions[0..combo.len]) |action| {
+                switch (action) {
+                    .damage => damage_pool += 1,
+                    .shield => shield_pool += 1,
+                    .heal => heal_pool += 1,
+                }
             }
         }
         std.log.info("round resolve — dmg={} shld={} heal={}", .{ damage_pool, shield_pool, heal_pool });
@@ -655,6 +681,17 @@ pub const Session = struct {
             else
                 0xFF;
 
+            // Embed the owning player's current combo so every client can
+            // render all players' pending combos, not just their own.
+            const combo_len: u8 = if (tm.id == .players and own != 0xFF)
+                if (self.action_pool[own]) |combo| combo.len else 0
+            else
+                0;
+            const combo_actions = if (combo_len > 0)
+                self.action_pool[own].?.actions
+            else
+                [_]c.ActionChoice{.damage} ** c.MAX_COMBO_LEN;
+
             snap.entities[snap.entity_count] = .{
                 .entity = e,
                 .slot = snap.entity_count,
@@ -664,6 +701,8 @@ pub const Session = struct {
                 .class = cl.tag,
                 .team = tm.id,
                 .owner = own,
+                .combo_len = combo_len,
+                .combo_actions = combo_actions,
             };
             snap.entity_count += 1;
         }
