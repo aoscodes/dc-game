@@ -11,7 +11,10 @@ module.exports = defineConfig({
   retries: 0,
   reporter: [["list"], ["html", { open: "never", outputFolder: "playwright-report" }]],
   use: {
-    headless: true,
+    // Set HEADED=1 to open a real browser window (e.g. for watching bot tests).
+    headless: !process.env.HEADED,
+    // Set SLOW_MO=<ms> to slow down Playwright actions (useful when watching).
+    slowMo: Number(process.env.SLOW_MO ?? 0),
     // Capture screenshots on failure for debugging CI.
     screenshot: "only-on-failure",
     video: "retain-on-failure",

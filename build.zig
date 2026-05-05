@@ -256,4 +256,25 @@ pub fn build(b: *std.Build) !void {
     });
     playwright_test.step.dependOn(&npm_install.step);
     browser_e2e_step.dependOn(&playwright_test.step);
+
+    // -----------------------------------------------------------------------
+    // Bot watch  (zig build bot-watch)
+    //
+    // Runs all browser e2e tests headed with slow-mo so you can watch bots
+    // play in a real browser window.  Requires a prior `zig build server`.
+    // The server is started by each test at its own port with the default
+    // round duration (3 s); pass --round-duration to the server manually if
+    // you want a different pace.
+    // -----------------------------------------------------------------------
+
+    const bot_watch_step = b.step("bot-watch", "Run all browser e2e tests headed (watch bots play)");
+    const bot_watch_cmd = b.addSystemCommand(&.{
+        "npx",                              "--prefix", "e2e/browser",
+        "playwright",                       "test",     "--config",
+        "e2e/browser/playwright.config.js", "--headed",
+    });
+    bot_watch_cmd.setEnvironmentVariable("SLOW_MO", "300");
+    bot_watch_cmd.step.dependOn(&server_install.step);
+    bot_watch_cmd.step.dependOn(&npm_install.step);
+    bot_watch_step.dependOn(&bot_watch_cmd.step);
 }

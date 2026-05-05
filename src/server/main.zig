@@ -10,6 +10,7 @@ const std = @import("std");
 const ws = @import("websocket");
 const shared = @import("shared");
 const proto = shared.protocol;
+const logic = shared.game_logic;
 const dbg = @import("debug_zig");
 
 const session_mod = @import("session.zig");
@@ -128,11 +129,22 @@ pub fn main() !void {
     defer g_ta.report_stderr("server");
 
     var port: u16 = DEFAULT_PORT;
+    var round_duration: f32 = logic.ROUND_DURATION_DEFAULT_S;
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // skip argv[0]
     if (args.next()) |arg| {
         port = std.fmt.parseInt(u16, arg, 10) catch DEFAULT_PORT;
+    }
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--round-duration")) {
+            if (args.next()) |val| {
+                round_duration = std.fmt.parseFloat(f32, val) catch blk: {
+                    std.log.warn("invalid --round-duration value '{s}', using default {d:.1}s", .{ val, logic.ROUND_DURATION_DEFAULT_S });
+                    break :blk logic.ROUND_DURATION_DEFAULT_S;
+                };
+            }
+        }
     }
 
     var join_code: [6]u8 = undefined;
@@ -144,6 +156,8 @@ pub fn main() !void {
 
     g_session = try Session.init(allocator, join_code);
     defer if (g_session) |*s| s.deinit();
+    g_session.?.round_duration = round_duration;
+    g_session.?.round_timer = round_duration;
 
     std.log.info("Room code: {s}", .{join_code});
     std.log.info("Listening on port {d}", .{port});

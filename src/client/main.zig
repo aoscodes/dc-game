@@ -6,29 +6,16 @@ const c = shared.components;
 const inp = @import("input.zig");
 const sw = @import("stdout_writer.zig");
 
-// Re-export state types so the rest of the file doesn't need sw. prefix.
 const ClientPhaseTag = sw.ClientPhaseTag;
 const LobbyState = sw.LobbyState;
 const GameState = sw.GameState;
 
-// ---------------------------------------------------------------------------
-// Global state
-// ---------------------------------------------------------------------------
-
-/// Inbound server messages are hex-encoded lines prefixed with "WIRE:".
-/// Key events arrive as lines prefixed with "KEY:".
 const WIRE_PREFIX = "WIRE:";
 const KEY_PREFIX = "KEY:";
 
-/// Tick rate for the render/logic loop (does not affect server tick rate).
 const RENDER_HZ: u64 = 60;
 const TICK_NS: u64 = std.time.ns_per_s / RENDER_HZ;
 
-/// Lock-protected, length-prefixed ring-buffer message queue.
-///
-/// Each enqueued message is stored as [u16-le length][payload bytes].
-/// `head` and `tail` are byte offsets into `buf` that wrap at `buf.len`.
-/// Invariant: `used() == (tail - head + buf.len) % buf.len`.
 const MsgQueue = struct {
     buf: [16384]u8 = undefined,
     head: usize = 0,
@@ -40,7 +27,6 @@ const MsgQueue = struct {
     }
 
     fn free(self: *const MsgQueue) usize {
-        // One slot kept empty to distinguish full from empty.
         return self.buf.len - 1 - self.used();
     }
 
@@ -53,7 +39,6 @@ const MsgQueue = struct {
             std.log.warn("msg queue full, dropping {} bytes", .{data.len});
             return;
         }
-        // Write 2-byte little-endian length header.
         self.write_byte(@intCast(data.len & 0xFF));
         self.write_byte(@intCast(data.len >> 8));
         for (data) |b| self.write_byte(b);
@@ -67,10 +52,8 @@ const MsgQueue = struct {
         const hi = self.peek_byte(1);
         const msg_len: usize = @as(usize, lo) | (@as(usize, hi) << 8);
         if (self.used() < 2 + msg_len) return null;
-        // Advance past the length header.
         self.head = (self.head + 2) % self.buf.len;
         if (msg_len > out.len) {
-            // Message too large for caller's buffer — discard and warn.
             std.log.warn("msg queue: message {} bytes too large for scratch, discarding", .{msg_len});
             self.head = (self.head + msg_len) % self.buf.len;
             return null;
@@ -110,20 +93,11 @@ const ClientState = struct {
 var g_state: ClientState = .{};
 var g_key_queue: inp.KeyQueue = .{};
 
-/// Mutex protecting stdout so stdin-reader and game loop don't interleave.
 var g_stdout_mu: std.Thread.Mutex = .{};
-
-// ---------------------------------------------------------------------------
-// Stdout writer accessor
-// ---------------------------------------------------------------------------
 
 fn stdout_writer() sw.Writer {
     return .{ .mu = &g_stdout_mu };
 }
-
-// ---------------------------------------------------------------------------
-// Stdin reader thread
-// ---------------------------------------------------------------------------
 
 fn stdin_reader(_: void) void {
     var stdin_file = std.fs.File.stdin();
@@ -158,10 +132,6 @@ fn stdin_reader(_: void) void {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Protocol helpers — send to server via bridge
-// ---------------------------------------------------------------------------
 
 fn emit_send(bytes: []const u8) void {
     stdout_writer().write_send(bytes);
@@ -199,10 +169,6 @@ fn send_action(action: c.ActionChoice) void {
     emit_send(fbs.getWritten());
 }
 
-// ---------------------------------------------------------------------------
-// Message processing
-// ---------------------------------------------------------------------------
-
 fn process_recv() void {
     while (g_state.recv_queue.pop(&g_state.recv_scratch)) |data| {
         var fbs = std.io.fixedBufferStream(data);
@@ -223,7 +189,6 @@ fn process_recv() void {
                 }
                 g_state.lobby.update = p;
                 g_state.lobby.player_id = g_state.player_id;
-                // Sync local cursor to the server-authoritative position.
                 for (p.players[0..p.player_count]) |pi| {
                     if (pi.player_id == g_state.player_id) {
                         g_state.lobby.chosen_pos = .{
@@ -263,10 +228,6 @@ fn process_recv() void {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Update logic
-// ---------------------------------------------------------------------------
 
 fn update_lobby() void {
     const key = g_key_queue.pop() orelse return;

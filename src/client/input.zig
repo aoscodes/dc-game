@@ -16,8 +16,6 @@ pub const InputEvent = union(InputEventTag) {
     heal: void,
 };
 
-/// Map a browser key name (as sent by JS KeyboardEvent.key) to a raw key token.
-/// Returns null for unrecognised keys.
 pub fn parse_key_name(name: []const u8) ?RawKey {
     if (std.mem.eql(u8, name, "ArrowUp")) return .up;
     if (std.mem.eql(u8, name, "ArrowDown")) return .down;
@@ -37,7 +35,6 @@ pub fn parse_key_name(name: []const u8) ?RawKey {
 
 pub const RawKey = enum { up, down, left, right, enter, escape, z, x, one, two, three };
 
-/// Thread-safe ring-buffer key queue.
 pub const KeyQueue = struct {
     buf: [64]RawKey = undefined,
     head: usize = 0,

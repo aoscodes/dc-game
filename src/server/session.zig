@@ -56,8 +56,6 @@ pub const TickZones = enum { drain, round, broadcast, check_win };
 
 /// Tracks all living entities belonging to the players team.
 pub const PlayerTeam = struct {};
-
-/// Tracks all living entities belonging to the enemies team.
 pub const EnemyTeam = struct {};
 
 pub const GameWorld = ecs.World(
@@ -405,10 +403,6 @@ pub const Session = struct {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Round resolution
-    // -------------------------------------------------------------------------
-
     fn resolve_round(self: *Session) !void {
         // Count player actions.
         var damage_pool: u16 = 0;
@@ -424,7 +418,6 @@ pub const Session = struct {
         }
         std.log.info("round resolve — dmg={} shld={} heal={}", .{ damage_pool, shield_pool, heal_pool });
 
-        // Snapshot living entity IDs into stack buffers before any mutation.
         var enemy_buf: [64]ecs.Entity = undefined;
         var player_buf: [MAX_PLAYERS]ecs.Entity = undefined;
         var n_enemies: usize = 0;
@@ -448,7 +441,6 @@ pub const Session = struct {
             }
         }
 
-        // 1. Damage pool → each living enemy.
         if (damage_pool > 0) {
             for (enemy_buf[0..n_enemies]) |e| {
                 const hp = self.world.get_component(e, c.Health);

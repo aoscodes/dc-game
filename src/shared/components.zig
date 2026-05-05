@@ -10,7 +10,6 @@ pub const Health = struct {
     max: u16,
 };
 
-/// Flat damage absorption. Depleted before HP takes damage.
 pub const Shield = struct {
     hp: u16,
 };
@@ -50,7 +49,6 @@ pub const Owner = struct {
     player_id: u8,
 };
 
-/// The action a player chooses to contribute to the shared pool each round.
 pub const ActionChoice = enum(u8) {
     damage = 0,
     shield = 1,

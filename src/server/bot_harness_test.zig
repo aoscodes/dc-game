@@ -61,6 +61,16 @@ const BotState = struct {
     }
 };
 
+/// Tunable parameters for BotHarness.  All fields have defaults so callers
+/// can use `.{}` for standard behaviour.
+pub const BotHarnessOptions = struct {
+    /// Round duration in seconds applied to the session before the game starts.
+    /// Default matches ROUND_DURATION_DEFAULT_S (3 s) — appropriate for
+    /// real-time watching against a live server.  Set to a small value
+    /// (e.g. 0.001) for fast headless CI runs.
+    round_duration: f32 = shared.game_logic.ROUND_DURATION_DEFAULT_S,
+};
+
 pub const BotHarness = struct {
     allocator: std.mem.Allocator,
     session: Session,
@@ -86,6 +96,7 @@ pub const BotHarness = struct {
         team: *const bots.BotTeam,
         wave: *const waves.Wave,
         join_code: [6]u8,
+        opts: BotHarnessOptions,
     ) !BotHarness {
         std.debug.assert(team.bots.len >= 1);
         std.debug.assert(team.bots.len <= session_mod.MAX_PLAYERS);
@@ -107,6 +118,10 @@ pub const BotHarness = struct {
             };
             bot_states[i].player_id = pid;
         }
+
+        // Apply timing options before starting the game.
+        sess.round_duration = opts.round_duration;
+        sess.round_timer = opts.round_duration;
 
         // Start the game, spawning enemies from `wave`.  Then replace player
         // entities with ones whose HP comes from BotStats rather than class defaults.
@@ -282,7 +297,7 @@ test "all_damage team beats wave_01_basic" {
     // damage_pool = 2 per round → 2*10 = 20 HP per enemy per round → 4 rounds to kill each.
     // All enemies should die; game_over with winner = .players.
     const allocator = std.testing.allocator;
-    var h = try BotHarness.init(allocator, &bots.team_all_damage, &waves.wave_01_basic, "BOTKEY".*);
+    var h = try BotHarness.init(allocator, &bots.team_all_damage, &waves.wave_01_basic, "BOTKEY".*, .{});
     defer h.deinit();
 
     const rounds = try h.run_to_completion(200);
@@ -298,7 +313,7 @@ test "heal-only team cannot kill enemies — eventually loses" {
     // Heal restores 1 * ACTION_EFFECT_VALUE = 10 HP/round.
     // Net drain = 2 HP/round. support_stats.max_hp = 80 → dies within 40 rounds.
     const allocator = std.testing.allocator;
-    var h = try BotHarness.init(allocator, &bots.team_all_heal, &wave_overwhelming, "BOTKEY".*);
+    var h = try BotHarness.init(allocator, &bots.team_all_heal, &wave_overwhelming, "BOTKEY".*, .{});
     defer h.deinit();
 
     const rounds = try h.run_to_completion(200);
@@ -312,7 +327,7 @@ test "mixed team beats two-grunt wave" {
     // team_mixed: tank (damage), medic (heal), cannon (damage).
     // damage_pool = 2/round → 20 HP/enemy/round → kills 30-HP grunts in 2 rounds each.
     const allocator = std.testing.allocator;
-    var h = try BotHarness.init(allocator, &bots.team_mixed, &wave_two_grunts, "BOTKEY".*);
+    var h = try BotHarness.init(allocator, &bots.team_mixed, &wave_two_grunts, "BOTKEY".*, .{});
     defer h.deinit();
 
     const rounds = try h.run_to_completion(50);
@@ -363,9 +378,9 @@ test "tank bot absorbs incoming damage with shield rotation" {
         }},
     };
 
-    var h_tank = try BotHarness.init(allocator, &tank_team, &wave_lethal_pack, "BOTK01".*);
+    var h_tank = try BotHarness.init(allocator, &tank_team, &wave_lethal_pack, "BOTK01".*, .{});
     defer h_tank.deinit();
-    var h_dmg = try BotHarness.init(allocator, &damage_team, &wave_lethal_pack, "BOTK02".*);
+    var h_dmg = try BotHarness.init(allocator, &damage_team, &wave_lethal_pack, "BOTK02".*, .{});
     defer h_dmg.deinit();
 
     const tank_rounds = try h_tank.run_to_completion(100);
@@ -398,7 +413,7 @@ test "profile cycles correctly across rounds" {
         }},
     };
 
-    var h = try BotHarness.init(allocator, &balanced_team, &wave_unkillable, "BOTKEY".*);
+    var h = try BotHarness.init(allocator, &balanced_team, &wave_unkillable, "BOTKEY".*, .{});
     defer h.deinit();
 
     const expected = [_]c.ActionChoice{ .damage, .damage, .shield, .heal, .damage };

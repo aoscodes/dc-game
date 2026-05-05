@@ -1,21 +1,10 @@
 //! Pure game logic: combat math and round resolution.
-//!
-//! All functions are stateless and take component values by value or pointer.
-//! No ECS World import here — callers pass in the data they need.
 
 const std = @import("std");
 const c = @import("components.zig");
 
-/// Default round duration in seconds. Overridden per-session via lobby config.
 pub const ROUND_DURATION_DEFAULT_S: f32 = 3.0;
-
-/// Effect value of a single player action contribution (damage dealt,
-/// shield HP granted, or HP healed).
-pub const ACTION_EFFECT_VALUE: u16 = 10;
-
-// ---------------------------------------------------------------------------
-// Core health mutations
-// ---------------------------------------------------------------------------
+pub const ACTION_EFFECT_VALUE: u16 = 1;
 
 pub fn apply_damage(health: *c.Health, damage: u16) void {
     health.current = if (health.current > damage) health.current - damage else 0;
@@ -30,13 +19,6 @@ pub fn is_dead(health: c.Health) bool {
     return health.current == 0;
 }
 
-// ---------------------------------------------------------------------------
-// Pool resolution — player action pools applied at round end
-// ---------------------------------------------------------------------------
-
-/// Apply accumulated damage pool to a single target's health.
-/// Returns the HP damage that landed (post-shield absorption).
-/// Shield absorbs first; overflow hits `health`.
 pub fn resolve_damage_pool(
     health: *c.Health,
     shield: *c.Shield,
@@ -51,12 +33,10 @@ pub fn resolve_damage_pool(
     return remaining;
 }
 
-/// Grant flat shield HP to a single entity from the shield pool.
 pub fn resolve_shield_pool(shield: *c.Shield, pool_size: u16) void {
     shield.hp +|= pool_size * ACTION_EFFECT_VALUE;
 }
 
-/// Apply heal pool to a single entity's health.
 pub fn resolve_heal_pool(health: *c.Health, pool_size: u16) void {
     apply_heal(health, pool_size * ACTION_EFFECT_VALUE);
 }
@@ -74,8 +54,6 @@ pub const EnemyIntent = struct {
     damage_per_player: u16,
 };
 
-/// Compute the enemy intent for the current round.
-///
 /// Each living enemy deals exactly 1 damage per player, so
 /// `damage_per_player = living_enemy_count`.
 pub fn compute_enemy_intent(living_enemy_count: u16) EnemyIntent {
@@ -97,10 +75,6 @@ pub fn apply_enemy_intent(
     apply_damage(health, remaining);
     return remaining;
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 test "apply_damage: no underflow" {
     var h = c.Health{ .current = 5, .max = 100 };

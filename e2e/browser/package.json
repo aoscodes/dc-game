@@ -4,7 +4,8 @@
   "description": "Playwright browser smoke tests for the canvas client",
   "scripts": {
     "test": "playwright test",
-    "test:headed": "playwright test --headed"
+    "test:headed": "playwright test --headed",
+    "test:watch": "HEADED=1 SLOW_MO=300 playwright test"
   },
   "devDependencies": {
     "@playwright/test": "^1.58.2"

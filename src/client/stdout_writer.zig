@@ -61,21 +61,13 @@ pub const LobbyState = struct {
 pub const GameState = struct {
     snapshot: proto.GameState = std.mem.zeroes(proto.GameState),
     player_id: u8 = 0xFF,
-    /// The action the local player has chosen this round (overwritten on each
-    /// key press; null = not yet chosen).
     pending_action: ?c.ActionChoice = null,
     round_timer: f32 = 0.0,
-    /// Full duration of each round (seconds). Set once from game_start.
     round_duration: f32 = 0.0,
     wave_label: [32]u8 = [_]u8{0} ** 32,
     wave_label_len: u8 = 0,
-    /// Set when the server sends game_over; null while the game is running.
     winner: ?proto.WinnerId = null,
 };
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
 
 fn write_render_inner(
     w: *std.io.Writer,
@@ -141,10 +133,6 @@ fn write_render_inner(
     try std.json.Stringify.value(frame, .{ .emit_null_optional_fields = false }, w);
 }
 
-// ---------------------------------------------------------------------------
-// JSON frame shapes — serialisation-only, private to this file.
-// ---------------------------------------------------------------------------
-
 const JsonSendFrame = struct {
     tag: []const u8,
     bytes: HexBytes,
@@ -167,7 +155,6 @@ const JsonRenderFrame = struct {
     phase: ClientPhaseTag,
     lobby: ?JsonLobby,
     game: ?JsonGame,
-    /// Present only when phase == .game_over.
     winner: ?proto.WinnerId,
 };
 
