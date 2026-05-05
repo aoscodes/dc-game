@@ -332,22 +332,6 @@ function drawTeam(game, team, dt) {
     // Sprite
     drawEntitySprite(e, cx, cy, e.last_action ?? null, dt, flip);
 
-    // HP bar
-    const BAR_H = 8;
-    const hpFrac = e.hp_max > 0 ? e.hp / e.hp_max : 0;
-    rect(cx, cy, CELL_W, BAR_H, C_HP_BG);
-    rect(cx, cy, CELL_W * hpFrac, BAR_H, C_HP_FILL);
-
-    // Shield bar (below HP bar, blue)
-    if (e.shield_hp > 0) {
-      const shieldFrac = Math.min(1, e.shield_hp / e.hp_max);
-      rect(cx, cy + BAR_H, CELL_W, BAR_H, "rgba(30,30,120,0.6)");
-      rect(cx, cy + BAR_H, CELL_W * shieldFrac, BAR_H, "rgba(80,160,255,0.9)");
-    }
-
-    // HP number (over sprite)
-    text(String(e.hp), cx + 4, cy + CELL_H - 6, 13, C_TEXT);
-
     // Player-owned entity border
     if (e.owner === game.player_id && team === "players") {
       rectStroke(cx, cy, CELL_W, CELL_H, 2, C_OWN_BORDER);
@@ -377,6 +361,9 @@ function drawTeam(game, team, dt) {
   }
 }
 
+// Must match game_logic.zig ACTION_EFFECT_VALUE.
+const ACTION_EFFECT_VALUE = 1;
+
 /** Map ActionChoice enum string → display character. */
 const ACTION_CHAR = { damage: "a", shield: "s", heal: "h" };
 
@@ -386,6 +373,83 @@ const ACTION_COLOR = {
   shield: "rgba(80,160,255,1)",
   heal:   "rgba(100,220,100,1)",
 };
+
+/**
+ * Draw stacked status bars confined to a horizontal span [x0, x1].
+ * Each bar has a short left label and a numeric value on the right.
+ *
+ * @param {{ label:string, value:number, frac:number, color:string, bg:string }[]} bars
+ * @param {number} x0  - left edge
+ * @param {number} x1  - right edge
+ * @param {number} y   - top of first bar
+ */
+function drawBars(bars, x0, x1, y) {
+  const BAR_H   = 10;
+  const GAP     = 4;
+  const LABEL_W = 40;
+  const ROW_H   = BAR_H + GAP;
+  const bx = x0 + LABEL_W;
+  const bw = (x1 - x0) - LABEL_W;
+
+  for (let i = 0; i < bars.length; i++) {
+    const { label, value, frac, color, bg } = bars[i];
+    const by = y + i * ROW_H;
+    const f  = Math.max(0, Math.min(1, frac));
+
+    text(label, x0, by + BAR_H - 2, 10, "rgba(180,200,255,0.85)");
+    rect(bx, by, bw, BAR_H, bg);
+    if (f > 0) rect(bx, by, bw * f, BAR_H, color);
+    text(String(Math.round(value)), bx + bw + 4, by + BAR_H - 2, 10, "rgba(180,200,255,0.7)");
+  }
+}
+
+/**
+ * Draw aggregate player-team bars (HP, projected shield, projected heal)
+ * in the header strip above the player zone.
+ * Draw aggregate enemy-team HP bar above the enemy zone.
+ */
+function drawTeamBars(game) {
+  const entities = game.entities || [];
+  const players  = entities.filter(e => e.team === "players" && e.hp > 0);
+  const enemies  = entities.filter(e => e.team === "enemies"  && e.hp > 0);
+
+  // --- Player bars ---
+  if (players.length > 0) {
+    let totalHp = 0, totalMaxHp = 0, shieldCount = 0, healCount = 0;
+    for (const e of players) {
+      totalHp    += e.hp;
+      totalMaxHp += e.hp_max;
+      for (const action of (e.combo ?? [])) {
+        if (action === "shield") shieldCount++;
+        else if (action === "heal")   healCount++;
+      }
+    }
+    const scale      = totalMaxHp > 0 ? 1 / totalMaxHp : 0;
+    const projShield = shieldCount * ACTION_EFFECT_VALUE;
+    const projHeal   = healCount   * ACTION_EFFECT_VALUE;
+
+    // Three bars stacked; top of first bar sits just below the "ALLIES" label.
+    const y = PLAYER_ZONE.y0 - 56; // leaves room for 3 × (10+4) = 42px + gap
+    drawBars([
+      { label: "HP",   value: totalHp,    frac: totalHp    * scale, color: "rgba(60,200,60,0.9)",   bg: C_HP_BG },
+      { label: "Shld", value: projShield, frac: projShield * scale, color: "rgba(80,160,255,0.9)",  bg: "rgba(20,20,80,0.6)" },
+      { label: "Heal", value: projHeal,   frac: projHeal   * scale, color: "rgba(140,230,100,0.9)", bg: "rgba(20,50,20,0.6)" },
+    ], PLAYER_ZONE.x0, PLAYER_ZONE.x1, y);
+  }
+
+  // --- Enemy bar ---
+  if (enemies.length > 0) {
+    let totalHp = 0, totalMaxHp = 0;
+    for (const e of enemies) { totalHp += e.hp; totalMaxHp += e.hp_max; }
+    const scale = totalMaxHp > 0 ? 1 / totalMaxHp : 0;
+
+    // One bar; align bottom with player bars bottom.
+    const y = ENEMY_ZONE.y0 - 56 + 28; // vertically centred in the same strip
+    drawBars([
+      { label: "HP", value: totalHp, frac: totalHp * scale, color: "rgba(255,100,60,0.9)", bg: C_HP_BG },
+    ], ENEMY_ZONE.x0, ENEMY_ZONE.x1, y);
+  }
+}
 
 function drawActionMenu(game) {
   const mx = SW / 2 - 160;
@@ -416,8 +480,10 @@ function drawGame(game, dt) {
   const wave = game.wave || "";
   text(`Wave: ${wave}`, 40, 30 + 20, 20, C_HEADER);
 
-  text("ALLIES",   PLAYER_ZONE.x0, 155 + 18, 18, C_HEADER);
-  text("ENEMIES",  ENEMY_ZONE.x0,  155 + 18, 18, C_ENEMY_HDR);
+  text("ALLIES",  PLAYER_ZONE.x0, PLAYER_ZONE.y0 - 62, 18, C_HEADER);
+  text("ENEMIES", ENEMY_ZONE.x0,  ENEMY_ZONE.y0  - 62, 18, C_ENEMY_HDR);
+
+  drawTeamBars(game);
 
   drawTeam(game, "players", dt);
   drawTeam(game, "enemies", dt);

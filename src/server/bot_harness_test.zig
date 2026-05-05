@@ -207,23 +207,29 @@ fn respawn_bots(
     team: *const bots.BotTeam,
     bot_states: []const BotState,
 ) !void {
+    // Rebuild player entities with bot-specific class/owner but no Health/Shield
+    // (HP lives in the shared pool).  Also recompute shared_hp from bot stats.
+    sess.shared_hp = .{ .current = 0, .max = 0 };
+    sess.shared_shield = .{ .hp = 0 };
     for (team.bots, bot_states) |entry, bs| {
         const slot = &sess.players[bs.player_id];
         // Destroy the entity created by spawn_players().
         if (slot.entity != std.math.maxInt(u32)) {
             sess.world.destroy_entity(slot.entity);
         }
-        // Create a fresh entity with stats from BotEntry.
+        // Create a fresh entity.  No Health/Shield — shared pool tracks HP.
         const e = sess.world.create_entity();
         slot.entity = e;
-        sess.world.add_component(e, c.Health{ .current = entry.stats.max_hp, .max = entry.stats.max_hp });
-        sess.world.add_component(e, c.Shield{ .hp = 0 });
         // ClassTag is required by the system signature; .fighter is used as a
         // no-op placeholder — bots.zig has no ClassTag concept.
         sess.world.add_component(e, c.Class{ .tag = .fighter });
         sess.world.add_component(e, c.Team{ .id = .players });
         sess.world.add_component(e, c.Owner{ .player_id = bs.player_id });
         sess.world.add_component(e, c.PlayerMarker{});
+        // Accumulate this bot's max HP into the shared pool.
+        const new_max = @as(u32, sess.shared_hp.max) + @as(u32, entry.stats.max_hp);
+        sess.shared_hp.max = @intCast(@min(new_max, @as(u32, std.math.maxInt(u16))));
+        sess.shared_hp.current = sess.shared_hp.max;
     }
 }
 
@@ -256,9 +262,9 @@ const wave_unkillable = waves.Wave{
     .next_wave = null,
 };
 
-/// 12 unkillable enemies: each round they deal 12 damage to each player.
-/// A single heal bot restores only 10 HP/round (1 * ACTION_EFFECT_VALUE),
-/// so net damage per round = 12 - 10 = 2 HP. The healer must eventually die.
+/// 12 unkillable enemies: each round they deal 12 damage to the shared party pool.
+/// A single heal bot restores only 1 * ACTION_EFFECT_VALUE HP/round to the pool,
+/// so net drain = 12 - 1 = 11 HP/round. The party pool is eventually depleted.
 const wave_overwhelming = waves.Wave{
     .label = "bot_overwhelming",
     .entries = &[_]waves.SpawnEntry{
@@ -309,9 +315,9 @@ test "all_damage team beats wave_01_basic" {
 
 test "heal-only team cannot kill enemies — eventually loses" {
     // A single healer bot never contributes to the damage pool.
-    // wave_overwhelming has 12 enemies → 12 damage/round per player.
-    // Heal restores 1 * ACTION_EFFECT_VALUE = 10 HP/round.
-    // Net drain = 2 HP/round. support_stats.max_hp = 80 → dies within 40 rounds.
+    // wave_overwhelming has 12 enemies → 12 damage/round to the shared pool.
+    // Heal restores ACTION_EFFECT_VALUE HP/round to the pool.
+    // Net drain = 11 HP/round → shared pool depleted → enemies win.
     const allocator = std.testing.allocator;
     var h = try BotHarness.init(allocator, &bots.team_all_heal, &wave_overwhelming, "BOTKEY".*, .{});
     defer h.deinit();
@@ -320,7 +326,8 @@ test "heal-only team cannot kill enemies — eventually loses" {
 
     try std.testing.expect(rounds < 200);
     try std.testing.expectEqual(session_mod.SessionPhase.lobby, h.session.phase);
-    try std.testing.expectEqual(@as(usize, 0), h.living_player_count());
+    // Shared party pool must be at 0 — that is what triggered the loss.
+    try std.testing.expectEqual(@as(u16, 0), h.session.shared_hp.current);
 }
 
 test "mixed team beats two-grunt wave" {
@@ -340,23 +347,20 @@ test "mixed team beats two-grunt wave" {
 test "tank bot absorbs incoming damage with shield rotation" {
     // One bot with the 'tank' profile ({shield, shield, damage}).
     // wave_lethal_pack = wave_overwhelming = 12 unkillable enemies.
-    // Enemy intent = damage_per_player = living_enemy_count = 12 HP/round.
-    // Shield grants ACTION_EFFECT_VALUE = 10 HP per shield action.
+    // Enemy intent = 12 damage/round to the shared party pool (1 bot team, so
+    // shared pool = bot max_hp = 30).
+    // Shield grants ACTION_EFFECT_VALUE = 1 HP to the shared shield buffer per action.
     //
-    // Damage-only bot (30 HP, no shields):
-    //   Takes 12 damage every round → dies in 3 rounds (30 / 12 = 2.5 → ceil 3).
+    // Damage-only bot (pool = 30 HP, no shields):
+    //   Takes 12 damage every round → pool gone in 3 rounds (30/12 = 2.5 → ceil 3).
     //
-    // Tank bot (30 HP, {shield, shield, damage} cycle):
-    //   Round 1: +10 shield, -12 → shield 0, HP 28
-    //   Round 2: +10 shield, -12 → shield 0, HP 26
-    //   Round 3: damage, -12     → HP 14
-    //   Round 4: +10 shield, -12 → shield 0, HP 12
-    //   Round 5: +10 shield, -12 → shield 0, HP 10
-    //   Round 6: damage, -12     → HP dies (0)
-    //   Survives 6 rounds — 2× the damage-only bot.
+    // Tank bot (pool = 30 HP, {shield, shield, damage} cycle):
+    //   Round 1: +1 shield, -12 → shield 0, pool 19
+    //   Round 2: +1 shield, -12 → shield 0, pool 8
+    //   Round 3: damage, -12    → pool 0 (dead)
+    //   Survives at least as many rounds as the damage-only bot.
     //
-    // We assert tank_rounds >= dmg_rounds (not the exact values, to stay
-    // robust if the exact logic shifts).
+    // We assert tank_rounds >= dmg_rounds (not exact values, robust to tuning).
 
     const allocator = std.testing.allocator;
 

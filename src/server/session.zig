@@ -7,10 +7,13 @@
 //!
 //! ## ECS layout
 //!
-//! Components: Health, Shield, Class, Team, Owner
+//! Components: Class, Team, Owner (player entities); Health, Shield, Class, Team (enemy entities)
 //! Systems:
-//!   - PlayerTeam  — tracks every living entity whose Team.id == .players
+//!   - PlayerTeam  — tracks every entity whose Team.id == .players
 //!   - EnemyTeam   — tracks every living entity whose Team.id == .enemies
+//!
+//! Player entities carry no Health or Shield; player HP/shield lives in the
+//! session-level `shared_hp` / `shared_shield` fields (shared party pool).
 //!
 //! System signatures are set at world-init time in `start_game_wave`.
 //! Entities are added/removed from system sets automatically by the world
@@ -23,11 +26,13 @@
 //! recorded in `action_pool`.  When the timer expires `resolve_round()` is
 //! called, which:
 //!   1. Applies the *player damage pool* to every living enemy.
-//!   2. Applies the *player shield pool* to every living player (flat HP).
-//!   3. Applies the *player heal pool* to every living player.
-//!   4. Applies *enemy intent* (via `compute_enemy_intent`) to every living
-//!      player, first absorbing from shield, then HP.
+//!   2. Applies the *player shield pool* to the shared party shield buffer.
+//!   3. Applies the *player heal pool* to the shared party HP pool.
+//!   4. Applies *enemy intent* (via `compute_enemy_intent`) to the shared
+//!      party pool: shield absorbs first, remainder drains shared HP.
 //!   5. Broadcasts all action results and checks win/loss.
+//!
+//! The party is defeated (enemies win) when `shared_hp.current` reaches 0.
 //!
 //! The round timer duration is configurable per session (`round_duration`) and
 //! is sent to clients at game start so they can display a countdown.
@@ -115,6 +120,15 @@ pub const Session = struct {
     /// Duration of each round in seconds. Configurable in lobby; sent to
     /// clients at game start so they can display the countdown.
     round_duration: f32 = logic.ROUND_DURATION_DEFAULT_S,
+
+    /// Shared party HP pool.  Initialised to the sum of all player max HPs at
+    /// game start.  Enemy intent drains this pool (shield absorbs first).
+    /// The party is defeated when `shared_hp.current` reaches 0.
+    shared_hp: c.Health = .{ .current = 0, .max = 0 },
+
+    /// Shared party shield buffer.  Shield actions add to this; enemy damage
+    /// absorbs from it before touching `shared_hp`.
+    shared_shield: c.Shield = .{ .hp = 0 },
 
     /// Per-player combo submitted this round.  Null = player hasn't acted yet.
     /// Overwritten freely until the round ends via choose_combo/choose_action;
@@ -244,21 +258,29 @@ pub const Session = struct {
         self.round_timer = self.round_duration;
         std.log.info("game start — wave: {s} round_duration={d:.1}s", .{ wave.label, self.round_duration });
         try self.spawn_players();
+        // Shared pool = sum of all player max HPs.  Accumulated in spawn_players.
+        self.shared_shield = .{ .hp = 0 };
+        std.log.info("shared party pool: {}/{}", .{ self.shared_hp.current, self.shared_hp.max });
         try self.spawn_wave(wave);
     }
 
     fn spawn_players(self: *Session) !void {
+        // Reset shared pool before accumulating player HPs.
+        self.shared_hp = .{ .current = 0, .max = 0 };
         for (&self.players) |*p| {
             if (!p.occupied or !p.connected) continue;
             const d = waves.class_defaults(p.class);
             const e = self.world.create_entity();
             p.entity = e;
-            self.world.add_component(e, c.Health{ .current = d.max_hp, .max = d.max_hp });
-            self.world.add_component(e, c.Shield{ .hp = 0 });
+            // Player entities carry no Health/Shield — HP lives in shared_hp.
             self.world.add_component(e, c.Class{ .tag = p.class });
             self.world.add_component(e, c.Team{ .id = .players });
             self.world.add_component(e, c.Owner{ .player_id = p.player_id });
             self.world.add_component(e, c.PlayerMarker{});
+            // Accumulate into the shared party HP pool.
+            const new_max = @as(u32, self.shared_hp.max) + @as(u32, d.max_hp);
+            self.shared_hp.max = @intCast(@min(new_max, @as(u32, std.math.maxInt(u16))));
+            self.shared_hp.current = self.shared_hp.max;
         }
     }
 
@@ -445,24 +467,13 @@ pub const Session = struct {
         std.log.info("round resolve — dmg={} shld={} heal={}", .{ damage_pool, shield_pool, heal_pool });
 
         var enemy_buf: [64]ecs.Entity = undefined;
-        var player_buf: [MAX_PLAYERS]ecs.Entity = undefined;
         var n_enemies: usize = 0;
-        var n_players: usize = 0;
         {
             var it = self.world.system_entity_sets[comptime GameWorld.system_index_of(EnemyTeam)].iterator(.{});
             while (it.next()) |u| {
                 if (n_enemies < enemy_buf.len) {
                     enemy_buf[n_enemies] = @intCast(u);
                     n_enemies += 1;
-                }
-            }
-        }
-        {
-            var it = self.world.system_entity_sets[comptime GameWorld.system_index_of(PlayerTeam)].iterator(.{});
-            while (it.next()) |u| {
-                if (n_players < player_buf.len) {
-                    player_buf[n_players] = @intCast(u);
-                    n_players += 1;
                 }
             }
         }
@@ -491,38 +502,30 @@ pub const Session = struct {
             }
         }
 
-        // 2. Shield pool → each still-living player.
+        // 2. Shield pool → shared party shield buffer.
         if (shield_pool > 0) {
-            for (player_buf[0..n_players]) |e| {
-                if (!self.entity_is_alive(e)) continue;
-                const sh = self.world.get_component(e, c.Shield);
-                logic.resolve_shield_pool(sh, shield_pool);
-                try self.broadcast_action_result(.{
-                    .tag = .shield,
-                    .actor_entity = std.math.maxInt(u32),
-                    .target_entity = e,
-                    .value = shield_pool * logic.ACTION_EFFECT_VALUE,
-                });
-            }
+            logic.resolve_shield_pool(&self.shared_shield, shield_pool);
+            try self.broadcast_action_result(.{
+                .tag = .shield,
+                .actor_entity = std.math.maxInt(u32),
+                .target_entity = std.math.maxInt(u32),
+                .value = shield_pool * logic.ACTION_EFFECT_VALUE,
+            });
         }
 
-        // 3. Heal pool → each still-living player.
+        // 3. Heal pool → shared party HP pool.
         if (heal_pool > 0) {
-            for (player_buf[0..n_players]) |e| {
-                if (!self.entity_is_alive(e)) continue;
-                const hp = self.world.get_component(e, c.Health);
-                logic.resolve_heal_pool(hp, heal_pool);
-                try self.broadcast_action_result(.{
-                    .tag = .heal,
-                    .actor_entity = std.math.maxInt(u32),
-                    .target_entity = e,
-                    .value = heal_pool * logic.ACTION_EFFECT_VALUE,
-                });
-            }
+            logic.resolve_heal_pool(&self.shared_hp, heal_pool);
+            try self.broadcast_action_result(.{
+                .tag = .heal,
+                .actor_entity = std.math.maxInt(u32),
+                .target_entity = std.math.maxInt(u32),
+                .value = heal_pool * logic.ACTION_EFFECT_VALUE,
+            });
         }
 
-        // 4. Enemy intent → each still-living player.
-        // Each living enemy deals 1 damage per player per round.
+        // 4. Enemy intent → shared party pool (shield absorbs first, then HP).
+        // Each living enemy deals 1 damage to the shared pool.
         const living_enemy_count: u16 = blk: {
             var count: u16 = 0;
             var it = self.world.system_entity_sets[comptime GameWorld.system_index_of(EnemyTeam)].iterator(.{});
@@ -531,37 +534,31 @@ pub const Session = struct {
         };
         if (living_enemy_count > 0) {
             const intent = logic.compute_enemy_intent(living_enemy_count);
-            for (player_buf[0..n_players]) |e| {
-                if (!self.entity_is_alive(e)) continue;
-                const hp = self.world.get_component(e, c.Health);
-                const sh = self.world.get_component(e, c.Shield);
-                const hp_dmg = logic.apply_enemy_intent(hp, sh, intent);
-                if (hp_dmg > 0) {
-                    try self.broadcast_action_result(.{
-                        .tag = .damage,
-                        .actor_entity = std.math.maxInt(u32),
-                        .target_entity = e,
-                        .value = hp_dmg,
-                    });
-                }
-                if (logic.is_dead(hp.*)) {
-                    std.log.info("player entity {} killed by enemies", .{e});
-                    self.kill_entity(e);
-                    try self.broadcast_action_result(.{
-                        .tag = .death,
-                        .actor_entity = std.math.maxInt(u32),
-                        .target_entity = e,
-                        .value = 0,
-                    });
-                }
+            const hp_dmg = logic.apply_enemy_intent(&self.shared_hp, &self.shared_shield, intent);
+            if (hp_dmg > 0) {
+                try self.broadcast_action_result(.{
+                    .tag = .damage,
+                    .actor_entity = std.math.maxInt(u32),
+                    .target_entity = std.math.maxInt(u32),
+                    .value = hp_dmg,
+                });
+            }
+            if (logic.is_dead(self.shared_hp)) {
+                std.log.info("shared party pool depleted — enemies win", .{});
+                try self.broadcast_action_result(.{
+                    .tag = .death,
+                    .actor_entity = std.math.maxInt(u32),
+                    .target_entity = std.math.maxInt(u32),
+                    .value = 0,
+                });
             }
         }
     }
 
-    /// Returns true if `entity` is tracked by a team system (i.e. still alive).
+    /// Returns true if `entity` is a living enemy (tracked by EnemyTeam).
+    /// Player entities are never removed from PlayerTeam; use shared_hp for their death.
     fn entity_is_alive(self: *const Session, entity: ecs.Entity) bool {
-        return self.world.system_entity_sets[comptime GameWorld.system_index_of(PlayerTeam)].isSet(entity) or
-            self.world.system_entity_sets[comptime GameWorld.system_index_of(EnemyTeam)].isSet(entity);
+        return self.world.system_entity_sets[comptime GameWorld.system_index_of(EnemyTeam)].isSet(entity);
     }
 
     fn kill_entity(self: *Session, entity: ecs.Entity) void {
@@ -569,9 +566,7 @@ pub const Session = struct {
     }
 
     fn check_win(self: *Session) !void {
-        const pi = comptime GameWorld.system_index_of(PlayerTeam);
         const ei = comptime GameWorld.system_index_of(EnemyTeam);
-        const players_alive = self.world.system_entity_sets[pi].count();
         const enemies_alive = self.world.system_entity_sets[ei].count();
 
         if (enemies_alive == 0) {
@@ -588,8 +583,8 @@ pub const Session = struct {
             }
             std.log.info("all waves cleared — players win", .{});
             try self.end_game(.players);
-        } else if (players_alive == 0) {
-            std.log.info("all players dead — enemies win", .{});
+        } else if (logic.is_dead(self.shared_hp)) {
+            std.log.info("shared party pool depleted — enemies win", .{});
             try self.end_game(.enemies);
         }
     }
@@ -668,29 +663,45 @@ pub const Session = struct {
             .entities = [_]proto.EntitySnapshot{std.mem.zeroes(proto.EntitySnapshot)} ** proto.MAX_ENTITIES_WIRE,
         };
 
-        // Iterate all component arrays directly — both teams.
-        const health_arr = &self.world.component_arrays.health;
-        for (health_arr.index_to_entity[0..health_arr.size]) |e| {
+        // Pass 1: player entities (no Health/Shield component — use shared pool).
+        const pm_arr = &self.world.component_arrays.player_marker;
+        for (pm_arr.index_to_entity[0..pm_arr.size]) |e| {
             if (snap.entity_count >= proto.MAX_ENTITIES_WIRE) break;
-            const hp = self.world.get_component(e, c.Health);
-            const sh = self.world.get_component(e, c.Shield);
             const cl = self.world.get_component(e, c.Class);
-            const tm = self.world.get_component(e, c.Team);
-            const own: u8 = if (self.world.component_arrays.owner.has(e))
-                self.world.get_component(e, c.Owner).player_id
-            else
-                0xFF;
-
-            // Embed the owning player's current combo so every client can
-            // render all players' pending combos, not just their own.
-            const combo_len: u8 = if (tm.id == .players and own != 0xFF)
-                if (self.action_pool[own]) |combo| combo.len else 0
-            else
-                0;
+            const own = self.world.get_component(e, c.Owner).player_id;
+            const combo_len: u8 = if (self.action_pool[own]) |combo| combo.len else 0;
             const combo_actions = if (combo_len > 0)
                 self.action_pool[own].?.actions
             else
                 [_]c.ActionChoice{.damage} ** c.MAX_COMBO_LEN;
+
+            snap.entities[snap.entity_count] = .{
+                .entity = e,
+                .slot = snap.entity_count,
+                // Every player entity snapshot carries the shared pool values so
+                // the client can read HP/shield from whichever entity it picks.
+                .hp_current = self.shared_hp.current,
+                .hp_max = self.shared_hp.max,
+                .shield_hp = self.shared_shield.hp,
+                .class = cl.tag,
+                .team = .players,
+                .owner = own,
+                .combo_len = combo_len,
+                .combo_actions = combo_actions,
+            };
+            snap.entity_count += 1;
+        }
+
+        // Pass 2: enemy entities (still have Health/Shield components).
+        const health_arr = &self.world.component_arrays.health;
+        for (health_arr.index_to_entity[0..health_arr.size]) |e| {
+            if (snap.entity_count >= proto.MAX_ENTITIES_WIRE) break;
+            // Skip any entity that also has a PlayerMarker — they were emitted above.
+            if (self.world.component_arrays.player_marker.has(e)) continue;
+            const hp = self.world.get_component(e, c.Health);
+            const sh = self.world.get_component(e, c.Shield);
+            const cl = self.world.get_component(e, c.Class);
+            const tm = self.world.get_component(e, c.Team);
 
             snap.entities[snap.entity_count] = .{
                 .entity = e,
@@ -700,9 +711,9 @@ pub const Session = struct {
                 .shield_hp = sh.hp,
                 .class = cl.tag,
                 .team = tm.id,
-                .owner = own,
-                .combo_len = combo_len,
-                .combo_actions = combo_actions,
+                .owner = 0xFF,
+                .combo_len = 0,
+                .combo_actions = [_]c.ActionChoice{.damage} ** c.MAX_COMBO_LEN,
             };
             snap.entity_count += 1;
         }
@@ -749,13 +760,10 @@ pub const Session = struct {
 
 fn set_world_system_signatures(world: *GameWorld) void {
     // PlayerTeam: requires PlayerMarker, which only player entities carry.
-    // EnemyTeam:  requires EnemyMarker, which only enemy entities carry.
-    // The two marker components are mutually exclusive, so the sets are
-    // disjoint despite all entities sharing Health/Shield/Class/Team.
+    //   Player entities have no Health/Shield — HP lives in shared_hp/shared_shield.
+    // EnemyTeam:  requires EnemyMarker + Health/Shield (enemies still die individually).
     {
         var sig = @import("ecs_zig").Signature.initEmpty();
-        sig.set(GameWorld.component_type(c.Health));
-        sig.set(GameWorld.component_type(c.Shield));
         sig.set(GameWorld.component_type(c.Class));
         sig.set(GameWorld.component_type(c.Team));
         sig.set(GameWorld.component_type(c.Owner));

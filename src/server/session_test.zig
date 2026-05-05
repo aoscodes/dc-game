@@ -462,7 +462,7 @@ test "kill enemy with exactly enough damage" {
     try std.testing.expect(found_death);
 }
 
-test "shield pool grants shield HP to all players" {
+test "shield pool grants shield HP to shared pool" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -475,28 +475,22 @@ test "shield pool grants shield HP to all players" {
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single);
 
-    // Both players shield → pool=2 → each player gets 2 shield HP
+    // Both players shield → pool=2 → shared shield gets 2*V HP
+    // Enemy (attack=1) then absorbs 1 from shield → net 2*V - 1
     try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .shield });
     try enqueue_msg(&s.sess, s.p[1].pid, .choose_action, proto.ChooseAction{ .action = .shield });
     s.p[0].clear();
     try tick_n(&s.sess, 0.11, 1);
 
-    {
-        var it = s.sess.world.system_entity_sets[comptime session_mod.GameWorld.system_index_of(session_mod.PlayerTeam)].iterator(.{});
-        while (it.next()) |u| {
-            const e: ecs.Entity = @intCast(u);
-            // shield = pool(2) * V, enemy (attack=1) absorbs 1 → net 2*V - 1
-            try std.testing.expectEqual(2 * V - 1, s.sess.world.get_component(e, c.Shield).hp);
-        }
-    }
+    try std.testing.expectEqual(2 * V - 1, s.sess.shared_shield.hp);
 
-    // shield broadcast
+    // shield broadcast — exactly one result for the whole party
     const msgs = try drain(s.p[0].buf.items, arena);
     const shield_count = try count_action_results_with(msgs, .shield);
-    try std.testing.expect(shield_count >= 2); // at least one per player
+    try std.testing.expect(shield_count >= 1);
 }
 
-test "heal pool heals all players" {
+test "heal pool heals shared party pool" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -506,29 +500,23 @@ test "heal pool heals all players" {
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single);
 
-    // Wound both players first
-    const pe0 = s.sess.players[s.p[0].pid].entity;
-    const pe1 = s.sess.players[s.p[1].pid].entity;
-    s.sess.world.get_component(pe0, c.Health).current = 50;
-    s.sess.world.get_component(pe1, c.Health).current = 50;
+    // Wound the shared pool first.
+    s.sess.shared_hp.current = 50;
+    const hp_before: u16 = 50;
 
-    const hp0_before: u16 = 50;
-
-    // Both players heal → pool=2 → each player heals 2*V HP
-    // Enemy (attack=1) deals 1 HP dmg in same round.
-    // Net: +2*V heal - 1 enemy dmg.
+    // Both players heal → pool=2 → shared HP heals 2*V
+    // Enemy (attack=1) deals 1 dmg to shared pool in same round.
+    // Net: +2*V - 1.
     try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .heal });
     try enqueue_msg(&s.sess, s.p[1].pid, .choose_action, proto.ChooseAction{ .action = .heal });
     try tick_n(&s.sess, 0.11, 1);
 
-    const hp0_after = s.sess.world.get_component(pe0, c.Health).current;
-    // Heal (+2*V) then enemy dmg (-1) → net +2*V-1
-    try std.testing.expectEqual(hp0_before + 2 * V - 1, hp0_after);
+    try std.testing.expectEqual(hp_before + 2 * V - 1, s.sess.shared_hp.current);
 
     s.p[0].clear();
 }
 
-test "shield absorbs enemy damage before HP" {
+test "shared shield absorbs enemy damage before shared HP" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -536,27 +524,23 @@ test "shield absorbs enemy damage before HP" {
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
-    try s.sess.start_game_wave(&test_wave_single); // 1 enemy → 1 dmg per round to each player
+    try s.sess.start_game_wave(&test_wave_single); // 1 enemy → 1 dmg/round to shared pool
 
-    const pe = s.sess.players[s.p[0].pid].entity;
-    const hp_before = s.sess.world.get_component(pe, c.Health).current;
+    const hp_before = s.sess.shared_hp.current;
 
-    // Give player a manual shield of 5 HP (more than enemy attack=1)
-    s.sess.world.get_component(pe, c.Shield).hp = 5;
+    // Give the shared shield 5 HP (more than enemy attack=1)
+    s.sess.shared_shield.hp = 5;
 
-    // No action chosen — enemy still attacks
+    // No action chosen — enemy still attacks shared pool
     try tick_n(&s.sess, 0.11, 1);
 
-    const hp_after = s.sess.world.get_component(pe, c.Health).current;
-    const shield_after = s.sess.world.get_component(pe, c.Shield).hp;
-
-    // HP unchanged (shield absorbed enemy attack=1)
-    try std.testing.expectEqual(hp_before, hp_after);
-    // Shield depleted by enemy attack (1)
-    try std.testing.expectEqual(@as(u16, 4), shield_after);
+    // HP unchanged (shield absorbed the 1 damage)
+    try std.testing.expectEqual(hp_before, s.sess.shared_hp.current);
+    // Shield reduced by 1
+    try std.testing.expectEqual(@as(u16, 4), s.sess.shared_shield.hp);
 }
 
-test "enemy kills all players — enemies win" {
+test "enemy depletes shared pool — enemies win" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -568,7 +552,7 @@ test "enemy kills all players — enemies win" {
 
     s.sess.round_duration = 0.1;
 
-    // Wave with 100 enemies → 100 dmg per round per player → instant kill.
+    // Wave with 100 enemies → 100 dmg/round to shared pool → instant kill.
     var entries: [100]waves.SpawnEntry = undefined;
     for (&entries, 0..) |*e, i| {
         e.* = .{
@@ -586,13 +570,8 @@ test "enemy kills all players — enemies win" {
 
     try s.sess.start_game_wave(&deadly_wave);
 
-    // Players have 1 HP, 100 enemies deal 100 dmg → die instantly
-    {
-        var it = s.sess.world.system_entity_sets[comptime session_mod.GameWorld.system_index_of(session_mod.PlayerTeam)].iterator(.{});
-        while (it.next()) |u| {
-            s.sess.world.get_component(@intCast(u), c.Health).current = 1;
-        }
-    }
+    // Shared pool at 1 HP → 100 enemies deal 100 dmg → pool gone instantly.
+    s.sess.shared_hp.current = 1;
 
     s.p[0].clear();
     try tick_n(&s.sess, 0.11, 1);
@@ -668,9 +647,6 @@ test "action can be overwritten before round resolves" {
     s.sess.round_duration = 0.5; // long round
     try s.sess.start_game_wave(&test_wave_single);
 
-    const pe = s.sess.players[s.p[0].pid].entity;
-    const hp_max = s.sess.world.get_component(pe, c.Health).max;
-
     // First submit heal, then overwrite with damage before round ends
     try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .heal });
     // Tick a little (doesn't fire round yet)
@@ -687,14 +663,13 @@ test "action can be overwritten before round resolves" {
     // Let the round fire — damage chosen, not heal
     try tick_n(&s.sess, 0.5, 1);
 
-    // Enemy HP must have gone down (damage applied), not up
+    // Enemy HP must have gone down (damage applied)
     const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
     const enemy_hp = s.sess.world.get_component(enemy_e, c.Health).current;
     try std.testing.expect(enemy_hp < V * 100); // started at V*100
 
-    // Player HP should NOT be at max (heal was not the final action)
-    const player_hp = s.sess.world.get_component(pe, c.Health).current;
-    try std.testing.expect(player_hp <= hp_max);
+    // Shared pool HP must not exceed max
+    try std.testing.expect(s.sess.shared_hp.current <= s.sess.shared_hp.max);
 }
 
 test "action pool resets after each round" {
@@ -718,7 +693,7 @@ test "action pool resets after each round" {
     }
 }
 
-test "no actions submitted — enemy still attacks" {
+test "no actions submitted — enemy still attacks shared pool" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -728,15 +703,13 @@ test "no actions submitted — enemy still attacks" {
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single); // 1 enemy
 
-    const pe = s.sess.players[s.p[0].pid].entity;
-    const hp_max = s.sess.world.get_component(pe, c.Health).max;
+    const hp_max = s.sess.shared_hp.max;
 
     // No actions; tick through round
     try tick_n(&s.sess, 0.11, 1);
 
-    // Enemy (attack=1) deals 1 HP dmg — player HP dropped by 1
-    const hp_after = s.sess.world.get_component(pe, c.Health).current;
-    try std.testing.expectEqual(hp_max - 1, hp_after);
+    // Enemy (attack=1) deals 1 dmg to shared pool
+    try std.testing.expectEqual(hp_max - 1, s.sess.shared_hp.current);
 }
 
 test "round_timer counts down and resets" {
@@ -777,10 +750,9 @@ test "mixed pool: damage + shield in one round" {
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
-    try s.sess.start_game_wave(&test_wave_single); // 1 enemy, 10 HP
+    try s.sess.start_game_wave(&test_wave_single); // 1 enemy, 100*V HP
 
     const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
-    const pe1 = s.sess.players[s.p[1].pid].entity;
 
     // p0 → damage, p1 → shield
     try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .damage });
@@ -791,11 +763,11 @@ test "mixed pool: damage + shield in one round" {
     const enemy_hp = s.sess.world.get_component(enemy_e, c.Health).current;
     try std.testing.expectEqual(V * 100 - V, enemy_hp);
 
-    // p1 got shield (pool=1 → +V shield, enemy attack=1 absorbed → net V-1)
-    try std.testing.expectEqual(V - 1, s.sess.world.get_component(pe1, c.Shield).hp);
+    // shared shield (pool=1 → +V), enemy attack=1 absorbed → net V-1
+    try std.testing.expectEqual(V - 1, s.sess.shared_shield.hp);
 }
 
-test "2 enemies deal 2 damage per player per round" {
+test "2 enemies deal 2 damage to shared pool per round" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -814,17 +786,15 @@ test "2 enemies deal 2 damage per player per round" {
     };
     try s.sess.start_game_wave(&two_enemy_wave);
 
-    const pe = s.sess.players[s.p[0].pid].entity;
-    const hp_before = s.sess.world.get_component(pe, c.Health).current;
+    const hp_before = s.sess.shared_hp.current;
 
-    // No actions: 2 enemies × 1 = 2 dmg to each player
+    // No actions: 2 enemies × 1 = 2 dmg to shared pool
     try tick_n(&s.sess, 0.11, 1);
 
-    const hp_after = s.sess.world.get_component(pe, c.Health).current;
-    try std.testing.expectEqual(hp_before - 2, hp_after);
+    try std.testing.expectEqual(hp_before - 2, s.sess.shared_hp.current);
 }
 
-test "player dead from enemy does not receive subsequent pool heal" {
+test "lethal enemy intent depletes shared pool even after heal" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -833,7 +803,7 @@ test "player dead from enemy does not receive subsequent pool heal" {
 
     s.sess.round_duration = 0.1;
 
-    // 100 enemies → lethal intent
+    // 100 enemies → 100 dmg/round to shared pool
     var entries: [100]waves.SpawnEntry = undefined;
     for (&entries, 0..) |*e, i| {
         e.* = .{
@@ -846,22 +816,16 @@ test "player dead from enemy does not receive subsequent pool heal" {
     const lethal_wave = waves.Wave{ .label = "t_lethal", .entries = &entries, .next_wave = null };
     try s.sess.start_game_wave(&lethal_wave);
 
-    const pe0 = s.sess.players[s.p[0].pid].entity;
-    const pe1 = s.sess.players[s.p[1].pid].entity;
-    // Set both to 1 HP — enemy intent will kill them
-    s.sess.world.get_component(pe0, c.Health).current = 1;
-    s.sess.world.get_component(pe1, c.Health).current = 1;
+    // Set shared pool to 1 HP — heal (+2*V) won't outpace 100 dmg
+    s.sess.shared_hp.current = 1;
 
     // Both choose heal — heal applies before enemy intent
     try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .heal });
     try enqueue_msg(&s.sess, s.p[1].pid, .choose_action, proto.ChooseAction{ .action = .heal });
     try tick_n(&s.sess, 0.11, 1);
 
-    // Both dead (enemy dealt 100 dmg, heal only gave +2)
-    try std.testing.expectEqual(@as(usize, 0), count_living_players(&s.sess));
-    // Neither entity should be alive in the ECS
-    try std.testing.expect(!s.sess.world.system_entity_sets[comptime session_mod.GameWorld.system_index_of(session_mod.PlayerTeam)].isSet(pe0));
-    try std.testing.expect(!s.sess.world.system_entity_sets[comptime session_mod.GameWorld.system_index_of(session_mod.PlayerTeam)].isSet(pe1));
+    // Shared pool depleted → game over
+    try std.testing.expectEqual(@as(u16, 0), s.sess.shared_hp.current);
 }
 
 test "game_state wire: round_timer decrement reflected in broadcast" {
@@ -889,7 +853,7 @@ test "game_state wire: round_timer decrement reflected in broadcast" {
     try std.testing.expect(gs.round_timer > 0.0);
 }
 
-test "game_state wire: shield_hp reflects server shield array" {
+test "game_state wire: shield_hp reflects shared shield in player snapshots" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -902,8 +866,8 @@ test "game_state wire: shield_hp reflects server shield array" {
     s.sess.round_duration = 1.0;
     try s.sess.start_game_wave(&test_wave_single);
 
-    const pe = s.sess.players[s.p[0].pid].entity;
-    s.sess.world.get_component(pe, c.Shield).hp = 7;
+    // Set the shared shield directly (round hasn't fired so value is stable)
+    s.sess.shared_shield.hp = 7;
 
     s.p[0].clear();
     try tick_n(&s.sess, 0.1, 1);
@@ -913,17 +877,16 @@ test "game_state wire: shield_hp reflects server shield array" {
     var fbs = std.io.fixedBufferStream(m.payload);
     const gs = try proto.decode_game_state(fbs.reader());
 
-    var found_shield: bool = false;
+    // Every player entity snapshot must carry the shared shield value.
+    var found_player: bool = false;
     var i: u8 = 0;
     while (i < gs.entity_count) : (i += 1) {
-        if (gs.entities[i].entity == pe) {
-            // Shield may have been consumed by enemy intent this tick (round not yet resolved)
-            // but timer hasn't expired yet so no resolution happened
+        if (gs.entities[i].team == .players) {
             try std.testing.expectEqual(@as(u16, 7), gs.entities[i].shield_hp);
-            found_shield = true;
+            found_player = true;
         }
     }
-    try std.testing.expect(found_shield);
+    try std.testing.expect(found_player);
 }
 
 test "cosmetic lobby position round-trip via choose_position" {
@@ -986,7 +949,7 @@ test "disconnect mid-game: round resolves cleanly for remaining player" {
     try std.testing.expect(find_tag(msgs, .game_state) != null);
 }
 
-test "heal at full HP — HP stays at max" {
+test "heal at full shared HP — HP stays at max" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -996,19 +959,17 @@ test "heal at full HP — HP stays at max" {
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single);
 
-    const pe = s.sess.players[s.p[0].pid].entity;
-    const hp_max = s.sess.world.get_component(pe, c.Health).max;
-    // Ensure player is at full HP
-    s.sess.world.get_component(pe, c.Health).current = hp_max;
+    // Shared pool already at max after spawn; ensure it is.
+    s.sess.shared_hp.current = s.sess.shared_hp.max;
+    const hp_max = s.sess.shared_hp.max;
 
     // Both players heal
     try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .heal });
     try enqueue_msg(&s.sess, s.p[1].pid, .choose_action, proto.ChooseAction{ .action = .heal });
     try tick_n(&s.sess, 0.11, 1);
 
-    // HP must not exceed max (enemy dealt 1 dmg so hp = max - 1, not max + 1)
-    const hp_after = s.sess.world.get_component(pe, c.Health).current;
-    try std.testing.expect(hp_after <= hp_max);
+    // HP must not exceed max (enemy dealt 1 dmg so hp = max - 1)
+    try std.testing.expect(s.sess.shared_hp.current <= hp_max);
 }
 
 test "action_result heal broadcast value matches pool size" {
@@ -1024,13 +985,8 @@ test "action_result heal broadcast value matches pool size" {
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single);
 
-    // Wound players so they can actually heal
-    {
-        var it = s.sess.world.system_entity_sets[comptime session_mod.GameWorld.system_index_of(session_mod.PlayerTeam)].iterator(.{});
-        while (it.next()) |u| {
-            s.sess.world.get_component(@intCast(u), c.Health).current = 50;
-        }
-    }
+    // Wound the shared pool so heal has room
+    s.sess.shared_hp.current = 50;
 
     // Both choose heal → pool = 2
     try enqueue_msg(&s.sess, s.p[0].pid, .choose_action, proto.ChooseAction{ .action = .heal });
@@ -1242,9 +1198,8 @@ test "combo [dmg,shld,heal,dmg] → all three pools receive correct counts" {
     const enemy_e = first_enemy(&s.sess) orelse return error.NoEnemy;
     const hp_before = s.sess.world.get_component(enemy_e, c.Health).current;
 
-    // Wound p0 so heal has room
-    const pe0 = s.sess.players[s.p[0].pid].entity;
-    s.sess.world.get_component(pe0, c.Health).current = 50;
+    // Wound shared pool so heal has room
+    s.sess.shared_hp.current = 50;
 
     // combo: dmg=2, shld=1, heal=1
     try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ActionChoice{ .damage, .shield, .heal, .damage }));
@@ -1254,8 +1209,8 @@ test "combo [dmg,shld,heal,dmg] → all three pools receive correct counts" {
     const hp_after = s.sess.world.get_component(enemy_e, c.Health).current;
     try std.testing.expectEqual(hp_before - 2 * V, hp_after);
 
-    // p0 shld pool=1 → +V shield, then enemy_intent=1 absorbed → net V-1
-    try std.testing.expectEqual(V - 1, s.sess.world.get_component(pe0, c.Shield).hp);
+    // shared shield pool=1 → +V shield, then enemy_intent=1 absorbed → net V-1
+    try std.testing.expectEqual(V - 1, s.sess.shared_shield.hp);
 }
 
 test "combo overwrite before round fires — latest combo wins" {
