@@ -21,15 +21,15 @@ pub const MsgTag = enum(u8) {
     ready_up = 0x03,
     choose_action = 0x04,
     reconnect = 0x05,
-    choose_position = 0x06, // cosmetic lobby position only
-    choose_combo = 0x07,    // submit/overwrite current action combo (1–4 actions)
-    cancel_combo = 0x08,    // cancel pending combo; server nulls the pool slot
+    choose_position = 0x06,
+    choose_combo = 0x07,
+    cancel_combo = 0x08,
 
     lobby_update = 0x10,
     game_start = 0x11,
     game_state = 0x12,
     action_result = 0x13,
-    round_reset = 0x14,     // server→client: round just fired, clear pending combo
+    round_reset = 0x14,
     game_over = 0x15,
     @"error" = 0x1F,
 };
@@ -52,8 +52,6 @@ pub const ChooseAction = struct {
     action: components.ActionChoice,
 };
 
-/// Ordered sequence of 1–4 actions submitted as a combo for the current round.
-/// Wire: [len: u8][action_0]..[action_N-1]
 pub const ChooseCombo = struct {
     combo: components.ActionCombo,
 };
@@ -71,7 +69,6 @@ pub const PlayerInfo = struct {
     class: components.ClassTag,
     ready: bool,
     connected: bool,
-    /// Cosmetic lobby grid position (col 0–2, row 0–3). No gameplay effect.
     grid_col: u8,
     grid_row: u8,
 };
@@ -81,7 +78,6 @@ pub const LobbyUpdate = struct {
     player_count: u8,
     players: [MAX_PLAYERS]PlayerInfo,
     player_id: u8,
-    /// Proposed round duration (seconds). Displayed in lobby; sent at game start.
     round_duration: f32,
 };
 
@@ -94,7 +90,6 @@ pub const GameStart = struct {
 
 pub const EntitySnapshot = struct {
     entity: u32,
-    /// Cosmetic slot index (0-based spawn order). No gameplay meaning.
     slot: u8,
     hp_current: u16,
     hp_max: u16,
@@ -102,8 +97,6 @@ pub const EntitySnapshot = struct {
     class: components.ClassTag,
     team: components.TeamId,
     owner: u8,
-    /// Number of actions in this entity's owning player's pending combo (0 = none).
-    /// Always 0 for enemy entities.
     combo_len: u8,
     combo_actions: [components.MAX_COMBO_LEN]components.ActionChoice,
 };
@@ -112,7 +105,6 @@ pub const MAX_ENTITIES_WIRE: u16 = 64;
 
 pub const GameState = struct {
     tick: u32,
-    /// Seconds remaining in the current round.
     round_timer: f32,
     entity_count: u8,
     entities: [MAX_ENTITIES_WIRE]EntitySnapshot,
@@ -127,7 +119,6 @@ pub const ActionResultTag = enum(u8) {
 
 pub const ActionResult = struct {
     tag: ActionResultTag,
-    /// 0xFFFFFFFF = no specific actor (pool action).
     actor_entity: u32,
     target_entity: u32,
     value: u16,

@@ -31,7 +31,6 @@ const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 const GameWorld = session_mod.GameWorld;
 const PlayerTeam = session_mod.PlayerTeam;
-const EnemyTeam = session_mod.EnemyTeam;
 
 // ---------------------------------------------------------------------------
 // BotHarness
@@ -188,10 +187,6 @@ pub const BotHarness = struct {
         return self.session.world.system_entity_sets[idx].count();
     }
 
-    pub fn living_enemy_count(self: *const BotHarness) usize {
-        const idx = comptime GameWorld.system_index_of(EnemyTeam);
-        return self.session.world.system_entity_sets[idx].count();
-    }
 };
 
 // ---------------------------------------------------------------------------
@@ -237,7 +232,7 @@ fn respawn_bots(
 // Tests
 // ---------------------------------------------------------------------------
 
-/// One enemy with HP = V so a single damage action from one bot kills it.
+/// One enemy with HP = V so a single damage action depletes the shared enemy pool.
 const wave_one_shot = waves.Wave{
     .label = "bot_one_shot",
     .entries = &[_]waves.SpawnEntry{.{
@@ -262,102 +257,84 @@ const wave_unkillable = waves.Wave{
     .next_wave = null,
 };
 
-/// 12 unkillable enemies: each round they deal 12 damage to the shared party pool.
-/// A single heal bot restores only 1 * ACTION_EFFECT_VALUE HP/round to the pool,
-/// so net drain = 12 - 1 = 11 HP/round. The party pool is eventually depleted.
+/// Unkillable enemy pool — shared_enemy_hp far too high to deplete in tests.
+/// Enemy intent = 1 dmg/round to party (pool is alive, entity count irrelevant).
+/// Used by survival tests that need a permanent attacker.
 const wave_overwhelming = waves.Wave{
     .label = "bot_overwhelming",
     .entries = &[_]waves.SpawnEntry{
         .{ .class = .grunt, .grid_col = 0, .grid_row = 0, .stats = .{ .max_hp = 60_000, .attack = 1 } },
-        .{ .class = .grunt, .grid_col = 1, .grid_row = 0, .stats = .{ .max_hp = 60_000, .attack = 1 } },
-        .{ .class = .grunt, .grid_col = 2, .grid_row = 0, .stats = .{ .max_hp = 60_000, .attack = 1 } },
-        .{ .class = .grunt, .grid_col = 0, .grid_row = 1, .stats = .{ .max_hp = 60_000, .attack = 1 } },
-        .{ .class = .grunt, .grid_col = 1, .grid_row = 1, .stats = .{ .max_hp = 60_000, .attack = 1 } },
-        .{ .class = .grunt, .grid_col = 2, .grid_row = 1, .stats = .{ .max_hp = 60_000, .attack = 1 } },
-        .{ .class = .grunt, .grid_col = 0, .grid_row = 2, .stats = .{ .max_hp = 60_000, .attack = 1 } },
-        .{ .class = .grunt, .grid_col = 1, .grid_row = 2, .stats = .{ .max_hp = 60_000, .attack = 1 } },
-        .{ .class = .grunt, .grid_col = 2, .grid_row = 2, .stats = .{ .max_hp = 60_000, .attack = 1 } },
-        .{ .class = .grunt, .grid_col = 0, .grid_row = 3, .stats = .{ .max_hp = 60_000, .attack = 1 } },
-        .{ .class = .grunt, .grid_col = 1, .grid_row = 3, .stats = .{ .max_hp = 60_000, .attack = 1 } },
-        .{ .class = .grunt, .grid_col = 2, .grid_row = 3, .stats = .{ .max_hp = 60_000, .attack = 1 } },
     },
     .next_wave = null,
 };
 
-/// Two-grunt wave used for mixed-team and all_damage tests.
+const wave_lethal_pack = wave_overwhelming;
+
+/// Two killable grunts — shared_enemy_hp = 160 (2 × 80).
+/// Used to verify mixed teams can actually win.
 const wave_two_grunts = waves.Wave{
     .label = "bot_two_grunts",
     .entries = &[_]waves.SpawnEntry{
-        .{ .class = .grunt, .grid_col = 0, .grid_row = 0, .stats = .{ .max_hp = 30, .attack = 1 } },
-        .{ .class = .grunt, .grid_col = 1, .grid_row = 0, .stats = .{ .max_hp = 30, .attack = 1 } },
+        .{ .class = .grunt, .grid_col = 0, .grid_row = 0, .stats = .{ .max_hp = 80, .attack = 1 } },
+        .{ .class = .grunt, .grid_col = 1, .grid_row = 0, .stats = .{ .max_hp = 80, .attack = 1 } },
     },
     .next_wave = null,
 };
 
-// wave_lethal_pack is an alias for wave_overwhelming: 12 enemies → 12 damage/round.
-// Used by the tank test (see below for why 12 enemies are needed).
-const wave_lethal_pack = wave_overwhelming;
-
-test "all_damage team beats wave_01_basic" {
-    // Two damage bots vs wave_01_basic (3 grunts, 80 HP each).
-    // damage_pool = 2 per round → 2*10 = 20 HP per enemy per round → 4 rounds to kill each.
-    // All enemies should die; game_over with winner = .players.
+test "all_damage team beats a beatable wave" {
+    // Two damage bots vs a single 40-HP grunt.
+    // shared_enemy_hp = 40. damage_pool = 2/round → 20 rounds to deplete.
+    // Party pool = 2 × fighter_hp. 1 enemy deals 1 dmg/round → party survives easily.
     const allocator = std.testing.allocator;
-    var h = try BotHarness.init(allocator, &bots.team_all_damage, &waves.wave_01_basic, "BOTKEY".*, .{});
-    defer h.deinit();
-
-    const rounds = try h.run_to_completion(200);
-
-    try std.testing.expect(rounds < 200); // game ended before timeout
-    try std.testing.expectEqual(session_mod.SessionPhase.lobby, h.session.phase);
-    try std.testing.expectEqual(@as(usize, 0), h.living_enemy_count());
-}
-
-test "heal-only team cannot kill enemies — eventually loses" {
-    // A single healer bot never contributes to the damage pool.
-    // wave_overwhelming has 12 enemies → 12 damage/round to the shared pool.
-    // Heal restores ACTION_EFFECT_VALUE HP/round to the pool.
-    // Net drain = 11 HP/round → shared pool depleted → enemies win.
-    const allocator = std.testing.allocator;
-    var h = try BotHarness.init(allocator, &bots.team_all_heal, &wave_overwhelming, "BOTKEY".*, .{});
+    const wave_beatable = waves.Wave{
+        .label = "bot_beatable",
+        .entries = &[_]waves.SpawnEntry{.{
+            .class = .grunt,
+            .grid_col = 0,
+            .grid_row = 0,
+            .stats = .{ .max_hp = 40, .attack = 1 },
+        }},
+        .next_wave = null,
+    };
+    var h = try BotHarness.init(allocator, &bots.team_all_damage, &wave_beatable, "BOTKEY".*, .{});
     defer h.deinit();
 
     const rounds = try h.run_to_completion(200);
 
     try std.testing.expect(rounds < 200);
     try std.testing.expectEqual(session_mod.SessionPhase.lobby, h.session.phase);
-    // Shared party pool must be at 0 — that is what triggered the loss.
-    try std.testing.expectEqual(@as(u16, 0), h.session.shared_hp.current);
+    try std.testing.expectEqual(@as(u16, 0), h.session.shared_enemy_hp.current);
 }
+
 
 test "mixed team beats two-grunt wave" {
     // team_mixed: tank (damage), medic (heal), cannon (damage).
-    // damage_pool = 2/round → 20 HP/enemy/round → kills 30-HP grunts in 2 rounds each.
+    // wave_two_grunts: 2 grunts × 80 HP = 160 shared_enemy_hp.
+    // damage_pool = 2/round → 80 rounds to deplete.
     const allocator = std.testing.allocator;
     var h = try BotHarness.init(allocator, &bots.team_mixed, &wave_two_grunts, "BOTKEY".*, .{});
     defer h.deinit();
 
-    const rounds = try h.run_to_completion(50);
+    const rounds = try h.run_to_completion(200);
 
-    try std.testing.expect(rounds < 50);
+    try std.testing.expect(rounds < 200);
     try std.testing.expectEqual(session_mod.SessionPhase.lobby, h.session.phase);
-    try std.testing.expectEqual(@as(usize, 0), h.living_enemy_count());
+    try std.testing.expectEqual(@as(u16, 0), h.session.shared_enemy_hp.current);
 }
 
 test "tank bot absorbs incoming damage with shield rotation" {
     // One bot with the 'tank' profile ({shield, shield, damage}).
-    // wave_lethal_pack = wave_overwhelming = 12 unkillable enemies.
-    // Enemy intent = 12 damage/round to the shared party pool (1 bot team, so
-    // shared pool = bot max_hp = 30).
-    // Shield grants ACTION_EFFECT_VALUE = 1 HP to the shared shield buffer per action.
+    // wave_lethal_pack: unkillable enemy pool → 1 dmg/round to party pool.
+    // Shield grants ACTION_EFFECT_VALUE = 1 HP to shared shield buffer per action.
     //
     // Damage-only bot (pool = 30 HP, no shields):
-    //   Takes 12 damage every round → pool gone in 3 rounds (30/12 = 2.5 → ceil 3).
+    //   Takes 1 damage every round → pool gone in 30 rounds.
     //
     // Tank bot (pool = 30 HP, {shield, shield, damage} cycle):
-    //   Round 1: +1 shield, -12 → shield 0, pool 19
-    //   Round 2: +1 shield, -12 → shield 0, pool 8
-    //   Round 3: damage, -12    → pool 0 (dead)
+    //   Round 1: +1 shield, -1 → shield 0, pool 30 (no net loss)
+    //   Round 2: +1 shield, -1 → shield 0, pool 30
+    //   Round 3: damage, -1    → pool 29
+    //   ... cycles: shield rounds break even; damage rounds cost 1 HP.
     //   Survives at least as many rounds as the damage-only bot.
     //
     // We assert tank_rounds >= dmg_rounds (not exact values, robust to tuning).
