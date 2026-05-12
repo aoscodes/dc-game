@@ -151,12 +151,6 @@ fn send_join() void {
     emit_send(fbs.getWritten());
 }
 
-fn send_choose_position(col: u8, row: u8) void {
-    var fbs = std.io.fixedBufferStream(&g_state.send_buf);
-    proto.encode(fbs.writer(), .choose_position, proto.ChoosePosition{ .col = col, .row = row }) catch return;
-    emit_send(fbs.getWritten());
-}
-
 fn send_ready_up() void {
     var fbs = std.io.fixedBufferStream(&g_state.send_buf);
     proto.encode(fbs.writer(), .ready_up, {}) catch return;
@@ -266,31 +260,6 @@ fn update_lobby() void {
         .enter => {
             g_state.lobby.ready = !g_state.lobby.ready;
             send_ready_up();
-        },
-        // Arrow keys move the cosmetic position cursor in the lobby.
-        .up => {
-            if (g_state.lobby.chosen_pos.row > 0) {
-                g_state.lobby.chosen_pos.row -= 1;
-                send_choose_position(g_state.lobby.chosen_pos.col, g_state.lobby.chosen_pos.row);
-            }
-        },
-        .down => {
-            if (g_state.lobby.chosen_pos.row < 3) {
-                g_state.lobby.chosen_pos.row += 1;
-                send_choose_position(g_state.lobby.chosen_pos.col, g_state.lobby.chosen_pos.row);
-            }
-        },
-        .left => {
-            if (g_state.lobby.chosen_pos.col < 2) {
-                g_state.lobby.chosen_pos.col += 1;
-                send_choose_position(g_state.lobby.chosen_pos.col, g_state.lobby.chosen_pos.row);
-            }
-        },
-        .right => {
-            if (g_state.lobby.chosen_pos.col > 0) {
-                g_state.lobby.chosen_pos.col -= 1;
-                send_choose_position(g_state.lobby.chosen_pos.col, g_state.lobby.chosen_pos.row);
-            }
         },
         else => {},
     }

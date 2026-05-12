@@ -7,8 +7,8 @@ const CELL_W = 90;
 const CELL_H = 100;
 
 // Team placement zones (soft boundaries — no hard grid).
-const PLAYER_ZONE = { x0: 20,  x1: 330, y0: 180, y1: 660 };
-const ENEMY_ZONE  = { x0: 694, x1: 1004, y0: 180, y1: 660 };
+const PLAYER_ZONE = { x0: 20, x1: 330, y0: 180, y1: 660 };
+const ENEMY_ZONE = { x0: 694, x1: 1004, y0: 180, y1: 660 };
 
 const C_BG = "#14141e";
 const C_HP_BG = "rgba(30,10,10,0.78)";
@@ -269,12 +269,6 @@ function drawLobby(lobby) {
   const pickerY = listY + 6 * 36 + 20;
   const readyLabel = lobby.ready ? "Press ENTER to un-ready" : "Press ENTER when ready";
   text(readyLabel, 60, pickerY, 18, C_TEXT);
-
-  // Position picker
-  const gridX = SW - 290;
-  const gridY = 130;
-  text("Position  [Arrow keys]", gridX, gridY - 14, 14, "rgba(180,200,255,0.9)");
-  drawLobbyGrid(lobby, gridX, gridY);
 }
 
 /**
@@ -352,7 +346,7 @@ function drawTeam(game, team, dt) {
         const action = entityCombo[i];
         if (action) {
           text(ACTION_CHAR[action] ?? "?", slotX, rowY + 13, 14,
-               ACTION_COLOR[action] ?? C_TEXT);
+            ACTION_COLOR[action] ?? C_TEXT);
         } else {
           text("·", slotX, rowY + 13, 14, "rgba(120,120,140,0.5)");
         }
@@ -371,7 +365,7 @@ const ACTION_CHAR = { damage: "a", shield: "s", heal: "h" };
 const ACTION_COLOR = {
   damage: "rgba(255,100,100,1)",
   shield: "rgba(80,160,255,1)",
-  heal:   "rgba(100,220,100,1)",
+  heal: "rgba(100,220,100,1)",
 };
 
 /**
@@ -384,17 +378,17 @@ const ACTION_COLOR = {
  * @param {number} y   - top of first bar
  */
 function drawBars(bars, x0, x1, y) {
-  const BAR_H   = 10;
-  const GAP     = 4;
+  const BAR_H = 10;
+  const GAP = 4;
   const LABEL_W = 40;
-  const ROW_H   = BAR_H + GAP;
+  const ROW_H = BAR_H + GAP;
   const bx = x0 + LABEL_W;
   const bw = (x1 - x0) - LABEL_W;
 
   for (let i = 0; i < bars.length; i++) {
     const { label, value, frac, color, bg } = bars[i];
     const by = y + i * ROW_H;
-    const f  = Math.max(0, Math.min(1, frac));
+    const f = Math.max(0, Math.min(1, frac));
 
     text(label, x0, by + BAR_H - 2, 10, "rgba(180,200,255,0.85)");
     rect(bx, by, bw, BAR_H, bg);
@@ -410,30 +404,30 @@ function drawBars(bars, x0, x1, y) {
  */
 function drawTeamBars(game) {
   const entities = game.entities || [];
-  const players  = entities.filter(e => e.team === "players" && e.hp > 0);
-  const enemies  = entities.filter(e => e.team === "enemies"  && e.hp > 0);
+  const players = entities.filter(e => e.team === "players" && e.hp > 0);
+  const enemies = entities.filter(e => e.team === "enemies" && e.hp > 0);
 
   // --- Player bars ---
   if (players.length > 0) {
     let totalHp = 0, totalMaxHp = 0, shieldCount = 0, healCount = 0;
     for (const e of players) {
-      totalHp    += e.hp;
+      totalHp += e.hp;
       totalMaxHp += e.hp_max;
       for (const action of (e.combo ?? [])) {
         if (action === "shield") shieldCount++;
-        else if (action === "heal")   healCount++;
+        else if (action === "heal") healCount++;
       }
     }
-    const scale      = totalMaxHp > 0 ? 1 / totalMaxHp : 0;
+    const scale = totalMaxHp > 0 ? 1 / totalMaxHp : 0;
     const projShield = shieldCount * ACTION_EFFECT_VALUE;
-    const projHeal   = healCount   * ACTION_EFFECT_VALUE;
+    const projHeal = healCount * ACTION_EFFECT_VALUE;
 
     // Three bars stacked; top of first bar sits just below the "ALLIES" label.
     const y = PLAYER_ZONE.y0 - 56; // leaves room for 3 × (10+4) = 42px + gap
     drawBars([
-      { label: "HP",   value: totalHp,    frac: totalHp    * scale, color: "rgba(60,200,60,0.9)",   bg: C_HP_BG },
-      { label: "Shld", value: projShield, frac: projShield * scale, color: "rgba(80,160,255,0.9)",  bg: "rgba(20,20,80,0.6)" },
-      { label: "Heal", value: projHeal,   frac: projHeal   * scale, color: "rgba(140,230,100,0.9)", bg: "rgba(20,50,20,0.6)" },
+      { label: "HP", value: totalHp, frac: totalHp * scale, color: "rgba(60,200,60,0.9)", bg: C_HP_BG },
+      { label: "Shld", value: projShield, frac: projShield * scale, color: "rgba(80,160,255,0.9)", bg: "rgba(20,20,80,0.6)" },
+      { label: "Heal", value: projHeal, frac: projHeal * scale, color: "rgba(140,230,100,0.9)", bg: "rgba(20,50,20,0.6)" },
     ], PLAYER_ZONE.x0, PLAYER_ZONE.x1, y);
   }
 
@@ -460,10 +454,10 @@ function drawActionMenu(game) {
   rect(mx, my, mw, mh, C_MENU_BG);
   rectStroke(mx, my, mw, mh, 2, C_MENU_BORDER);
 
-  text("[1] Atk", mx + 10,        my + 14 + 16, 16, C_TEXT);
+  text("[1] Atk", mx + 10, my + 14 + 16, 16, C_TEXT);
   text("[2] Shld", mx + 10 + 106, my + 14 + 16, 16, C_TEXT);
   text("[3] Heal", mx + 10 + 212, my + 14 + 16, 16, C_TEXT);
-  text("[Esc] Cancel", mx + 10,   my + 14 + 34, 12, "rgba(180,180,180,0.8)");
+  text("[Esc] Cancel", mx + 10, my + 14 + 34, 12, "rgba(180,180,180,0.8)");
 
   // Round timer bar
   const timerFrac = game.round_duration > 0
@@ -480,8 +474,8 @@ function drawGame(game, dt) {
   const wave = game.wave || "";
   text(`Wave: ${wave}`, 40, 30 + 20, 20, C_HEADER);
 
-  text("ALLIES",  PLAYER_ZONE.x0, PLAYER_ZONE.y0 - 62, 18, C_HEADER);
-  text("ENEMIES", ENEMY_ZONE.x0,  ENEMY_ZONE.y0  - 62, 18, C_ENEMY_HDR);
+  text("ALLIES", PLAYER_ZONE.x0, PLAYER_ZONE.y0 - 62, 18, C_HEADER);
+  text("ENEMIES", ENEMY_ZONE.x0, ENEMY_ZONE.y0 - 62, 18, C_ENEMY_HDR);
 
   drawTeamBars(game);
 
@@ -511,10 +505,10 @@ function renderFrame(msg, dt) {
 
   switch (msg.phase) {
     case "connecting": drawConnecting(); break;
-    case "lobby":     drawLobby(msg.lobby); break;
-    case "game":      drawGame(msg.game, dt); break;
+    case "lobby": drawLobby(msg.lobby); break;
+    case "game": drawGame(msg.game, dt); break;
     case "game_over": drawGameOver(); break;
-    default:          drawConnecting();
+    default: drawConnecting();
   }
 }
 

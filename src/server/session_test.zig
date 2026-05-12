@@ -130,7 +130,6 @@ fn consume_payload(tag: proto.MsgTag, r: anytype) bool {
         .choose_class => if (proto.decode_choose_class(r)) |_| true else |_| false,
         .choose_action => if (proto.decode_choose_action(r)) |_| true else |_| false,
         .reconnect => if (proto.decode_reconnect(r)) |_| true else |_| false,
-        .choose_position => if (proto.decode_choose_position(r)) |_| true else |_| false,
         .ready_up => true, // zero-payload message
         .choose_combo => if (proto.decode_choose_combo(r)) |_| true else |_| false,
         .cancel_combo => true, // zero-payload message
@@ -188,8 +187,6 @@ fn tick_n(sess: *Session, dt: f32, n: u32) !void {
     var i: u32 = 0;
     while (i < n) : (i += 1) try sess.tick(dt);
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Two-player session factory
@@ -831,33 +828,6 @@ test "game_state wire: shield_hp reflects shared shield in player snapshots" {
         }
     }
     try std.testing.expect(found_player);
-}
-
-test "cosmetic lobby position round-trip via choose_position" {
-    const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .mage);
-    defer s.deinit();
-
-    const pid = s.p[0].pid;
-    try enqueue_msg(&s.sess, pid, .choose_position, proto.ChoosePosition{ .col = 2, .row = 3 });
-    // drain_queues is called on tick, but session is in lobby — tick still drains
-    try s.sess.tick(0.016);
-
-    s.p[0].clear();
-    try s.sess.broadcast_lobby_update();
-
-    const msgs = try drain(s.p[0].buf.items, arena);
-    const m = find_tag(msgs, .lobby_update) orelse return error.NoLobbyUpdate;
-    var fbs = std.io.fixedBufferStream(m.payload);
-    const lu = try proto.decode_lobby_update(fbs.reader());
-
-    try std.testing.expectEqual(@as(u8, 2), lu.players[pid].grid_col);
-    try std.testing.expectEqual(@as(u8, 3), lu.players[pid].grid_row);
 }
 
 test "disconnect mid-game: round resolves cleanly for remaining player" {

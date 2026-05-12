@@ -83,9 +83,6 @@ pub const GameWorld = ecs.World(
 
 pub const MAX_PLAYERS = proto.MAX_PLAYERS;
 
-/// Cosmetic grid position stored in the lobby (no gameplay effect).
-pub const LobbyGridPos = struct { col: u2 = 0, row: u2 = 0 };
-
 pub const PlayerSlot = struct {
     occupied: bool = false,
     connected: bool = false,
@@ -94,8 +91,6 @@ pub const PlayerSlot = struct {
     name_len: u8 = 0,
     class: c.ClassTag = .fighter,
     ready: bool = false,
-    /// Cosmetic lobby grid position — no gameplay effect.
-    grid_pos: LobbyGridPos = .{},
     entity: ecs.Entity = std.math.maxInt(ecs.Entity),
     transport: ?shared.Transport = null,
     queue_lock: std.Thread.Mutex = .{},
@@ -125,16 +120,10 @@ pub const Session = struct {
     recorder: ?dbg.replay.Recorder(std.io.AnyWriter) = null,
 
     pub fn init(allocator: std.mem.Allocator, join_code: [6]u8) !Session {
-        const default_positions = [MAX_PLAYERS]LobbyGridPos{
-            .{ .col = 0, .row = 0 }, .{ .col = 1, .row = 1 },
-            .{ .col = 2, .row = 2 }, .{ .col = 0, .row = 3 },
-            .{ .col = 1, .row = 3 }, .{ .col = 2, .row = 3 },
-        };
         var players: [MAX_PLAYERS]PlayerSlot = undefined;
         for (&players, 0..) |*p, i| {
             p.* = PlayerSlot{
                 .player_id = @intCast(i),
-                .grid_pos = default_positions[i],
                 .allocator = allocator,
             };
         }
@@ -374,31 +363,6 @@ pub const Session = struct {
                     try self.broadcast_game_start("wave_01_basic");
                 }
             },
-            .choose_position => {
-                if (self.phase == .lobby) {
-                    const p = try proto.decode_choose_position(fbs.reader());
-                    if (p.col < 3 and p.row < 4) {
-                        var taken = false;
-                        for (&self.players) |*other| {
-                            if (!other.occupied or other.player_id == player_id) continue;
-                            if (other.grid_pos.col == @as(u2, @intCast(p.col)) and
-                                other.grid_pos.row == @as(u2, @intCast(p.row)))
-                            {
-                                taken = true;
-                                break;
-                            }
-                        }
-                        if (!taken) {
-                            self.players[player_id].grid_pos = LobbyGridPos{
-                                .col = @intCast(p.col),
-                                .row = @intCast(p.row),
-                            };
-                            std.log.info("player {} position: col={} row={}", .{ player_id, p.col, p.row });
-                            try self.broadcast_lobby_update();
-                        }
-                    }
-                }
-            },
             .choose_action => {
                 if (self.phase == .playing and player_id < MAX_PLAYERS) {
                     const p = try proto.decode_choose_action(fbs.reader());
@@ -543,25 +507,13 @@ pub const Session = struct {
     }
 
     pub fn broadcast_lobby_update(self: *Session) !void {
-        var base = proto.LobbyUpdate{
+        const base = proto.LobbyUpdate{
             .join_code = self.join_code,
             .player_count = self.player_count,
             .players = [_]proto.PlayerInfo{std.mem.zeroes(proto.PlayerInfo)} ** proto.MAX_PLAYERS,
             .player_id = 0xFF,
             .round_duration = self.round_duration,
         };
-        for (&self.players) |*slot| {
-            if (!slot.occupied) continue;
-            const pi = &base.players[slot.player_id];
-            pi.player_id = slot.player_id;
-            pi.name = slot.name;
-            pi.name_len = slot.name_len;
-            pi.class = slot.class;
-            pi.ready = slot.ready;
-            pi.connected = slot.connected;
-            pi.grid_col = slot.grid_pos.col;
-            pi.grid_row = slot.grid_pos.row;
-        }
         for (&self.players) |*slot| {
             if (!slot.connected) continue;
             const t = slot.transport orelse continue;

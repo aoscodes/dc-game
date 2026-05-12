@@ -21,7 +21,6 @@ pub const MsgTag = enum(u8) {
     ready_up = 0x03,
     choose_action = 0x04,
     reconnect = 0x05,
-    choose_position = 0x06,
     choose_combo = 0x07,
     cancel_combo = 0x08,
 
@@ -149,10 +148,6 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
         .ready_up => {},
         .choose_action => try writer.writeByte(@intFromEnum(payload.action)),
         .reconnect => try writer.writeByte(payload.player_id),
-        .choose_position => {
-            try writer.writeByte(payload.col);
-            try writer.writeByte(payload.row);
-        },
         .choose_combo => {
             try writer.writeByte(payload.combo.len);
             for (payload.combo.actions[0..payload.combo.len]) |a|
@@ -287,10 +282,6 @@ pub fn decode_choose_combo(reader: anytype) !ChooseCombo {
 
 pub fn decode_reconnect(reader: anytype) !Reconnect {
     return .{ .player_id = try reader.readByte() };
-}
-
-pub fn decode_choose_position(reader: anytype) !ChoosePosition {
-    return .{ .col = try reader.readByte(), .row = try reader.readByte() };
 }
 
 pub fn decode_lobby_update(reader: anytype) !LobbyUpdate {
