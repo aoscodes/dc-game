@@ -189,15 +189,6 @@ fn process_recv() void {
                 }
                 g_state.lobby.update = p;
                 g_state.lobby.player_id = g_state.player_id;
-                for (p.players[0..p.player_count]) |pi| {
-                    if (pi.player_id == g_state.player_id) {
-                        g_state.lobby.chosen_pos = .{
-                            .col = pi.grid_col,
-                            .row = pi.grid_row,
-                        };
-                        break;
-                    }
-                }
                 g_state.phase = .lobby;
             },
             .game_start => {
@@ -245,8 +236,6 @@ fn process_recv() void {
                 }
             },
             .round_reset => {
-                // Server round fired — clear pending combo so the browser
-                // sees an empty array in the next render frame.
                 g_state.game.pending_combo.clear();
             },
             else => {},
@@ -278,15 +267,7 @@ fn update_game() void {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bridge handshake
-// ---------------------------------------------------------------------------
-
 var g_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
 
 pub fn main() !void {
     const stdin_thread = try std.Thread.spawn(.{}, stdin_reader, .{{}});

@@ -1,23 +1,11 @@
-//! Serialises client state to newline-delimited JSON frames written to stdout.
-//!
-//! Two frame kinds:
-//!
-//!   render  — full UI snapshot sent every tick so the browser can redraw.
-//!   send    — request for the bridge to forward bytes to the game server.
-//!
-//! The bridge reads these frames from the child process stdout.
-
 const std = @import("std");
 const proto = @import("shared").protocol;
 const c = @import("shared").components;
 const inp = @import("input.zig");
 
-/// Writer wraps stdout with a mutex so stdin-reader and game loop don't race.
 pub const Writer = struct {
     mu: *std.Thread.Mutex,
 
-    /// Serialise the full render state as a single JSON line.
-    /// Clears game.last_action_count after flushing so each animation fires once.
     pub fn write_render(
         self: Writer,
         phase: ClientPhaseTag,
@@ -35,8 +23,6 @@ pub const Writer = struct {
         game.last_action_count = 0;
     }
 
-    /// Emit a `send` frame carrying hex-encoded bytes for the bridge to
-    /// forward to the game server.
     pub fn write_send(self: Writer, bytes: []const u8) void {
         self.mu.lock();
         defer self.mu.unlock();
@@ -56,8 +42,6 @@ pub const LobbyState = struct {
     update: proto.LobbyUpdate = std.mem.zeroes(proto.LobbyUpdate),
     player_id: u8 = 0xFF,
     ready: bool = false,
-    /// Cosmetic lobby position cursor (col 0–2, row 0–3).
-    chosen_pos: struct { col: u8 = 0, row: u8 = 0 } = .{},
 };
 
 pub const LastActionEntry = struct { entity: u32, anim: c.ActionAnimation };
@@ -65,16 +49,12 @@ pub const LastActionEntry = struct { entity: u32, anim: c.ActionAnimation };
 pub const GameState = struct {
     snapshot: proto.GameState = std.mem.zeroes(proto.GameState),
     player_id: u8 = 0xFF,
-    /// Actions the player has queued this round (0–4 slots).
-    /// Cleared when the server broadcasts round_reset.
     pending_combo: inp.ComboBuffer = .{},
     round_timer: f32 = 0.0,
     round_duration: f32 = 0.0,
     wave_label: [32]u8 = [_]u8{0} ** 32,
     wave_label_len: u8 = 0,
     winner: ?proto.WinnerId = null,
-    /// Animations triggered this tick by action_result messages.
-    /// Cleared by write_render() after each flush so each animation fires once.
     last_action_count: u8 = 0,
     last_actions: [proto.MAX_ENTITIES_WIRE]LastActionEntry = undefined,
 };
@@ -103,12 +83,13 @@ fn write_render_inner(
 
     var entities_buf: [proto.MAX_ENTITIES_WIRE]JsonEntity = undefined;
     for (0..game.snapshot.entity_count) |i| {
-        // Use a pointer so combo slice remains valid for the lifetime of entities_buf.
         const e = &game.snapshot.entities[i];
-        // Find any animation triggered for this entity this tick.
         var anim: ?c.ActionAnimation = null;
         for (game.last_actions[0..game.last_action_count]) |la| {
-            if (la.entity == e.entity) { anim = la.anim; break; }
+            if (la.entity == e.entity) {
+                anim = la.anim;
+                break;
+            }
         }
         entities_buf[i] = .{
             .id = e.entity,
@@ -131,8 +112,6 @@ fn write_render_inner(
             .join_code = lobby.update.join_code[0..jc_end],
             .player_id = lobby.update.player_id,
             .ready = lobby.ready,
-            .chosen_col = lobby.chosen_pos.col,
-            .chosen_row = lobby.chosen_pos.row,
             .round_duration = lobby.update.round_duration,
             .players = players_buf[0..lobby.update.player_count],
         } else null,
@@ -180,8 +159,6 @@ const JsonLobby = struct {
     join_code: []const u8,
     player_id: u8,
     ready: bool,
-    chosen_col: u8,
-    chosen_row: u8,
     round_duration: f32,
     players: []const JsonPlayer,
 };
@@ -199,8 +176,6 @@ const JsonPlayer = struct {
 const JsonGame = struct {
     wave: []const u8,
     player_id: u8,
-    /// Filled prefix of the player's current combo (0–4 entries).
-    /// Empty slice when no combo is pending.
     pending_combo: []const c.ActionChoice,
     round_timer: f32,
     round_duration: f32,
@@ -217,9 +192,6 @@ const JsonEntity = struct {
     class: c.ClassTag,
     team: c.TeamId,
     owner: u8,
-    /// Animation to play this tick; null if none.  Omitted from JSON when null.
     last_action: ?c.ActionAnimation,
-    /// Filled prefix of the owning player's pending combo (0–4 entries).
-    /// Empty slice for enemy entities or players with no pending combo.
     combo: []const c.ActionChoice,
 };

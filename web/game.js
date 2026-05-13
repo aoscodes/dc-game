@@ -22,13 +22,8 @@ const C_MENU_BG = "rgba(20,20,40,0.86)";
 const C_MENU_BORDER = C_HEADER;
 const C_SEL = C_CURSOR;
 
-// ---------------------------------------------------------------------------
-// Asset loading
-// ---------------------------------------------------------------------------
-
 const CLASSES = ["fighter", "mage", "healer", "grunt", "archer", "shaman", "boss"];
 
-/** @type {Map<string, { img: HTMLImageElement, meta: { frame_w: number, frame_h: number, clips: Record<string,{row:number,frames:number,fps:number,loop:boolean}> } }>} */
 const sprites = new Map();
 
 async function loadAssets() {
@@ -45,10 +40,6 @@ async function loadAssets() {
     sprites.set(cls, { img, meta });
   }));
 }
-
-// ---------------------------------------------------------------------------
-// Per-entity animator state
-// ---------------------------------------------------------------------------
 
 /**
  * @typedef {{ clip: string, frame: number, elapsed: number, locked: boolean }} AnimState
@@ -78,8 +69,6 @@ function tickAnimator(id, cls, lastAction, dt) {
     animState.set(id, s);
   }
 
-  // Transition: a new last_action from the server overrides the current clip
-  // (unless we're mid-die, which must never be interrupted).
   if (lastAction && lastAction !== s.clip && s.clip !== "die") {
     s.clip = lastAction;
     s.frame = 0;
@@ -88,7 +77,7 @@ function tickAnimator(id, cls, lastAction, dt) {
   }
 
   const clip = clips[s.clip] ?? clips["idle"];
-  const spf = 1 / clip.fps; // seconds per frame
+  const spf = 1 / clip.fps;
 
   s.elapsed += dt;
   while (s.elapsed >= spf) {
@@ -98,10 +87,8 @@ function tickAnimator(id, cls, lastAction, dt) {
       if (clip.loop) {
         s.frame = 0;
       } else {
-        // Hold last frame; unlock so idle can resume next tick.
         s.frame = clip.frames - 1;
         s.locked = false;
-        // Revert to idle unless this is die (stay dead).
         if (s.clip !== "die") {
           s.clip = "idle";
           s.frame = 0;
@@ -114,10 +101,6 @@ function tickAnimator(id, cls, lastAction, dt) {
 
   return { clip: s.clip, frame: s.frame };
 }
-
-// ---------------------------------------------------------------------------
-// Entity positions — assigned once on first sight, persist until cleared.
-// ---------------------------------------------------------------------------
 
 /** @type {Map<number, {x: number, y: number}>} */
 const entityPositions = new Map();
@@ -132,7 +115,7 @@ const entityPositions = new Map();
  */
 function assignPosition(zone) {
   const MAX_TRIES = 50;
-  const SEP = CELL_W + 8; // minimum centre-to-centre distance
+  const SEP = CELL_W + 8; // minimum center-to-center distance
   const existing = [...entityPositions.values()];
 
   for (let i = 0; i < MAX_TRIES; i++) {
@@ -141,7 +124,6 @@ function assignPosition(zone) {
     const ok = existing.every(p => Math.abs(p.x - x) >= SEP || Math.abs(p.y - y) >= SEP);
     if (ok) return { x, y };
   }
-  // Fallback: place without collision check.
   return {
     x: zone.x0 + Math.random() * (zone.x1 - zone.x0 - CELL_W),
     y: zone.y0 + Math.random() * (zone.y1 - zone.y0 - CELL_H),
@@ -152,10 +134,6 @@ function clearEntityState() {
   entityPositions.clear();
   animState.clear();
 }
-
-// ---------------------------------------------------------------------------
-// Canvas
-// ---------------------------------------------------------------------------
 
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
@@ -182,10 +160,6 @@ function rectStroke(x, y, w, h, lineW, color) {
   ctx.strokeRect(x + lineW / 2, y + lineW / 2, w - lineW, h - lineW);
 }
 
-// ---------------------------------------------------------------------------
-// Screen helpers
-// ---------------------------------------------------------------------------
-
 function drawConnecting() {
   clear();
   text("Connecting to server...", 40, 60, 24, C_TEXT);
@@ -197,9 +171,6 @@ function drawFull() {
   text("Close another tab to free a slot.", 40, SH / 2 + 16, 18, C_TEXT);
 }
 
-// Draw the 3×2 lobby position-picker grid.
-// Columns are visually flipped so col 0 (front rank) is on the right, matching
-// the in-game ally grid orientation (closest to enemies = right edge).
 function drawLobbyGrid(lobby, ox, oy) {
   const CW = 70, CH = 56, CP = 5;
   const players = lobby.players || [];
@@ -212,35 +183,6 @@ function drawLobbyGrid(lobby, ox, oy) {
     }
   }
 
-  for (let col = 0; col < 3; col++) {
-    for (let row = 0; row < 4; row++) {
-      // Flip columns: col 0 (front) renders at the right edge
-      const cx = ox + (2 - col) * (CW + CP);
-      const cy = oy + row * (CH + CP);
-
-      const key = `${col},${row}`;
-      const occ = occupied[key];
-      const isOurs = occ && occ.id === lobby.player_id;
-      const isCursor = col === (lobby.chosen_col ?? 0) && row === (lobby.chosen_row ?? 0);
-
-      // Cell background
-      let bg = "rgba(40,40,55,0.7)";
-      if (occ) bg = isOurs ? "rgba(80,160,80,0.86)" : "rgba(120,80,80,0.7)";
-      rect(cx, cy, CW, CH, bg);
-
-      // Cursor highlight
-      if (isCursor) rectStroke(cx, cy, CW, CH, 3, C_CURSOR);
-
-      // Player name or col label
-      if (occ) {
-        const nameColor = isOurs ? "rgba(255,255,100,1)" : C_TEXT;
-        text(occ.name.slice(0, 6), cx + 4, cy + 20, 13, nameColor);
-        text(occ.class.slice(0, 3).toUpperCase(), cx + 4, cy + 38, 12, C_TEXT);
-      }
-    }
-  }
-
-  // Column rank labels below the grid (front = right, back = left, matching flip)
   const labelY = oy + 4 * (CH + CP) + 14;
   for (let col = 0; col < 3; col++) {
     const lx = ox + (2 - col) * (CW + CP) + CW / 2 - 14;
