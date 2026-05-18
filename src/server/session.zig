@@ -50,18 +50,8 @@ const dbg = @import("debug_zig");
 
 const ws_server = @import("net/ws_server.zig");
 
-/// Zones measured by the per-session tick profiler.
 pub const TickZones = enum { drain, round, broadcast, check_win };
 
-// ---------------------------------------------------------------------------
-// ECS system marker types
-//
-// A "system" in this ECS is a plain struct whose presence in World(...)
-// causes a DynamicBitSet to be maintained for all matching entities.
-// The struct itself carries no state; the World owns the entity set.
-// ---------------------------------------------------------------------------
-
-/// Tracks all living entities belonging to the players team.
 pub const PlayerTeam = struct {};
 pub const EnemyTeam = struct {};
 
@@ -128,7 +118,6 @@ pub const Session = struct {
             };
         }
         var world = try GameWorld.init(allocator);
-        // System signatures set once here; maintained automatically by world.
         set_world_system_signatures(&world);
         return Session{
             .allocator = allocator,
@@ -550,6 +539,16 @@ pub const Session = struct {
             .round_timer = @max(self.round_timer, 0.0),
             .entity_count = 0,
             .entities = [_]proto.EntitySnapshot{std.mem.zeroes(proto.EntitySnapshot)} ** proto.MAX_ENTITIES_WIRE,
+            .players = .{
+                .hp_current = self.shared_hp.current,
+                .hp_max = self.shared_hp.max,
+                .shield_hp = self.shared_shield.hp,
+            },
+            .enemies = .{
+                .hp_current = self.shared_enemy_hp.current,
+                .hp_max = self.shared_enemy_hp.max,
+                .shield_hp = self.shared_enemy_shield.hp,
+            },
         };
 
         const pm_arr = &self.world.component_arrays.player_marker;
@@ -565,10 +564,6 @@ pub const Session = struct {
 
             snap.entities[snap.entity_count] = .{
                 .entity = e,
-                .slot = snap.entity_count,
-                .hp_current = self.shared_hp.current,
-                .hp_max = self.shared_hp.max,
-                .shield_hp = self.shared_shield.hp,
                 .class = cl.tag,
                 .team = .players,
                 .owner = own,
@@ -585,10 +580,6 @@ pub const Session = struct {
 
             snap.entities[snap.entity_count] = .{
                 .entity = e,
-                .slot = snap.entity_count,
-                .hp_current = self.shared_enemy_hp.current,
-                .hp_max = self.shared_enemy_hp.max,
-                .shield_hp = self.shared_enemy_shield.hp,
                 .class = cl.tag,
                 .team = .enemies,
                 .owner = 0xFF,

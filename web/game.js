@@ -254,10 +254,12 @@ function drawEntitySprite(e, cx, cy, lastAction, dt, flip) {
 function drawTeam(game, team, dt) {
   const zone = team === "players" ? PLAYER_ZONE : ENEMY_ZONE;
   const flip = team === "enemies";
+  const summary = team === "enemies" ? game.enemies : game.players;
+  const teamAlive = summary && summary.hp_current > 0;
 
   const entities = (game.entities || []).filter(e => e.team === team);
   for (const e of entities) {
-    if (e.hp <= 0) continue;
+    if (!teamAlive) continue;
 
     // Assign position on first sight; never move it.
     if (!entityPositions.has(e.id)) {
@@ -346,43 +348,43 @@ function drawBars(bars, x0, x1, y) {
  */
 function drawTeamBars(game) {
   const entities = game.entities || [];
-  const players = entities.filter(e => e.team === "players" && e.hp > 0);
-  const enemies = entities.filter(e => e.team === "enemies" && e.hp > 0);
+  const players = entities.filter(e => e.team === "players");
+  const enemies = entities.filter(e => e.team === "enemies");
 
   // --- Player bars ---
-  if (players.length > 0) {
-    let totalHp = 0, totalMaxHp = 0, shieldCount = 0, healCount = 0;
+  const playerSummary = game.players;
+  if (players.length > 0 && playerSummary && playerSummary.hp_max > 0) {
+    let shieldCount = 0, healCount = 0;
     for (const e of players) {
-      totalHp += e.hp;
-      totalMaxHp += e.hp_max;
       for (const action of (e.combo ?? [])) {
         if (action === "shield") shieldCount++;
         else if (action === "heal") healCount++;
       }
     }
-    const scale = totalMaxHp > 0 ? 1 / totalMaxHp : 0;
+    const { hp_current, hp_max, shield_hp } = playerSummary;
+    const scale = hp_max > 0 ? 1 / hp_max : 0;
     const projShield = shieldCount * ACTION_EFFECT_VALUE;
     const projHeal = healCount * ACTION_EFFECT_VALUE;
 
     // Three bars stacked; top of first bar sits just below the "ALLIES" label.
     const y = PLAYER_ZONE.y0 - 56; // leaves room for 3 × (10+4) = 42px + gap
     drawBars([
-      { label: "HP", value: totalHp, frac: totalHp * scale, color: "rgba(60,200,60,0.9)", bg: C_HP_BG },
-      { label: "Shld", value: projShield, frac: projShield * scale, color: "rgba(80,160,255,0.9)", bg: "rgba(20,20,80,0.6)" },
+      { label: "HP", value: hp_current, frac: hp_current * scale, color: "rgba(60,200,60,0.9)", bg: C_HP_BG },
+      { label: "Shld", value: shield_hp + projShield, frac: (shield_hp + projShield) * scale, color: "rgba(80,160,255,0.9)", bg: "rgba(20,20,80,0.6)" },
       { label: "Heal", value: projHeal, frac: projHeal * scale, color: "rgba(140,230,100,0.9)", bg: "rgba(20,50,20,0.6)" },
     ], PLAYER_ZONE.x0, PLAYER_ZONE.x1, y);
   }
 
   // --- Enemy bar ---
-  if (enemies.length > 0) {
-    let totalHp = 0, totalMaxHp = 0;
-    for (const e of enemies) { totalHp += e.hp; totalMaxHp += e.hp_max; }
-    const scale = totalMaxHp > 0 ? 1 / totalMaxHp : 0;
+  const enemySummary = game.enemies;
+  if (enemies.length > 0 && enemySummary && enemySummary.hp_max > 0) {
+    const { hp_current, hp_max } = enemySummary;
+    const scale = hp_max > 0 ? 1 / hp_max : 0;
 
     // One bar; align bottom with player bars bottom.
     const y = ENEMY_ZONE.y0 - 56 + 28; // vertically centred in the same strip
     drawBars([
-      { label: "HP", value: totalHp, frac: totalHp * scale, color: "rgba(255,100,60,0.9)", bg: C_HP_BG },
+      { label: "HP", value: hp_current, frac: hp_current * scale, color: "rgba(255,100,60,0.9)", bg: C_HP_BG },
     ], ENEMY_ZONE.x0, ENEMY_ZONE.x1, y);
   }
 }

@@ -93,10 +93,6 @@ fn write_render_inner(
         }
         entities_buf[i] = .{
             .id = e.entity,
-            .slot = e.slot,
-            .hp = e.hp_current,
-            .hp_max = e.hp_max,
-            .shield_hp = e.shield_hp,
             .class = e.class,
             .team = e.team,
             .owner = e.owner,
@@ -123,6 +119,16 @@ fn write_render_inner(
             .round_duration = game.round_duration,
             .tick = game.snapshot.tick,
             .entities = entities_buf[0..game.snapshot.entity_count],
+            .players = .{
+                .hp_current = game.snapshot.players.hp_current,
+                .hp_max = game.snapshot.players.hp_max,
+                .shield_hp = game.snapshot.players.shield_hp,
+            },
+            .enemies = .{
+                .hp_current = game.snapshot.enemies.hp_current,
+                .hp_max = game.snapshot.enemies.hp_max,
+                .shield_hp = game.snapshot.enemies.shield_hp,
+            },
         } else null,
         .winner = if (phase == .game_over) game.winner else null,
     };
@@ -173,6 +179,12 @@ const JsonPlayer = struct {
     grid_row: u8,
 };
 
+const JsonTeamSummary = struct {
+    hp_current: u16,
+    hp_max: u16,
+    shield_hp: u16,
+};
+
 const JsonGame = struct {
     wave: []const u8,
     player_id: u8,
@@ -181,14 +193,12 @@ const JsonGame = struct {
     round_duration: f32,
     tick: u32,
     entities: []const JsonEntity,
+    players: JsonTeamSummary,
+    enemies: JsonTeamSummary,
 };
 
 const JsonEntity = struct {
     id: u32,
-    slot: u8,
-    hp: u16,
-    hp_max: u16,
-    shield_hp: u16,
     class: c.ClassTag,
     team: c.TeamId,
     owner: u8,

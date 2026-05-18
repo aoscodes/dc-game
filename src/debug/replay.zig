@@ -153,17 +153,13 @@ test "replay: record then play back" {
         .round_timer = 3.0,
         .entity_count = 1,
         .entities = [_]proto.EntitySnapshot{std.mem.zeroes(proto.EntitySnapshot)} ** proto.MAX_ENTITIES_WIRE,
+        .players = .{ .hp_current = 100, .hp_max = 100, .shield_hp = 0 },
+        .enemies = .{ .hp_current = 0, .hp_max = 0, .shield_hp = 0 },
     };
-    gs1.entities[0] = .{
-        .entity = 0,
-        .slot = 0,
-        .hp_current = 100,
-        .hp_max = 100,
-        .shield_hp = 0,
-        .class = .fighter,
-        .team = .players,
-        .owner = 0,
-    };
+    gs1.entities[0] = std.mem.zeroes(proto.EntitySnapshot);
+    gs1.entities[0].entity = 0;
+    gs1.entities[0].class = .fighter;
+    gs1.entities[0].team = .players;
     var gs2 = gs1;
     gs2.tick = 2;
     gs2.round_timer = 2.0;

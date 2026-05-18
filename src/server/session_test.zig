@@ -794,7 +794,7 @@ test "game_state wire: round_timer decrement reflected in broadcast" {
     try std.testing.expect(gs.round_timer > 0.0);
 }
 
-test "game_state wire: shield_hp reflects shared shield in player snapshots" {
+test "game_state wire: shield_hp reflects shared shield in players summary" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -818,16 +818,7 @@ test "game_state wire: shield_hp reflects shared shield in player snapshots" {
     var fbs = std.io.fixedBufferStream(m.payload);
     const gs = try proto.decode_game_state(fbs.reader());
 
-    // Every player entity snapshot must carry the shared shield value.
-    var found_player: bool = false;
-    var i: u8 = 0;
-    while (i < gs.entity_count) : (i += 1) {
-        if (gs.entities[i].team == .players) {
-            try std.testing.expectEqual(@as(u16, 7), gs.entities[i].shield_hp);
-            found_player = true;
-        }
-    }
-    try std.testing.expect(found_player);
+    try std.testing.expectEqual(@as(u16, 7), gs.players.shield_hp);
 }
 
 test "disconnect mid-game: round resolves cleanly for remaining player" {

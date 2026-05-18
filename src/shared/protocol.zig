@@ -89,10 +89,6 @@ pub const GameStart = struct {
 
 pub const EntitySnapshot = struct {
     entity: u32,
-    slot: u8,
-    hp_current: u16,
-    hp_max: u16,
-    shield_hp: u16,
     class: components.ClassTag,
     team: components.TeamId,
     owner: u8,
@@ -102,11 +98,21 @@ pub const EntitySnapshot = struct {
 
 pub const MAX_ENTITIES_WIRE: u16 = 64;
 
+/// Aggregate pool state for one team, broadcast once per game_state message.
+/// Replaces the old pattern of duplicating pool HP across every EntitySnapshot.
+pub const TeamSummary = struct {
+    hp_current: u16,
+    hp_max: u16,
+    shield_hp: u16,
+};
+
 pub const GameState = struct {
     tick: u32,
     round_timer: f32,
     entity_count: u8,
     entities: [MAX_ENTITIES_WIRE]EntitySnapshot,
+    players: TeamSummary,
+    enemies: TeamSummary,
 };
 
 pub const ActionResultTag = enum(u8) {
@@ -196,6 +202,12 @@ fn encode_game_start(w: anytype, p: GameStart) !void {
     try w.writeInt(u32, @bitCast(p.round_duration), .little);
 }
 
+fn encode_team_summary(w: anytype, s: TeamSummary) !void {
+    try w.writeInt(u16, s.hp_current, .little);
+    try w.writeInt(u16, s.hp_max, .little);
+    try w.writeInt(u16, s.shield_hp, .little);
+}
+
 fn encode_game_state(w: anytype, p: GameState) !void {
     try w.writeInt(u32, p.tick, .little);
     try w.writeInt(u32, @bitCast(p.round_timer), .little);
@@ -204,10 +216,6 @@ fn encode_game_state(w: anytype, p: GameState) !void {
     while (i < p.entity_count) : (i += 1) {
         const e = p.entities[i];
         try w.writeInt(u32, e.entity, .little);
-        try w.writeByte(e.slot);
-        try w.writeInt(u16, e.hp_current, .little);
-        try w.writeInt(u16, e.hp_max, .little);
-        try w.writeInt(u16, e.shield_hp, .little);
         try w.writeByte(@intFromEnum(e.class));
         try w.writeByte(@intFromEnum(e.team));
         try w.writeByte(e.owner);
@@ -216,6 +224,8 @@ fn encode_game_state(w: anytype, p: GameState) !void {
         while (j < e.combo_len) : (j += 1)
             try w.writeByte(@intFromEnum(e.combo_actions[j]));
     }
+    try encode_team_summary(w, p.players);
+    try encode_team_summary(w, p.enemies);
 }
 
 fn encode_action_result(w: anytype, p: ActionResult) !void {
@@ -321,6 +331,14 @@ pub fn decode_game_start(reader: anytype) !GameStart {
     return p;
 }
 
+fn decode_team_summary(reader: anytype) !TeamSummary {
+    return .{
+        .hp_current = try reader.readInt(u16, .little),
+        .hp_max = try reader.readInt(u16, .little),
+        .shield_hp = try reader.readInt(u16, .little),
+    };
+}
+
 pub fn decode_game_state(reader: anytype) !GameState {
     var p: GameState = undefined;
     p.tick = try reader.readInt(u32, .little);
@@ -331,10 +349,6 @@ pub fn decode_game_state(reader: anytype) !GameState {
     while (i < p.entity_count) : (i += 1) {
         var e: EntitySnapshot = undefined;
         e.entity = try reader.readInt(u32, .little);
-        e.slot = try reader.readByte();
-        e.hp_current = try reader.readInt(u16, .little);
-        e.hp_max = try reader.readInt(u16, .little);
-        e.shield_hp = try reader.readInt(u16, .little);
         const class_byte = try reader.readByte();
         e.class = std.meta.intToEnum(components.ClassTag, class_byte) catch
             return DecodeError.InvalidClass;
@@ -353,6 +367,8 @@ pub fn decode_game_state(reader: anytype) !GameState {
         }
         p.entities[i] = e;
     }
+    p.players = try decode_team_summary(reader);
+    p.enemies = try decode_team_summary(reader);
     return p;
 }
 
@@ -417,7 +433,7 @@ test "round-trip: join_lobby" {
     try std.testing.expectEqualSlices(u8, name, decoded.name[0..decoded.name_len]);
 }
 
-test "round-trip: game_state — round_timer and shield_hp survive" {
+test "round-trip: game_state — round_timer, team summaries, and combo survive" {
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
 
@@ -426,13 +442,11 @@ test "round-trip: game_state — round_timer and shield_hp survive" {
         .round_timer = 1.75,
         .entity_count = 1,
         .entities = [_]EntitySnapshot{std.mem.zeroes(EntitySnapshot)} ** MAX_ENTITIES_WIRE,
+        .players = .{ .hp_current = 80, .hp_max = 100, .shield_hp = 5 },
+        .enemies = .{ .hp_current = 240, .hp_max = 240, .shield_hp = 0 },
     };
     gs.entities[0] = EntitySnapshot{
         .entity = 7,
-        .slot = 0,
-        .hp_current = 80,
-        .hp_max = 100,
-        .shield_hp = 5,
         .class = .fighter,
         .team = .players,
         .owner = 0,
@@ -449,8 +463,9 @@ test "round-trip: game_state — round_timer and shield_hp survive" {
     try std.testing.expectEqual(@as(u32, 42), decoded.tick);
     try std.testing.expectApproxEqAbs(@as(f32, 1.75), decoded.round_timer, 0.001);
     try std.testing.expectEqual(@as(u8, 1), decoded.entity_count);
-    try std.testing.expectEqual(@as(u16, 5), decoded.entities[0].shield_hp);
-    try std.testing.expectEqual(@as(u16, 80), decoded.entities[0].hp_current);
+    try std.testing.expectEqual(@as(u16, 5), decoded.players.shield_hp);
+    try std.testing.expectEqual(@as(u16, 80), decoded.players.hp_current);
+    try std.testing.expectEqual(@as(u16, 240), decoded.enemies.hp_current);
     try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].combo_len);
     try std.testing.expectEqual(components.ActionChoice.damage, decoded.entities[0].combo_actions[0]);
     try std.testing.expectEqual(components.ActionChoice.shield, decoded.entities[0].combo_actions[1]);

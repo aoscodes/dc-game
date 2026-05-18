@@ -21,10 +21,10 @@ const TICK_HZ: u64 = 20;
 const TICK_NS: u64 = std.time.ns_per_s / TICK_HZ;
 const DEFAULT_PORT: u16 = 9001;
 
-var g_gpa = std.heap.GeneralPurposeAllocator(.{}){};
-var g_ta: dbg.TrackingAllocator = undefined;
-var g_session: ?Session = null;
-var g_session_lock: std.Thread.Mutex = .{};
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+var ta: dbg.TrackingAllocator = undefined;
+var session: ?Session = null;
+var session_lock: std.Thread.Mutex = .{};
 
 const Handler = struct {
     conn: *ws.Conn,
@@ -36,10 +36,10 @@ const Handler = struct {
     }
 
     pub fn afterInit(self: *Handler) !void {
-        g_session_lock.lock();
-        defer g_session_lock.unlock();
+        session_lock.lock();
+        defer session_lock.unlock();
 
-        const sess = &(g_session orelse return error.NoSession);
+        const sess = &(session orelse return error.NoSession);
         const t = ws_server.conn_transport(self.conn);
 
         if (sess.join(t, "")) |pid| {
@@ -60,9 +60,9 @@ const Handler = struct {
 
         if (tag == .reconnect) {
             const p = proto.decode_reconnect(fbs_peek.reader()) catch return;
-            g_session_lock.lock();
-            defer g_session_lock.unlock();
-            const sess = &(g_session orelse return);
+            session_lock.lock();
+            defer session_lock.unlock();
+            const sess = &(session orelse return);
             const t = ws_server.conn_transport(self.conn);
             if (sess.reconnect(p.player_id, t)) {
                 if (self.player_id != p.player_id) {
@@ -75,19 +75,19 @@ const Handler = struct {
             return;
         }
 
-        g_session_lock.lock();
-        const sess_ptr = if (g_session) |*s| s else {
-            g_session_lock.unlock();
+        session_lock.lock();
+        const sess_ptr = if (session) |*s| s else {
+            session_lock.unlock();
             return;
         };
         sess_ptr.enqueue_message(self.player_id, data);
-        g_session_lock.unlock();
+        session_lock.unlock();
     }
 
     pub fn close(self: *Handler) void {
-        g_session_lock.lock();
-        defer g_session_lock.unlock();
-        const sess = &(g_session orelse return);
+        session_lock.lock();
+        defer session_lock.unlock();
+        const sess = &(session orelse return);
         const joined = self.player_id < session_mod.MAX_PLAYERS and
             sess.players[self.player_id].name_len > 0;
         sess.disconnect(self.player_id);
@@ -105,14 +105,14 @@ fn tick_loop(_: void) void {
         const start = timer.read();
 
         {
-            g_session_lock.lock();
-            if (g_session) |*sess| {
+            session_lock.lock();
+            if (session) |*sess| {
                 const dt: f32 = @as(f32, @floatFromInt(TICK_NS)) / @as(f32, @floatFromInt(std.time.ns_per_s));
                 sess.tick(dt) catch |err| {
                     std.log.err("tick error: {}", .{err});
                 };
             }
-            g_session_lock.unlock();
+            session_lock.unlock();
         }
 
         const elapsed = timer.read() - start;
@@ -123,10 +123,10 @@ fn tick_loop(_: void) void {
 }
 
 pub fn main() !void {
-    defer _ = g_gpa.deinit();
-    g_ta = dbg.TrackingAllocator.init(g_gpa.allocator());
-    const allocator = g_ta.allocator();
-    defer g_ta.report_stderr("server");
+    defer _ = gpa.deinit();
+    ta = dbg.TrackingAllocator.init(gpa.allocator());
+    const allocator = ta.allocator();
+    defer ta.report_stderr("server");
 
     var port: u16 = DEFAULT_PORT;
     var round_duration: f32 = logic.ROUND_DURATION_DEFAULT_S;
@@ -154,10 +154,10 @@ pub fn main() !void {
         ch.* = charset[rng.random().int(u8) % charset.len];
     }
 
-    g_session = try Session.init(allocator, join_code);
-    defer if (g_session) |*s| s.deinit();
-    g_session.?.round_duration = round_duration;
-    g_session.?.round_timer = round_duration;
+    session = try Session.init(allocator, join_code);
+    defer if (session) |*s| s.deinit();
+    session.?.round_duration = round_duration;
+    session.?.round_timer = round_duration;
 
     std.log.info("Room code: {s}", .{join_code});
     std.log.info("Listening on port {d}", .{port});
