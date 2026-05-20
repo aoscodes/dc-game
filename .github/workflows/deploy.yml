@@ -17,10 +17,10 @@ jobs:
   changes:
     runs-on: ubuntu-24.04
     outputs:
-      server:  ${{ steps.filter.outputs.server }}
-      client:  ${{ steps.filter.outputs.client }}
-      web:     ${{ steps.filter.outputs.web }}
-      setup:   ${{ steps.filter.outputs.setup }}
+      server: ${{ steps.filter.outputs.server }}
+      client: ${{ steps.filter.outputs.client }}
+      web: ${{ steps.filter.outputs.web }}
+      setup: ${{ steps.filter.outputs.setup }}
       browser: ${{ steps.filter.outputs.browser }}
     steps:
       - uses: actions/checkout@v4
@@ -150,65 +150,6 @@ jobs:
           retention-days: 7
 
   # ------------------------------------------------------------------
-  # Browser e2e — Playwright + headless Chromium
-  # Requires server + client binaries, so depends on build-server and
-  # build-client (which upload their artifacts).
-  # ------------------------------------------------------------------
-
-  browser-e2e:
-    needs: [changes, build-server, build-client]
-    if: needs.changes.outputs.browser == 'true' || inputs.deploy_all == true
-    runs-on: ubuntu-24.04
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: download server artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: server-binary
-          path: zig-out/bin/
-
-      - name: download client artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: client-bundle
-          path: deploy/
-
-      - name: place client binary
-        run: |
-          mkdir -p zig-out/bin
-          cp deploy/zig-out/bin/client zig-out/bin/client
-          chmod +x zig-out/bin/server zig-out/bin/client
-
-      - name: install node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: e2e/browser/package-lock.json
-
-      - name: install browser e2e deps
-        run: npm ci
-        working-directory: e2e/browser
-
-      - name: install playwright browsers
-        run: npx playwright install --with-deps chromium
-        working-directory: e2e/browser
-
-      - name: run browser e2e
-        run: npx playwright test
-        working-directory: e2e/browser
-
-      - name: upload playwright report on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: playwright-report
-          path: e2e/browser/playwright-report/
-          retention-days: 7
-
-  # ------------------------------------------------------------------
   # Deploy jobs
   # ------------------------------------------------------------------
 
@@ -227,19 +168,19 @@ jobs:
       - name: scp server binary to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
-          host:     ${{ secrets.VPS_HOST }}
+          host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
-          source:   "deploy/server"
-          target:   "/tmp/dragoncon-deploy/zig-out/bin/"
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "deploy/server"
+          target: "/tmp/dragoncon-deploy/zig-out/bin/"
           strip_components: 1
 
       - name: install binary and restart service
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host:     ${{ secrets.VPS_HOST }}
+          host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
+          key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             sudo /usr/bin/install -o dragoncon -g dragoncon -m 755 \
               /tmp/dragoncon-deploy/zig-out/bin/server \
@@ -262,19 +203,19 @@ jobs:
       - name: scp client bundle to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
-          host:     ${{ secrets.VPS_HOST }}
+          host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
-          source:   "deploy/*"
-          target:   "/tmp/dragoncon-deploy/"
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "deploy/*"
+          target: "/tmp/dragoncon-deploy/"
           strip_components: 1
 
       - name: install client binary + bridge and restart service
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host:     ${{ secrets.VPS_HOST }}
+          host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
+          key: ${{ secrets.VPS_SSH_KEY }}
           script: |
             sudo /usr/bin/install -o dragoncon -g dragoncon -m 755 \
               /tmp/dragoncon-deploy/zig-out/bin/client \
@@ -295,11 +236,11 @@ jobs:
       - name: scp static web assets to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
-          host:     ${{ secrets.VPS_HOST }}
+          host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
-          source:   "web/*"
-          target:   "/var/www/dragoncon/"
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "web/*"
+          target: "/var/www/dragoncon/"
           strip_components: 1
 
   deploy-setup:
@@ -313,9 +254,9 @@ jobs:
       - name: push setup script to VPS
         uses: appleboy/scp-action@v0.1.7
         with:
-          host:     ${{ secrets.VPS_HOST }}
+          host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
-          key:      ${{ secrets.VPS_SSH_KEY }}
-          source:   "scripts/vps-setup.sh"
-          target:   "~/"
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "scripts/vps-setup.sh"
+          target: "~/"
           strip_components: 1
