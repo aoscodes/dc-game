@@ -496,13 +496,26 @@ pub const Session = struct {
     }
 
     pub fn broadcast_lobby_update(self: *Session) !void {
-        const base = proto.LobbyUpdate{
+        var base = proto.LobbyUpdate{
             .join_code = self.join_code,
             .player_count = self.player_count,
             .players = [_]proto.PlayerInfo{std.mem.zeroes(proto.PlayerInfo)} ** proto.MAX_PLAYERS,
             .player_id = 0xFF,
             .round_duration = self.round_duration,
         };
+        for (&self.players, 0..) |*slot, i| {
+            if (!slot.occupied) continue;
+            base.players[i] = .{
+                .player_id = slot.player_id,
+                .name = slot.name,
+                .name_len = slot.name_len,
+                .class = slot.class,
+                .ready = slot.ready,
+                .connected = slot.connected,
+                .grid_col = 0,
+                .grid_row = 0,
+            };
+        }
         for (&self.players) |*slot| {
             if (!slot.connected) continue;
             const t = slot.transport orelse continue;
