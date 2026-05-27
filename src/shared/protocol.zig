@@ -35,6 +35,30 @@ pub const ChooseCombo = struct {
     combo: components.ActionCombo,
 };
 
+/// Encode one ComboSlot to a single byte.
+/// Action slots use raw ActionChoice value (0x00–0x02).
+/// Element slots use 0x80 | raw Element value (0x80–0x83).
+fn encode_combo_slot(w: anytype, slot: components.ComboSlot) !void {
+    switch (slot) {
+        .action  => |a| try w.writeByte(@intFromEnum(a)),
+        .element => |e| try w.writeByte(0x80 | @intFromEnum(e)),
+    }
+}
+
+/// Decode one ComboSlot byte. Returns error on unknown values.
+fn decode_combo_slot(byte: u8) !components.ComboSlot {
+    if (byte & 0x80 != 0) {
+        const raw: u8 = byte & 0x7F;
+        const el = std.meta.intToEnum(components.Element, raw) catch
+            return DecodeError.InvalidElement;
+        return .{ .element = el };
+    } else {
+        const ac = std.meta.intToEnum(components.ActionChoice, byte) catch
+            return DecodeError.InvalidActionChoice;
+        return .{ .action = ac };
+    }
+}
+
 pub const Reconnect = struct {
     player_id: u8,
 };
@@ -73,7 +97,17 @@ pub const EntitySnapshot = struct {
     team: components.TeamId,
     owner: u8,
     combo_len: u8,
-    combo_actions: [components.MAX_COMBO_LEN]components.ActionChoice,
+    combo_slots: [components.MAX_COMBO_LEN]components.ComboSlot,
+
+    /// A safe blank value (cannot use std.mem.zeroes because ComboSlot is a union).
+    pub const blank = EntitySnapshot{
+        .entity     = 0,
+        .class      = .grunt,
+        .team       = .players,
+        .owner      = 0xFF,
+        .combo_len  = 0,
+        .combo_slots = [_]components.ComboSlot{.{ .action = .damage }} ** components.MAX_COMBO_LEN,
+    };
 };
 
 pub const MAX_ENTITIES_WIRE: u16 = 64;
@@ -91,6 +125,15 @@ pub const GameState = struct {
     entities: [MAX_ENTITIES_WIRE]EntitySnapshot,
     players: TeamSummary,
     enemies: TeamSummary,
+
+    pub const blank = GameState{
+        .tick         = 0,
+        .round_timer  = 0,
+        .entity_count = 0,
+        .entities     = [_]EntitySnapshot{EntitySnapshot.blank} ** MAX_ENTITIES_WIRE,
+        .players      = .{ .hp_current = 0, .hp_max = 0, .shield_hp = 0 },
+        .enemies      = .{ .hp_current = 0, .hp_max = 0, .shield_hp = 0 },
+    };
 };
 
 pub const ActionResultTag = enum(u8) {
@@ -130,8 +173,8 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
         .reconnect => try writer.writeByte(payload.player_id),
         .choose_combo => {
             try writer.writeByte(payload.combo.len);
-            for (payload.combo.actions[0..payload.combo.len]) |a|
-                try writer.writeByte(@intFromEnum(a));
+            for (payload.combo.slots[0..payload.combo.len]) |slot|
+                try encode_combo_slot(writer, slot);
         },
         .cancel_combo => {},
         .round_reset => {},
@@ -195,7 +238,7 @@ fn encode_game_state(w: anytype, p: GameState) !void {
         try w.writeByte(e.combo_len);
         var j: u8 = 0;
         while (j < e.combo_len) : (j += 1)
-            try w.writeByte(@intFromEnum(e.combo_actions[j]));
+            try encode_combo_slot(w, e.combo_slots[j]);
     }
     try encode_team_summary(w, p.players);
     try encode_team_summary(w, p.enemies);
@@ -212,6 +255,7 @@ pub const DecodeError = error{
     UnknownTag,
     InvalidClass,
     InvalidActionChoice,
+    InvalidElement,
     InvalidTeam,
     InvalidActionResultTag,
     InvalidWinner,
@@ -251,14 +295,13 @@ pub fn decode_choose_combo(reader: anytype) !ChooseCombo {
     const len = try reader.readByte();
     if (len == 0 or len > components.MAX_COMBO_LEN) return DecodeError.InvalidComboLen;
     var combo = components.ActionCombo{
-        .actions = [_]components.ActionChoice{.damage} ** components.MAX_COMBO_LEN,
+        .slots = [_]components.ComboSlot{.{ .action = .damage }} ** components.MAX_COMBO_LEN,
         .len = len,
     };
     var i: u8 = 0;
     while (i < len) : (i += 1) {
         const byte = try reader.readByte();
-        combo.actions[i] = std.meta.intToEnum(components.ActionChoice, byte) catch
-            return DecodeError.InvalidActionChoice;
+        combo.slots[i] = try decode_combo_slot(byte);
     }
     return .{ .combo = combo };
 }
@@ -331,12 +374,11 @@ pub fn decode_game_state(reader: anytype) !GameState {
         e.owner = try reader.readByte();
         e.combo_len = try reader.readByte();
         if (e.combo_len > components.MAX_COMBO_LEN) return DecodeError.InvalidComboLen;
-        e.combo_actions = [_]components.ActionChoice{.damage} ** components.MAX_COMBO_LEN;
+        e.combo_slots = [_]components.ComboSlot{.{ .action = .damage }} ** components.MAX_COMBO_LEN;
         var j: u8 = 0;
         while (j < e.combo_len) : (j += 1) {
             const ab = try reader.readByte();
-            e.combo_actions[j] = std.meta.intToEnum(components.ActionChoice, ab) catch
-                return DecodeError.InvalidActionChoice;
+            e.combo_slots[j] = try decode_combo_slot(ab);
         }
         p.entities[i] = e;
     }
@@ -414,7 +456,7 @@ test "round-trip: game_state — round_timer, team summaries, and combo survive"
         .tick = 42,
         .round_timer = 1.75,
         .entity_count = 1,
-        .entities = [_]EntitySnapshot{std.mem.zeroes(EntitySnapshot)} ** MAX_ENTITIES_WIRE,
+        .entities = [_]EntitySnapshot{EntitySnapshot.blank} ** MAX_ENTITIES_WIRE,
         .players = .{ .hp_current = 80, .hp_max = 100, .shield_hp = 5 },
         .enemies = .{ .hp_current = 240, .hp_max = 240, .shield_hp = 0 },
     };
@@ -424,7 +466,12 @@ test "round-trip: game_state — round_timer, team summaries, and combo survive"
         .team = .players,
         .owner = 0,
         .combo_len = 2,
-        .combo_actions = [_]components.ActionChoice{ .damage, .shield, .damage, .damage },
+        .combo_slots = [_]components.ComboSlot{
+            .{ .action = .damage },
+            .{ .action = .shield },
+            .{ .action = .damage },
+            .{ .action = .damage },
+        },
     };
 
     try encode(fbs.writer(), .game_state, gs);
@@ -440,8 +487,8 @@ test "round-trip: game_state — round_timer, team summaries, and combo survive"
     try std.testing.expectEqual(@as(u16, 80), decoded.players.hp_current);
     try std.testing.expectEqual(@as(u16, 240), decoded.enemies.hp_current);
     try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].combo_len);
-    try std.testing.expectEqual(components.ActionChoice.damage, decoded.entities[0].combo_actions[0]);
-    try std.testing.expectEqual(components.ActionChoice.shield, decoded.entities[0].combo_actions[1]);
+    try std.testing.expectEqual(components.ActionChoice.damage, decoded.entities[0].combo_slots[0].action);
+    try std.testing.expectEqual(components.ActionChoice.shield, decoded.entities[0].combo_slots[1].action);
 }
 
 test "round-trip: lobby_update — round_duration survives" {
@@ -505,12 +552,12 @@ test "round-trip: choose_combo [damage, shield, heal]" {
     var fbs = std.io.fixedBufferStream(&buf);
 
     var combo = components.ActionCombo{
-        .actions = [_]components.ActionChoice{.damage} ** components.MAX_COMBO_LEN,
+        .slots = [_]components.ComboSlot{.{ .action = .damage }} ** components.MAX_COMBO_LEN,
         .len = 3,
     };
-    combo.actions[0] = .damage;
-    combo.actions[1] = .shield;
-    combo.actions[2] = .heal;
+    combo.slots[0] = .{ .action = .damage };
+    combo.slots[1] = .{ .action = .shield };
+    combo.slots[2] = .{ .action = .heal };
 
     try encode(fbs.writer(), .choose_combo, ChooseCombo{ .combo = combo });
     fbs.reset();
@@ -518,9 +565,9 @@ test "round-trip: choose_combo [damage, shield, heal]" {
     try std.testing.expectEqual(MsgTag.choose_combo, tag);
     const decoded = try decode_choose_combo(fbs.reader());
     try std.testing.expectEqual(@as(u8, 3), decoded.combo.len);
-    try std.testing.expectEqual(components.ActionChoice.damage, decoded.combo.actions[0]);
-    try std.testing.expectEqual(components.ActionChoice.shield, decoded.combo.actions[1]);
-    try std.testing.expectEqual(components.ActionChoice.heal, decoded.combo.actions[2]);
+    try std.testing.expectEqual(components.ActionChoice.damage, decoded.combo.slots[0].action);
+    try std.testing.expectEqual(components.ActionChoice.shield, decoded.combo.slots[1].action);
+    try std.testing.expectEqual(components.ActionChoice.heal,   decoded.combo.slots[2].action);
 }
 
 test "round-trip: choose_combo len=4 all damage" {
@@ -528,7 +575,7 @@ test "round-trip: choose_combo len=4 all damage" {
     var fbs = std.io.fixedBufferStream(&buf);
 
     const combo = components.ActionCombo{
-        .actions = [_]components.ActionChoice{.damage} ** components.MAX_COMBO_LEN,
+        .slots = [_]components.ComboSlot{.{ .action = .damage }} ** components.MAX_COMBO_LEN,
         .len = 4,
     };
     try encode(fbs.writer(), .choose_combo, ChooseCombo{ .combo = combo });
@@ -536,8 +583,67 @@ test "round-trip: choose_combo len=4 all damage" {
     _ = try read_tag(fbs.reader());
     const decoded = try decode_choose_combo(fbs.reader());
     try std.testing.expectEqual(@as(u8, 4), decoded.combo.len);
-    for (decoded.combo.actions[0..4]) |a|
-        try std.testing.expectEqual(components.ActionChoice.damage, a);
+    for (decoded.combo.slots[0..4]) |s|
+        try std.testing.expectEqual(components.ActionChoice.damage, s.action);
+}
+
+test "round-trip: choose_combo with element slots [fire, damage, water, shield]" {
+    var buf: [16]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    const combo = components.ActionCombo{
+        .slots = [_]components.ComboSlot{
+            .{ .element = .fire   },
+            .{ .action  = .damage },
+            .{ .element = .water  },
+            .{ .action  = .shield },
+        },
+        .len = 4,
+    };
+    try encode(fbs.writer(), .choose_combo, ChooseCombo{ .combo = combo });
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    const decoded = try decode_choose_combo(fbs.reader());
+    try std.testing.expectEqual(@as(u8, 4), decoded.combo.len);
+    try std.testing.expectEqual(components.Element.fire,          decoded.combo.slots[0].element);
+    try std.testing.expectEqual(components.ActionChoice.damage,   decoded.combo.slots[1].action);
+    try std.testing.expectEqual(components.Element.water,         decoded.combo.slots[2].element);
+    try std.testing.expectEqual(components.ActionChoice.shield,   decoded.combo.slots[3].action);
+}
+
+test "round-trip: game_state snapshot with element slot" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    var gs = GameState{
+        .tick = 1,
+        .round_timer = 0.5,
+        .entity_count = 1,
+        .entities = [_]EntitySnapshot{EntitySnapshot.blank} ** MAX_ENTITIES_WIRE,
+        .players = .{ .hp_current = 10, .hp_max = 10, .shield_hp = 0 },
+        .enemies = .{ .hp_current = 5,  .hp_max = 5,  .shield_hp = 0 },
+    };
+    gs.entities[0] = EntitySnapshot{
+        .entity = 1,
+        .class  = .mage,
+        .team   = .players,
+        .owner  = 0,
+        .combo_len = 2,
+        .combo_slots = [_]components.ComboSlot{
+            .{ .element = .earth  },
+            .{ .action  = .damage },
+            .{ .action  = .damage },
+            .{ .action  = .damage },
+        },
+    };
+
+    try encode(fbs.writer(), .game_state, gs);
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    const decoded = try decode_game_state(fbs.reader());
+    try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].combo_len);
+    try std.testing.expectEqual(components.Element.earth,        decoded.entities[0].combo_slots[0].element);
+    try std.testing.expectEqual(components.ActionChoice.damage,  decoded.entities[0].combo_slots[1].action);
 }
 
 test "decode_choose_combo: len=0 returns InvalidComboLen" {

@@ -1,6 +1,7 @@
 const std = @import("std");
 const shared = @import("shared");
 const c = shared.components;
+const ComboSlot = c.ComboSlot;
 
 pub fn parse_key_name(name: []const u8) ?RawKey {
     if (std.mem.eql(u8, name, "Enter")) return .enter;
@@ -44,12 +45,12 @@ pub const KeyQueue = struct {
 };
 
 pub const ComboBuffer = struct {
-    actions: [c.MAX_COMBO_LEN]c.ActionChoice = undefined,
+    slots: [c.MAX_COMBO_LEN]ComboSlot = undefined,
     len: u8 = 0,
 
-    pub fn push(self: *ComboBuffer, action: c.ActionChoice) bool {
+    pub fn push(self: *ComboBuffer, slot: ComboSlot) bool {
         if (self.len >= c.MAX_COMBO_LEN) return false;
-        self.actions[self.len] = action;
+        self.slots[self.len] = slot;
         self.len += 1;
         return true;
     }
@@ -60,10 +61,10 @@ pub const ComboBuffer = struct {
 
     pub fn to_combo(self: *const ComboBuffer) c.ActionCombo {
         var out = c.ActionCombo{
-            .actions = [_]c.ActionChoice{.damage} ** c.MAX_COMBO_LEN,
+            .slots = [_]ComboSlot{.{ .action = .damage }} ** c.MAX_COMBO_LEN,
             .len = self.len,
         };
-        @memcpy(out.actions[0..self.len], self.actions[0..self.len]);
+        @memcpy(out.slots[0..self.len], self.slots[0..self.len]);
         return out;
     }
 };
@@ -79,14 +80,26 @@ pub fn drain_into_combo(queue: *KeyQueue, combo: *ComboBuffer) DrainResult {
     while (queue.pop()) |key| {
         switch (key) {
             .escape => return .cancelled,
+            // Action keys: 1=damage  2=shield  3=heal
             .one, .two, .three => {
                 const action: c.ActionChoice = switch (key) {
-                    .one => .damage,
-                    .two => .shield,
+                    .one   => .damage,
+                    .two   => .shield,
                     .three => .heal,
-                    else => unreachable,
+                    else   => unreachable,
                 };
-                if (combo.push(action)) result = .appended;
+                if (combo.push(.{ .action = action })) result = .appended;
+            },
+            // Element keys: Q=fire  W=earth  E=wind  R=water
+            .q, .w, .e, .r => {
+                const element: c.Element = switch (key) {
+                    .q    => .fire,
+                    .w    => .earth,
+                    .e    => .wind,
+                    .r    => .water,
+                    else  => unreachable,
+                };
+                if (combo.push(.{ .element = element })) result = .appended;
             },
             else => {},
         }

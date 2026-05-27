@@ -141,15 +141,20 @@ pub const BotHarness = struct {
         self.allocator.free(self.bot_states);
     }
 
-    /// Encode each bot's next move and enqueue it into the session.
+    /// Encode each bot's next move as a single-slot combo and enqueue it.
     /// Call this before ticking past the round timer, or use step() which
     /// does both.
     pub fn inject_actions(self: *BotHarness) !void {
         for (self.bot_states) |*bs| {
             const move = bs.profile.moves[self.round % bs.profile.moves.len];
-            var buf: [4]u8 = undefined;
+            const combo = c.ActionCombo{
+                .slots = [_]c.ComboSlot{.{ .action = move }} ++
+                         [_]c.ComboSlot{.{ .action = .damage }} ** (c.MAX_COMBO_LEN - 1),
+                .len = 1,
+            };
+            var buf: [8]u8 = undefined;
             var fbs = std.io.fixedBufferStream(&buf);
-            try proto.encode(fbs.writer(), .choose_action, proto.ChooseAction{ .action = move });
+            try proto.encode(fbs.writer(), .choose_combo, proto.ChooseCombo{ .combo = combo });
             self.session.enqueue_message(bs.player_id, fbs.getWritten());
         }
     }
@@ -398,11 +403,10 @@ test "profile cycles correctly across rounds" {
         //    expiring the round timer (round_timer > 0 after reset).
         try h.session.tick(0.0);
         // 3. Verify the pool was set correctly before round resolution fires.
-        // Bots submit via choose_action → wrapped as combo-of-1.
         const pid = h.bot_states[0].player_id;
         const got = h.session.action_pool[pid] orelse return error.NoAction;
         try std.testing.expectEqual(@as(u8, 1), got.len);
-        try std.testing.expectEqual(want, got.actions[0]);
+        try std.testing.expectEqual(want, got.slots[0].action);
         // 4. Fire round resolution by ticking past the timer, then advance h.round.
         try h.session.tick(h.session.round_duration + 0.001);
         h.round += 1;

@@ -4,6 +4,39 @@ const c = @import("components.zig");
 pub const ROUND_DURATION_DEFAULT_S: f32 = 3.0;
 pub const ACTION_EFFECT_VALUE: u16 = 1;
 
+/// An action slot with its resolved element modifier (null = no element).
+pub const ElementedAction = struct {
+    action:  c.ActionChoice,
+    element: ?c.Element,
+};
+
+/// Parse a combo into a flat sequence of ElementedActions.
+///
+/// Rules:
+///   - An element token sets the *current element*; it persists until the
+///     next element token or end of combo.
+///   - An action token consumes the current element (which may be null) and
+///     emits one ElementedAction.
+///   - Trailing element tokens with no following action are silently dropped.
+///
+/// Returns the number of entries written to `out`.  `out` must have capacity
+/// >= combo.len (a combo of all-action slots is the worst case).
+pub fn parse_combo(combo: c.ActionCombo, out: []ElementedAction) usize {
+    var current_element: ?c.Element = null;
+    var count: usize = 0;
+    for (combo.slots[0..combo.len]) |slot| {
+        switch (slot) {
+            .element => |el| current_element = el,
+            .action  => |ac| {
+                out[count] = .{ .action = ac, .element = current_element };
+                count += 1;
+                // Element persists — do NOT reset current_element here.
+            },
+        }
+    }
+    return count;
+}
+
 pub fn apply_damage(health: *c.Health, damage: u16) void {
     health.current = if (health.current > damage) health.current - damage else 0;
 }
@@ -175,4 +208,93 @@ test "resolve_heal_pool: at max HP — no overflow" {
 test "compute_enemy_intent: zero enemies — zero damage" {
     const intent = compute_enemy_intent(0);
     try std.testing.expectEqual(@as(u16, 0), intent.damage_per_player);
+}
+
+// ---------------------------------------------------------------------------
+// parse_combo tests
+// ---------------------------------------------------------------------------
+
+fn make_combo(comptime slots: []const c.ComboSlot) c.ActionCombo {
+    var combo = c.ActionCombo{
+        .slots = [_]c.ComboSlot{.{ .action = .damage }} ** c.MAX_COMBO_LEN,
+        .len   = @intCast(slots.len),
+    };
+    @memcpy(combo.slots[0..slots.len], slots);
+    return combo;
+}
+
+test "parse_combo: action-only — element is null for all" {
+    const combo = make_combo(&[_]c.ComboSlot{
+        .{ .action = .damage },
+        .{ .action = .shield },
+        .{ .action = .heal },
+    });
+    var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
+    const n = parse_combo(combo, &out);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(c.ActionChoice.damage, out[0].action);
+    try std.testing.expectEqual(@as(?c.Element, null), out[0].element);
+    try std.testing.expectEqual(c.ActionChoice.shield, out[1].action);
+    try std.testing.expectEqual(@as(?c.Element, null), out[1].element);
+    try std.testing.expectEqual(c.ActionChoice.heal, out[2].action);
+    try std.testing.expectEqual(@as(?c.Element, null), out[2].element);
+}
+
+test "parse_combo: element persists across following actions" {
+    // [fire, damage, damage] → both actions are fire
+    const combo = make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire },
+        .{ .action  = .damage },
+        .{ .action  = .damage },
+    });
+    var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
+    const n = parse_combo(combo, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(c.Element.fire, out[0].element.?);
+    try std.testing.expectEqual(c.Element.fire, out[1].element.?);
+}
+
+test "parse_combo: second element overrides first" {
+    // [fire, damage, water, shield] → fire-damage, water-shield
+    const combo = make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire  },
+        .{ .action  = .damage },
+        .{ .element = .water },
+        .{ .action  = .shield },
+    });
+    var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
+    const n = parse_combo(combo, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(c.Element.fire,  out[0].element.?);
+    try std.testing.expectEqual(c.Element.water, out[1].element.?);
+}
+
+test "parse_combo: trailing element is silently dropped" {
+    // [damage, fire] → 1 action (no element), fire token dropped
+    const combo = make_combo(&[_]c.ComboSlot{
+        .{ .action  = .damage },
+        .{ .element = .fire   },
+    });
+    var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
+    const n = parse_combo(combo, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(?c.Element, null), out[0].element);
+}
+
+test "parse_combo: mixed — fire persists, water overrides" {
+    // [fire, damage, damage, water, shield] — but MAX_COMBO_LEN=4 so truncate:
+    // [fire, damage, water, shield] → fire-damage, water-shield
+    const combo = make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire  },
+        .{ .action  = .damage },
+        .{ .element = .water },
+        .{ .action  = .shield },
+    });
+    var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
+    const n = parse_combo(combo, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(c.ActionChoice.damage, out[0].action);
+    try std.testing.expectEqual(c.Element.fire,        out[0].element.?);
+    try std.testing.expectEqual(c.ActionChoice.shield, out[1].action);
+    try std.testing.expectEqual(c.Element.water,       out[1].element.?);
 }

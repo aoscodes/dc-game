@@ -236,6 +236,7 @@ fn process_recv() void {
                 }
             },
             .round_reset => {
+                g_state.game.round += 1;
                 g_state.game.pending_combo.clear();
             },
             else => {},

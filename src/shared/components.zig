@@ -4,6 +4,16 @@
 //! instantiation, so this file is the single source of truth for both.
 //! Neither client nor server may define additional game-state components
 //! outside this file.
+//!
+//! ## Combo slot model
+//!
+//! A combo is a sequence of up to MAX_COMBO_LEN `ComboSlot` values.
+//! Each slot is either an `ActionChoice` (damage/shield/heal) or an
+//! `Element` modifier (fire/earth/wind/water).  An element token applies
+//! to all following action tokens until the next element token or end of
+//! combo.  Trailing element tokens with no following action are ignored
+//! during resolution.  See `game_logic.parse_combo` for the canonical
+//! interpretation.
 
 pub const Health = struct {
     current: u16,
@@ -55,13 +65,30 @@ pub const ActionChoice = enum(u8) {
     heal = 2,
 };
 
+/// Elemental modifier applied to following action slots in a combo.
+pub const Element = enum(u8) {
+    fire  = 0,
+    earth = 1,
+    wind  = 2,
+    water = 3,
+};
+
+/// One slot in a combo: either an action or an element modifier.
+/// Wire encoding: action = raw ActionChoice value (0x00–0x02);
+///                element = 0x80 | raw Element value (0x80–0x83).
+pub const ComboSlot = union(enum) {
+    action:  ActionChoice,
+    element: Element,
+};
+
 pub const MAX_COMBO_LEN: u8 = 4;
 
-/// An ordered sequence of 1–4 actions submitted by a player for one round.
-/// Every slot in `actions[0..len]` contributes independently to the shared
-/// action pools when the round resolves.
+/// An ordered sequence of 1–MAX_COMBO_LEN combo slots submitted by a player
+/// for one round.  Slots are action tokens (damage/shield/heal) optionally
+/// preceded by element modifier tokens.  See `game_logic.parse_combo` for
+/// the resolution rules.
 pub const ActionCombo = struct {
-    actions: [MAX_COMBO_LEN]ActionChoice,
+    slots: [MAX_COMBO_LEN]ComboSlot,
     len: u8, // 1..MAX_COMBO_LEN
 };
 

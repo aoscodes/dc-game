@@ -3,6 +3,21 @@ const proto = @import("shared").protocol;
 const c = @import("shared").components;
 const inp = @import("input.zig");
 
+/// JSON serialisation for ComboSlot.
+/// Emits {"action":"damage"} or {"element":"fire"} so game.js can branch.
+const JsonComboSlot = struct {
+    slot: c.ComboSlot,
+
+    pub fn jsonStringify(self: JsonComboSlot, jws: anytype) !void {
+        try jws.beginObject();
+        switch (self.slot) {
+            .action  => |a| { try jws.objectField("action");  try jws.write(@tagName(a)); },
+            .element => |e| { try jws.objectField("element"); try jws.write(@tagName(e)); },
+        }
+        try jws.endObject();
+    }
+};
+
 pub const Writer = struct {
     mu: *std.Thread.Mutex,
 
@@ -47,7 +62,7 @@ pub const LobbyState = struct {
 pub const LastActionEntry = struct { entity: u32, anim: c.ActionAnimation };
 
 pub const GameState = struct {
-    snapshot: proto.GameState = std.mem.zeroes(proto.GameState),
+    snapshot: proto.GameState = proto.GameState.blank,
     player_id: u8 = 0xFF,
     pending_combo: inp.ComboBuffer = .{},
     round_timer: f32 = 0.0,
@@ -57,6 +72,9 @@ pub const GameState = struct {
     winner: ?proto.WinnerId = null,
     last_action_count: u8 = 0,
     last_actions: [proto.MAX_ENTITIES_WIRE]LastActionEntry = undefined,
+    /// Incremented each time a round_reset message is received.
+    /// JS detects a change in this value to know a round just resolved.
+    round: u32 = 0,
 };
 
 fn write_render_inner(
@@ -81,6 +99,8 @@ fn write_render_inner(
         };
     }
 
+    // Per-entity slot buffers for JSON serialisation.
+    var slot_bufs: [proto.MAX_ENTITIES_WIRE][c.MAX_COMBO_LEN]JsonComboSlot = undefined;
     var entities_buf: [proto.MAX_ENTITIES_WIRE]JsonEntity = undefined;
     for (0..game.snapshot.entity_count) |i| {
         const e = &game.snapshot.entities[i];
@@ -91,14 +111,23 @@ fn write_render_inner(
                 break;
             }
         }
+        for (e.combo_slots[0..e.combo_len], 0..) |s, j| {
+            slot_bufs[i][j] = .{ .slot = s };
+        }
         entities_buf[i] = .{
             .id = e.entity,
             .class = e.class,
             .team = e.team,
             .owner = e.owner,
             .last_action = anim,
-            .combo = e.combo_actions[0..e.combo_len],
+            .combo = slot_bufs[i][0..e.combo_len],
         };
+    }
+
+    // Convert pending combo slots for JSON.
+    var pending_slots_buf: [c.MAX_COMBO_LEN]JsonComboSlot = undefined;
+    for (game.pending_combo.slots[0..game.pending_combo.len], 0..) |s, i| {
+        pending_slots_buf[i] = .{ .slot = s };
     }
 
     const frame = JsonRenderFrame{
@@ -114,10 +143,11 @@ fn write_render_inner(
         .game = if (phase == .game) JsonGame{
             .wave = game.wave_label[0..game.wave_label_len],
             .player_id = game.player_id,
-            .pending_combo = game.pending_combo.actions[0..game.pending_combo.len],
+            .pending_combo = pending_slots_buf[0..game.pending_combo.len],
             .round_timer = game.round_timer,
             .round_duration = game.round_duration,
             .tick = game.snapshot.tick,
+            .round = game.round,
             .entities = entities_buf[0..game.snapshot.entity_count],
             .players = .{
                 .hp_current = game.snapshot.players.hp_current,
@@ -188,10 +218,11 @@ const JsonTeamSummary = struct {
 const JsonGame = struct {
     wave: []const u8,
     player_id: u8,
-    pending_combo: []const c.ActionChoice,
+    pending_combo: []const JsonComboSlot,
     round_timer: f32,
     round_duration: f32,
     tick: u32,
+    round: u32,
     entities: []const JsonEntity,
     players: JsonTeamSummary,
     enemies: JsonTeamSummary,
@@ -203,5 +234,5 @@ const JsonEntity = struct {
     team: c.TeamId,
     owner: u8,
     last_action: ?c.ActionAnimation,
-    combo: []const c.ActionChoice,
+    combo: []const JsonComboSlot,
 };

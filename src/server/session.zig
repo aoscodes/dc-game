@@ -345,16 +345,9 @@ pub const Session = struct {
                 }
             },
             .choose_action => {
-                if (self.phase == .playing and player_id < MAX_PLAYERS) {
-                    const p = try proto.decode_choose_action(fbs.reader());
-                    var combo = c.ActionCombo{
-                        .actions = [_]c.ActionChoice{.damage} ** c.MAX_COMBO_LEN,
-                        .len = 1,
-                    };
-                    combo.actions[0] = p.action;
-                    self.action_pool[player_id] = combo;
-                    std.log.debug("player {} action (single): {s}", .{ player_id, @tagName(p.action) });
-                }
+                // Legacy single-action path removed; combo-only protocol.
+                // Consume the payload byte so the stream stays aligned.
+                _ = try proto.decode_choose_action(fbs.reader());
             },
             .choose_combo => {
                 if (self.phase == .playing and player_id < MAX_PLAYERS) {
@@ -378,13 +371,15 @@ pub const Session = struct {
         var damage_pool: u16 = 0;
         var shield_pool: u16 = 0;
         var heal_pool: u16 = 0;
+        var ea_buf: [c.MAX_COMBO_LEN]logic.ElementedAction = undefined;
         for (&self.action_pool) |maybe_combo| {
             const combo = maybe_combo orelse continue;
-            for (combo.actions[0..combo.len]) |action| {
-                switch (action) {
+            const n = logic.parse_combo(combo, &ea_buf);
+            for (ea_buf[0..n]) |ea| {
+                switch (ea.action) {
                     .damage => damage_pool += 1,
                     .shield => shield_pool += 1,
-                    .heal => heal_pool += 1,
+                    .heal   => heal_pool   += 1,
                 }
             }
         }
@@ -543,7 +538,7 @@ pub const Session = struct {
             .tick = self.tick_count,
             .round_timer = @max(self.round_timer, 0.0),
             .entity_count = 0,
-            .entities = [_]proto.EntitySnapshot{std.mem.zeroes(proto.EntitySnapshot)} ** proto.MAX_ENTITIES_WIRE,
+            .entities = [_]proto.EntitySnapshot{proto.EntitySnapshot.blank} ** proto.MAX_ENTITIES_WIRE,
             .players = .{
                 .hp_current = self.shared_hp.current,
                 .hp_max = self.shared_hp.max,
@@ -562,10 +557,10 @@ pub const Session = struct {
             const cl = self.world.get_component(e, c.Class);
             const own = self.world.get_component(e, c.Owner).player_id;
             const combo_len: u8 = if (self.action_pool[own]) |combo| combo.len else 0;
-            const combo_actions = if (combo_len > 0)
-                self.action_pool[own].?.actions
+            const combo_slots = if (combo_len > 0)
+                self.action_pool[own].?.slots
             else
-                [_]c.ActionChoice{.damage} ** c.MAX_COMBO_LEN;
+                [_]c.ComboSlot{.{ .action = .damage }} ** c.MAX_COMBO_LEN;
 
             snap.entities[snap.entity_count] = .{
                 .entity = e,
@@ -573,7 +568,7 @@ pub const Session = struct {
                 .team = .players,
                 .owner = own,
                 .combo_len = combo_len,
-                .combo_actions = combo_actions,
+                .combo_slots = combo_slots,
             };
             snap.entity_count += 1;
         }
@@ -589,7 +584,7 @@ pub const Session = struct {
                 .team = .enemies,
                 .owner = 0xFF,
                 .combo_len = 0,
-                .combo_actions = [_]c.ActionChoice{.damage} ** c.MAX_COMBO_LEN,
+                .combo_slots = [_]c.ComboSlot{.{ .action = .damage }} ** c.MAX_COMBO_LEN,
             };
             snap.entity_count += 1;
         }
