@@ -115,7 +115,6 @@ pub const MAX_ENTITIES_WIRE: u16 = 64;
 pub const TeamSummary = struct {
     hp_current: u16,
     hp_max: u16,
-    shield_hp: u16,
 };
 
 pub const GameState = struct {
@@ -125,14 +124,22 @@ pub const GameState = struct {
     entities: [MAX_ENTITIES_WIRE]EntitySnapshot,
     players: TeamSummary,
     enemies: TeamSummary,
+    /// Total damage the enemy team intends to deal this round (living enemy count).
+    enemy_intent_damage: u16,
+    /// Element of the enemy intent: 0xFF = non-elemental, else raw Element ordinal (0–3).
+    enemy_intent_element: u8,
+
+    pub const INTENT_ELEMENT_NONE: u8 = 0xFF;
 
     pub const blank = GameState{
-        .tick         = 0,
-        .round_timer  = 0,
-        .entity_count = 0,
-        .entities     = [_]EntitySnapshot{EntitySnapshot.blank} ** MAX_ENTITIES_WIRE,
-        .players      = .{ .hp_current = 0, .hp_max = 0, .shield_hp = 0 },
-        .enemies      = .{ .hp_current = 0, .hp_max = 0, .shield_hp = 0 },
+        .tick                = 0,
+        .round_timer         = 0,
+        .entity_count        = 0,
+        .entities            = [_]EntitySnapshot{EntitySnapshot.blank} ** MAX_ENTITIES_WIRE,
+        .players             = .{ .hp_current = 0, .hp_max = 0 },
+        .enemies             = .{ .hp_current = 0, .hp_max = 0 },
+        .enemy_intent_damage  = 0,
+        .enemy_intent_element = INTENT_ELEMENT_NONE,
     };
 };
 
@@ -221,7 +228,6 @@ fn encode_game_start(w: anytype, p: GameStart) !void {
 fn encode_team_summary(w: anytype, s: TeamSummary) !void {
     try w.writeInt(u16, s.hp_current, .little);
     try w.writeInt(u16, s.hp_max, .little);
-    try w.writeInt(u16, s.shield_hp, .little);
 }
 
 fn encode_game_state(w: anytype, p: GameState) !void {
@@ -242,6 +248,8 @@ fn encode_game_state(w: anytype, p: GameState) !void {
     }
     try encode_team_summary(w, p.players);
     try encode_team_summary(w, p.enemies);
+    try w.writeInt(u16, p.enemy_intent_damage, .little);
+    try w.writeByte(p.enemy_intent_element);
 }
 
 fn encode_action_result(w: anytype, p: ActionResult) !void {
@@ -351,7 +359,6 @@ fn decode_team_summary(reader: anytype) !TeamSummary {
     return .{
         .hp_current = try reader.readInt(u16, .little),
         .hp_max = try reader.readInt(u16, .little),
-        .shield_hp = try reader.readInt(u16, .little),
     };
 }
 
@@ -384,6 +391,8 @@ pub fn decode_game_state(reader: anytype) !GameState {
     }
     p.players = try decode_team_summary(reader);
     p.enemies = try decode_team_summary(reader);
+    p.enemy_intent_damage  = try reader.readInt(u16, .little);
+    p.enemy_intent_element = try reader.readByte();
     return p;
 }
 
@@ -457,8 +466,10 @@ test "round-trip: game_state — round_timer, team summaries, and combo survive"
         .round_timer = 1.75,
         .entity_count = 1,
         .entities = [_]EntitySnapshot{EntitySnapshot.blank} ** MAX_ENTITIES_WIRE,
-        .players = .{ .hp_current = 80, .hp_max = 100, .shield_hp = 5 },
-        .enemies = .{ .hp_current = 240, .hp_max = 240, .shield_hp = 0 },
+        .players = .{ .hp_current = 80, .hp_max = 100 },
+        .enemies = .{ .hp_current = 240, .hp_max = 240 },
+        .enemy_intent_damage  = 0,
+        .enemy_intent_element = GameState.INTENT_ELEMENT_NONE,
     };
     gs.entities[0] = EntitySnapshot{
         .entity = 7,
@@ -483,7 +494,6 @@ test "round-trip: game_state — round_timer, team summaries, and combo survive"
     try std.testing.expectEqual(@as(u32, 42), decoded.tick);
     try std.testing.expectApproxEqAbs(@as(f32, 1.75), decoded.round_timer, 0.001);
     try std.testing.expectEqual(@as(u8, 1), decoded.entity_count);
-    try std.testing.expectEqual(@as(u16, 5), decoded.players.shield_hp);
     try std.testing.expectEqual(@as(u16, 80), decoded.players.hp_current);
     try std.testing.expectEqual(@as(u16, 240), decoded.enemies.hp_current);
     try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].combo_len);
@@ -620,8 +630,10 @@ test "round-trip: game_state snapshot with element slot" {
         .round_timer = 0.5,
         .entity_count = 1,
         .entities = [_]EntitySnapshot{EntitySnapshot.blank} ** MAX_ENTITIES_WIRE,
-        .players = .{ .hp_current = 10, .hp_max = 10, .shield_hp = 0 },
-        .enemies = .{ .hp_current = 5,  .hp_max = 5,  .shield_hp = 0 },
+        .players = .{ .hp_current = 10, .hp_max = 10 },
+        .enemies = .{ .hp_current = 5,  .hp_max = 5  },
+        .enemy_intent_damage  = 0,
+        .enemy_intent_element = GameState.INTENT_ELEMENT_NONE,
     };
     gs.entities[0] = EntitySnapshot{
         .entity = 1,
@@ -674,6 +686,42 @@ test "round-trip: round_reset (zero payload)" {
     fbs.reset();
     const tag = try read_tag(fbs.reader());
     try std.testing.expectEqual(MsgTag.round_reset, tag);
+}
+
+test "round-trip: game_state enemy_intent_element fire survives" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    var gs = GameState.blank;
+    gs.tick = 7;
+    gs.enemy_intent_damage  = 3;
+    gs.enemy_intent_element = @intFromEnum(components.Element.fire); // 0
+
+    try encode(fbs.writer(), .game_state, gs);
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    const decoded = try decode_game_state(fbs.reader());
+
+    try std.testing.expectEqual(@as(u32, 7), decoded.tick);
+    try std.testing.expectEqual(@as(u16, 3), decoded.enemy_intent_damage);
+    try std.testing.expectEqual(@intFromEnum(components.Element.fire), decoded.enemy_intent_element);
+}
+
+test "round-trip: game_state enemy_intent_element none (0xFF) survives" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    var gs = GameState.blank;
+    gs.enemy_intent_damage  = 5;
+    gs.enemy_intent_element = GameState.INTENT_ELEMENT_NONE;
+
+    try encode(fbs.writer(), .game_state, gs);
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    const decoded = try decode_game_state(fbs.reader());
+
+    try std.testing.expectEqual(@as(u16, 5), decoded.enemy_intent_damage);
+    try std.testing.expectEqual(GameState.INTENT_ELEMENT_NONE, decoded.enemy_intent_element);
 }
 
 test "round-trip: action_result shield tag" {

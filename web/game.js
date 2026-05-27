@@ -135,7 +135,8 @@ function clearEntityState() {
   animState.clear();
   floaters.length = 0;
   lastRoundSeen = -1;
-  lastEntitiesSnapshot = [];
+  lastEntitiesSnapshot    = [];
+  lastEnemyIntentSnapshot = null;
 }
 
 const canvas = document.getElementById("canvas");
@@ -301,6 +302,46 @@ function drawTeam(game, team, dt) {
           text("·", slotX, rowY + 13, 14, "rgba(120,120,140,0.5)");
         }
       }
+    } else {
+      // Enemy: show per-action lines above the sprite.
+      // Format per line: "[element_char] action_label [±value]"
+      // Intent contributes 1 damage action of intent.element per entity.
+      // Combo contributes its parsed elemented actions.
+      // Colour: element colour if elemental, else action colour.
+      const lines = [];
+
+      // Intent: 1 damage of intent.element (shared across all enemies).
+      const intent = game.enemy_intent;
+      if (intent && intent.damage > 0) {
+        const el     = intent.element ?? null;
+        const elChar = el ? (ELEMENT_CHAR[el] ?? "") : "";
+        const color  = el ? (ELEMENT_COLOR[el] ?? ACTION_COLOR.damage) : ACTION_COLOR.damage;
+        const prefix = elChar ? `${elChar} ` : "";
+        lines.push({ str: `${prefix}dmg -1`, color });
+      }
+
+      // Combo: parse element-resolved actions from the entity's combo slots.
+      for (const { action, element } of parseComboSlots(e.combo ?? [])) {
+        const el       = element;
+        const elChar   = el ? (ELEMENT_CHAR[el] ?? "") : "";
+        const color    = el ? (ELEMENT_COLOR[el] ?? ACTION_COLOR[action] ?? C_TEXT)
+                            : (ACTION_COLOR[action] ?? C_TEXT);
+        const prefix   = elChar ? `${elChar} ` : "";
+        const label    = action === "damage" ? "dmg"
+                       : action === "shield" ? "shld"
+                       : "heal";
+        const sign     = action === "damage" ? `-${ACTION_EFFECT_VALUE}`
+                                             : `+${ACTION_EFFECT_VALUE}`;
+        lines.push({ str: `${prefix}${label} ${sign}`, color });
+      }
+
+      // Render bottom-to-top above the sprite: last line sits just above cy.
+      const LINE_H = 14;
+      const baseY  = cy - 4;
+      for (let i = 0; i < lines.length; i++) {
+        const lineY = baseY - (lines.length - 1 - i) * LINE_H;
+        text(lines[i].str, cx, lineY, 11, lines[i].color);
+      }
     }
   }
 }
@@ -419,7 +460,7 @@ function tallyPlayerActions(entities) {
  * @param {object} game   - current game frame (used for enemy count/intent)
  * @param {Array}  prevEntities - entity snapshot from the frame before round_reset
  */
-function spawnRoundSummaryFloaters(game, prevEntities) {
+function spawnRoundSummaryFloaters(game, prevEntities, prevEnemyIntent) {
   const tally = tallyPlayerActions(prevEntities);
 
   // Centre points for spawn zones.
@@ -445,13 +486,23 @@ function spawnRoundSummaryFloaters(game, prevEntities) {
       floaterY += 22;
     }
 
-    const shieldColor = element === "none"
-      ? "rgba(80,160,255,1)"
-      : (ELEMENT_COLOR[element] ?? "rgba(80,160,255,1)");
-    if (counts.shield > 0) {
+    // Show "blocked N" for the amount of enemy damage actually cancelled this round.
+    // blocked = min(player shield count, enemy damage of same element).
+    // Enemy damage for this element = intent damage (if intent.element matches) + 0 (no enemy combos shown client-side).
+    // We approximate using prevEnemyIntent element match for the "none" bucket only;
+    // for other elements the intent element may differ, so we use Math.min conservatively.
+    const intentMatchesElement = prevEnemyIntent
+      ? ((prevEnemyIntent.element ?? null) === (element === "none" ? null : element))
+      : false;
+    const intentDmgForElement = (intentMatchesElement && prevEnemyIntent) ? prevEnemyIntent.damage : 0;
+    const blocked = Math.min(counts.shield, intentDmgForElement);
+    if (blocked > 0) {
+      const shieldColor = element === "none"
+        ? "rgba(80,160,255,1)"
+        : (ELEMENT_COLOR[element] ?? "rgba(80,160,255,1)");
       const label = element === "none"
-        ? `+${counts.shield} shld`
-        : `+${counts.shield} shld ${elChar}`;
+        ? `blocked ${blocked * ACTION_EFFECT_VALUE}`
+        : `blocked ${blocked * ACTION_EFFECT_VALUE} ${elChar}`;
       spawnFloater(label, px + jitter(), py, shieldColor);
     }
 
@@ -463,10 +514,13 @@ function spawnRoundSummaryFloaters(game, prevEntities) {
     }
   }
 
-  // Enemy intent: 1 damage per living enemy entity.
-  const enemyCount = (game.entities ?? []).filter(e => e.team === "enemies").length;
-  if (enemyCount > 0) {
-    spawnFloater(`-${enemyCount}`, px + jitter(), py - 22, "rgba(255,80,80,1)");
+  // Enemy intent floater: use the snapshotted intent from the round that just resolved.
+  const intent = prevEnemyIntent;
+  if (intent && intent.damage > 0) {
+    const elChar  = intent.element ? (ELEMENT_CHAR[intent.element]  ?? "") : "";
+    const elColor = intent.element ? (ELEMENT_COLOR[intent.element] ?? "rgba(255,80,80,1)") : "rgba(255,80,80,1)";
+    const label = elChar ? `-${intent.damage} ${elChar}` : `-${intent.damage}`;
+    spawnFloater(label, px + jitter(), py - 22, elColor);
   }
 }
 
@@ -477,6 +531,8 @@ function spawnRoundSummaryFloaters(game, prevEntities) {
 let lastRoundSeen    = -1;
 /** Shallow copy of game.entities from the previous frame. */
 let lastEntitiesSnapshot = [];
+/** Copy of game.enemy_intent from the previous frame (used in round-boundary floaters). */
+let lastEnemyIntentSnapshot = null;
 
 /**
  * Call at the start of every drawGame frame.
@@ -485,11 +541,12 @@ let lastEntitiesSnapshot = [];
  */
 function updateRoundTracking(game) {
   if (game.round !== lastRoundSeen && lastRoundSeen !== -1) {
-    spawnRoundSummaryFloaters(game, lastEntitiesSnapshot);
+    spawnRoundSummaryFloaters(game, lastEntitiesSnapshot, lastEnemyIntentSnapshot);
   }
   lastRoundSeen = game.round;
-  // Snapshot current entities so they're available next frame if a round fires.
-  lastEntitiesSnapshot = (game.entities ?? []).slice();
+  // Snapshot current entities and intent so they're available next frame if a round fires.
+  lastEntitiesSnapshot     = (game.entities ?? []).slice();
+  lastEnemyIntentSnapshot  = game.enemy_intent ?? null;
 }
 
 /** Map ActionChoice enum string → display character. */
@@ -543,9 +600,9 @@ function drawBars(bars, x0, x1, y) {
 }
 
 /**
- * Draw aggregate player-team bars (HP, projected shield, projected heal)
- * in the header strip above the player zone.
+ * Draw aggregate player-team bars (HP, projected heal) above the player zone.
  * Draw aggregate enemy-team HP bar above the enemy zone.
+ * Shield pools are removed — shields cancel damage within the round, no bar needed.
  */
 function drawTeamBars(game) {
   const entities = game.entities || [];
@@ -555,24 +612,21 @@ function drawTeamBars(game) {
   // --- Player bars ---
   const playerSummary = game.players;
   if (players.length > 0 && playerSummary && playerSummary.hp_max > 0) {
-    let shieldCount = 0, healCount = 0;
+    let healCount = 0;
     for (const e of players) {
       for (const slot of (e.combo ?? [])) {
-        if (slot.action === "shield") shieldCount++;
-        else if (slot.action === "heal") healCount++;
+        if (slot.action === "heal") healCount++;
       }
     }
-    const { hp_current, hp_max, shield_hp } = playerSummary;
+    const { hp_current, hp_max } = playerSummary;
     const scale = hp_max > 0 ? 1 / hp_max : 0;
-    const projShield = shieldCount * ACTION_EFFECT_VALUE;
     const projHeal = healCount * ACTION_EFFECT_VALUE;
 
-    // Three bars stacked; top of first bar sits just below the "ALLIES" label.
-    const y = PLAYER_ZONE.y0 - 56; // leaves room for 3 × (10+4) = 42px + gap
+    // Two bars stacked; top sits just below the "ALLIES" label.
+    const y = PLAYER_ZONE.y0 - 42;
     drawBars([
-      { label: "HP", value: hp_current, frac: hp_current * scale, color: "rgba(60,200,60,0.9)", bg: C_HP_BG },
-      { label: "Shld", value: shield_hp + projShield, frac: (shield_hp + projShield) * scale, color: "rgba(80,160,255,0.9)", bg: "rgba(20,20,80,0.6)" },
-      { label: "Heal", value: projHeal, frac: projHeal * scale, color: "rgba(140,230,100,0.9)", bg: "rgba(20,50,20,0.6)" },
+      { label: "HP",   value: hp_current, frac: hp_current * scale, color: "rgba(60,200,60,0.9)",   bg: C_HP_BG },
+      { label: "Heal", value: projHeal,   frac: projHeal   * scale, color: "rgba(140,230,100,0.9)", bg: "rgba(20,50,20,0.6)" },
     ], PLAYER_ZONE.x0, PLAYER_ZONE.x1, y);
   }
 
@@ -582,15 +636,13 @@ function drawTeamBars(game) {
     const { hp_current, hp_max } = enemySummary;
     const scale = hp_max > 0 ? 1 / hp_max : 0;
 
-    // One bar; align bottom with player bars bottom.
-    const y = ENEMY_ZONE.y0 - 56 + 28; // vertically centred in the same strip
+    // One bar; vertically centred in the same strip.
+    const y = ENEMY_ZONE.y0 - 42;
     drawBars([
       { label: "HP", value: hp_current, frac: hp_current * scale, color: "rgba(255,100,60,0.9)", bg: C_HP_BG },
     ], ENEMY_ZONE.x0, ENEMY_ZONE.x1, y);
 
-    // Intent label: 1 damage per living enemy entity this round.
-    const intentDmg = enemies.length;
-    text(`Intent: -${intentDmg} dmg`, ENEMY_ZONE.x0, y + 24, 11, "rgba(255,160,100,0.85)");
+
   }
 }
 

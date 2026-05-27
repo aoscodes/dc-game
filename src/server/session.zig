@@ -13,10 +13,10 @@
 //!   - PlayerTeam — tracks every entity whose Team.id == .players
 //!   - EnemyTeam  — tracks every entity whose Team.id == .enemies
 //!
-//! Neither side carries Health or Shield components.  All HP/shield lives in
-//! four session-level fields:
-//!   - `shared_hp` / `shared_shield`       — party pool (players)
-//!   - `shared_enemy_hp` / `shared_enemy_shield` — enemy pool
+//! Neither side carries Health components in the ECS.  All HP lives in
+//! two session-level fields:
+//!   - `shared_hp`       — party pool (players)
+//!   - `shared_enemy_hp` — enemy pool
 //!
 //! System signatures are set at world-init time in `start_game_wave`.
 //! Entities are never destroyed during play; system sets remain stable.
@@ -100,10 +100,17 @@ pub const Session = struct {
     round_timer: f32 = logic.ROUND_DURATION_DEFAULT_S,
     round_duration: f32 = logic.ROUND_DURATION_DEFAULT_S,
     shared_hp: c.Health = .{ .current = 0, .max = 0 },
-    shared_shield: c.Shield = .{ .hp = 0 },
     shared_enemy_hp: c.Health = .{ .current = 0, .max = 0 },
-    shared_enemy_shield: c.Shield = .{ .hp = 0 },
     action_pool: [MAX_PLAYERS]?c.ActionCombo,
+    /// Per-enemy combos generated at round start by the AI.
+    /// Indexed by enemy order in the ECS enemy_marker component array.
+    enemy_combos: [proto.MAX_ENTITIES_WIRE]?c.ActionCombo =
+        [_]?c.ActionCombo{null} ** proto.MAX_ENTITIES_WIRE,
+    /// Enemy intent chosen at round start; broadcast every frame so clients
+    /// can display it during the countdown.
+    pending_enemy_intent: logic.EnemyIntent = .{ .damage_per_player = 0, .element = null },
+    /// PRNG seeded once at init; drives enemy AI randomness.
+    prng: std.Random.DefaultPrng,
     profiler: dbg.Profiler(TickZones) = dbg.Profiler(TickZones).init(),
 
     pub fn init(allocator: std.mem.Allocator, join_code: [6]u8) !Session {
@@ -116,12 +123,14 @@ pub const Session = struct {
         }
         var world = try GameWorld.init(allocator);
         set_world_system_signatures(&world);
+        const seed = std.crypto.random.int(u64);
         return Session{
             .allocator = allocator,
             .join_code = join_code,
             .players = players,
             .world = world,
             .action_pool = [_]?c.ActionCombo{null} ** MAX_PLAYERS,
+            .prng = std.Random.DefaultPrng.init(seed),
         };
     }
 
@@ -203,6 +212,7 @@ pub const Session = struct {
         self.world = try GameWorld.init(self.allocator);
         set_world_system_signatures(&self.world);
         for (&self.action_pool) |*a| a.* = @as(?c.ActionCombo, null);
+        for (&self.enemy_combos) |*a| a.* = null;
         self.tick_count = 0;
 
         self.phase = .playing;
@@ -210,9 +220,11 @@ pub const Session = struct {
         self.round_timer = self.round_duration;
         std.log.info("game start — wave: {s} round_duration={d:.1}s", .{ wave.label, self.round_duration });
         try self.spawn_players();
-        self.shared_shield = .{ .hp = 0 };
         std.log.info("shared party pool: {}/{}", .{ self.shared_hp.current, self.shared_hp.max });
         try self.spawn_wave(wave);
+        // Choose intent and enemy combos for the very first round.
+        self.generate_enemy_combos();
+        self.pending_enemy_intent = self.generate_enemy_intent();
     }
 
     fn spawn_players(self: *Session) !void {
@@ -235,7 +247,6 @@ pub const Session = struct {
     fn spawn_wave(self: *Session, wave: *const waves.Wave) !void {
         std.log.info("spawning wave: {s} ({} enemies)", .{ wave.label, wave.entries.len });
         self.shared_enemy_hp = .{ .current = 0, .max = 0 };
-        self.shared_enemy_shield = .{ .hp = 0 };
         for (wave.entries) |entry| {
             const d = waves.resolve_stats(entry.class, entry.stats);
             const e = self.world.create_entity();
@@ -282,6 +293,10 @@ pub const Session = struct {
     fn reset_round(self: *Session) void {
         for (&self.action_pool) |*a| a.* = null;
         self.round_timer = self.round_duration;
+        // Generate next round's AI before broadcasting round_reset so the
+        // intent is available in the very first broadcast after reset.
+        self.generate_enemy_combos();
+        self.pending_enemy_intent = self.generate_enemy_intent();
         var buf: [2]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
         proto.encode(fbs.writer(), .round_reset, {}) catch return;
@@ -368,25 +383,52 @@ pub const Session = struct {
     }
 
     fn resolve_round(self: *Session) !void {
-        var damage_pool: u16 = 0;
-        var shield_pool: u16 = 0;
-        var heal_pool: u16 = 0;
         var ea_buf: [c.MAX_COMBO_LEN]logic.ElementedAction = undefined;
+
+        // --- Tally player actions by element ---
+        var player_damage_by_key: [5]u16 = [_]u16{0} ** 5;
+        var player_shield_by_key: [5]u16 = [_]u16{0} ** 5;
+        var heal_pool: u16 = 0;
         for (&self.action_pool) |maybe_combo| {
             const combo = maybe_combo orelse continue;
             const n = logic.parse_combo(combo, &ea_buf);
             for (ea_buf[0..n]) |ea| {
+                const k = @intFromEnum(c.element_key(ea.element));
                 switch (ea.action) {
-                    .damage => damage_pool += 1,
-                    .shield => shield_pool += 1,
-                    .heal   => heal_pool   += 1,
+                    .damage => player_damage_by_key[k] += 1,
+                    .shield => player_shield_by_key[k] += 1,
+                    .heal   => heal_pool += 1,
                 }
             }
         }
-        std.log.info("round resolve — dmg={} shld={} heal={}", .{ damage_pool, shield_pool, heal_pool });
 
-        if (damage_pool > 0) {
-            const dealt = logic.resolve_damage_pool(&self.shared_enemy_hp, &self.shared_enemy_shield, damage_pool);
+        // --- Tally enemy actions by element (combos + structured intent) ---
+        var enemy_damage_by_key: [5]u16 = [_]u16{0} ** 5;
+        var enemy_shield_by_key: [5]u16 = [_]u16{0} ** 5;
+        const em_size = self.world.component_arrays.enemy_marker.size;
+        for (self.enemy_combos[0..em_size]) |maybe_combo| {
+            const combo = maybe_combo orelse continue;
+            const n = logic.parse_combo(combo, &ea_buf);
+            for (ea_buf[0..n]) |ea| {
+                const k = @intFromEnum(c.element_key(ea.element));
+                switch (ea.action) {
+                    .damage => enemy_damage_by_key[k] += 1,
+                    .shield => enemy_shield_by_key[k] += 1,
+                    .heal   => {}, // enemies don't heal the player party
+                }
+            }
+        }
+        // Fold structured intent into the enemy damage tally.
+        if (!logic.is_dead(self.shared_enemy_hp)) {
+            const ik = @intFromEnum(c.element_key(self.pending_enemy_intent.element));
+            enemy_damage_by_key[ik] +|= self.pending_enemy_intent.damage_per_player;
+        }
+
+        // --- Net player damage against enemy shields, apply to enemy HP ---
+        for (0..5) |k| {
+            const net = player_damage_by_key[k] -| enemy_shield_by_key[k];
+            if (net == 0) continue;
+            const dealt = logic.resolve_damage_pool(&self.shared_enemy_hp, net, key_to_element(k));
             if (dealt > 0) {
                 try self.broadcast_action_result(.{
                     .tag = .damage,
@@ -395,27 +437,18 @@ pub const Session = struct {
                     .value = dealt,
                 });
             }
-            if (logic.is_dead(self.shared_enemy_hp)) {
-                std.log.info("shared enemy pool depleted — players win", .{});
-                try self.broadcast_action_result(.{
-                    .tag = .death,
-                    .actor_entity = std.math.maxInt(u32),
-                    .target_entity = std.math.maxInt(u32),
-                    .value = 0,
-                });
-            }
         }
-
-        if (shield_pool > 0) {
-            logic.resolve_shield_pool(&self.shared_shield, shield_pool);
+        if (logic.is_dead(self.shared_enemy_hp)) {
+            std.log.info("shared enemy pool depleted — players win", .{});
             try self.broadcast_action_result(.{
-                .tag = .shield,
+                .tag = .death,
                 .actor_entity = std.math.maxInt(u32),
                 .target_entity = std.math.maxInt(u32),
-                .value = shield_pool * logic.ACTION_EFFECT_VALUE,
+                .value = 0,
             });
         }
 
+        // --- Player heal ---
         if (heal_pool > 0) {
             logic.resolve_heal_pool(&self.shared_hp, heal_pool);
             try self.broadcast_action_result(.{
@@ -426,17 +459,22 @@ pub const Session = struct {
             });
         }
 
+        // --- Net enemy damage against player shields, apply to player HP ---
         if (!logic.is_dead(self.shared_enemy_hp)) {
-            const intent = logic.compute_enemy_intent(1);
-            const hp_dmg = logic.apply_enemy_intent(&self.shared_hp, &self.shared_shield, intent);
-            if (hp_dmg > 0) {
-                try self.broadcast_action_result(.{
-                    .tag = .damage,
-                    .actor_entity = std.math.maxInt(u32),
-                    .target_entity = std.math.maxInt(u32),
-                    .value = hp_dmg,
-                });
+            for (0..5) |k| {
+                const net = enemy_damage_by_key[k] -| player_shield_by_key[k];
+                if (net == 0) continue;
+                const dealt = logic.resolve_damage_pool(&self.shared_hp, net, key_to_element(k));
+                if (dealt > 0) {
+                    try self.broadcast_action_result(.{
+                        .tag = .damage,
+                        .actor_entity = std.math.maxInt(u32),
+                        .target_entity = std.math.maxInt(u32),
+                        .value = dealt,
+                    });
+                }
             }
+
             if (logic.is_dead(self.shared_hp)) {
                 std.log.info("shared party pool depleted — enemies win", .{});
                 try self.broadcast_action_result(.{
@@ -446,6 +484,46 @@ pub const Session = struct {
                     .value = 0,
                 });
             }
+        }
+    }
+
+    /// Map a bucket index back to an optional Element.
+    fn key_to_element(k: usize) ?c.Element {
+        return if (k == 0) null else @enumFromInt(k - 1);
+    }
+
+    /// Count living enemies (by ECS array size — enemies are never removed, just die via HP).
+    fn count_living_enemies(self: *const Session) u16 {
+        return @intCast(self.world.component_arrays.enemy_marker.size);
+    }
+
+    /// Choose a random element (or null) for the enemy intent this round.
+    fn generate_enemy_intent(self: *Session) logic.EnemyIntent {
+        const living = self.count_living_enemies();
+        const roll = self.prng.random().intRangeAtMost(u8, 0, 4);
+        const element: ?c.Element = if (roll == 0) null else @enumFromInt(roll - 1);
+        return logic.compute_enemy_intent(living, element);
+    }
+
+    /// Generate a random ActionCombo for each enemy entity.
+    fn generate_enemy_combos(self: *Session) void {
+        const em_arr = &self.world.component_arrays.enemy_marker;
+        for (0..em_arr.size) |i| {
+            const combo_len = self.prng.random().intRangeAtMost(u8, 1, c.MAX_COMBO_LEN);
+            var slots: [c.MAX_COMBO_LEN]c.ComboSlot =
+                [_]c.ComboSlot{.{ .action = .damage }} ** c.MAX_COMBO_LEN;
+            for (0..combo_len) |j| {
+                // 0–3: element token; 4–6: action token (damage/shield/heal); 7: damage
+                const roll = self.prng.random().intRangeAtMost(u8, 0, 7);
+                slots[j] = switch (roll) {
+                    0...3 => .{ .element = @enumFromInt(roll) },
+                    4     => .{ .action = .damage },
+                    5     => .{ .action = .shield },
+                    6     => .{ .action = .heal },
+                    else  => .{ .action = .damage },
+                };
+            }
+            self.enemy_combos[i] = .{ .slots = slots, .len = combo_len };
         }
     }
 
@@ -534,6 +612,11 @@ pub const Session = struct {
     }
 
     fn broadcast_game_state(self: *Session) !void {
+        const intent_element_byte: u8 = if (self.pending_enemy_intent.element) |el|
+            @intFromEnum(el)
+        else
+            proto.GameState.INTENT_ELEMENT_NONE;
+
         var snap = proto.GameState{
             .tick = self.tick_count,
             .round_timer = @max(self.round_timer, 0.0),
@@ -542,13 +625,13 @@ pub const Session = struct {
             .players = .{
                 .hp_current = self.shared_hp.current,
                 .hp_max = self.shared_hp.max,
-                .shield_hp = self.shared_shield.hp,
             },
             .enemies = .{
                 .hp_current = self.shared_enemy_hp.current,
                 .hp_max = self.shared_enemy_hp.max,
-                .shield_hp = self.shared_enemy_shield.hp,
             },
+            .enemy_intent_damage  = self.pending_enemy_intent.damage_per_player,
+            .enemy_intent_element = intent_element_byte,
         };
 
         const pm_arr = &self.world.component_arrays.player_marker;
@@ -574,17 +657,21 @@ pub const Session = struct {
         }
 
         const em_arr = &self.world.component_arrays.enemy_marker;
-        for (em_arr.index_to_entity[0..em_arr.size]) |e| {
+        for (em_arr.index_to_entity[0..em_arr.size], 0..) |e, i| {
             if (snap.entity_count >= proto.MAX_ENTITIES_WIRE) break;
             const cl = self.world.get_component(e, c.Class);
+            const enemy_combo = self.enemy_combos[i];
+            const combo_len: u8 = if (enemy_combo) |ec| ec.len else 0;
+            const combo_slots = if (enemy_combo) |ec| ec.slots
+                else [_]c.ComboSlot{.{ .action = .damage }} ** c.MAX_COMBO_LEN;
 
             snap.entities[snap.entity_count] = .{
                 .entity = e,
                 .class = cl.tag,
                 .team = .enemies,
                 .owner = 0xFF,
-                .combo_len = 0,
-                .combo_slots = [_]c.ComboSlot{.{ .action = .damage }} ** c.MAX_COMBO_LEN,
+                .combo_len = combo_len,
+                .combo_slots = combo_slots,
             };
             snap.entity_count += 1;
         }

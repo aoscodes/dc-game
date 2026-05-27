@@ -50,22 +50,19 @@ pub fn is_dead(health: c.Health) bool {
     return health.current == 0;
 }
 
+/// Apply `net_count` damage actions of the given element to `health`.
+/// Caller is responsible for netting damage against shield actions before calling.
+/// Returns HP damage dealt.
 pub fn resolve_damage_pool(
     health: *c.Health,
-    shield: *c.Shield,
-    pool_size: u16,
+    net_count: u16,
+    element: ?c.Element,
 ) u16 {
-    const total = pool_size * ACTION_EFFECT_VALUE;
+    _ = element; // element is metadata only; callers track it for floaters/logs
+    const total = net_count * ACTION_EFFECT_VALUE;
     if (total == 0) return 0;
-    const absorbed = @min(shield.hp, total);
-    shield.hp -= absorbed;
-    const remaining = total - absorbed;
-    apply_damage(health, remaining);
-    return remaining;
-}
-
-pub fn resolve_shield_pool(shield: *c.Shield, pool_size: u16) void {
-    shield.hp +|= pool_size * ACTION_EFFECT_VALUE;
+    apply_damage(health, total);
+    return total;
 }
 
 pub fn resolve_heal_pool(health: *c.Health, pool_size: u16) void {
@@ -74,24 +71,12 @@ pub fn resolve_heal_pool(health: *c.Health, pool_size: u16) void {
 
 pub const EnemyIntent = struct {
     damage_per_player: u16,
+    /// null = non-elemental.  Chosen per-round by the session; extensible for future AI.
+    element: ?c.Element,
 };
 
-pub fn compute_enemy_intent(living_enemy_count: u16) EnemyIntent {
-    return .{ .damage_per_player = living_enemy_count };
-}
-
-pub fn apply_enemy_intent(
-    health: *c.Health,
-    shield: *c.Shield,
-    intent: EnemyIntent,
-) u16 {
-    const total = intent.damage_per_player;
-    if (total == 0) return 0;
-    const absorbed = @min(shield.hp, total);
-    shield.hp -= absorbed;
-    const remaining = total - absorbed;
-    apply_damage(health, remaining);
-    return remaining;
+pub fn compute_enemy_intent(living_enemy_count: u16, element: ?c.Element) EnemyIntent {
+    return .{ .damage_per_player = living_enemy_count, .element = element };
 }
 
 test "apply_damage: no underflow" {
@@ -106,97 +91,34 @@ test "apply_heal: no overflow" {
     try std.testing.expectEqual(@as(u16, 100), h.current);
 }
 
-test "resolve_damage_pool: no shield" {
-    // pool=1, no shield: all V damage lands on hp
+test "resolve_damage_pool: applies net_count * V damage" {
     const V = ACTION_EFFECT_VALUE;
     var h = c.Health{ .current = V * 10, .max = V * 10 };
-    var shield = c.Shield{ .hp = 0 };
-    const dealt = resolve_damage_pool(&h, &shield, 1);
-    try std.testing.expectEqual(V, dealt); // full V reaches HP
-    try std.testing.expectEqual(V * 9, h.current);
-    try std.testing.expectEqual(@as(u16, 0), shield.hp);
+    const dealt = resolve_damage_pool(&h, 3, null);
+    try std.testing.expectEqual(3 * V, dealt);
+    try std.testing.expectEqual(V * 7, h.current);
 }
 
-test "resolve_damage_pool: shield fully absorbs" {
-    // pool=1, shield >= V: hp untouched, dealt = 0 (no HP damage)
-    const V = ACTION_EFFECT_VALUE;
-    var h = c.Health{ .current = V * 10, .max = V * 10 };
-    var shield = c.Shield{ .hp = V + 5 };
-    const dealt = resolve_damage_pool(&h, &shield, 1);
-    try std.testing.expectEqual(@as(u16, 0), dealt); // shield ate it all
-    try std.testing.expectEqual(V * 10, h.current); // hp untouched
-    try std.testing.expectEqual(@as(u16, 5), shield.hp); // only excess remains
+test "resolve_damage_pool: zero net_count — no change" {
+    var h = c.Health{ .current = 10, .max = 10 };
+    const dealt = resolve_damage_pool(&h, 0, null);
+    try std.testing.expectEqual(@as(u16, 0), dealt);
+    try std.testing.expectEqual(@as(u16, 10), h.current);
 }
 
-test "resolve_damage_pool: shield partially absorbs" {
-    // pool=2 (total=2V), shield=V/2: shield absorbs V/2, remaining 3V/2 hits hp
+test "resolve_damage_pool: element arg is ignored (metadata only)" {
     const V = ACTION_EFFECT_VALUE;
-    const partial: u16 = V / 2;
-    var h = c.Health{ .current = V * 10, .max = V * 10 };
-    var shield = c.Shield{ .hp = partial };
-    const total = 2 * V;
-    const expected_hp_dmg = total - partial;
-    const dealt = resolve_damage_pool(&h, &shield, 2);
-    try std.testing.expectEqual(expected_hp_dmg, dealt); // only remainder lands on HP
-    try std.testing.expectEqual(V * 10 - expected_hp_dmg, h.current);
-    try std.testing.expectEqual(@as(u16, 0), shield.hp);
-}
-
-test "resolve_shield_pool: grants shield" {
-    // pool=1 grants ACTION_EFFECT_VALUE shield HP
-    const V = ACTION_EFFECT_VALUE;
-    var shield = c.Shield{ .hp = 3 };
-    resolve_shield_pool(&shield, 1);
-    try std.testing.expectEqual(@as(u16, 3 + V), shield.hp);
+    var h = c.Health{ .current = V * 5, .max = V * 5 };
+    const dealt = resolve_damage_pool(&h, 2, .fire);
+    try std.testing.expectEqual(2 * V, dealt);
+    try std.testing.expectEqual(V * 3, h.current);
 }
 
 test "resolve_heal_pool: heals" {
-    // pool=1 heals ACTION_EFFECT_VALUE HP
     const V = ACTION_EFFECT_VALUE;
     var h = c.Health{ .current = 5, .max = V * 10 };
     resolve_heal_pool(&h, 1);
     try std.testing.expectEqual(@as(u16, 5 + V), h.current);
-}
-
-test "compute_enemy_intent: 1 dmg per living enemy" {
-    const intent = compute_enemy_intent(42);
-    try std.testing.expectEqual(@as(u16, 42), intent.damage_per_player);
-}
-
-test "apply_enemy_intent: shield absorbs first" {
-    // intent deals 15 damage; 7 shield absorbs first → 8 hp damage
-    var h = c.Health{ .current = 100, .max = 100 };
-    var shield = c.Shield{ .hp = 7 };
-    const intent = EnemyIntent{ .damage_per_player = 15 };
-    const hp_dmg = apply_enemy_intent(&h, &shield, intent);
-    try std.testing.expectEqual(@as(u16, 8), hp_dmg);
-    try std.testing.expectEqual(@as(u16, 92), h.current);
-    try std.testing.expectEqual(@as(u16, 0), shield.hp);
-}
-
-test "resolve_damage_pool: zero pool — no change" {
-    var h = c.Health{ .current = 10, .max = 10 };
-    var shield = c.Shield{ .hp = 3 };
-    const dealt = resolve_damage_pool(&h, &shield, 0);
-    try std.testing.expectEqual(@as(u16, 0), dealt);
-    try std.testing.expectEqual(@as(u16, 10), h.current);
-    try std.testing.expectEqual(@as(u16, 3), shield.hp);
-}
-
-test "resolve_shield_pool: saturation — no overflow past maxInt(u16)" {
-    var shield = c.Shield{ .hp = std.math.maxInt(u16) - 2 };
-    resolve_shield_pool(&shield, 5); // would overflow without saturating add
-    try std.testing.expectEqual(@as(u16, std.math.maxInt(u16)), shield.hp);
-}
-
-test "apply_enemy_intent: zero damage — no change" {
-    var h = c.Health{ .current = 8, .max = 10 };
-    var shield = c.Shield{ .hp = 4 };
-    const intent = EnemyIntent{ .damage_per_player = 0 };
-    const hp_dmg = apply_enemy_intent(&h, &shield, intent);
-    try std.testing.expectEqual(@as(u16, 0), hp_dmg);
-    try std.testing.expectEqual(@as(u16, 8), h.current);
-    try std.testing.expectEqual(@as(u16, 4), shield.hp);
 }
 
 test "resolve_heal_pool: at max HP — no overflow" {
@@ -205,8 +127,14 @@ test "resolve_heal_pool: at max HP — no overflow" {
     try std.testing.expectEqual(@as(u16, 100), h.current);
 }
 
+test "compute_enemy_intent: 1 dmg per living enemy" {
+    const intent = compute_enemy_intent(42, null);
+    try std.testing.expectEqual(@as(u16, 42), intent.damage_per_player);
+    try std.testing.expectEqual(@as(?c.Element, null), intent.element);
+}
+
 test "compute_enemy_intent: zero enemies — zero damage" {
-    const intent = compute_enemy_intent(0);
+    const intent = compute_enemy_intent(0, null);
     try std.testing.expectEqual(@as(u16, 0), intent.damage_per_player);
 }
 

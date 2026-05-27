@@ -4,11 +4,10 @@
 //! Transport is a BufferTransport that accumulates outgoing bytes.
 //!
 //! Round mechanics under test:
-//!   - damage pool → shared enemy HP pool takes pool_size * ACTION_EFFECT_VALUE damage
-//!   - shield pool → shared party shield buffer gains pool_size * ACTION_EFFECT_VALUE HP
+//!   - damage pool → net(damage - opposing_shield) * ACTION_EFFECT_VALUE applied to HP pool
+//!   - shield pool → cancels equal opposing damage this round; unused shields discarded
 //!   - heal pool   → shared party HP pool heals pool_size * ACTION_EFFECT_VALUE
-//!   - enemy intent → shared party pool takes living_enemy_count damage
-//!                    (shield absorbs first, overflow drains HP)
+//!   - enemy intent → folded into enemy damage tally; netted against player shields
 //!   - configurable round_duration respected
 //!   - death/wave-chain/game-over paths
 
@@ -368,6 +367,7 @@ test "damage pool reduces shared enemy HP" {
 
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 1); // clear enemy combos so no enemy shields block player damage
 
     const hp_before = s.sess.shared_enemy_hp.current;
 
@@ -414,6 +414,7 @@ test "kill enemy with exactly enough damage" {
 
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_one_hp); // shared_enemy_hp = V
+    set_enemy_ai(&s.sess, 0); // clear enemy combos so no shields block player damage
 
     // 1 player damage action → pool=1 → 1*V dmg → shared_enemy_hp = 0
     try enqueue_action(&s.sess, s.p[0].pid, .damage);
@@ -435,11 +436,10 @@ test "kill enemy with exactly enough damage" {
     try std.testing.expect(found_death);
 }
 
-test "shield pool grants shield HP to shared pool" {
+test "shield cancels equal element-matched enemy damage — HP unchanged" {
+    // Two players each shield (null-element). Enemy intent = 2 dmg (null-element).
+    // Net enemy damage to player pool: 2 - 2 = 0. HP unchanged.
     const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator, .fighter, .fighter);
@@ -448,19 +448,15 @@ test "shield pool grants shield HP to shared pool" {
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single);
 
-    // Both players shield → pool=2 → shared shield gets 2*V HP
-    // Enemy (attack=1) then absorbs 1 from shield → net 2*V - 1
-    try enqueue_action(&s.sess, s.p[0].pid, .shield);
-    try enqueue_action(&s.sess, s.p[1].pid, .shield);
-    s.p[0].clear();
+    set_enemy_ai(&s.sess, 2); // 2 null-element damage
+
+    const hp_before = s.sess.shared_hp.current;
+    try enqueue_action(&s.sess, s.p[0].pid, .shield); // +1 null shield
+    try enqueue_action(&s.sess, s.p[1].pid, .shield); // +1 null shield
     try tick_n(&s.sess, 0.11, 1);
 
-    try std.testing.expectEqual(2 * V - 1, s.sess.shared_shield.hp);
-
-    // shield broadcast — exactly one result for the whole party
-    const msgs = try drain(s.p[0].buf.items, arena);
-    const shield_count = try count_action_results_with(msgs, .shield);
-    try std.testing.expect(shield_count >= 1);
+    // 2 shield vs 2 damage → net 0 → HP unchanged.
+    try std.testing.expectEqual(hp_before, s.sess.shared_hp.current);
 }
 
 test "heal pool heals shared party pool" {
@@ -473,12 +469,15 @@ test "heal pool heals shared party pool" {
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single);
 
+    // Force null-element intent (1 dmg) so HP math is deterministic.
+    set_enemy_ai(&s.sess, 1);
+
     // Wound the shared pool first.
     s.sess.shared_hp.current = 50;
     const hp_before: u16 = 50;
 
     // Both players heal → pool=2 → shared HP heals 2*V
-    // Enemy (attack=1) deals 1 dmg to shared pool in same round.
+    // Enemy null-intent deals 1 dmg to shared pool in same round.
     // Net: +2*V - 1.
     try enqueue_action(&s.sess, s.p[0].pid, .heal);
     try enqueue_action(&s.sess, s.p[1].pid, .heal);
@@ -489,7 +488,9 @@ test "heal pool heals shared party pool" {
     s.p[0].clear();
 }
 
-test "shared shield absorbs enemy damage before shared HP" {
+test "null-element shield granted this round absorbs null-element enemy damage" {
+    // Shields reset at the start of each round and must be granted via actions.
+    // This verifies that shield granted in the same round absorbs matching enemy damage.
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -497,20 +498,21 @@ test "shared shield absorbs enemy damage before shared HP" {
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
-    try s.sess.start_game_wave(&test_wave_single); // 1 enemy → 1 dmg/round to shared pool
+    try s.sess.start_game_wave(&test_wave_single); // 1 enemy
+
+    // Force null-element intent (1 dmg) and no enemy combo damage.
+    set_enemy_ai(&s.sess, 1);
 
     const hp_before = s.sess.shared_hp.current;
 
-    // Give the shared shield 5 HP (more than enemy attack=1)
-    s.sess.shared_shield.hp = 5;
-
-    // No action chosen — enemy still attacks shared pool
+    // Both players shield (2 null-element). Enemy intent = 1 null-element.
+    // Net: 1 damage - 2 shield = 0 → HP unchanged.
+    try enqueue_action(&s.sess, s.p[0].pid, .shield);
+    try enqueue_action(&s.sess, s.p[1].pid, .shield);
     try tick_n(&s.sess, 0.11, 1);
 
-    // HP unchanged (shield absorbed the 1 damage)
+    // HP must be unchanged: shield absorbed the 1 null-element damage.
     try std.testing.expectEqual(hp_before, s.sess.shared_hp.current);
-    // Shield reduced by 1
-    try std.testing.expectEqual(@as(u16, 4), s.sess.shared_shield.hp);
 }
 
 test "enemy depletes shared pool — enemies win" {
@@ -524,8 +526,10 @@ test "enemy depletes shared pool — enemies win" {
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
-    // One enemy alive → intent = 1 dmg/round. Set party pool to 1 HP → dies.
     try s.sess.start_game_wave(&test_wave_single);
+
+    // Force null-element intent with 1 dmg so it directly kills the 1-HP party pool.
+    set_enemy_ai(&s.sess, 1);
 
     s.sess.shared_hp.current = 1;
     s.sess.shared_hp.max = 1;
@@ -554,6 +558,7 @@ test "shared enemy pool depleted — players win" {
 
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_one_hp); // shared_enemy_hp = V
+    set_enemy_ai(&s.sess, 0); // clear enemy combos so no shields block player damage
 
     try enqueue_action(&s.sess, s.p[0].pid, .damage);
     s.p[0].clear();
@@ -581,6 +586,7 @@ test "wave chain advances to next wave" {
     s.sess.round_duration = 0.1;
     // First wave: shared_enemy_hp = 1 → next wave = wave_01_basic (3 grunts × 80 HP)
     try s.sess.start_game_wave(&test_wave_to_real);
+    set_enemy_ai(&s.sess, 0); // clear enemy combos so no shields block player damage
 
     try enqueue_action(&s.sess, s.p[0].pid, .damage);
     s.p[0].clear();
@@ -603,6 +609,7 @@ test "action can be overwritten before round resolves" {
 
     s.sess.round_duration = 0.5; // long round
     try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 1); // clear enemy combos so no shields block player damage
 
     // First submit heal, then overwrite with damage before round ends
     try enqueue_action(&s.sess, s.p[0].pid, .heal);
@@ -658,12 +665,15 @@ test "no actions submitted — enemy still attacks shared pool" {
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single); // 1 enemy
 
+    // Force null-element intent (1 dmg) and clear enemy combos for determinism.
+    set_enemy_ai(&s.sess, 1);
+
     const hp_max = s.sess.shared_hp.max;
 
     // No actions; tick through round
     try tick_n(&s.sess, 0.11, 1);
 
-    // Enemy (attack=1) deals 1 dmg to shared pool
+    // Enemy null-intent deals 1 dmg to shared pool
     try std.testing.expectEqual(hp_max - 1, s.sess.shared_hp.current);
 }
 
@@ -707,16 +717,22 @@ test "mixed pool: damage + shield in one round" {
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single); // shared_enemy_hp = 100*V
 
-    // p0 → damage, p1 → shield
+    // Force null-element intent so shield absorption is deterministic.
+    set_enemy_ai(&s.sess, 1);
+
+    // p0 → damage (null), p1 → shield (null)
+    // Player damage: 1 null. Enemy shield: 0. Net player damage: 1.
+    // Enemy damage (intent 1 null). Player shield: 1 null. Net enemy damage: 0.
     try enqueue_action(&s.sess, s.p[0].pid, .damage);
     try enqueue_action(&s.sess, s.p[1].pid, .shield);
+
+    const hp_before = s.sess.shared_hp.current;
     try tick_n(&s.sess, 0.11, 1);
 
-    // shared enemy pool took V damage (pool=1 → 1*V)
+    // Enemy pool took 1*V damage from player.
     try std.testing.expectEqual(V * 100 - V, s.sess.shared_enemy_hp.current);
-
-    // shared shield (pool=1 → +V), enemy attack=1 absorbed → net V-1
-    try std.testing.expectEqual(V - 1, s.sess.shared_shield.hp);
+    // Player pool took 0 damage: 1 shield cancelled 1 intent.
+    try std.testing.expectEqual(hp_before, s.sess.shared_hp.current);
 }
 
 test "enemy pool alive deals 1 damage to party per round" {
@@ -738,9 +754,12 @@ test "enemy pool alive deals 1 damage to party per round" {
     };
     try s.sess.start_game_wave(&two_enemy_wave);
 
+    // Force 1 null-element damage so assertion is deterministic regardless of living count.
+    set_enemy_ai(&s.sess, 1);
+
     const hp_before = s.sess.shared_hp.current;
 
-    // No actions: enemy pool alive → 1 dmg to party pool
+    // No actions: null-element intent → 1 dmg to party pool
     try tick_n(&s.sess, 0.11, 1);
 
     try std.testing.expectEqual(hp_before - 1, s.sess.shared_hp.current);
@@ -754,16 +773,15 @@ test "enemy intent depletes shared pool when heal cannot outpace it" {
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
-    // One enemy alive → intent = 1 dmg/round to party pool.
     try s.sess.start_game_wave(&test_wave_single);
 
-    // Set shared pool to V — heal (+2*V) first then enemy (-1) → net +2V-1 > 0.
-    // Instead: set to 0 after intentionally bypassing guard — just verify that
-    // when pool is exactly 1 and no heal, enemy kills it.
+    // Force null-element intent with 1 dmg — deterministic kill.
+    set_enemy_ai(&s.sess, 1);
+
     s.sess.shared_hp.current = 1;
     s.sess.shared_hp.max = 1;
 
-    // No actions: enemy intent = 1 → pool goes to 0
+    // No actions: null-element intent = 1 → pool goes to 0
     try tick_n(&s.sess, 0.11, 1);
 
     try std.testing.expectEqual(@as(u16, 0), s.sess.shared_hp.current);
@@ -792,33 +810,6 @@ test "game_state wire: round_timer decrement reflected in broadcast" {
 
     try std.testing.expect(gs.round_timer < 1.0);
     try std.testing.expect(gs.round_timer > 0.0);
-}
-
-test "game_state wire: shield_hp reflects shared shield in players summary" {
-    const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
-    defer s.deinit();
-
-    s.sess.round_duration = 1.0;
-    try s.sess.start_game_wave(&test_wave_single);
-
-    // Set the shared shield directly (round hasn't fired so value is stable)
-    s.sess.shared_shield.hp = 7;
-
-    s.p[0].clear();
-    try tick_n(&s.sess, 0.1, 1);
-
-    const msgs = try drain(s.p[0].buf.items, arena);
-    const m = find_tag(msgs, .game_state) orelse return error.NoGameState;
-    var fbs = std.io.fixedBufferStream(m.payload);
-    const gs = try proto.decode_game_state(fbs.reader());
-
-    try std.testing.expectEqual(@as(u16, 7), gs.players.shield_hp);
 }
 
 test "disconnect mid-game: round resolves cleanly for remaining player" {
@@ -1059,6 +1050,13 @@ fn make_action_combo(actions: []const c.ActionChoice) c.ActionCombo {
     return make_combo(slots[0..actions.len]);
 }
 
+/// Force deterministic enemy behaviour for tests that rely on exact HP/shield math.
+/// Sets intent to null-element with the given damage value and clears all enemy combos.
+fn set_enemy_ai(sess: *Session, intent_damage: u16) void {
+    sess.pending_enemy_intent = .{ .damage_per_player = intent_damage, .element = null };
+    for (&sess.enemy_combos) |*ec| ec.* = null;
+}
+
 fn enqueue_combo(sess: *Session, pid: u8, combo: c.ActionCombo) !void {
     var buf: [16]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -1083,6 +1081,9 @@ test "combo [dmg,dmg] → damage_pool = 2" {
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single);
 
+    // Clear enemy combos so no enemy shields cancel player damage.
+    set_enemy_ai(&s.sess, 1);
+
     const hp_before = s.sess.shared_enemy_hp.current;
 
     // p0 submits combo [dmg, dmg] → contributes 2 to damage pool → 2*V dmg to shared enemy pool
@@ -1092,7 +1093,12 @@ test "combo [dmg,dmg] → damage_pool = 2" {
     try std.testing.expectEqual(hp_before - 2 * V, s.sess.shared_enemy_hp.current);
 }
 
-test "combo [dmg,shld,heal,dmg] → all three pools receive correct counts" {
+test "combo [dmg,shld,heal,dmg] → damage, shield cancel, and heal all apply" {
+    // combo: damage=2, shield=1, heal=1 (all null-element).
+    // Enemy intent = 1 null-element.
+    // Player damage (2) vs enemy shield (0) → 2*V to enemy HP.
+    // Enemy damage (1 intent) vs player shield (1) → net 0 → player HP unchanged.
+    // Heal: +V to player HP.
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -1102,20 +1108,21 @@ test "combo [dmg,shld,heal,dmg] → all three pools receive correct counts" {
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single);
 
+    set_enemy_ai(&s.sess, 1); // 1 null-element intent
+
     const enemy_hp_before = s.sess.shared_enemy_hp.current;
 
-    // Wound shared party pool so heal has room
+    // Wound party pool so heal has room.
     s.sess.shared_hp.current = 50;
+    const party_hp_before = s.sess.shared_hp.current;
 
-    // combo: dmg=2, shld=1, heal=1
     try enqueue_combo(&s.sess, s.p[0].pid, make_action_combo(&[_]c.ActionChoice{ .damage, .shield, .heal, .damage }));
     try tick_n(&s.sess, 0.11, 1);
 
-    // shared enemy pool took 2*V damage (pool=2)
+    // Enemy pool: 2*V damage from player.
     try std.testing.expectEqual(enemy_hp_before - 2 * V, s.sess.shared_enemy_hp.current);
-
-    // shared shield pool=1 → +V shield, then enemy_intent=1 absorbed → net V-1
-    try std.testing.expectEqual(V - 1, s.sess.shared_shield.hp);
+    // Player pool: 1 intent - 1 shield = 0 net damage; heal +V.
+    try std.testing.expectEqual(party_hp_before + V, s.sess.shared_hp.current);
 }
 
 test "combo overwrite before round fires — latest combo wins" {
@@ -1127,6 +1134,7 @@ test "combo overwrite before round fires — latest combo wins" {
 
     s.sess.round_duration = 0.5;
     try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 1); // clear enemy combos so no shields block player damage
 
     const enemy_hp_before = s.sess.shared_enemy_hp.current;
 
@@ -1140,7 +1148,9 @@ test "combo overwrite before round fires — latest combo wins" {
     try tick_n(&s.sess, 0.1, 1);
     try std.testing.expectEqual(@as(u8, 2), s.sess.action_pool[s.p[0].pid].?.len);
 
-    // Let round fire
+    // Let round fire (reset_round regenerates AI; apply_fixed_intent not available here
+    // so we re-clear enemy combos manually before the timer fires)
+    set_enemy_ai(&s.sess, 1);
     try tick_n(&s.sess, 0.5, 1);
 
     // Shared enemy pool took 2*V damage (damage combo resolved, not the heal)
@@ -1176,6 +1186,7 @@ test "two combos from different players — both contribute" {
 
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 1); // clear enemy combos so no shields block player damage
 
     const hp_before = s.sess.shared_enemy_hp.current;
 
@@ -1241,6 +1252,7 @@ test "element combo [fire, damage, damage] → damage_pool = 2" {
 
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 1); // clear enemy combos so no shields block player damage
 
     const hp_before = s.sess.shared_enemy_hp.current;
 
@@ -1256,7 +1268,9 @@ test "element combo [fire, damage, damage] → damage_pool = 2" {
     try std.testing.expectEqual(hp_before - 2 * V, s.sess.shared_enemy_hp.current);
 }
 
-test "element combo [earth, shield] → shield_pool = 1" {
+test "element-mismatched shield does not cancel enemy damage" {
+    // Player submits [earth, shield]. Enemy intent = 1 null-element.
+    // Earth shield does not cancel null-element damage → player HP takes full intent damage.
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -1266,15 +1280,19 @@ test "element combo [earth, shield] → shield_pool = 1" {
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single);
 
-    // [earth, shield] → 1 earth-elemented shield action → shield_pool = 1
-    // Enemy (attack=1) then absorbs 1 from the new shield → net V-1
+    set_enemy_ai(&s.sess, 1); // 1 null-element intent
+
+    const hp_before = s.sess.shared_hp.current;
+
     try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
         .{ .element = .earth  },
         .{ .action  = .shield },
     }));
     try tick_n(&s.sess, 0.11, 1);
 
-    try std.testing.expectEqual(V - 1, s.sess.shared_shield.hp);
+    // Earth shield (key=earth) does not cancel null-element damage (key=none).
+    // Player HP takes full 1*V intent damage.
+    try std.testing.expectEqual(hp_before - V, s.sess.shared_hp.current);
 }
 
 test "trailing element in combo is ignored — damage_pool unchanged" {
@@ -1286,6 +1304,7 @@ test "trailing element in combo is ignored — damage_pool unchanged" {
 
     s.sess.round_duration = 0.1;
     try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 1); // clear enemy combos so no shields block player damage
 
     const hp_before = s.sess.shared_enemy_hp.current;
 

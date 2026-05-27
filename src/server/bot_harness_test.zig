@@ -68,6 +68,10 @@ pub const BotHarnessOptions = struct {
     /// real-time watching against a live server.  Set to a small value
     /// (e.g. 0.001) for fast headless CI runs.
     round_duration: f32 = shared.game_logic.ROUND_DURATION_DEFAULT_S,
+    /// When non-null, overrides the random enemy intent after every reset so
+    /// tests that depend on exact HP/shield arithmetic are deterministic.
+    /// Uses null element (no elemental type) so null-element player shields absorb.
+    fixed_enemy_intent_damage: ?u16 = null,
 };
 
 pub const BotHarness = struct {
@@ -77,6 +81,8 @@ pub const BotHarness = struct {
     bot_states: []BotState,
     /// Number of rounds that have been resolved (incremented by step()).
     round: u32,
+    /// If non-null, overrides random enemy intent before each round resolves.
+    fixed_enemy_intent_damage: ?u16,
 
     /// Initialise the harness.
     ///
@@ -127,12 +133,23 @@ pub const BotHarness = struct {
         try sess.start_game_wave(wave);
         try respawn_bots(&sess, team, bot_states);
 
-        return BotHarness{
+        var h = BotHarness{
             .allocator = allocator,
             .session = sess,
             .bot_states = bot_states,
             .round = 0,
+            .fixed_enemy_intent_damage = opts.fixed_enemy_intent_damage,
         };
+        // Apply fixed intent for the very first round (set by start_game_wave).
+        h.apply_fixed_intent();
+        return h;
+    }
+
+    /// Override pending_enemy_intent and clear enemy_combos if fixed intent is set.
+    fn apply_fixed_intent(self: *BotHarness) void {
+        const dmg = self.fixed_enemy_intent_damage orelse return;
+        self.session.pending_enemy_intent = .{ .damage_per_player = dmg, .element = null };
+        for (&self.session.enemy_combos) |*ec| ec.* = null;
     }
 
     pub fn deinit(self: *BotHarness) void {
@@ -161,7 +178,8 @@ pub const BotHarness = struct {
 
     /// Advance the session by exactly one full round:
     ///   1. inject_actions() for every bot
-    ///   2. tick past the round timer (small dt ticks until timer fires)
+    ///   2. tick past the round timer (round resolves, then reset_round regenerates AI)
+    ///   3. re-apply fixed intent (if set) so next round is also deterministic
     ///
     /// Increments self.round after resolution.
     pub fn step(self: *BotHarness) !void {
@@ -169,6 +187,8 @@ pub const BotHarness = struct {
         // Tick with dt = round_duration + epsilon so the timer expires in one tick.
         const dt = self.session.round_duration + 0.001;
         try self.session.tick(dt);
+        // reset_round() just regenerated random AI; override it for the next round.
+        self.apply_fixed_intent();
         self.round += 1;
     }
 
@@ -198,17 +218,16 @@ fn respawn_bots(
     team: *const bots.BotTeam,
     bot_states: []const BotState,
 ) !void {
-    // Rebuild player entities with bot-specific class/owner but no Health/Shield
-    // (HP lives in the shared pool).  Also recompute shared_hp from bot stats.
+    // Rebuild player entities with bot-specific class/owner; HP lives in shared pool.
+    // Recompute shared_hp from bot stats.
     sess.shared_hp = .{ .current = 0, .max = 0 };
-    sess.shared_shield = .{ .hp = 0 };
     for (team.bots, bot_states) |entry, bs| {
         const slot = &sess.players[bs.player_id];
         // Destroy the entity created by spawn_players().
         if (slot.entity != std.math.maxInt(u32)) {
             sess.world.destroy_entity(slot.entity);
         }
-        // Create a fresh entity.  No Health/Shield — shared pool tracks HP.
+        // Create a fresh entity — shared pool tracks HP.
         const e = sess.world.create_entity();
         slot.entity = e;
         // ClassTag is required by the system signature; .fighter is used as a
@@ -320,16 +339,15 @@ test "mixed team beats two-grunt wave" {
 
 test "tank bot absorbs incoming damage with shield rotation" {
     // One bot with the 'tank' profile ({shield, shield, damage}).
-    // wave_lethal_pack: unkillable enemy pool → 1 dmg/round to party pool.
-    // Shield grants ACTION_EFFECT_VALUE = 1 HP to shared shield buffer per action.
+    // wave_lethal_pack: unkillable enemy pool → 1 dmg/round to party pool (fixed intent).
     //
     // Damage-only bot (pool = 30 HP, no shields):
     //   Takes 1 damage every round → pool gone in 30 rounds.
     //
     // Tank bot (pool = 30 HP, {shield, shield, damage} cycle):
-    //   Round 1: +1 shield, -1 → shield 0, pool 30 (no net loss)
-    //   Round 2: +1 shield, -1 → shield 0, pool 30
-    //   Round 3: damage, -1    → pool 29
+    //   Round 1: 1 shield cancels 1 intent → net 0 dmg → pool 30
+    //   Round 2: same → pool 30
+    //   Round 3: damage action, no shield → net 1 dmg → pool 29
     //   ... cycles: shield rounds break even; damage rounds cost 1 HP.
     //   Survives at least as many rounds as the damage-only bot.
     //
@@ -355,9 +373,9 @@ test "tank bot absorbs incoming damage with shield rotation" {
         }},
     };
 
-    var h_tank = try BotHarness.init(allocator, &tank_team, &wave_lethal_pack, "BOTK01".*, .{});
+    var h_tank = try BotHarness.init(allocator, &tank_team,  &wave_lethal_pack, "BOTK01".*, .{ .fixed_enemy_intent_damage = 1 });
     defer h_tank.deinit();
-    var h_dmg = try BotHarness.init(allocator, &damage_team, &wave_lethal_pack, "BOTK02".*, .{});
+    var h_dmg  = try BotHarness.init(allocator, &damage_team, &wave_lethal_pack, "BOTK02".*, .{ .fixed_enemy_intent_damage = 1 });
     defer h_dmg.deinit();
 
     const tank_rounds = try h_tank.run_to_completion(100);

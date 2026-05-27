@@ -14,14 +14,19 @@
 //! combo.  Trailing element tokens with no following action are ignored
 //! during resolution.  See `game_logic.parse_combo` for the canonical
 //! interpretation.
+//!
+//! ## Elemental shields
+//!
+//! Shield actions cancel matching-element damage actions within the same round.
+//! `ElementKey` and `element_key` index the 5-bucket tally arrays used during
+//! round resolution.  Shields do not persist between rounds; unused cancellation
+//! capacity is silently discarded.
+
+const std = @import("std");
 
 pub const Health = struct {
     current: u16,
     max: u16,
-};
-
-pub const Shield = struct {
-    hp: u16,
 };
 
 pub const ClassTag = enum(u8) {
@@ -72,6 +77,21 @@ pub const Element = enum(u8) {
     wind  = 2,
     water = 3,
 };
+
+/// Array index for elemental shield buckets.  `none` covers non-elemental
+/// actions; the four element variants map 1-to-1 from `Element` ordinal + 1.
+pub const ElementKey = enum(u8) {
+    none  = 0,
+    fire  = 1,
+    earth = 2,
+    wind  = 3,
+    water = 4,
+};
+
+/// Map an optional Element to the corresponding ElementKey bucket index.
+pub fn element_key(e: ?Element) ElementKey {
+    return if (e) |el| @enumFromInt(@intFromEnum(el) + 1) else .none;
+}
 
 /// One slot in a combo: either an action or an element modifier.
 /// Wire encoding: action = raw ActionChoice value (0x00–0x02);

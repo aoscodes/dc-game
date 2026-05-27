@@ -152,12 +152,14 @@ fn write_render_inner(
             .players = .{
                 .hp_current = game.snapshot.players.hp_current,
                 .hp_max = game.snapshot.players.hp_max,
-                .shield_hp = game.snapshot.players.shield_hp,
             },
             .enemies = .{
                 .hp_current = game.snapshot.enemies.hp_current,
                 .hp_max = game.snapshot.enemies.hp_max,
-                .shield_hp = game.snapshot.enemies.shield_hp,
+            },
+            .enemy_intent = .{
+                .damage      = game.snapshot.enemy_intent_damage,
+                .element_raw = game.snapshot.enemy_intent_element,
             },
         } else null,
         .winner = if (phase == .game_over) game.winner else null,
@@ -212,7 +214,27 @@ const JsonPlayer = struct {
 const JsonTeamSummary = struct {
     hp_current: u16,
     hp_max: u16,
-    shield_hp: u16,
+};
+
+/// Serialises enemy intent as `{"damage":N,"element":"fire"}` or `{"damage":N}` when non-elemental.
+const JsonEnemyIntent = struct {
+    damage: u16,
+    /// Raw element byte from protocol: 0xFF = non-elemental (omitted), 0–3 = Element ordinal.
+    element_raw: u8,
+
+    pub fn jsonStringify(self: JsonEnemyIntent, jws: anytype) !void {
+        try jws.beginObject();
+        try jws.objectField("damage");
+        try jws.write(self.damage);
+        if (self.element_raw != proto.GameState.INTENT_ELEMENT_NONE) {
+            const el = std.meta.intToEnum(c.Element, self.element_raw) catch null;
+            if (el) |e| {
+                try jws.objectField("element");
+                try jws.write(@tagName(e));
+            }
+        }
+        try jws.endObject();
+    }
 };
 
 const JsonGame = struct {
@@ -226,6 +248,7 @@ const JsonGame = struct {
     entities: []const JsonEntity,
     players: JsonTeamSummary,
     enemies: JsonTeamSummary,
+    enemy_intent: JsonEnemyIntent,
 };
 
 const JsonEntity = struct {
