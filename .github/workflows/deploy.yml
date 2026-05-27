@@ -115,6 +115,7 @@ jobs:
           cp bridge/index.js             deploy/bridge/index.js
           cp bridge/package.json         deploy/bridge/package.json
           cp bridge/package-lock.json    deploy/bridge/package-lock.json
+          cp -r bridge/node_modules      deploy/bridge/node_modules
 
       - name: upload client artifact
         uses: actions/upload-artifact@v4
@@ -195,7 +196,6 @@ jobs:
               /tmp/dragoncon-deploy/zig-out/bin/client \
               /opt/dragoncon/client
             sudo rsync -a --delete /tmp/dragoncon-deploy/bridge/ /opt/dragoncon/bridge/
-            cd /opt/dragoncon/bridge && sudo -u dragoncon npm ci --omit=dev
             sudo systemctl restart dragoncon-bridge
             rm -rf /tmp/dragoncon-deploy
 

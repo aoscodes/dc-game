@@ -66,7 +66,6 @@ deploy ALL=(root) NOPASSWD: /bin/systemctl restart dragoncon-server
 deploy ALL=(root) NOPASSWD: /usr/bin/install -o dragoncon -g dragoncon -m 755 /tmp/dragoncon-deploy/zig-out/bin/client /opt/dragoncon/client
 deploy ALL=(root) NOPASSWD: /usr/bin/rsync -a --delete /tmp/dragoncon-deploy/bridge/ /opt/dragoncon/bridge/
 deploy ALL=(root) NOPASSWD: /bin/systemctl restart dragoncon-bridge
-deploy ALL=(dragoncon) NOPASSWD: /usr/bin/npm
 EOF
 chmod 440 /etc/sudoers.d/deploy
 
