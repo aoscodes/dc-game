@@ -161,6 +161,20 @@ fn write_render_inner(
                 .damage      = game.snapshot.enemy_intent_damage,
                 .element_raw = game.snapshot.enemy_intent_element,
             },
+            .dot_stacks = .{
+                .players = .{
+                    .fire  = game.snapshot.player_dot_stacks[0],
+                    .earth = game.snapshot.player_dot_stacks[1],
+                    .wind  = game.snapshot.player_dot_stacks[2],
+                    .water = game.snapshot.player_dot_stacks[3],
+                },
+                .enemies = .{
+                    .fire  = game.snapshot.enemy_dot_stacks[0],
+                    .earth = game.snapshot.enemy_dot_stacks[1],
+                    .wind  = game.snapshot.enemy_dot_stacks[2],
+                    .water = game.snapshot.enemy_dot_stacks[3],
+                },
+            },
         } else null,
         .winner = if (phase == .game_over) game.winner else null,
     };
@@ -216,6 +230,19 @@ const JsonTeamSummary = struct {
     hp_max: u16,
 };
 
+/// DoT stacks broadcast each frame so the client can display and floater them.
+/// Named by element so Zig's JSON layer emits a proper object, not a byte-string.
+const JsonDotStackSide = struct {
+    fire:  u16,
+    earth: u16,
+    wind:  u16,
+    water: u16,
+};
+const JsonDotStacks = struct {
+    players: JsonDotStackSide,
+    enemies: JsonDotStackSide,
+};
+
 /// Serialises enemy intent as `{"damage":N,"element":"fire"}` or `{"damage":N}` when non-elemental.
 const JsonEnemyIntent = struct {
     damage: u16,
@@ -249,6 +276,7 @@ const JsonGame = struct {
     players: JsonTeamSummary,
     enemies: JsonTeamSummary,
     enemy_intent: JsonEnemyIntent,
+    dot_stacks: JsonDotStacks,
 };
 
 const JsonEntity = struct {

@@ -109,6 +109,15 @@ pub const Session = struct {
     /// Enemy intent chosen at round start; broadcast every frame so clients
     /// can display it during the countdown.
     pending_enemy_intent: logic.EnemyIntent = .{ .damage_per_player = 0, .element = null },
+    /// Damage-over-time stacks on the player party, indexed by Element ordinal
+    /// (0=fire,1=earth,2=wind,3=water).  Sticky: persist until game ends.
+    player_dot_stacks: [4]u16 = [_]u16{0} ** 4,
+    /// DoT stacks on the enemy side; same layout.
+    enemy_dot_stacks: [4]u16 = [_]u16{0} ** 4,
+    /// Number of rounds resolved so far in the current game.
+    /// Reset to 0 on wave start; incremented in reset_round before generate_enemy_combos.
+    /// Even = DoT phase; odd = cleanse phase.
+    round_count: u32 = 0,
     /// PRNG seeded once at init; drives enemy AI randomness.
     prng: std.Random.DefaultPrng,
     profiler: dbg.Profiler(TickZones) = dbg.Profiler(TickZones).init(),
@@ -213,7 +222,10 @@ pub const Session = struct {
         set_world_system_signatures(&self.world);
         for (&self.action_pool) |*a| a.* = @as(?c.ActionCombo, null);
         for (&self.enemy_combos) |*a| a.* = null;
+        self.player_dot_stacks = [_]u16{0} ** 4;
+        self.enemy_dot_stacks  = [_]u16{0} ** 4;
         self.tick_count = 0;
+        self.round_count = 0;
 
         self.phase = .playing;
         self.current_wave = wave;
@@ -293,6 +305,7 @@ pub const Session = struct {
     fn reset_round(self: *Session) void {
         for (&self.action_pool) |*a| a.* = null;
         self.round_timer = self.round_duration;
+        self.round_count += 1;
         // Generate next round's AI before broadcasting round_reset so the
         // intent is available in the very first broadcast after reset.
         self.generate_enemy_combos();
@@ -385,46 +398,133 @@ pub const Session = struct {
     fn resolve_round(self: *Session) !void {
         var ea_buf: [c.MAX_COMBO_LEN]logic.ElementedAction = undefined;
 
-        // --- Tally player actions by element ---
-        var player_damage_by_key: [5]u16 = [_]u16{0} ** 5;
-        var player_shield_by_key: [5]u16 = [_]u16{0} ** 5;
+        // --- Step 1: Tally player actions by element ---
+        // Actions whose element participates in a DoT trigger (dmg+heal same element) or a
+        // cleanse trigger (heal+shield same element) are withheld from normal pools.
+        // DoT-withheld damage → player_dot_dmg_by_key for the Step 3 shield-gate peek-net.
+        // Cleanse-withheld heal+shield → player_cleanse_by_el for Step 2.5 stack removal.
+        var player_damage_by_key:  [5]u16 = [_]u16{0} ** 5;
+        var player_shield_by_key:  [5]u16 = [_]u16{0} ** 5;
+        var player_dot_dmg_by_key: [5]u16 = [_]u16{0} ** 5;
+        var player_cleanse_by_el:  [4]u16 = [_]u16{0} ** 4; // indexed by Element ordinal 0-3
         var heal_pool: u16 = 0;
         for (&self.action_pool) |maybe_combo| {
             const combo = maybe_combo orelse continue;
+            const dot_mask     = logic.detect_dot_triggers(combo);
+            const cleanse_mask = logic.detect_cleanse_triggers(combo);
             const n = logic.parse_combo(combo, &ea_buf);
             for (ea_buf[0..n]) |ea| {
                 const k = @intFromEnum(c.element_key(ea.element));
-                switch (ea.action) {
-                    .damage => player_damage_by_key[k] += 1,
-                    .shield => player_shield_by_key[k] += 1,
-                    .heal   => heal_pool += 1,
+                const el_bit: u4 = if (ea.element) |el|
+                    @as(u4, 1) << @as(u2, @intCast(@intFromEnum(el)))
+                else
+                    0;
+                const dot_withheld     = el_bit != 0 and (dot_mask     & el_bit) != 0 and ea.action != .shield;
+                const cleanse_withheld = el_bit != 0 and (cleanse_mask & el_bit) != 0 and ea.action != .damage;
+                if (dot_withheld) {
+                    if (ea.action == .damage) player_dot_dmg_by_key[k] += 1;
+                    // withheld heal: dropped
+                } else if (cleanse_withheld) {
+                    // heal+shield consumed by cleanse; counted in player_cleanse_by_el
+                    if (ea.action == .heal) {
+                        const i: usize = @intFromEnum(ea.element.?);
+                        player_cleanse_by_el[i] += 1;
+                    }
+                    // shield: counted implicitly via cleanse_mask; don't add to shield pool
+                } else {
+                    switch (ea.action) {
+                        .damage => player_damage_by_key[k] += 1,
+                        .shield => player_shield_by_key[k] += 1,
+                        .heal   => heal_pool += 1,
+                    }
                 }
             }
         }
 
-        // --- Tally enemy actions by element (combos + structured intent) ---
-        var enemy_damage_by_key: [5]u16 = [_]u16{0} ** 5;
-        var enemy_shield_by_key: [5]u16 = [_]u16{0} ** 5;
+        // --- Step 2: Tally enemy actions by element (combos + structured intent) ---
+        var enemy_damage_by_key:  [5]u16 = [_]u16{0} ** 5;
+        var enemy_shield_by_key:  [5]u16 = [_]u16{0} ** 5;
+        var enemy_dot_dmg_by_key: [5]u16 = [_]u16{0} ** 5;
+        var enemy_cleanse_by_el:  [4]u16 = [_]u16{0} ** 4;
         const em_size = self.world.component_arrays.enemy_marker.size;
         for (self.enemy_combos[0..em_size]) |maybe_combo| {
             const combo = maybe_combo orelse continue;
+            const dot_mask     = logic.detect_dot_triggers(combo);
+            const cleanse_mask = logic.detect_cleanse_triggers(combo);
             const n = logic.parse_combo(combo, &ea_buf);
             for (ea_buf[0..n]) |ea| {
                 const k = @intFromEnum(c.element_key(ea.element));
-                switch (ea.action) {
-                    .damage => enemy_damage_by_key[k] += 1,
-                    .shield => enemy_shield_by_key[k] += 1,
-                    .heal   => {}, // enemies don't heal the player party
+                const el_bit: u4 = if (ea.element) |el|
+                    @as(u4, 1) << @as(u2, @intCast(@intFromEnum(el)))
+                else
+                    0;
+                const dot_withheld     = el_bit != 0 and (dot_mask     & el_bit) != 0 and ea.action != .shield;
+                const cleanse_withheld = el_bit != 0 and (cleanse_mask & el_bit) != 0 and ea.action != .damage;
+                if (dot_withheld) {
+                    if (ea.action == .damage) enemy_dot_dmg_by_key[k] += 1;
+                } else if (cleanse_withheld) {
+                    if (ea.action == .heal) {
+                        const i: usize = @intFromEnum(ea.element.?);
+                        enemy_cleanse_by_el[i] += 1;
+                    }
+                } else {
+                    switch (ea.action) {
+                        .damage => enemy_damage_by_key[k] += 1,
+                        .shield => enemy_shield_by_key[k] += 1,
+                        .heal   => {}, // enemy heal not implemented
+                    }
                 }
             }
         }
         // Fold structured intent into the enemy damage tally.
+        // Structured intent is never elemental dmg+heal so it never triggers DoT.
         if (!logic.is_dead(self.shared_enemy_hp)) {
             const ik = @intFromEnum(c.element_key(self.pending_enemy_intent.element));
             enemy_damage_by_key[ik] +|= self.pending_enemy_intent.damage_per_player;
         }
 
-        // --- Net player damage against enemy shields, apply to enemy HP ---
+        // --- Step 2.5: Apply cleanses ---
+        // Each cleanse combo removes 1 stack of the matching DoT element from own side.
+        // Cleanse is unconditional (no opponent-shield gate).
+        // Stack removal happens before Step 4 injection so ticks are reduced accordingly.
+        for (0..4) |i| {
+            self.player_dot_stacks[i] -|= player_cleanse_by_el[i];
+            self.enemy_dot_stacks[i]  -|= enemy_cleanse_by_el[i];
+        }
+
+        // --- Step 3: Peek-nets for DoT trigger check ---
+        // A DoT trigger fires for element i when the withheld elemental damage from that
+        // combo survives the opponent's elemental shields.
+        // player_dot_dmg_by_key[k] > 0 already implies both dmg and heal were present
+        // (detect_dot_triggers guarantees the intersection).
+        for (0..4) |i| {
+            const k: usize = i + 1; // element keys are 1-indexed; 0 = none
+
+            // Player combo triggers DoT on enemies.
+            const player_dot_net = player_dot_dmg_by_key[k] -| enemy_shield_by_key[k];
+            if (player_dot_net > 0) {
+                self.enemy_dot_stacks[i] +|= 1;
+            }
+
+            // Enemy combo triggers DoT on players.
+            const enemy_dot_net = enemy_dot_dmg_by_key[k] -| player_shield_by_key[k];
+            if (enemy_dot_net > 0) {
+                self.player_dot_stacks[i] +|= 1;
+            }
+        }
+
+        // --- Step 4: Inject DoT ticks (including newly-added stacks) into damage pools ---
+        // DoT is elemental; it feeds into the same buckets as direct damage so that
+        // shields net against the combined total in the application step below.
+        for (0..4) |i| {
+            const k: usize = i + 1;
+            player_damage_by_key[k] +|= self.enemy_dot_stacks[i]; // enemy stacks hit players
+            enemy_damage_by_key[k]  +|= self.player_dot_stacks[i]; // player stacks hit enemies
+        }
+
+        // --- Step 5: Net and apply to HP ---
+
+        // Player damage (including DoT ticks on enemy) net against enemy shields → enemy HP.
         for (0..5) |k| {
             const net = player_damage_by_key[k] -| enemy_shield_by_key[k];
             if (net == 0) continue;
@@ -459,7 +559,7 @@ pub const Session = struct {
             });
         }
 
-        // --- Net enemy damage against player shields, apply to player HP ---
+        // Enemy damage (including DoT ticks on players) net against player shields → player HP.
         if (!logic.is_dead(self.shared_enemy_hp)) {
             for (0..5) |k| {
                 const net = enemy_damage_by_key[k] -| player_shield_by_key[k];
@@ -505,25 +605,32 @@ pub const Session = struct {
         return logic.compute_enemy_intent(living, element);
     }
 
-    /// Generate a random ActionCombo for each enemy entity.
+    /// Generate the enemy combo for the current round.
+    ///
+    /// Alternates by round_count parity so the enemy demonstrates both DoT and
+    /// cleanse mechanics:
+    ///   even round → [fire, damage, heal]  — triggers fire DoT on players
+    ///   odd  round → [fire, heal, shield]  — cleanses 1 fire stack from enemy side
+    ///
+    /// All enemies share the same combo each round.
     fn generate_enemy_combos(self: *Session) void {
         const em_arr = &self.world.component_arrays.enemy_marker;
-        for (0..em_arr.size) |i| {
-            const combo_len = self.prng.random().intRangeAtMost(u8, 1, c.MAX_COMBO_LEN);
-            var slots: [c.MAX_COMBO_LEN]c.ComboSlot =
-                [_]c.ComboSlot{.{ .action = .damage }} ** c.MAX_COMBO_LEN;
-            for (0..combo_len) |j| {
-                // 0–3: element token; 4–6: action token (damage/shield/heal); 7: damage
-                const roll = self.prng.random().intRangeAtMost(u8, 0, 7);
-                slots[j] = switch (roll) {
-                    0...3 => .{ .element = @enumFromInt(roll) },
-                    4     => .{ .action = .damage },
-                    5     => .{ .action = .shield },
-                    6     => .{ .action = .heal },
-                    else  => .{ .action = .damage },
-                };
+        const slots: [c.MAX_COMBO_LEN]c.ComboSlot = if (self.round_count % 2 == 0)
+            .{
+                .{ .element = .fire   },
+                .{ .action  = .damage },
+                .{ .action  = .heal   },
+                .{ .action  = .damage }, // pad — ignored (len = 3)
             }
-            self.enemy_combos[i] = .{ .slots = slots, .len = combo_len };
+        else
+            .{
+                .{ .element = .fire   },
+                .{ .action  = .heal   },
+                .{ .action  = .shield },
+                .{ .action  = .damage }, // pad — ignored (len = 3)
+            };
+        for (0..em_arr.size) |i| {
+            self.enemy_combos[i] = .{ .slots = slots, .len = 3 };
         }
     }
 
@@ -632,6 +739,18 @@ pub const Session = struct {
             },
             .enemy_intent_damage  = self.pending_enemy_intent.damage_per_player,
             .enemy_intent_element = intent_element_byte,
+            .player_dot_stacks = .{
+                @intCast(@min(self.player_dot_stacks[0], 255)),
+                @intCast(@min(self.player_dot_stacks[1], 255)),
+                @intCast(@min(self.player_dot_stacks[2], 255)),
+                @intCast(@min(self.player_dot_stacks[3], 255)),
+            },
+            .enemy_dot_stacks = .{
+                @intCast(@min(self.enemy_dot_stacks[0], 255)),
+                @intCast(@min(self.enemy_dot_stacks[1], 255)),
+                @intCast(@min(self.enemy_dot_stacks[2], 255)),
+                @intCast(@min(self.enemy_dot_stacks[3], 255)),
+            },
         };
 
         const pm_arr = &self.world.component_arrays.player_marker;

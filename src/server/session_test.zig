@@ -828,6 +828,8 @@ test "disconnect mid-game: round resolves cleanly for remaining player" {
     // Disconnect player 1 mid-game
     s.sess.disconnect(s.p[1].pid);
 
+    set_enemy_ai(&s.sess, 0); // clear enemy combos so no shields block player damage
+
     // Submit damage from surviving player 0
     try enqueue_action(&s.sess, s.p[0].pid, .damage);
     s.p[0].clear();
@@ -1316,4 +1318,425 @@ test "trailing element in combo is ignored — damage_pool unchanged" {
     try tick_n(&s.sess, 0.11, 1);
 
     try std.testing.expectEqual(hp_before - V, s.sess.shared_enemy_hp.current);
+}
+
+// ---------------------------------------------------------------------------
+// DoT (damage-over-time) tests
+// ---------------------------------------------------------------------------
+
+test "DoT: player [fire,dmg,heal] with no enemy shield → enemy gains 1 fire stack" {
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 0); // no enemy shields
+
+    // [fire, damage, heal] → direct net = 1, heal_element_mask has fire → trigger
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire  },
+        .{ .action  = .damage },
+        .{ .action  = .heal   },
+    }));
+    try tick_n(&s.sess, 0.11, 1);
+
+    try std.testing.expectEqual(@as(u16, 1), s.sess.enemy_dot_stacks[0]); // fire = index 0
+    try std.testing.expectEqual(@as(u16, 0), s.sess.enemy_dot_stacks[1]); // earth unchanged
+}
+
+test "DoT: player fire trigger blocked by enemy fire shield → no stack" {
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    // Enemy has 1 fire shield — exactly cancels the 1 fire damage.
+    s.sess.pending_enemy_intent = .{ .damage_per_player = 0, .element = null };
+    s.sess.enemy_combos[0] = make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire  },
+        .{ .action  = .shield },
+    });
+
+    // Player: [fire, dmg, heal] → direct net = 1 - 1 = 0 → no trigger
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire  },
+        .{ .action  = .damage },
+        .{ .action  = .heal   },
+    }));
+    try tick_n(&s.sess, 0.11, 1);
+
+    try std.testing.expectEqual(@as(u16, 0), s.sess.enemy_dot_stacks[0]);
+}
+
+test "DoT: stacks persist across rounds without re-trigger" {
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 0);
+
+    // Round 1: trigger fire DoT
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire  },
+        .{ .action  = .damage },
+        .{ .action  = .heal   },
+    }));
+    try tick_n(&s.sess, 0.11, 1);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.enemy_dot_stacks[0]);
+
+    // Round 2: no player action; pin enemy AI so it doesn't cleanse the stack
+    set_enemy_ai(&s.sess, 0);
+    try tick_n(&s.sess, 0.11, 1);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.enemy_dot_stacks[0]);
+}
+
+test "DoT: existing enemy stack ticks damage each round" {
+    // Pre-seed 1 fire stack on enemy; verify enemy HP decreases by 1*V each round.
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 0);
+    s.sess.enemy_dot_stacks[0] = 1; // 1 fire stack pre-seeded
+
+    const hp_before = s.sess.shared_enemy_hp.current;
+
+    // No player action — only DoT ticks
+    try tick_n(&s.sess, 0.11, 1);
+
+    // 1 fire stack × V = V damage to enemy
+    try std.testing.expectEqual(hp_before - V, s.sess.shared_enemy_hp.current);
+}
+
+test "DoT: enemy fire stack partially mitigated by player fire shield" {
+    // 2 fire stacks on enemy side (ticks 2*V to players); player has 1 fire shield → net 1*V
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 0);
+    s.sess.player_dot_stacks[0] = 2; // 2 fire stacks on player party
+
+    // Wound party so we can observe damage
+    s.sess.shared_hp.current = 50;
+    const hp_before = s.sess.shared_hp.current;
+
+    // Player submits 1 fire shield
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire  },
+        .{ .action  = .shield },
+    }));
+    try tick_n(&s.sess, 0.11, 1);
+
+    // Fire DoT = 2*V; fire shield absorbs 1*V; net = 1*V damage to party
+    try std.testing.expectEqual(hp_before - V, s.sess.shared_hp.current);
+}
+
+test "DoT: enemy [fire,dmg,heal] triggers player fire stack (symmetric)" {
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    // Enemy has [fire, dmg, heal]; no player shields
+    s.sess.pending_enemy_intent = .{ .damage_per_player = 0, .element = null };
+    s.sess.enemy_combos[0] = make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire  },
+        .{ .action  = .damage },
+        .{ .action  = .heal   },
+    });
+
+    // No player shields
+    try tick_n(&s.sess, 0.11, 1);
+
+    try std.testing.expectEqual(@as(u16, 1), s.sess.player_dot_stacks[0]);
+}
+
+test "DoT: two players both trigger same element → 2 stacks added" {
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 0); // no enemy shields
+
+    // Both players submit [fire, dmg, heal]; each contributes 1 fire-dmg + 1 fire-heal.
+    // Pooled fire-dmg = 2, enemy fire-shield = 0, net = 2 > 0 → trigger fires per trigger check.
+    // But the trigger fires once at the pool level (peek-net checks the pooled damage bucket).
+    // So enemy_dot_stacks[0] increments once per trigger, not per player.
+    // → We expect exactly 1 stack (pool-level trigger, not per-player).
+    const fire_combo = make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire  },
+        .{ .action  = .damage },
+        .{ .action  = .heal   },
+    });
+    try enqueue_combo(&s.sess, s.p[0].pid, fire_combo);
+    try enqueue_combo(&s.sess, s.p[1].pid, fire_combo);
+    try tick_n(&s.sess, 0.11, 1);
+
+    try std.testing.expectEqual(@as(u16, 1), s.sess.enemy_dot_stacks[0]);
+}
+
+test "DoT: trigger fires on second round when re-triggered → stacks accumulate" {
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 0);
+
+    const fire_combo = make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire  },
+        .{ .action  = .damage },
+        .{ .action  = .heal   },
+    });
+
+    // Round 1: trigger → 1 stack
+    try enqueue_combo(&s.sess, s.p[0].pid, fire_combo);
+    try tick_n(&s.sess, 0.11, 1);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.enemy_dot_stacks[0]);
+
+    // reset_round regenerates enemy combos; re-pin so no fire shield blocks the trigger
+    set_enemy_ai(&s.sess, 0);
+
+    // Round 2: trigger again → 2 stacks
+    try enqueue_combo(&s.sess, s.p[0].pid, fire_combo);
+    try tick_n(&s.sess, 0.11, 1);
+    try std.testing.expectEqual(@as(u16, 2), s.sess.enemy_dot_stacks[0]);
+}
+
+// ---------------------------------------------------------------------------
+// Cleanse tests
+// ---------------------------------------------------------------------------
+
+test "cleanse: [fire,heal,shield] removes 1 fire stack from player side" {
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 0);
+    s.sess.player_dot_stacks[0] = 2; // 2 fire stacks on players
+
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .heal   },
+        .{ .action  = .shield },
+    }));
+    try tick_n(&s.sess, 0.11, 1);
+
+    try std.testing.expectEqual(@as(u16, 1), s.sess.player_dot_stacks[0]);
+}
+
+test "cleanse: cleansed stack does not tick this round" {
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 0);
+    s.sess.player_dot_stacks[0] = 1; // exactly 1 fire stack — will be cleansed
+    s.sess.shared_hp.current = 50;
+    const hp_before = s.sess.shared_hp.current;
+
+    // Cleanse the only fire stack; nothing else damages players
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .heal   },
+        .{ .action  = .shield },
+    }));
+    try tick_n(&s.sess, 0.11, 1);
+
+    // Stack removed before tick; 0 stacks × V = 0 damage → HP unchanged
+    try std.testing.expectEqual(hp_before, s.sess.shared_hp.current);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.player_dot_stacks[0]);
+}
+
+test "cleanse: cannot cleanse below 0 stacks (saturating)" {
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 0);
+    // player_dot_stacks[0] = 0; cleanse should not underflow
+
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .heal   },
+        .{ .action  = .shield },
+    }));
+    try tick_n(&s.sess, 0.11, 1);
+
+    try std.testing.expectEqual(@as(u16, 0), s.sess.player_dot_stacks[0]);
+}
+
+test "cleanse: partial — 2 stacks, cleanse 1, remaining tick still fires" {
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 0);
+    s.sess.player_dot_stacks[0] = 2;
+    s.sess.shared_hp.current = 50;
+    const hp_before = s.sess.shared_hp.current;
+
+    // Cleanse 1 of the 2 stacks
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .heal   },
+        .{ .action  = .shield },
+    }));
+    try tick_n(&s.sess, 0.11, 1);
+
+    // 1 stack remains and ticks 1*V damage; hp drops by V
+    try std.testing.expectEqual(hp_before - V, s.sess.shared_hp.current);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.player_dot_stacks[0]);
+}
+
+test "cleanse: two players each cleanse → 2 stacks removed" {
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 0);
+    s.sess.player_dot_stacks[0] = 3; // 3 stacks; both players cleanse → 1 remains
+
+    const cleanse = make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .heal   },
+        .{ .action  = .shield },
+    });
+    try enqueue_combo(&s.sess, s.p[0].pid, cleanse);
+    try enqueue_combo(&s.sess, s.p[1].pid, cleanse);
+    try tick_n(&s.sess, 0.11, 1);
+
+    try std.testing.expectEqual(@as(u16, 1), s.sess.player_dot_stacks[0]);
+}
+
+test "cleanse: enemy [fire,heal,shield] removes 1 enemy fire stack (symmetric)" {
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    s.sess.pending_enemy_intent = .{ .damage_per_player = 0, .element = null };
+    s.sess.enemy_combos[0] = make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .heal   },
+        .{ .action  = .shield },
+    });
+    s.sess.enemy_dot_stacks[0] = 2; // 2 fire stacks on enemies
+
+    try tick_n(&s.sess, 0.11, 1);
+
+    try std.testing.expectEqual(@as(u16, 1), s.sess.enemy_dot_stacks[0]);
+}
+
+test "cleanse: heal and shield are withheld — no HP recovery, no shield pool contribution" {
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    set_enemy_ai(&s.sess, 2); // 2 null-element damage from enemies — enough to hit players if unshielded
+    s.sess.shared_hp.current = 50;
+    const hp_before = s.sess.shared_hp.current;
+
+    // Cleanse combo: heal and shield are withheld, so no shield blocks enemy damage
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .heal   },
+        .{ .action  = .shield },
+    }));
+    try tick_n(&s.sess, 0.11, 1);
+
+    // Enemy dealt 2*V damage; cleanse shield did NOT block it (withheld); no HP recovery either
+    try std.testing.expectEqual(hp_before - 2 * V, s.sess.shared_hp.current);
+}
+
+// ---------------------------------------------------------------------------
+// Enemy AI cycle test
+// ---------------------------------------------------------------------------
+
+test "enemy AI: round 0 DoT trigger, round 1 cleanse" {
+    // Round 0 (round_count=0, even): enemy emits [fire,dmg,heal] → triggers fire DoT on players.
+    //   Player also submits [fire,dmg,heal] → triggers fire DoT on enemies.
+    //   After round 0: player_dot_stacks[0]=1, enemy_dot_stacks[0]=1.
+    //
+    // round_count increments to 1 in reset_round.
+    //
+    // Round 1 (round_count=1, odd): enemy emits [fire,heal,shield] → cleanses enemy_dot_stacks[0]
+    //   by 1 (from 1 → 0).  Player submits nothing.  player_dot_stacks[0] ticks V damage.
+    //   After round 1: enemy_dot_stacks[0]=0, player HP dropped by V.
+
+    const allocator = std.testing.allocator;
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    defer s.deinit();
+
+    s.sess.round_duration = 0.1;
+    try s.sess.start_game_wave(&test_wave_single);
+    // Enemy AI governs combos; zero out structured intent so only combo damage applies.
+    s.sess.pending_enemy_intent = .{ .damage_per_player = 0, .element = null };
+
+    // Round 0: player triggers fire DoT on enemies; enemy AI triggers fire DoT on players.
+    try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .damage },
+        .{ .action  = .heal   },
+    }));
+    try tick_n(&s.sess, 0.11, 1);
+
+    try std.testing.expectEqual(@as(u16, 1), s.sess.enemy_dot_stacks[0]);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.player_dot_stacks[0]);
+
+    // reset_round incremented round_count to 1; enemy AI will now emit cleanse.
+    // Zero structured intent again (reset_round regenerates it).
+    s.sess.pending_enemy_intent = .{ .damage_per_player = 0, .element = null };
+    s.sess.shared_hp.current = 50;
+    const hp_before = s.sess.shared_hp.current;
+
+    // Round 1: no player action; enemy cleanse fires.
+    try tick_n(&s.sess, 0.11, 1);
+
+    // Enemy cleansed its own fire stack → 0
+    try std.testing.expectEqual(@as(u16, 0), s.sess.enemy_dot_stacks[0]);
+    // Player fire stack was NOT cleansed → ticked V damage to players
+    try std.testing.expectEqual(hp_before - V, s.sess.shared_hp.current);
 }

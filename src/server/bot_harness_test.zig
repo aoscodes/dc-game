@@ -311,7 +311,8 @@ test "all_damage team beats a beatable wave" {
         }},
         .next_wave = null,
     };
-    var h = try BotHarness.init(allocator, &bots.team_all_damage, &wave_beatable, "BOTKEY".*, .{});
+    var h = try BotHarness.init(allocator, &bots.team_all_damage, &wave_beatable, "BOTKEY".*,
+        .{ .fixed_enemy_intent_damage = 1 });
     defer h.deinit();
 
     const rounds = try h.run_to_completion(200);
@@ -326,8 +327,11 @@ test "mixed team beats two-grunt wave" {
     // team_mixed: tank (damage), medic (heal), cannon (damage).
     // wave_two_grunts: 2 grunts × 80 HP = 160 shared_enemy_hp.
     // damage_pool = 2/round → 80 rounds to deplete.
+    // fixed_enemy_intent_damage = 2 clears random enemy combos so DoT stacks
+    // don't accumulate and overwhelm the team's heal output.
     const allocator = std.testing.allocator;
-    var h = try BotHarness.init(allocator, &bots.team_mixed, &wave_two_grunts, "BOTKEY".*, .{});
+    var h = try BotHarness.init(allocator, &bots.team_mixed, &wave_two_grunts, "BOTKEY".*,
+        .{ .fixed_enemy_intent_damage = 2 });
     defer h.deinit();
 
     const rounds = try h.run_to_completion(200);

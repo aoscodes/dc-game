@@ -128,6 +128,12 @@ pub const GameState = struct {
     enemy_intent_damage: u16,
     /// Element of the enemy intent: 0xFF = non-elemental, else raw Element ordinal (0–3).
     enemy_intent_element: u8,
+    /// Damage-over-time stacks currently on the player party, indexed by Element ordinal
+    /// (0=fire, 1=earth, 2=wind, 3=water).  Each stack deals 1 damage of that element
+    /// per round.  Saturated to u8 from the session's u16 counter.
+    player_dot_stacks: [4]u8,
+    /// DoT stacks currently on the enemy side; same layout as player_dot_stacks.
+    enemy_dot_stacks: [4]u8,
 
     pub const INTENT_ELEMENT_NONE: u8 = 0xFF;
 
@@ -140,6 +146,8 @@ pub const GameState = struct {
         .enemies             = .{ .hp_current = 0, .hp_max = 0 },
         .enemy_intent_damage  = 0,
         .enemy_intent_element = INTENT_ELEMENT_NONE,
+        .player_dot_stacks    = [_]u8{0} ** 4,
+        .enemy_dot_stacks     = [_]u8{0} ** 4,
     };
 };
 
@@ -250,6 +258,8 @@ fn encode_game_state(w: anytype, p: GameState) !void {
     try encode_team_summary(w, p.enemies);
     try w.writeInt(u16, p.enemy_intent_damage, .little);
     try w.writeByte(p.enemy_intent_element);
+    try w.writeAll(&p.player_dot_stacks);
+    try w.writeAll(&p.enemy_dot_stacks);
 }
 
 fn encode_action_result(w: anytype, p: ActionResult) !void {
@@ -393,6 +403,8 @@ pub fn decode_game_state(reader: anytype) !GameState {
     p.enemies = try decode_team_summary(reader);
     p.enemy_intent_damage  = try reader.readInt(u16, .little);
     p.enemy_intent_element = try reader.readByte();
+    _ = try reader.readAll(&p.player_dot_stacks);
+    _ = try reader.readAll(&p.enemy_dot_stacks);
     return p;
 }
 
@@ -470,6 +482,8 @@ test "round-trip: game_state — round_timer, team summaries, and combo survive"
         .enemies = .{ .hp_current = 240, .hp_max = 240 },
         .enemy_intent_damage  = 0,
         .enemy_intent_element = GameState.INTENT_ELEMENT_NONE,
+        .player_dot_stacks    = [_]u8{0} ** 4,
+        .enemy_dot_stacks     = [_]u8{0} ** 4,
     };
     gs.entities[0] = EntitySnapshot{
         .entity = 7,
@@ -634,6 +648,8 @@ test "round-trip: game_state snapshot with element slot" {
         .enemies = .{ .hp_current = 5,  .hp_max = 5  },
         .enemy_intent_damage  = 0,
         .enemy_intent_element = GameState.INTENT_ELEMENT_NONE,
+        .player_dot_stacks    = [_]u8{0} ** 4,
+        .enemy_dot_stacks     = [_]u8{0} ** 4,
     };
     gs.entities[0] = EntitySnapshot{
         .entity = 1,
@@ -742,4 +758,21 @@ test "round-trip: action_result shield tag" {
     try std.testing.expectEqual(ActionResultTag.shield, decoded.tag);
     try std.testing.expectEqual(@as(u32, 5), decoded.target_entity);
     try std.testing.expectEqual(@as(u16, 3), decoded.value);
+}
+
+test "round-trip: game_state dot stacks survive encode/decode" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    var gs = GameState.blank;
+    gs.player_dot_stacks = .{ 3, 0, 1, 0 }; // 3 fire stacks, 1 wind stack on players
+    gs.enemy_dot_stacks  = .{ 0, 2, 0, 4 }; // 2 earth, 4 water stacks on enemies
+
+    try encode(fbs.writer(), .game_state, gs);
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    const decoded = try decode_game_state(fbs.reader());
+
+    try std.testing.expectEqualSlices(u8, &gs.player_dot_stacks, &decoded.player_dot_stacks);
+    try std.testing.expectEqualSlices(u8, &gs.enemy_dot_stacks,  &decoded.enemy_dot_stacks);
 }

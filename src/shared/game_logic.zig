@@ -75,6 +75,106 @@ pub const EnemyIntent = struct {
     element: ?c.Element,
 };
 
+/// Returns a bitmask (bit i = `@intFromEnum(Element)` ordinal i, 0=fire…3=water)
+/// of elements whose action group in `combo` is **exactly** one damage and one
+/// heal — no other actions.  Groups are delimited by element tokens; actions
+/// before the first element token are null-element and never trigger DoT.
+///
+/// Examples:
+///   [♦, dmg, heal]           → fire bit set   (group = {dmg, heal})
+///   [♦, dmg, heal, shield]   → 0              (group = {dmg, heal, shield})
+///   [♦, dmg, heal, ≋, dmg]   → fire bit set   (fire group = {dmg,heal}; wind = {dmg})
+///   [♦, dmg, dmg, heal]      → 0              (two dmg in fire group)
+///   [♦, dmg, shield, heal]   → 0              (shield in fire group)
+///
+/// Used by `session.resolve_round` to determine which elemental DoT stacks to
+/// apply to the receiving party after damage has cleared the opponent's shields.
+pub fn detect_dot_triggers(combo: c.ActionCombo) u4 {
+    var trigger_mask: u4 = 0;
+    var current_el:   ?c.Element = null;
+    var dmg_count:    u8 = 0;
+    var heal_count:   u8 = 0;
+    var other_count:  u8 = 0; // shields or any non-dmg/heal action
+
+    const flush = struct {
+        fn f(mask: *u4, el: c.Element, dc: u8, hc: u8, oc: u8) void {
+            if (dc == 1 and hc == 1 and oc == 0)
+                mask.* |= @as(u4, 1) << @as(u2, @intCast(@intFromEnum(el)));
+        }
+    }.f;
+
+    for (combo.slots[0..combo.len]) |slot| {
+        switch (slot) {
+            .element => |el| {
+                if (current_el) |prev| flush(&trigger_mask, prev, dmg_count, heal_count, other_count);
+                current_el  = el;
+                dmg_count   = 0;
+                heal_count  = 0;
+                other_count = 0;
+            },
+            .action => |ac| {
+                if (current_el == null) continue; // null-element actions never trigger DoT
+                switch (ac) {
+                    .damage => dmg_count  +|= 1,
+                    .heal   => heal_count +|= 1,
+                    .shield => other_count +|= 1,
+                }
+            },
+        }
+    }
+    if (current_el) |prev| flush(&trigger_mask, prev, dmg_count, heal_count, other_count);
+    return trigger_mask;
+}
+
+/// Returns a bitmask (bit i = `@intFromEnum(Element)` ordinal i, 0=fire…3=water)
+/// of elements whose action group in `combo` is **exactly** one heal and one
+/// shield — no other actions.  Submitting this pattern consumes the heal and
+/// shield (they are withheld from normal pools) and removes 1 DoT stack of
+/// that element from the caster's own side.
+///
+/// Examples:
+///   [♦, heal, shield]        → fire bit set
+///   [♦, heal, shield, dmg]   → 0   (extra action in group)
+///   [♦, heal, heal, shield]  → 0   (extra heal)
+///   [♦, dmg, heal, shield]   → 0   (damage present)
+///   [heal, shield]            → 0   (no element token)
+pub fn detect_cleanse_triggers(combo: c.ActionCombo) u4 {
+    var trigger_mask: u4 = 0;
+    var current_el:   ?c.Element = null;
+    var heal_count:   u8 = 0;
+    var shield_count: u8 = 0;
+    var other_count:  u8 = 0; // damage or any extra action beyond {heal, shield}
+
+    const flush = struct {
+        fn f(mask: *u4, el: c.Element, hc: u8, sc: u8, oc: u8) void {
+            if (hc == 1 and sc == 1 and oc == 0)
+                mask.* |= @as(u4, 1) << @as(u2, @intCast(@intFromEnum(el)));
+        }
+    }.f;
+
+    for (combo.slots[0..combo.len]) |slot| {
+        switch (slot) {
+            .element => |el| {
+                if (current_el) |prev| flush(&trigger_mask, prev, heal_count, shield_count, other_count);
+                current_el    = el;
+                heal_count    = 0;
+                shield_count  = 0;
+                other_count   = 0;
+            },
+            .action => |ac| {
+                if (current_el == null) continue;
+                switch (ac) {
+                    .heal   => heal_count   +|= 1,
+                    .shield => shield_count +|= 1,
+                    .damage => other_count  +|= 1,
+                }
+            },
+        }
+    }
+    if (current_el) |prev| flush(&trigger_mask, prev, heal_count, shield_count, other_count);
+    return trigger_mask;
+}
+
 pub fn compute_enemy_intent(living_enemy_count: u16, element: ?c.Element) EnemyIntent {
     return .{ .damage_per_player = living_enemy_count, .element = element };
 }
@@ -225,4 +325,137 @@ test "parse_combo: mixed — fire persists, water overrides" {
     try std.testing.expectEqual(c.Element.fire,        out[0].element.?);
     try std.testing.expectEqual(c.ActionChoice.shield, out[1].action);
     try std.testing.expectEqual(c.Element.water,       out[1].element.?);
+}
+
+// ---------------------------------------------------------------------------
+// detect_dot_triggers tests
+// ---------------------------------------------------------------------------
+
+test "detect_dot_triggers: [fire,dmg,heal] → fire bit set" {
+    const mask = detect_dot_triggers(make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .damage },
+        .{ .action  = .heal   },
+    }));
+    try std.testing.expectEqual(@as(u4, 0b0001), mask); // bit 0 = fire
+}
+
+test "detect_dot_triggers: [fire,dmg,earth,heal] → 0 (dmg and heal in different groups)" {
+    const mask = detect_dot_triggers(make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .damage },
+        .{ .element = .earth  },
+        .{ .action  = .heal   },
+    }));
+    try std.testing.expectEqual(@as(u4, 0), mask);
+}
+
+test "detect_dot_triggers: [fire,dmg,shield] — no heal → 0" {
+    const mask = detect_dot_triggers(make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .damage },
+        .{ .action  = .shield },
+    }));
+    try std.testing.expectEqual(@as(u4, 0), mask);
+}
+
+test "detect_dot_triggers: [fire,dmg,shield,heal] → 0 (shield in group blocks DoT)" {
+    // MAX_COMBO_LEN=4 fits all four slots exactly
+    const mask = detect_dot_triggers(make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .damage },
+        .{ .action  = .shield },
+        .{ .action  = .heal   },
+    }));
+    try std.testing.expectEqual(@as(u4, 0), mask);
+}
+
+test "detect_dot_triggers: [fire,dmg,heal,wind] → fire bit only (wind group empty)" {
+    // fire group = {dmg,heal} → triggers; wind token is trailing with no action → no trigger
+    const mask = detect_dot_triggers(make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .damage },
+        .{ .action  = .heal   },
+        .{ .element = .wind   },
+    }));
+    try std.testing.expectEqual(@as(u4, 0b0001), mask);
+}
+
+test "detect_dot_triggers: [fire,dmg,dmg,heal] → 0 (extra dmg blocks)" {
+    const mask = detect_dot_triggers(make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .damage },
+        .{ .action  = .damage },
+        .{ .action  = .heal   },
+    }));
+    try std.testing.expectEqual(@as(u4, 0), mask);
+}
+
+test "detect_dot_triggers: null-element dmg+heal → 0 (no element = no DoT)" {
+    const mask = detect_dot_triggers(make_combo(&[_]c.ComboSlot{
+        .{ .action = .damage },
+        .{ .action = .heal   },
+    }));
+    try std.testing.expectEqual(@as(u4, 0), mask);
+}
+
+// ---------------------------------------------------------------------------
+// detect_cleanse_triggers tests
+// ---------------------------------------------------------------------------
+
+test "detect_cleanse_triggers: [fire,heal,shield] → fire bit set" {
+    const mask = detect_cleanse_triggers(make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .heal   },
+        .{ .action  = .shield },
+    }));
+    try std.testing.expectEqual(@as(u4, 0b0001), mask);
+}
+
+test "detect_cleanse_triggers: [fire,heal,shield,wind] → fire bit only (wind group empty)" {
+    const mask = detect_cleanse_triggers(make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .heal   },
+        .{ .action  = .shield },
+        .{ .element = .wind   },
+    }));
+    try std.testing.expectEqual(@as(u4, 0b0001), mask);
+}
+
+test "detect_cleanse_triggers: [fire,heal,shield,dmg] → 0 (extra action in group)" {
+    const mask = detect_cleanse_triggers(make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .heal   },
+        .{ .action  = .shield },
+        .{ .action  = .damage },
+    }));
+    try std.testing.expectEqual(@as(u4, 0), mask);
+}
+
+test "detect_cleanse_triggers: [fire,heal,heal,shield] → 0 (extra heal)" {
+    const mask = detect_cleanse_triggers(make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .heal   },
+        .{ .action  = .heal   },
+        .{ .action  = .shield },
+    }));
+    try std.testing.expectEqual(@as(u4, 0), mask);
+}
+
+test "detect_cleanse_triggers: [fire,dmg,heal,shield] → 0 (damage present)" {
+    const mask = detect_cleanse_triggers(make_combo(&[_]c.ComboSlot{
+        .{ .element = .fire   },
+        .{ .action  = .damage },
+        .{ .action  = .heal   },
+        .{ .action  = .shield },
+    }));
+    try std.testing.expectEqual(@as(u4, 0), mask);
+}
+
+test "detect_cleanse_triggers: [heal,shield] → 0 (no element token)" {
+    const mask = detect_cleanse_triggers(make_combo(&[_]c.ComboSlot{
+        .{ .action = .heal   },
+        .{ .action = .shield },
+    }));
+    try std.testing.expectEqual(@as(u4, 0), mask);
 }

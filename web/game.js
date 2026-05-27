@@ -320,18 +320,29 @@ function drawTeam(game, team, dt) {
         lines.push({ str: `${prefix}dmg -1`, color });
       }
 
-      // Combo: parse element-resolved actions from the entity's combo slots.
-      for (const { action, element } of parseComboSlots(e.combo ?? [])) {
-        const el       = element;
-        const elChar   = el ? (ELEMENT_CHAR[el] ?? "") : "";
-        const color    = el ? (ELEMENT_COLOR[el] ?? ACTION_COLOR[action] ?? C_TEXT)
-                            : (ACTION_COLOR[action] ?? C_TEXT);
-        const prefix   = elChar ? `${elChar} ` : "";
-        const label    = action === "damage" ? "dmg"
-                       : action === "shield" ? "shld"
-                       : "heal";
-        const sign     = action === "damage" ? `-${ACTION_EFFECT_VALUE}`
-                                             : `+${ACTION_EFFECT_VALUE}`;
+      // Combo: detect special groups first, then render remaining actions individually.
+      const combo           = e.combo ?? [];
+      const dotTriggers     = detectDotTriggers(combo);
+      const cleanseTriggers = detectCleanseTriggers(combo);
+      const consumed        = new Set([...dotTriggers, ...cleanseTriggers]);
+
+      for (const el of dotTriggers) {
+        lines.push({ str: `${ELEMENT_CHAR[el] ?? el} DoT +1`, color: ELEMENT_COLOR[el] ?? ACTION_COLOR.damage });
+      }
+      for (const el of cleanseTriggers) {
+        lines.push({ str: `${ELEMENT_CHAR[el] ?? el} Clr 1`, color: ELEMENT_COLOR[el] ?? ACTION_COLOR.heal });
+      }
+
+      for (const { action, element } of parseComboSlots(combo)) {
+        if (element && consumed.has(element)) continue; // already shown as special label
+        const elChar = element ? (ELEMENT_CHAR[element] ?? "") : "";
+        const color  = element ? (ELEMENT_COLOR[element] ?? ACTION_COLOR[action] ?? C_TEXT)
+                               : (ACTION_COLOR[action] ?? C_TEXT);
+        const prefix = elChar ? `${elChar} ` : "";
+        const label  = action === "damage" ? "dmg"
+                     : action === "shield" ? "shld"
+                     : "heal";
+        const sign   = action === "damage" ? `-${ACTION_EFFECT_VALUE}` : `+${ACTION_EFFECT_VALUE}`;
         lines.push({ str: `${prefix}${label} ${sign}`, color });
       }
 
@@ -428,6 +439,39 @@ function parseComboSlots(slots) {
 }
 
 /**
+ * Group combo slots by element token and return element names that satisfy
+ * `predicate(dmgCount, healCount, shieldCount)`.  Mirrors the Zig
+ * detect_dot_triggers / detect_cleanse_triggers group semantics exactly.
+ *
+ * @param {Array<{action?:string, element?:string}>} slots
+ * @param {(dc:number, hc:number, sc:number) => boolean} predicate
+ * @returns {Set<string>}
+ */
+function detectSpecialGroups(slots, predicate) {
+  const result = new Set();
+  let el = null, dc = 0, hc = 0, sc = 0;
+  const flush = () => { if (el && predicate(dc, hc, sc)) result.add(el); };
+  for (const slot of slots) {
+    if (slot.element !== undefined) {
+      flush();
+      el = slot.element; dc = 0; hc = 0; sc = 0;
+    } else if (slot.action !== undefined && el !== null) {
+      if      (slot.action === "damage") dc++;
+      else if (slot.action === "heal")   hc++;
+      else if (slot.action === "shield") sc++;
+    }
+  }
+  flush();
+  return result;
+}
+
+/** Returns Set of element names whose group is exactly {dmg, heal} → DoT trigger. */
+const detectDotTriggers     = s => detectSpecialGroups(s, (dc, hc, sc) => dc === 1 && hc === 1 && sc === 0);
+
+/** Returns Set of element names whose group is exactly {heal, shield} → cleanse trigger. */
+const detectCleanseTriggers = s => detectSpecialGroups(s, (dc, hc, sc) => hc === 1 && sc === 1 && dc === 0);
+
+/**
  * Given a list of entity snapshots (from the prior frame), tally all
  * elemented actions across every player entity's combo.
  *
@@ -460,7 +504,7 @@ function tallyPlayerActions(entities) {
  * @param {object} game   - current game frame (used for enemy count/intent)
  * @param {Array}  prevEntities - entity snapshot from the frame before round_reset
  */
-function spawnRoundSummaryFloaters(game, prevEntities, prevEnemyIntent) {
+function spawnRoundSummaryFloaters(game, prevEntities, prevEnemyIntent, prevDotStacks) {
   const tally = tallyPlayerActions(prevEntities);
 
   // Centre points for spawn zones.
@@ -522,6 +566,32 @@ function spawnRoundSummaryFloaters(game, prevEntities, prevEnemyIntent) {
     const label = elChar ? `-${intent.damage} ${elChar}` : `-${intent.damage}`;
     spawnFloater(label, px + jitter(), py - 22, elColor);
   }
+
+  // DoT tick floaters — show elemental ticks on each side.
+  // prevDotStacks contains the stack counts at the moment the round fired.
+  // A non-zero stack on a side means it ticked damage this round.
+  if (prevDotStacks) {
+    // DoT on enemy side: stacks in prevDotStacks.enemies dealt damage to enemies.
+    let dotEnemyY = ey + 28;
+    for (let i = 0; i < 4; i++) {
+      const elName = ELEMENT_NAMES[i];
+      const stacks = prevDotStacks.enemies[elName];
+      if (!stacks || stacks === 0) continue;
+      const color  = ELEMENT_COLOR[elName] ?? "rgba(255,100,100,1)";
+      spawnFloater(`${ELEMENT_CHAR[elName]} dot -${stacks * ACTION_EFFECT_VALUE}`, ex + jitter(), dotEnemyY, color);
+      dotEnemyY += 22;
+    }
+    // DoT on player side: stacks in prevDotStacks.players dealt damage to players.
+    let dotPlayerY = py + 50;
+    for (let i = 0; i < 4; i++) {
+      const elName = ELEMENT_NAMES[i];
+      const stacks = prevDotStacks.players[elName];
+      if (!stacks || stacks === 0) continue;
+      const color  = ELEMENT_COLOR[elName] ?? "rgba(255,100,100,1)";
+      spawnFloater(`${ELEMENT_CHAR[elName]} dot -${stacks * ACTION_EFFECT_VALUE}`, px + jitter(), dotPlayerY, color);
+      dotPlayerY += 22;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +603,8 @@ let lastRoundSeen    = -1;
 let lastEntitiesSnapshot = [];
 /** Copy of game.enemy_intent from the previous frame (used in round-boundary floaters). */
 let lastEnemyIntentSnapshot = null;
+/** Copy of game.dot_stacks from the previous frame (used in round-boundary floaters). */
+let lastDotStacksSnapshot = null;
 
 /**
  * Call at the start of every drawGame frame.
@@ -541,12 +613,13 @@ let lastEnemyIntentSnapshot = null;
  */
 function updateRoundTracking(game) {
   if (game.round !== lastRoundSeen && lastRoundSeen !== -1) {
-    spawnRoundSummaryFloaters(game, lastEntitiesSnapshot, lastEnemyIntentSnapshot);
+    spawnRoundSummaryFloaters(game, lastEntitiesSnapshot, lastEnemyIntentSnapshot, lastDotStacksSnapshot);
   }
   lastRoundSeen = game.round;
-  // Snapshot current entities and intent so they're available next frame if a round fires.
+  // Snapshot current entities, intent and dot_stacks so they're available next frame if a round fires.
   lastEntitiesSnapshot     = (game.entities ?? []).slice();
   lastEnemyIntentSnapshot  = game.enemy_intent ?? null;
+  lastDotStacksSnapshot    = game.dot_stacks ?? null;
 }
 
 /** Map ActionChoice enum string → display character. */
@@ -558,6 +631,9 @@ const ACTION_COLOR = {
   shield: "rgba(80,160,255,1)",
   heal:   "rgba(100,220,100,1)",
 };
+
+/** Element ordinal → name string; matches protocol Element ordinal order. */
+const ELEMENT_NAMES = ["fire", "earth", "wind", "water"];
 
 /** Map Element enum string → display character (Unicode symbols). */
 const ELEMENT_CHAR = { fire: "♦", earth: "▲", wind: "≋", water: "~" };
@@ -628,9 +704,21 @@ function drawTeamBars(game) {
       { label: "HP",   value: hp_current, frac: hp_current * scale, color: "rgba(60,200,60,0.9)",   bg: C_HP_BG },
       { label: "Heal", value: projHeal,   frac: projHeal   * scale, color: "rgba(140,230,100,0.9)", bg: "rgba(20,50,20,0.6)" },
     ], PLAYER_ZONE.x0, PLAYER_ZONE.x1, y);
+
+    // DoT stacks on the player party (applied by enemies).
+    const dotP = game.dot_stacks?.players;
+    if (dotP) {
+      let dx = PLAYER_ZONE.x0;
+      for (let i = 0; i < 4; i++) {
+        const elName = ELEMENT_NAMES[i];
+        if (!dotP[elName]) continue;
+        text(`${ELEMENT_CHAR[elName]}×${dotP[elName]}`, dx, y + 30, 10, ELEMENT_COLOR[elName]);
+        dx += 38;
+      }
+    }
   }
 
-  // --- Enemy bar + intent label ---
+  // --- Enemy HP bar ---
   const enemySummary = game.enemies;
   if (enemies.length > 0 && enemySummary && enemySummary.hp_max > 0) {
     const { hp_current, hp_max } = enemySummary;
@@ -642,7 +730,17 @@ function drawTeamBars(game) {
       { label: "HP", value: hp_current, frac: hp_current * scale, color: "rgba(255,100,60,0.9)", bg: C_HP_BG },
     ], ENEMY_ZONE.x0, ENEMY_ZONE.x1, y);
 
-
+    // DoT stacks on the enemy side (applied by players).
+    const dotE = game.dot_stacks?.enemies;
+    if (dotE) {
+      let dx = ENEMY_ZONE.x0;
+      for (let i = 0; i < 4; i++) {
+        const elName = ELEMENT_NAMES[i];
+        if (!dotE[elName]) continue;
+        text(`${ELEMENT_CHAR[elName]}×${dotE[elName]}`, dx, y + 16, 10, ELEMENT_COLOR[elName]);
+        dx += 38;
+      }
+    }
   }
 }
 
