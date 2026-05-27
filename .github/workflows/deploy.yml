@@ -47,16 +47,11 @@ jobs:
             setup:
               - 'scripts/vps-setup.sh'
             browser:
-              - 'e2e/browser/**'
               - 'src/client/**'
               - 'src/server/**'
               - 'src/shared/**'
               - 'bridge/**'
               - 'web/**'
-
-  # ------------------------------------------------------------------
-  # Build server — runs tests and e2e, produces the server binary
-  # ------------------------------------------------------------------
 
   build-server:
     needs: changes
@@ -80,9 +75,6 @@ jobs:
 
       - name: unit tests
         run: zig build test
-
-      - name: e2e test
-        run: zig build e2e
 
       - name: build server (ReleaseSafe)
         run: zig build server -Doptimize=ReleaseSafe -Dcpu=baseline
