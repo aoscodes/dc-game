@@ -2,38 +2,21 @@ const std = @import("std");
 const shared = @import("shared");
 const c = shared.components;
 
-pub const InputEventTag = enum {
-    none,
-    damage,
-    shield,
-    heal,
-};
-
-pub const InputEvent = union(InputEventTag) {
-    none: void,
-    damage: void,
-    shield: void,
-    heal: void,
-};
-
 pub fn parse_key_name(name: []const u8) ?RawKey {
-    if (std.mem.eql(u8, name, "ArrowUp")) return .up;
-    if (std.mem.eql(u8, name, "ArrowDown")) return .down;
-    if (std.mem.eql(u8, name, "ArrowLeft")) return .left;
-    if (std.mem.eql(u8, name, "ArrowRight")) return .right;
     if (std.mem.eql(u8, name, "Enter")) return .enter;
     if (std.mem.eql(u8, name, "Escape")) return .escape;
-    if (std.mem.eql(u8, name, "z") or
-        std.mem.eql(u8, name, "Z")) return .z;
-    if (std.mem.eql(u8, name, "x") or
-        std.mem.eql(u8, name, "X")) return .x;
     if (std.mem.eql(u8, name, "1")) return .one;
     if (std.mem.eql(u8, name, "2")) return .two;
     if (std.mem.eql(u8, name, "3")) return .three;
+    if (std.mem.eql(u8, name, "q")) return .q;
+    if (std.mem.eql(u8, name, "w")) return .w;
+    if (std.mem.eql(u8, name, "e")) return .e;
+    if (std.mem.eql(u8, name, "r")) return .r;
+
     return null;
 }
 
-pub const RawKey = enum { up, down, left, right, enter, escape, z, x, one, two, three };
+pub const RawKey = enum { enter, escape, one, two, three, q, w, e, r };
 
 pub const KeyQueue = struct {
     buf: [64]RawKey = undefined,
@@ -60,16 +43,6 @@ pub const KeyQueue = struct {
     }
 };
 
-pub fn poll(queue: *KeyQueue) InputEvent {
-    const key = queue.pop() orelse return .none;
-    return switch (key) {
-        .one => .damage,
-        .two => .shield,
-        .three => .heal,
-        else => .none,
-    };
-}
-
 pub const ComboBuffer = struct {
     actions: [c.MAX_COMBO_LEN]c.ActionChoice = undefined,
     len: u8 = 0,
@@ -83,14 +56,6 @@ pub const ComboBuffer = struct {
 
     pub fn clear(self: *ComboBuffer) void {
         self.len = 0;
-    }
-
-    pub fn is_full(self: *const ComboBuffer) bool {
-        return self.len >= c.MAX_COMBO_LEN;
-    }
-
-    pub fn is_empty(self: *const ComboBuffer) bool {
-        return self.len == 0;
     }
 
     pub fn to_combo(self: *const ComboBuffer) c.ActionCombo {

@@ -6,13 +6,8 @@
 //! Usage:
 //!
 //!   var ta = TrackingAllocator.init(gpa.allocator());
-//!   defer ta.report("server", std.io.getStdErr().writer());
+//!   defer ta.report_stderr("server");
 //!   const allocator = ta.allocator();
-//!   // ... pass allocator to Session.init, etc.
-//!
-//!   // Inspect live stats at any time:
-//!   const s = ta.stats();
-//!   std.log.debug("heap: {} bytes current, {} peak", .{s.current_bytes, s.peak_bytes});
 
 const std = @import("std");
 
@@ -58,25 +53,7 @@ pub const TrackingAllocator = struct {
         };
     }
 
-    pub fn reset_peak(self: *TrackingAllocator) void {
-        const cur: u64 = @intCast(@max(0, self.current_bytes.load(.monotonic)));
-        self.peak_bytes.store(cur, .monotonic);
-    }
-
-    pub fn report(self: *const TrackingAllocator, label: []const u8, writer: anytype) void {
-        const s = self.stats();
-        writer.print(
-            "--- alloc tracker: {s} ---\n" ++
-                "  allocs:  {d}\n" ++
-                "  frees:   {d}\n" ++
-                "  current: {d} bytes\n" ++
-                "  peak:    {d} bytes\n" ++
-                "  total:   {d} bytes\n",
-            .{ label, s.alloc_count, s.free_count, s.current_bytes, s.peak_bytes, s.total_bytes },
-        ) catch {};
-    }
-
-    /// Convenience: dump stats to stderr using std.debug.print.
+    /// Dump stats to stderr using std.debug.print.
     pub fn report_stderr(self: *const TrackingAllocator, label: []const u8) void {
         const s = self.stats();
         std.debug.print(

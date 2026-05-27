@@ -1,17 +1,3 @@
-//! Binary wire protocol for client↔server communication.
-//!
-//! Every message is a packed byte stream:
-//!   [1 byte MsgTag] [payload bytes...]
-//!
-//! All multi-byte integers are little-endian.
-//! Strings are length-prefixed: [u8 len][bytes...] (max 255 bytes).
-//!
-//! Encoding/decoding uses std.io Reader/Writer passed by the caller; no
-//! internal allocation.  The caller owns all buffers.
-//!
-//! Design rule: every field has a fixed or length-prefixed size.  No
-//! optional fields inside a message — use a separate MsgTag variant instead.
-
 const std = @import("std");
 const components = @import("components.zig");
 
@@ -30,7 +16,6 @@ pub const MsgTag = enum(u8) {
     action_result = 0x13,
     round_reset = 0x14,
     game_over = 0x15,
-    @"error" = 0x1F,
 };
 
 pub const JoinLobby = struct {
@@ -40,11 +25,6 @@ pub const JoinLobby = struct {
 
 pub const ChooseClass = struct {
     class: components.ClassTag,
-};
-
-pub const ChoosePosition = struct {
-    col: u8,
-    row: u8,
 };
 
 pub const ChooseAction = struct {
@@ -98,8 +78,6 @@ pub const EntitySnapshot = struct {
 
 pub const MAX_ENTITIES_WIRE: u16 = 64;
 
-/// Aggregate pool state for one team, broadcast once per game_state message.
-/// Replaces the old pattern of duplicating pool HP across every EntitySnapshot.
 pub const TeamSummary = struct {
     hp_current: u16,
     hp_max: u16,
@@ -138,10 +116,6 @@ pub const GameOver = struct {
     winner: WinnerId,
 };
 
-pub const Error = struct {
-    message: [64]u8,
-};
-
 pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
     try writer.writeByte(@intFromEnum(tag));
     const T = @TypeOf(payload);
@@ -167,7 +141,6 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
         .game_state => try encode_game_state(writer, payload),
         .action_result => try encode_action_result(writer, payload),
         .game_over => try writer.writeByte(@intFromEnum(payload.winner)),
-        .@"error" => try writer.writeAll(&payload.message),
     }
 }
 

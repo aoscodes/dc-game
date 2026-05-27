@@ -57,8 +57,6 @@ pub const EnemyTeam = struct {};
 
 pub const GameWorld = ecs.World(
     .{
-        .health = c.Health,
-        .shield = c.Shield,
         .class = c.Class,
         .team = c.Team,
         .owner = c.Owner,
@@ -107,7 +105,6 @@ pub const Session = struct {
     shared_enemy_shield: c.Shield = .{ .hp = 0 },
     action_pool: [MAX_PLAYERS]?c.ActionCombo,
     profiler: dbg.Profiler(TickZones) = dbg.Profiler(TickZones).init(),
-    recorder: ?dbg.replay.Recorder(std.io.AnyWriter) = null,
 
     pub fn init(allocator: std.mem.Allocator, join_code: [6]u8) !Session {
         var players: [MAX_PLAYERS]PlayerSlot = undefined;
@@ -183,11 +180,6 @@ pub const Session = struct {
     pub fn set_class(self: *Session, player_id: u8, class: c.ClassTag) void {
         if (player_id >= MAX_PLAYERS) return;
         self.players[player_id].class = class;
-    }
-
-    pub fn set_ready(self: *Session, player_id: u8, ready: bool) void {
-        if (player_id >= MAX_PLAYERS) return;
-        self.players[player_id].ready = ready;
     }
 
     pub fn all_ready(self: *const Session) bool {
@@ -607,11 +599,6 @@ pub const Session = struct {
         try proto.encode(fbs.writer(), .game_state, snap);
         try self.broadcast_raw(fbs.getWritten());
 
-        if (self.recorder) |*rec| {
-            rec.record(snap) catch |err| {
-                std.log.warn("replay recorder error: {}", .{err});
-            };
-        }
     }
 
     fn broadcast_action_result(self: *Session, result: proto.ActionResult) !void {

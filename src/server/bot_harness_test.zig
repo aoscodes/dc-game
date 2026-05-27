@@ -178,15 +178,6 @@ pub const BotHarness = struct {
         return r;
     }
 
-    // -----------------------------------------------------------------------
-    // Query helpers
-    // -----------------------------------------------------------------------
-
-    pub fn living_player_count(self: *const BotHarness) usize {
-        const idx = comptime GameWorld.system_index_of(PlayerTeam);
-        return self.session.world.system_entity_sets[idx].count();
-    }
-
 };
 
 // ---------------------------------------------------------------------------

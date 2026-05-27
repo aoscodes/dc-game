@@ -6,7 +6,7 @@
 //!   prof.begin(.drain);
 //!   // ... work ...
 //!   prof.end(.drain);
-//!   if (prof.should_report()) prof.report(std.io.getStdErr().writer(), 0);
+//!   if (prof.should_report(interval)) prof.report_stderr("label");
 //!
 //! `zones` is a comptime enum whose fields name each measurement zone.
 //! All storage is inline in the Profiler struct; no heap is touched.
@@ -69,32 +69,7 @@ pub fn Profiler(comptime ZoneEnum: type) type {
             return self.calls_since_report >= interval;
         }
 
-        /// Write a table of zone stats to `writer`.  `label` is a prefix line.
-        /// Resets `calls_since_report` to 0.
-        pub fn report(self: *Self, writer: anytype, label: []const u8) void {
-            if (label.len > 0) writer.print("--- profiler: {s} ---\n", .{label}) catch {};
-            const fields = @typeInfo(ZoneEnum).@"enum".fields;
-            inline for (fields, 0..) |f, i| {
-                const z = &self.zones[i];
-                if (z.count != 0) {
-                    const avg = z.total_ns / z.count;
-                    writer.print(
-                        "  {s:<16} cnt={d:>6}  last={d:>7}us  avg={d:>7}us  min={d:>7}us  max={d:>7}us\n",
-                        .{
-                            f.name,
-                            z.count,
-                            z.last_ns / 1000,
-                            avg / 1000,
-                            z.min_ns / 1000,
-                            z.max_ns / 1000,
-                        },
-                    ) catch {};
-                }
-            }
-            self.calls_since_report = 0;
-        }
-
-        /// Convenience: dump stats to stderr using std.debug.print.
+        /// Dump stats to stderr using std.debug.print.
         /// Safe to call from any thread; does not require a writer.
         pub fn report_stderr(self: *Self, label: []const u8) void {
             if (label.len > 0) std.debug.print("--- profiler: {s} ---\n", .{label});
@@ -119,11 +94,6 @@ pub fn Profiler(comptime ZoneEnum: type) type {
             self.calls_since_report = 0;
         }
 
-        /// Zero all accumulated stats (keeps the struct alive).
-        pub fn reset(self: *Self) void {
-            self.zones = [_]Zone{.{}} ** n;
-            self.calls_since_report = 0;
-        }
     };
 }
 
@@ -159,18 +129,7 @@ test "profiler: should_report throttle" {
     p.begin(.x);
     p.end(.x);
     try std.testing.expect(p.should_report(3));
-    // report resets counter
-    var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    p.report(fbs.writer(), "test");
+    // report_stderr resets counter
+    p.report_stderr("test");
     try std.testing.expect(!p.should_report(3));
-}
-
-test "profiler: reset clears state" {
-    const Zones = enum { z };
-    var p = Profiler(Zones).init();
-    p.begin(.z);
-    p.end(.z);
-    p.reset();
-    try std.testing.expect(p.zones[0].count == 0);
 }

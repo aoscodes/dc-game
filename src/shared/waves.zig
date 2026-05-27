@@ -35,30 +35,24 @@ pub const Wave = struct {
 };
 
 pub const DefaultStats = struct {
-    attack: u16,
-    defense: u16,
-    speed_base: f32,
     max_hp: u16,
 };
 
 pub fn class_defaults(tag: ClassTag) DefaultStats {
     return switch (tag) {
-        .grunt => .{ .attack = 12, .defense = 8, .speed_base = 0.18, .max_hp = 80 },
-        .archer => .{ .attack = 18, .defense = 4, .speed_base = 0.22, .max_hp = 55 },
-        .shaman => .{ .attack = 8, .defense = 6, .speed_base = 0.15, .max_hp = 60 },
-        .boss => .{ .attack = 25, .defense = 16, .speed_base = 0.10, .max_hp = 220 },
-        .fighter => .{ .attack = 20, .defense = 14, .speed_base = 0.20, .max_hp = 120 },
-        .mage => .{ .attack = 28, .defense = 5, .speed_base = 0.17, .max_hp = 70 },
-        .healer => .{ .attack = 10, .defense = 8, .speed_base = 0.16, .max_hp = 80 },
+        .grunt => .{ .max_hp = 80 },
+        .archer => .{ .max_hp = 55 },
+        .shaman => .{ .max_hp = 60 },
+        .boss => .{ .max_hp = 220 },
+        .fighter => .{ .max_hp = 120 },
+        .mage => .{ .max_hp = 70 },
+        .healer => .{ .max_hp = 80 },
     };
 }
 
 pub fn resolve_stats(class: ClassTag, override: StatOverride) DefaultStats {
     const d = class_defaults(class);
     return .{
-        .attack = override.attack orelse d.attack,
-        .defense = override.defense orelse d.defense,
-        .speed_base = override.speed_base orelse d.speed_base,
         .max_hp = override.max_hp orelse d.max_hp,
     };
 }

@@ -139,11 +139,6 @@ fn consume_payload(tag: proto.MsgTag, r: anytype) bool {
         .action_result => if (proto.decode_action_result(r)) |_| true else |_| false,
         .round_reset => true, // zero-payload message
         .game_over => if (proto.decode_game_over(r)) |_| true else |_| false,
-        .@"error" => blk: {
-            var buf: [64]u8 = undefined;
-            _ = r.readAll(&buf) catch break :blk false;
-            break :blk true;
-        },
     };
 }
 

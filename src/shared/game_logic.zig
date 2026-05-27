@@ -1,5 +1,3 @@
-//! Pure game logic: combat math and round resolution.
-
 const std = @import("std");
 const c = @import("components.zig");
 
@@ -41,27 +39,14 @@ pub fn resolve_heal_pool(health: *c.Health, pool_size: u16) void {
     apply_heal(health, pool_size * ACTION_EFFECT_VALUE);
 }
 
-// ---------------------------------------------------------------------------
-// Enemy intent abstraction
-//
-// `EnemyIntent` is the authoritative description of what the enemy side does
-// each round.  Callers use only this struct — never raw enemy counts — so
-// future AI extensions only need to change `compute_enemy_intent`.
-// ---------------------------------------------------------------------------
-
 pub const EnemyIntent = struct {
-    /// Total damage dealt to each living player this round.
     damage_per_player: u16,
 };
 
-/// Each living enemy deals exactly 1 damage per player, so
-/// `damage_per_player = living_enemy_count`.
 pub fn compute_enemy_intent(living_enemy_count: u16) EnemyIntent {
     return .{ .damage_per_player = living_enemy_count };
 }
 
-/// Apply enemy intent damage to a single player, absorbing from shield first.
-/// Returns the raw HP damage that landed (post-shield).
 pub fn apply_enemy_intent(
     health: *c.Health,
     shield: *c.Shield,

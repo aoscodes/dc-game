@@ -298,37 +298,8 @@ pub fn World(
             self.refresh_systems(entity, sig);
         }
 
-        pub fn remove_component(self: *Self, entity: Entity, comptime C: type) void {
-            @field(self.component_arrays, comp_field(C)).remove(entity);
-
-            var sig = self.entity_manager.get_signature(entity);
-            sig.unset(component_type(C));
-            self.entity_manager.set_signature(entity, sig);
-            self.refresh_systems(entity, sig);
-        }
-
         pub fn get_component(self: *Self, entity: Entity, comptime C: type) *C {
             return @field(self.component_arrays, comp_field(C)).get(entity);
-        }
-
-        // ------------------------------------------------------------------
-        // System access
-        // ------------------------------------------------------------------
-
-        /// Direct pointer to a system's state struct.
-        pub fn get_system(self: *Self, comptime S: type) *S {
-            return &@field(self.systems, sys_field(S));
-        }
-
-        /// Call cb(world, entity, system_ptr) for each entity tracked by S.
-        pub fn each(
-            self: *Self,
-            comptime S: type,
-            comptime cb: fn (*Self, Entity, *S) void,
-        ) void {
-            const sys_ptr = self.get_system(S);
-            var iter = self.system_entity_sets[comptime system_index(S)].iterator(.{});
-            while (iter.next()) |usize_entity| cb(self, @intCast(usize_entity), sys_ptr);
         }
 
         // ------------------------------------------------------------------

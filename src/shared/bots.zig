@@ -34,8 +34,6 @@ pub const Profile = struct {
 
 pub const BotStats = struct {
     max_hp: u16,
-    attack: u16 = 0,
-    defense: u16 = 0,
 };
 
 pub const BotEntry = struct {
@@ -59,11 +57,6 @@ pub const profile_all_heal = Profile{
     .moves = &[_]Move{.heal},
 };
 
-pub const profile_all_shield = Profile{
-    .label = "all_shield",
-    .moves = &[_]Move{.shield},
-};
-
 pub const profile_balanced = Profile{
     .label = "balanced",
     .moves = &[_]Move{ .damage, .damage, .shield, .heal },
@@ -74,23 +67,16 @@ pub const profile_tank = Profile{
     .moves = &[_]Move{ .shield, .shield, .damage },
 };
 
-const fighter_stats = BotStats{ .max_hp = 120, .attack = 20, .defense = 14 };
-const tank_stats = BotStats{ .max_hp = 200, .attack = 10, .defense = 20 };
-const cannon_stats = BotStats{ .max_hp = 70, .attack = 28, .defense = 5 };
-const support_stats = BotStats{ .max_hp = 80, .attack = 10, .defense = 8 };
+const fighter_stats = BotStats{ .max_hp = 120 };
+const tank_stats = BotStats{ .max_hp = 200 };
+const cannon_stats = BotStats{ .max_hp = 70 };
+const support_stats = BotStats{ .max_hp = 80 };
 
 pub const team_all_damage = BotTeam{
     .label = "team_all_damage",
     .bots = &[_]BotEntry{
         .{ .name = "DmgBot1", .stats = fighter_stats, .profile = &profile_all_damage },
         .{ .name = "DmgBot2", .stats = fighter_stats, .profile = &profile_all_damage },
-    },
-};
-
-pub const team_all_heal = BotTeam{
-    .label = "team_all_heal",
-    .bots = &[_]BotEntry{
-        .{ .name = "HealBot", .stats = support_stats, .profile = &profile_all_heal },
     },
 };
 

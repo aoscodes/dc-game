@@ -39,32 +39,6 @@ pub fn inspect(world: anytype, entity: ecs.Entity, writer: anytype) void {
     }
 }
 
-/// Print a one-line summary of every living entity in `living_slice`.
-///
-///   entity 0  [grid_pos health speed class team owner stats action_state]
-///
-pub fn inspect_all(world: anytype, living: []const ecs.Entity, writer: anytype) void {
-    for (living) |entity| {
-        inspect_one_line(world, entity, writer);
-    }
-}
-
-fn inspect_one_line(world: anytype, entity: ecs.Entity, writer: anytype) void {
-    writer.print("entity {}  [", .{entity}) catch {};
-    const comp_arrays = &world.component_arrays;
-    const CT = @TypeOf(comp_arrays.*);
-    const fields = @typeInfo(CT).@"struct".fields;
-    var first = true;
-    inline for (fields) |f| {
-        const arr = &@field(comp_arrays, f.name);
-        if (!arr.has(entity)) continue;
-        if (!first) writer.writeByte(' ') catch {};
-        writer.writeAll(f.name) catch {};
-        first = false;
-    }
-    writer.writeAll("]\n") catch {};
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
