@@ -158,7 +158,7 @@ test "replay: record then play back" {
     };
     gs1.entities[0] = proto.EntitySnapshot.blank;
     gs1.entities[0].entity = 0;
-    gs1.entities[0].class = .fighter;
+    gs1.entities[0].kind = .player;
     gs1.entities[0].team = .players;
     var gs2 = gs1;
     gs2.tick = 2;

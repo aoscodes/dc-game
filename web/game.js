@@ -22,7 +22,7 @@ const C_MENU_BG = "rgba(20,20,40,0.86)";
 const C_MENU_BORDER = C_HEADER;
 const C_SEL = C_CURSOR;
 
-const CLASSES = ["fighter", "mage", "healer", "grunt", "archer", "shaman", "boss"];
+const CLASSES = ["player", "grunt", "archer", "shaman", "boss"];
 
 const sprites = new Map();
 
@@ -243,7 +243,7 @@ function drawLobby(lobby) {
     const color = p.id === lobby.player_id ? "rgba(255,255,100,1)" : C_TEXT;
     const ready = p.ready ? "[READY]" : "[     ]";
     const conn = p.connected ? "" : " (disconnected)";
-    text(`${p.name}  ${p.class}  ${ready}${conn}`, 60, y, 20, color);
+    text(`${p.name}  ${p.kind}  ${ready}${conn}`, 60, y, 20, color);
   });
 
   const pickerY = listY + 6 * 36 + 20;
@@ -263,12 +263,12 @@ function drawLobby(lobby) {
  * @param {boolean} flip - mirror horizontally (enemies)
  */
 function drawEntitySprite(e, cx, cy, lastAction, dt, flip) {
-  const sp = sprites.get(e.class);
+  const sp = sprites.get(e.kind);
   if (!sp) return;
 
   const { img, meta } = sp;
   const { frame_w, frame_h, clips } = meta;
-  const { frame } = tickAnimator(e.id, e.class, lastAction, dt);
+  const { frame } = tickAnimator(e.id, e.kind, lastAction, dt);
   const clip = clips[animState.get(e.id)?.clip ?? "idle"] ?? clips["idle"];
 
   const srcX = frame * frame_w;

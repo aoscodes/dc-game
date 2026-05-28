@@ -91,7 +91,7 @@ fn write_render_inner(
         players_buf[i] = .{
             .id = p.player_id,
             .name = p.name[0..p.name_len],
-            .class = p.class,
+            .kind = p.kind,
             .ready = p.ready,
             .connected = p.connected,
             .grid_col = p.grid_col,
@@ -116,7 +116,7 @@ fn write_render_inner(
         }
         entities_buf[i] = .{
             .id = e.entity,
-            .class = e.class,
+            .kind = e.kind,
             .team = e.team,
             .owner = e.owner,
             .last_action = anim,
@@ -218,7 +218,7 @@ const JsonLobby = struct {
 const JsonPlayer = struct {
     id: u8,
     name: []const u8,
-    class: c.ClassTag,
+    kind: c.EntityKind,
     ready: bool,
     connected: bool,
     grid_col: u8,
@@ -281,7 +281,7 @@ const JsonGame = struct {
 
 const JsonEntity = struct {
     id: u32,
-    class: c.ClassTag,
+    kind: c.EntityKind,
     team: c.TeamId,
     owner: u8,
     last_action: ?c.ActionAnimation,

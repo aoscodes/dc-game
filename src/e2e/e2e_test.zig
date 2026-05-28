@@ -186,10 +186,9 @@ fn run_bot_inner(ctx: *BotCtx) !void {
 
                 if (in_game) break; // shouldn't happen, but be safe
 
-                // Send join_lobby + choose_class exactly once.
+                // Send join_lobby exactly once.
                 if (!sent_join) {
                     try send_join_lobby(&client, ctx.name);
-                    try send_choose_class(&client, .fighter);
                     sent_join = true;
                 }
 
@@ -265,13 +264,6 @@ fn send_join_lobby(client: *ws.Client, name: []const u8) !void {
     var p = proto.JoinLobby{ .name = [_]u8{0} ** 16, .name_len = name_len };
     @memcpy(p.name[0..name_len], name[0..name_len]);
     try proto.encode(fbs.writer(), .join_lobby, p);
-    try client.writeBin(fbs.getWritten());
-}
-
-fn send_choose_class(client: *ws.Client, class: shared.ClassTag) !void {
-    var buf: [4]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try proto.encode(fbs.writer(), .choose_class, proto.ChooseClass{ .class = class });
     try client.writeBin(fbs.getWritten());
 }
 

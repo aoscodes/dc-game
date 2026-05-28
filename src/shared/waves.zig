@@ -9,58 +9,27 @@
 //! `ALL_WAVES`.  No other file needs to change.
 
 const components = @import("components.zig");
-const ClassTag = components.ClassTag;
-
-/// Per-field overrides for a spawned entity's stats.  Null = use class default.
-/// Using optionals avoids the zero-sentinel bug where explicitly setting a
-/// stat to 0 would be indistinguishable from "not overridden".
-pub const StatOverride = struct {
-    attack: ?u16 = null,
-    defense: ?u16 = null,
-    speed_base: ?f32 = null,
-    max_hp: ?u16 = null,
-};
+const EntityKind = components.EntityKind;
+const Statblock = components.Statblock;
 
 pub const SpawnEntry = struct {
-    class: ClassTag,
+    kind:     EntityKind,
     grid_col: u2,
     grid_row: u2,
-    stats: StatOverride = .{},
+    stats:    Statblock,
 };
 
 pub const Wave = struct {
-    label: []const u8,
-    entries: []const SpawnEntry,
+    label:     []const u8,
+    entries:   []const SpawnEntry,
     next_wave: ?[]const u8 = null,
 };
-
-pub const DefaultStats = struct {
-    max_hp: u16,
-};
-
-pub fn class_defaults(tag: ClassTag) DefaultStats {
-    return switch (tag) {
-        .grunt => .{ .max_hp = 80 },
-        .archer => .{ .max_hp = 55 },
-        .shaman => .{ .max_hp = 60 },
-        .boss => .{ .max_hp = 220 },
-        .fighter => .{ .max_hp = 120 },
-        .mage => .{ .max_hp = 70 },
-        .healer => .{ .max_hp = 80 },
-    };
-}
-
-pub fn resolve_stats(class: ClassTag, override: StatOverride) DefaultStats {
-    const d = class_defaults(class);
-    return .{
-        .max_hp = override.max_hp orelse d.max_hp,
-    };
-}
 
 pub const wave_01_basic = Wave{
     .label = "wave_01_basic",
     .entries = &[_]SpawnEntry{
-        .{ .class = .grunt, .grid_col = 0, .grid_row = 0 },
+        .{ .kind = .grunt, .grid_col = 0, .grid_row = 0,
+           .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
     },
     .next_wave = null,
 };
@@ -68,11 +37,16 @@ pub const wave_01_basic = Wave{
 pub const wave_02_spread = Wave{
     .label = "wave_02_spread",
     .entries = &[_]SpawnEntry{
-        .{ .class = .grunt, .grid_col = 0, .grid_row = 0 },
-        .{ .class = .grunt, .grid_col = 2, .grid_row = 0 },
-        .{ .class = .archer, .grid_col = 1, .grid_row = 1 },
-        .{ .class = .archer, .grid_col = 0, .grid_row = 2 },
-        .{ .class = .archer, .grid_col = 2, .grid_row = 2 },
+        .{ .kind = .grunt,  .grid_col = 0, .grid_row = 0,
+           .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .grunt,  .grid_col = 2, .grid_row = 0,
+           .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .archer, .grid_col = 1, .grid_row = 1,
+           .stats = .{ .hp = 55, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .archer, .grid_col = 0, .grid_row = 2,
+           .stats = .{ .hp = 55, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .archer, .grid_col = 2, .grid_row = 2,
+           .stats = .{ .hp = 55, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
     },
     .next_wave = "wave_03_healer_back",
 };
@@ -80,10 +54,14 @@ pub const wave_02_spread = Wave{
 pub const wave_03_healer_back = Wave{
     .label = "wave_03_healer_back",
     .entries = &[_]SpawnEntry{
-        .{ .class = .grunt, .grid_col = 0, .grid_row = 0 },
-        .{ .class = .grunt, .grid_col = 1, .grid_row = 0 },
-        .{ .class = .grunt, .grid_col = 2, .grid_row = 0 },
-        .{ .class = .shaman, .grid_col = 1, .grid_row = 2 },
+        .{ .kind = .grunt,  .grid_col = 0, .grid_row = 0,
+           .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .grunt,  .grid_col = 1, .grid_row = 0,
+           .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .grunt,  .grid_col = 2, .grid_row = 0,
+           .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .shaman, .grid_col = 1, .grid_row = 2,
+           .stats = .{ .hp = 60, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
     },
     .next_wave = "wave_04_all_archers",
 };
@@ -91,10 +69,14 @@ pub const wave_03_healer_back = Wave{
 pub const wave_04_all_archers = Wave{
     .label = "wave_04_all_archers",
     .entries = &[_]SpawnEntry{
-        .{ .class = .archer, .grid_col = 0, .grid_row = 0 },
-        .{ .class = .archer, .grid_col = 2, .grid_row = 0 },
-        .{ .class = .archer, .grid_col = 0, .grid_row = 2 },
-        .{ .class = .archer, .grid_col = 2, .grid_row = 2 },
+        .{ .kind = .archer, .grid_col = 0, .grid_row = 0,
+           .stats = .{ .hp = 55, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .archer, .grid_col = 2, .grid_row = 0,
+           .stats = .{ .hp = 55, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .archer, .grid_col = 0, .grid_row = 2,
+           .stats = .{ .hp = 55, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .archer, .grid_col = 2, .grid_row = 2,
+           .stats = .{ .hp = 55, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
     },
     .next_wave = "wave_05_boss_plus_grunts",
 };
@@ -102,9 +84,12 @@ pub const wave_04_all_archers = Wave{
 pub const wave_05_boss_plus_grunts = Wave{
     .label = "wave_05_boss_plus_grunts",
     .entries = &[_]SpawnEntry{
-        .{ .class = .grunt, .grid_col = 0, .grid_row = 0 },
-        .{ .class = .grunt, .grid_col = 2, .grid_row = 0 },
-        .{ .class = .boss, .grid_col = 1, .grid_row = 1 },
+        .{ .kind = .grunt, .grid_col = 0, .grid_row = 0,
+           .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .grunt, .grid_col = 2, .grid_row = 0,
+           .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .boss,  .grid_col = 1, .grid_row = 1,
+           .stats = .{ .hp = 220, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
     },
     .next_wave = "wave_06_full_grid",
 };
@@ -112,27 +97,33 @@ pub const wave_05_boss_plus_grunts = Wave{
 pub const wave_06_full_grid = Wave{
     .label = "wave_06_full_grid",
     .entries = &[_]SpawnEntry{
-        .{ .class = .grunt, .grid_col = 0, .grid_row = 0 },
-        .{ .class = .grunt, .grid_col = 1, .grid_row = 0 },
-        .{ .class = .grunt, .grid_col = 2, .grid_row = 0 },
-        .{ .class = .archer, .grid_col = 0, .grid_row = 1 },
-        .{ .class = .shaman, .grid_col = 1, .grid_row = 2 },
-        .{ .class = .archer, .grid_col = 2, .grid_row = 1 },
+        .{ .kind = .grunt,  .grid_col = 0, .grid_row = 0,
+           .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .grunt,  .grid_col = 1, .grid_row = 0,
+           .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .grunt,  .grid_col = 2, .grid_row = 0,
+           .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .archer, .grid_col = 0, .grid_row = 1,
+           .stats = .{ .hp = 55, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .shaman, .grid_col = 1, .grid_row = 2,
+           .stats = .{ .hp = 60, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
+        .{ .kind = .archer, .grid_col = 2, .grid_row = 1,
+           .stats = .{ .hp = 55, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
     },
 };
 
 pub const WaveEntry = struct {
     label: []const u8,
-    wave: *const Wave,
+    wave:  *const Wave,
 };
 
 pub const ALL_WAVES = [_]WaveEntry{
-    .{ .label = wave_01_basic.label, .wave = &wave_01_basic },
-    .{ .label = wave_02_spread.label, .wave = &wave_02_spread },
-    .{ .label = wave_03_healer_back.label, .wave = &wave_03_healer_back },
-    .{ .label = wave_04_all_archers.label, .wave = &wave_04_all_archers },
-    .{ .label = wave_05_boss_plus_grunts.label, .wave = &wave_05_boss_plus_grunts },
-    .{ .label = wave_06_full_grid.label, .wave = &wave_06_full_grid },
+    .{ .label = wave_01_basic.label,           .wave = &wave_01_basic },
+    .{ .label = wave_02_spread.label,          .wave = &wave_02_spread },
+    .{ .label = wave_03_healer_back.label,     .wave = &wave_03_healer_back },
+    .{ .label = wave_04_all_archers.label,     .wave = &wave_04_all_archers },
+    .{ .label = wave_05_boss_plus_grunts.label,.wave = &wave_05_boss_plus_grunts },
+    .{ .label = wave_06_full_grid.label,       .wave = &wave_06_full_grid },
 };
 
 pub fn find_wave(label: []const u8) ?*const Wave {

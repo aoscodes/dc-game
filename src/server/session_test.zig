@@ -28,15 +28,21 @@ const V = logic.ACTION_EFFECT_VALUE;
 // Minimal test waves
 // ---------------------------------------------------------------------------
 
+const default_stats = c.Statblock{
+    .attack = 1, .shield = 1, .heal = 1,
+    .fire = 1, .earth = 1, .wind = 1, .water = 1,
+    .hp = 0, .level = 1,
+};
+
 /// One grunt that survives many rounds (HP = 100 * V, attack = 1).
 /// With pool=2 players, deals V*2 damage per round → needs 50 rounds to die.
 const test_wave_single = waves.Wave{
     .label = "test_single",
     .entries = &[_]waves.SpawnEntry{.{
-        .class = .grunt,
+        .kind = .grunt,
         .grid_col = 0,
         .grid_row = 0,
-        .stats = .{ .attack = 1, .defense = 1, .max_hp = V * 100, .speed_base = 0.001 },
+        .stats = blk: { var s = default_stats; s.hp = V * 100; break :blk s; },
     }},
     .next_wave = null,
 };
@@ -45,10 +51,10 @@ const test_wave_single = waves.Wave{
 const test_wave_one_hp = waves.Wave{
     .label = "test_one_hp",
     .entries = &[_]waves.SpawnEntry{.{
-        .class = .grunt,
+        .kind = .grunt,
         .grid_col = 0,
         .grid_row = 0,
-        .stats = .{ .attack = 1, .defense = 1, .max_hp = V, .speed_base = 0.001 },
+        .stats = blk: { var s = default_stats; s.hp = V; break :blk s; },
     }},
     .next_wave = null,
 };
@@ -57,10 +63,10 @@ const test_wave_one_hp = waves.Wave{
 const test_wave_to_real = waves.Wave{
     .label = "test_to_real",
     .entries = &[_]waves.SpawnEntry{.{
-        .class = .grunt,
+        .kind = .grunt,
         .grid_col = 0,
         .grid_row = 0,
-        .stats = .{ .attack = 1, .defense = 1, .max_hp = 1, .speed_base = 0.001 },
+        .stats = blk: { var s = default_stats; s.hp = 1; break :blk s; },
     }},
     .next_wave = "wave_01_basic",
 };
@@ -126,7 +132,6 @@ fn drain(raw: []const u8, arena: std.mem.Allocator) ![]Msg {
 fn consume_payload(tag: proto.MsgTag, r: anytype) bool {
     return switch (tag) {
         .join_lobby    => if (proto.decode_join_lobby(r))    |_| true else |_| false,
-        .choose_class  => if (proto.decode_choose_class(r))  |_| true else |_| false,
         .choose_action => if (proto.decode_choose_action(r)) |_| true else |_| false,
         .reconnect     => if (proto.decode_reconnect(r))     |_| true else |_| false,
         .ready_up      => true, // zero-payload
@@ -206,8 +211,6 @@ const TwoPlayerSession = struct {
 fn init_two_player_session(
     self: *TwoPlayerSession,
     allocator: std.mem.Allocator,
-    class0: c.ClassTag,
-    class1: c.ClassTag,
 ) !void {
     self.allocator = allocator;
     self.p[0].buf = .empty;
@@ -221,9 +224,6 @@ fn init_two_player_session(
     const pid1 = self.sess.join(self.p[1].transport(), "") orelse return error.JoinFailed;
     self.p[0].pid = pid0;
     self.p[1].pid = pid1;
-
-    self.sess.set_class(pid0, class0);
-    self.sess.set_class(pid1, class1);
 
     const slot0 = &self.sess.players[pid0];
     @memcpy(slot0.name[0..5], "Alice");
@@ -245,7 +245,7 @@ test "join sets name in lobby_update" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .mage);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.p[0].clear();
@@ -268,7 +268,7 @@ test "lobby_update carries correct player_id" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .mage);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.p[0].clear();
@@ -291,7 +291,7 @@ test "lobby_update carries round_duration" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .mage);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 5.0;
@@ -312,7 +312,7 @@ test "all ready triggers game_start with round_duration" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .healer);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 4.0;
@@ -362,7 +362,7 @@ test "damage pool reduces shared enemy HP" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -386,7 +386,7 @@ test "damage pool: action_result.damage broadcast" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -409,7 +409,7 @@ test "kill enemy with exactly enough damage" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -442,7 +442,7 @@ test "shield cancels equal element-matched enemy damage — HP unchanged" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -463,7 +463,7 @@ test "heal pool heals shared party pool" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -494,7 +494,7 @@ test "null-element shield granted this round absorbs null-element enemy damage" 
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -522,7 +522,7 @@ test "enemy depletes shared pool — enemies win" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -553,7 +553,7 @@ test "shared enemy pool depleted — players win" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -580,7 +580,7 @@ test "wave chain advances to next wave" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -604,7 +604,7 @@ test "action can be overwritten before round resolves" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.5; // long round
@@ -638,7 +638,7 @@ test "action pool resets after each round" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -659,7 +659,7 @@ test "no actions submitted — enemy still attacks shared pool" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -681,7 +681,7 @@ test "round_timer counts down and resets" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 1.0;
@@ -711,7 +711,7 @@ test "mixed pool: damage + shield in one round" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -739,7 +739,7 @@ test "enemy pool alive deals 1 damage to party per round" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -747,8 +747,8 @@ test "enemy pool alive deals 1 damage to party per round" {
     const two_enemy_wave = waves.Wave{
         .label = "t_two",
         .entries = &[_]waves.SpawnEntry{
-            .{ .class = .grunt, .grid_col = 0, .grid_row = 0, .stats = .{ .attack = 1, .defense = 1, .max_hp = 99, .speed_base = 0.001 } },
-            .{ .class = .grunt, .grid_col = 1, .grid_row = 0, .stats = .{ .attack = 1, .defense = 1, .max_hp = 99, .speed_base = 0.001 } },
+            .{ .kind = .grunt, .grid_col = 0, .grid_row = 0, .stats = .{ .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .hp = 99, .level = 1 } },
+            .{ .kind = .grunt, .grid_col = 1, .grid_row = 0, .stats = .{ .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .hp = 99, .level = 1 } },
         },
         .next_wave = null,
     };
@@ -769,7 +769,7 @@ test "enemy intent depletes shared pool when heal cannot outpace it" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -794,7 +794,7 @@ test "game_state wire: round_timer decrement reflected in broadcast" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 1.0;
@@ -819,7 +819,7 @@ test "disconnect mid-game: round resolves cleanly for remaining player" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -849,7 +849,7 @@ test "heal at full shared HP — HP stays at max" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -875,7 +875,7 @@ test "action_result heal broadcast value matches pool size" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -920,7 +920,7 @@ test "disconnect in lobby: slot freed and player_count decremented" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .mage);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     try std.testing.expectEqual(@as(u8, 2), s.sess.player_count);
@@ -943,32 +943,6 @@ test "disconnect in lobby: slot freed and player_count decremented" {
     try std.testing.expectEqual(@as(u8, 1), lu.player_count);
 }
 
-test "choose_class: class reflected in next lobby_update" {
-    const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
-    defer s.deinit();
-
-    const pid = s.p[0].pid;
-    try enqueue_msg(&s.sess, pid, .choose_class, proto.ChooseClass{ .class = .mage });
-    // tick to drain queue (still in lobby)
-    try s.sess.tick(0.016);
-
-    s.p[0].clear();
-    try s.sess.broadcast_lobby_update();
-
-    const msgs = try drain(s.p[0].buf.items, arena);
-    const m = find_tag(msgs, .lobby_update) orelse return error.NoLobbyUpdate;
-    var fbs = std.io.fixedBufferStream(m.payload);
-    const lu = try proto.decode_lobby_update(fbs.reader());
-
-    try std.testing.expectEqual(c.ClassTag.mage, lu.players[pid].class);
-}
-
 test "reconnect to lobby slot: slot re-occupied without join" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -976,7 +950,7 @@ test "reconnect to lobby slot: slot re-occupied without join" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .healer);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     const pid = s.p[0].pid;
@@ -1009,7 +983,7 @@ test "reconnect restores slot" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .healer);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     const pid = s.p[0].pid;
@@ -1077,7 +1051,7 @@ test "combo [dmg,dmg] → damage_pool = 2" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1104,7 +1078,7 @@ test "combo [dmg,shld,heal,dmg] → damage, shield cancel, and heal all apply" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1131,7 +1105,7 @@ test "combo overwrite before round fires — latest combo wins" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.5;
@@ -1163,7 +1137,7 @@ test "cancel_combo nulls the pool slot" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.5;
@@ -1183,7 +1157,7 @@ test "two combos from different players — both contribute" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1209,7 +1183,7 @@ test "round_reset broadcast after resolve_round" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1226,7 +1200,7 @@ test "action pool resets after combo round" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1249,7 +1223,7 @@ test "element combo [fire, damage, damage] → damage_pool = 2" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1276,7 +1250,7 @@ test "element-mismatched shield does not cancel enemy damage" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1301,7 +1275,7 @@ test "trailing element in combo is ignored — damage_pool unchanged" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1327,7 +1301,7 @@ test "trailing element in combo is ignored — damage_pool unchanged" {
 test "DoT: player [fire,dmg,heal] with no enemy shield → enemy gains 1 fire stack" {
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1349,7 +1323,7 @@ test "DoT: player [fire,dmg,heal] with no enemy shield → enemy gains 1 fire st
 test "DoT: player fire trigger blocked by enemy fire shield → no stack" {
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1375,7 +1349,7 @@ test "DoT: player fire trigger blocked by enemy fire shield → no stack" {
 test "DoT: stacks persist across rounds without re-trigger" {
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1401,7 +1375,7 @@ test "DoT: existing enemy stack ticks damage each round" {
     // Pre-seed 1 fire stack on enemy; verify enemy HP decreases by 1*V each round.
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1422,7 +1396,7 @@ test "DoT: enemy fire stack partially mitigated by player fire shield" {
     // 2 fire stacks on enemy side (ticks 2*V to players); player has 1 fire shield → net 1*V
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1448,7 +1422,7 @@ test "DoT: enemy fire stack partially mitigated by player fire shield" {
 test "DoT: enemy [fire,dmg,heal] triggers player fire stack (symmetric)" {
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1470,7 +1444,7 @@ test "DoT: enemy [fire,dmg,heal] triggers player fire stack (symmetric)" {
 test "DoT: two players both trigger same element → 2 stacks added" {
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1497,7 +1471,7 @@ test "DoT: two players both trigger same element → 2 stacks added" {
 test "DoT: trigger fires on second round when re-triggered → stacks accumulate" {
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1531,7 +1505,7 @@ test "DoT: trigger fires on second round when re-triggered → stacks accumulate
 test "cleanse: [fire,heal,shield] removes 1 fire stack from player side" {
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1552,7 +1526,7 @@ test "cleanse: [fire,heal,shield] removes 1 fire stack from player side" {
 test "cleanse: cleansed stack does not tick this round" {
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1578,7 +1552,7 @@ test "cleanse: cleansed stack does not tick this round" {
 test "cleanse: cannot cleanse below 0 stacks (saturating)" {
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1599,7 +1573,7 @@ test "cleanse: cannot cleanse below 0 stacks (saturating)" {
 test "cleanse: partial — 2 stacks, cleanse 1, remaining tick still fires" {
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1625,7 +1599,7 @@ test "cleanse: partial — 2 stacks, cleanse 1, remaining tick still fires" {
 test "cleanse: two players each cleanse → 2 stacks removed" {
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1648,7 +1622,7 @@ test "cleanse: two players each cleanse → 2 stacks removed" {
 test "cleanse: enemy [fire,heal,shield] removes 1 enemy fire stack (symmetric)" {
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1669,7 +1643,7 @@ test "cleanse: enemy [fire,heal,shield] removes 1 enemy fire stack (symmetric)" 
 test "cleanse: heal and shield are withheld — no HP recovery, no shield pool contribution" {
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;
@@ -1707,7 +1681,7 @@ test "enemy AI: round 0 DoT trigger, round 1 cleanse" {
 
     const allocator = std.testing.allocator;
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator, .fighter, .fighter);
+    try init_two_player_session(&s, allocator);
     defer s.deinit();
 
     s.sess.round_duration = 0.1;

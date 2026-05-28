@@ -29,18 +29,28 @@ pub const Health = struct {
     max: u16,
 };
 
-pub const ClassTag = enum(u8) {
-    fighter = 0,
-    mage = 1,
-    healer = 2,
-    grunt = 3,
-    archer = 4,
-    shaman = 5,
-    boss = 6,
+pub const EntityKind = enum(u8) {
+    player = 0,
+    grunt  = 1,
+    archer = 2,
+    shaman = 3,
+    boss   = 4,
 };
 
-pub const Class = struct {
-    tag: ClassTag,
+pub const Kind = struct {
+    tag: EntityKind,
+};
+
+pub const Statblock = struct {
+    attack: u16,
+    shield: u16,
+    heal:   u16,
+    fire:   u16,
+    earth:  u16,
+    wind:   u16,
+    water:  u16,
+    hp:     u16,
+    level:  u16,
 };
 
 pub const TeamId = enum(u8) {
@@ -69,7 +79,7 @@ pub const ActionChoice = enum(u8) {
     shield = 1,
     heal = 2,
 
-    pub const size = @typeInfo(ElementKey).@"enum".fields.len;
+    pub const size = @typeInfo(ActionChoice).@"enum".fields.len;
 };
 
 /// Elemental modifier applied to following action slots in a combo.
@@ -79,7 +89,7 @@ pub const Element = enum(u8) {
     wind = 2,
     water = 3,
 
-    pub const size = @typeInfo(ElementKey).@"enum".fields.len;
+    pub const size = @typeInfo(Element).@"enum".fields.len;
 };
 
 /// Array index for elemental shield buckets.  `none` covers non-elemental

@@ -3,7 +3,6 @@ const components = @import("components.zig");
 
 pub const MsgTag = enum(u8) {
     join_lobby = 0x01,
-    choose_class = 0x02,
     ready_up = 0x03,
     choose_action = 0x04,
     reconnect = 0x05,
@@ -21,10 +20,6 @@ pub const MsgTag = enum(u8) {
 pub const JoinLobby = struct {
     name: [16]u8,
     name_len: u8,
-};
-
-pub const ChooseClass = struct {
-    class: components.ClassTag,
 };
 
 pub const ChooseAction = struct {
@@ -69,7 +64,7 @@ pub const PlayerInfo = struct {
     player_id: u8,
     name: [16]u8,
     name_len: u8,
-    class: components.ClassTag,
+    kind: components.EntityKind,
     ready: bool,
     connected: bool,
     grid_col: u8,
@@ -93,7 +88,7 @@ pub const GameStart = struct {
 
 pub const EntitySnapshot = struct {
     entity: u32,
-    class: components.ClassTag,
+    kind: components.EntityKind,
     team: components.TeamId,
     owner: u8,
     combo_len: u8,
@@ -102,7 +97,7 @@ pub const EntitySnapshot = struct {
     /// A safe blank value (cannot use std.mem.zeroes because ComboSlot is a union).
     pub const blank = EntitySnapshot{
         .entity     = 0,
-        .class      = .grunt,
+        .kind       = .grunt,
         .team       = .players,
         .owner      = 0xFF,
         .combo_len  = 0,
@@ -182,7 +177,6 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
 
     switch (tag) {
         .join_lobby => try encode_join_lobby(writer, payload),
-        .choose_class => try writer.writeByte(@intFromEnum(payload.class)),
         .ready_up => {},
         .choose_action => try writer.writeByte(@intFromEnum(payload.action)),
         .reconnect => try writer.writeByte(payload.player_id),
@@ -218,7 +212,7 @@ fn encode_lobby_update(w: anytype, p: LobbyUpdate) !void {
         try w.writeByte(pl.player_id);
         try w.writeByte(pl.name_len);
         try w.writeAll(pl.name[0..pl.name_len]);
-        try w.writeByte(@intFromEnum(pl.class));
+        try w.writeByte(@intFromEnum(pl.kind));
         try w.writeByte(if (pl.ready) 1 else 0);
         try w.writeByte(if (pl.connected) 1 else 0);
         try w.writeByte(pl.grid_col);
@@ -246,7 +240,7 @@ fn encode_game_state(w: anytype, p: GameState) !void {
     while (i < p.entity_count) : (i += 1) {
         const e = p.entities[i];
         try w.writeInt(u32, e.entity, .little);
-        try w.writeByte(@intFromEnum(e.class));
+        try w.writeByte(@intFromEnum(e.kind));
         try w.writeByte(@intFromEnum(e.team));
         try w.writeByte(e.owner);
         try w.writeByte(e.combo_len);
@@ -271,7 +265,7 @@ fn encode_action_result(w: anytype, p: ActionResult) !void {
 
 pub const DecodeError = error{
     UnknownTag,
-    InvalidClass,
+    InvalidKind,
     InvalidActionChoice,
     InvalidElement,
     InvalidTeam,
@@ -293,13 +287,6 @@ pub fn decode_join_lobby(reader: anytype) !JoinLobby {
     var p = JoinLobby{ .name = [_]u8{0} ** 16, .name_len = len };
     _ = try reader.readAll(p.name[0..len]);
     return p;
-}
-
-pub fn decode_choose_class(reader: anytype) !ChooseClass {
-    const byte = try reader.readByte();
-    const class = std.meta.intToEnum(components.ClassTag, byte) catch
-        return DecodeError.InvalidClass;
-    return .{ .class = class };
 }
 
 pub fn decode_choose_action(reader: anytype) !ChooseAction {
@@ -343,9 +330,9 @@ pub fn decode_lobby_update(reader: anytype) !LobbyUpdate {
         p.players[i].name = [_]u8{0} ** 16;
         p.players[i].name_len = nlen;
         _ = try reader.readAll(p.players[i].name[0..nlen]);
-        const class_byte = try reader.readByte();
-        p.players[i].class = std.meta.intToEnum(components.ClassTag, class_byte) catch
-            return DecodeError.InvalidClass;
+        const kind_byte = try reader.readByte();
+        p.players[i].kind = std.meta.intToEnum(components.EntityKind, kind_byte) catch
+            return DecodeError.InvalidKind;
         p.players[i].ready = (try reader.readByte()) != 0;
         p.players[i].connected = (try reader.readByte()) != 0;
         p.players[i].grid_col = try reader.readByte();
@@ -382,9 +369,9 @@ pub fn decode_game_state(reader: anytype) !GameState {
     while (i < p.entity_count) : (i += 1) {
         var e: EntitySnapshot = undefined;
         e.entity = try reader.readInt(u32, .little);
-        const class_byte = try reader.readByte();
-        e.class = std.meta.intToEnum(components.ClassTag, class_byte) catch
-            return DecodeError.InvalidClass;
+        const kind_byte = try reader.readByte();
+        e.kind = std.meta.intToEnum(components.EntityKind, kind_byte) catch
+            return DecodeError.InvalidKind;
         const team_byte = try reader.readByte();
         e.team = std.meta.intToEnum(components.TeamId, team_byte) catch
             return DecodeError.InvalidTeam;
@@ -487,7 +474,7 @@ test "round-trip: game_state — round_timer, team summaries, and combo survive"
     };
     gs.entities[0] = EntitySnapshot{
         .entity = 7,
-        .class = .fighter,
+        .kind = .player,
         .team = .players,
         .owner = 0,
         .combo_len = 2,
@@ -530,7 +517,7 @@ test "round-trip: lobby_update — round_duration survives" {
         .player_id = 0,
         .name = [_]u8{0} ** 16,
         .name_len = 3,
-        .class = .fighter,
+        .kind = .player,
         .ready = false,
         .connected = true,
         .grid_col = 1,
@@ -653,7 +640,7 @@ test "round-trip: game_state snapshot with element slot" {
     };
     gs.entities[0] = EntitySnapshot{
         .entity = 1,
-        .class  = .mage,
+        .kind   = .player,
         .team   = .players,
         .owner  = 0,
         .combo_len = 2,

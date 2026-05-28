@@ -87,8 +87,8 @@ pub const BotHarness = struct {
     /// Initialise the harness.
     ///
     /// - Joins each bot from `team` as an occupied, connected PlayerSlot.
-    /// - Sets HP from BotEntry.stats.max_hp (ClassTag is forced to .fighter
-    ///   as a placeholder; class is otherwise irrelevant since stat overrides
+    /// - Sets HP from BotEntry.stats.max_hp (Kind is forced to .player
+    ///   as a placeholder; entity kind is otherwise irrelevant since stat overrides
     ///   are applied directly in spawn_bots below).
     /// - Starts the game against `wave` directly, bypassing the lobby ready flow.
     ///
@@ -209,8 +209,8 @@ pub const BotHarness = struct {
 // Internal: respawn player entities with BotStats HP
 // ---------------------------------------------------------------------------
 
-/// After start_game_wave() spawns players using class_defaults, this function
-/// destroys those entities and recreates them with the HP values from BotStats.
+/// After start_game_wave() spawns players, this function destroys those entities
+/// and recreates them with the HP values from BotStats.
 /// This is done after start_game_wave (not before) so the world is fully
 /// initialised and system signatures are set.
 fn respawn_bots(
@@ -218,7 +218,7 @@ fn respawn_bots(
     team: *const bots.BotTeam,
     bot_states: []const BotState,
 ) !void {
-    // Rebuild player entities with bot-specific class/owner; HP lives in shared pool.
+    // Rebuild player entities with bot-specific owner; HP lives in shared pool.
     // Recompute shared_hp from bot stats.
     sess.shared_hp = .{ .current = 0, .max = 0 };
     for (team.bots, bot_states) |entry, bs| {
@@ -230,9 +230,7 @@ fn respawn_bots(
         // Create a fresh entity — shared pool tracks HP.
         const e = sess.world.create_entity();
         slot.entity = e;
-        // ClassTag is required by the system signature; .fighter is used as a
-        // no-op placeholder — bots.zig has no ClassTag concept.
-        sess.world.add_component(e, c.Class{ .tag = .fighter });
+        sess.world.add_component(e, c.Kind{ .tag = .player });
         sess.world.add_component(e, c.Team{ .id = .players });
         sess.world.add_component(e, c.Owner{ .player_id = bs.player_id });
         sess.world.add_component(e, c.PlayerMarker{});
@@ -247,14 +245,20 @@ fn respawn_bots(
 // Tests
 // ---------------------------------------------------------------------------
 
+const base_enemy_stats = c.Statblock{
+    .attack = 1, .shield = 1, .heal = 1,
+    .fire = 1, .earth = 1, .wind = 1, .water = 1,
+    .hp = 0, .level = 1,
+};
+
 /// One enemy with HP = V so a single damage action depletes the shared enemy pool.
 const wave_one_shot = waves.Wave{
     .label = "bot_one_shot",
     .entries = &[_]waves.SpawnEntry{.{
-        .class = .grunt,
+        .kind = .grunt,
         .grid_col = 0,
         .grid_row = 0,
-        .stats = .{ .max_hp = shared.game_logic.ACTION_EFFECT_VALUE, .attack = 1 },
+        .stats = blk: { var s = base_enemy_stats; s.hp = shared.game_logic.ACTION_EFFECT_VALUE; break :blk s; },
     }},
     .next_wave = null,
 };
@@ -264,10 +268,10 @@ const wave_one_shot = waves.Wave{
 const wave_unkillable = waves.Wave{
     .label = "bot_unkillable",
     .entries = &[_]waves.SpawnEntry{.{
-        .class = .grunt,
+        .kind = .grunt,
         .grid_col = 0,
         .grid_row = 0,
-        .stats = .{ .max_hp = 60_000, .attack = 1 },
+        .stats = blk: { var s = base_enemy_stats; s.hp = 60_000; break :blk s; },
     }},
     .next_wave = null,
 };
@@ -278,7 +282,7 @@ const wave_unkillable = waves.Wave{
 const wave_overwhelming = waves.Wave{
     .label = "bot_overwhelming",
     .entries = &[_]waves.SpawnEntry{
-        .{ .class = .grunt, .grid_col = 0, .grid_row = 0, .stats = .{ .max_hp = 60_000, .attack = 1 } },
+        .{ .kind = .grunt, .grid_col = 0, .grid_row = 0, .stats = blk: { var s = base_enemy_stats; s.hp = 60_000; break :blk s; } },
     },
     .next_wave = null,
 };
@@ -290,8 +294,8 @@ const wave_lethal_pack = wave_overwhelming;
 const wave_two_grunts = waves.Wave{
     .label = "bot_two_grunts",
     .entries = &[_]waves.SpawnEntry{
-        .{ .class = .grunt, .grid_col = 0, .grid_row = 0, .stats = .{ .max_hp = 80, .attack = 1 } },
-        .{ .class = .grunt, .grid_col = 1, .grid_row = 0, .stats = .{ .max_hp = 80, .attack = 1 } },
+        .{ .kind = .grunt, .grid_col = 0, .grid_row = 0, .stats = blk: { var s = base_enemy_stats; s.hp = 80; break :blk s; } },
+        .{ .kind = .grunt, .grid_col = 1, .grid_row = 0, .stats = blk: { var s = base_enemy_stats; s.hp = 80; break :blk s; } },
     },
     .next_wave = null,
 };
@@ -304,10 +308,10 @@ test "all_damage team beats a beatable wave" {
     const wave_beatable = waves.Wave{
         .label = "bot_beatable",
         .entries = &[_]waves.SpawnEntry{.{
-            .class = .grunt,
+            .kind = .grunt,
             .grid_col = 0,
             .grid_row = 0,
-            .stats = .{ .max_hp = 40, .attack = 1 },
+            .stats = blk: { var s = base_enemy_stats; s.hp = 40; break :blk s; },
         }},
         .next_wave = null,
     };

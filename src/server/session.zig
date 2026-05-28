@@ -57,7 +57,8 @@ pub const EnemyTeam = struct {};
 
 pub const GameWorld = ecs.World(
     .{
-        .class = c.Class,
+        .kind = c.Kind,
+        .statblock = c.Statblock,
         .team = c.Team,
         .owner = c.Owner,
         .player_marker = c.PlayerMarker,
@@ -77,7 +78,7 @@ pub const PlayerSlot = struct {
     player_id: u8,
     name: [16]u8 = [_]u8{0} ** 16,
     name_len: u8 = 0,
-    class: c.ClassTag = .fighter,
+    statblock: c.Statblock = .{ .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .hp = 120, .level = 1 },
     ready: bool = false,
     entity: ecs.Entity = std.math.maxInt(ecs.Entity),
     transport: ?shared.Transport = null,
@@ -195,11 +196,6 @@ pub const Session = struct {
         }
     }
 
-    pub fn set_class(self: *Session, player_id: u8, class: c.ClassTag) void {
-        if (player_id >= MAX_PLAYERS) return;
-        self.players[player_id].class = class;
-    }
-
     pub fn all_ready(self: *const Session) bool {
         var connected: u8 = 0;
         var ready: u8 = 0;
@@ -243,14 +239,14 @@ pub const Session = struct {
         self.shared_hp = .{ .current = 0, .max = 0 };
         for (&self.players) |*p| {
             if (!p.occupied or !p.connected) continue;
-            const d = waves.class_defaults(p.class);
             const e = self.world.create_entity();
             p.entity = e;
-            self.world.add_component(e, c.Class{ .tag = p.class });
+            self.world.add_component(e, c.Kind{ .tag = .player });
+            self.world.add_component(e, p.statblock);
             self.world.add_component(e, c.Team{ .id = .players });
             self.world.add_component(e, c.Owner{ .player_id = p.player_id });
             self.world.add_component(e, c.PlayerMarker{});
-            const new_max = @as(u32, self.shared_hp.max) + @as(u32, d.max_hp);
+            const new_max = @as(u32, self.shared_hp.max) + @as(u32, p.statblock.hp);
             self.shared_hp.max = @intCast(@min(new_max, @as(u32, std.math.maxInt(u16))));
             self.shared_hp.current = self.shared_hp.max;
         }
@@ -260,12 +256,12 @@ pub const Session = struct {
         std.log.info("spawning wave: {s} ({} enemies)", .{ wave.label, wave.entries.len });
         self.shared_enemy_hp = .{ .current = 0, .max = 0 };
         for (wave.entries) |entry| {
-            const d = waves.resolve_stats(entry.class, entry.stats);
             const e = self.world.create_entity();
-            self.world.add_component(e, c.Class{ .tag = entry.class });
+            self.world.add_component(e, c.Kind{ .tag = entry.kind });
+            self.world.add_component(e, entry.stats);
             self.world.add_component(e, c.Team{ .id = .enemies });
             self.world.add_component(e, c.EnemyMarker{});
-            const new_max = @as(u32, self.shared_enemy_hp.max) + @as(u32, d.max_hp);
+            const new_max = @as(u32, self.shared_enemy_hp.max) + @as(u32, entry.stats.hp);
             self.shared_enemy_hp.max = @intCast(@min(new_max, @as(u32, std.math.maxInt(u16))));
             self.shared_enemy_hp.current = self.shared_enemy_hp.max;
         }
@@ -364,12 +360,6 @@ pub const Session = struct {
                     try self.broadcast_lobby_update();
                 }
             },
-            .choose_class => {
-                const p = try proto.decode_choose_class(fbs.reader());
-                self.set_class(player_id, p.class);
-                std.log.info("player {} class: {s}", .{ player_id, @tagName(p.class) });
-                try self.broadcast_lobby_update();
-            },
             .ready_up => {
                 const slot = &self.players[player_id];
                 slot.ready = !slot.ready;
@@ -414,7 +404,7 @@ pub const Session = struct {
         // Cleanse-withheld heal+shield → player_cleanse_by_el for Step 2.5 stack removal.
         var player_damage_by_key: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
         var player_shield_by_key: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
-        var player_dot_dmg_by_el: [c.Element.size]u16 = [_]u16{0} ** c.Element.size;
+        var player_dot_dmg_by_el: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
         var player_cleanse_by_el: [c.Element.size]u16 = [_]u16{0} ** c.Element.size; // indexed by Element ordinal 0-3
         var heal_pool: u16 = 0;
         for (&self.action_pool) |maybe_combo| {
@@ -453,7 +443,7 @@ pub const Session = struct {
         // --- Step 2: Tally enemy actions by element (combos + structured intent) ---
         var enemy_damage_by_key: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
         var enemy_shield_by_key: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
-        var enemy_dot_dmg_by_el: [c.Element.size]u16 = [_]u16{0} ** c.Element.size;
+        var enemy_dot_dmg_by_el: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
         var enemy_cleanse_by_el: [c.Element.size]u16 = [_]u16{0} ** c.Element.size;
         var enemy_heal_pool: u16 = 0;
 
@@ -690,19 +680,19 @@ pub const Session = struct {
     }
 
     /// Spawn an ECS entity for a player who joined while the game is in progress.
-    /// Extends shared_hp.max by the class's max_hp but leaves current unchanged,
+    /// Extends shared_hp.max by the player's statblock hp but leaves current unchanged,
     /// preserving the party's current health state.
     fn spawn_player_midgame(self: *Session, player_id: u8) !void {
         if (player_id >= MAX_PLAYERS) return;
         const slot = &self.players[player_id];
-        const d = waves.class_defaults(slot.class);
         const e = self.world.create_entity();
         slot.entity = e;
-        self.world.add_component(e, c.Class{ .tag = slot.class });
+        self.world.add_component(e, c.Kind{ .tag = .player });
+        self.world.add_component(e, slot.statblock);
         self.world.add_component(e, c.Team{ .id = .players });
         self.world.add_component(e, c.Owner{ .player_id = slot.player_id });
         self.world.add_component(e, c.PlayerMarker{});
-        const new_max = @as(u32, self.shared_hp.max) + @as(u32, d.max_hp);
+        const new_max = @as(u32, self.shared_hp.max) + @as(u32, slot.statblock.hp);
         self.shared_hp.max = @intCast(@min(new_max, @as(u32, std.math.maxInt(u16))));
         std.log.info("player {} joined mid-game — party pool now {}/{}", .{
             player_id, self.shared_hp.current, self.shared_hp.max,
@@ -743,7 +733,7 @@ pub const Session = struct {
                 .player_id = slot.player_id,
                 .name = slot.name,
                 .name_len = slot.name_len,
-                .class = slot.class,
+                .kind = .player,
                 .ready = slot.ready,
                 .connected = slot.connected,
                 .grid_col = 0,
@@ -818,7 +808,7 @@ pub const Session = struct {
         const pm_arr = &self.world.component_arrays.player_marker;
         for (pm_arr.index_to_entity[0..pm_arr.size]) |e| {
             if (snap.entity_count >= proto.MAX_ENTITIES_WIRE) break;
-            const cl = self.world.get_component(e, c.Class);
+            const kd = self.world.get_component(e, c.Kind);
             const own = self.world.get_component(e, c.Owner).player_id;
             const combo_len: u8 = if (self.action_pool[own]) |combo| combo.len else 0;
             const combo_slots = if (combo_len > 0)
@@ -828,7 +818,7 @@ pub const Session = struct {
 
             snap.entities[snap.entity_count] = .{
                 .entity = e,
-                .class = cl.tag,
+                .kind = kd.tag,
                 .team = .players,
                 .owner = own,
                 .combo_len = combo_len,
@@ -840,14 +830,14 @@ pub const Session = struct {
         const em_arr = &self.world.component_arrays.enemy_marker;
         for (em_arr.index_to_entity[0..em_arr.size], 0..) |e, i| {
             if (snap.entity_count >= proto.MAX_ENTITIES_WIRE) break;
-            const cl = self.world.get_component(e, c.Class);
+            const kd = self.world.get_component(e, c.Kind);
             const enemy_combo = self.enemy_combos[i];
             const combo_len: u8 = if (enemy_combo) |ec| ec.len else 0;
             const combo_slots = if (enemy_combo) |ec| ec.slots else [_]c.ComboSlot{.{ .action = .damage }} ** c.MAX_COMBO_LEN;
 
             snap.entities[snap.entity_count] = .{
                 .entity = e,
-                .class = cl.tag,
+                .kind = kd.tag,
                 .team = .enemies,
                 .owner = 0xFF,
                 .combo_len = combo_len,
@@ -889,7 +879,7 @@ pub const Session = struct {
 fn set_world_system_signatures(world: *GameWorld) void {
     {
         var sig = @import("ecs_zig").Signature.initEmpty();
-        sig.set(GameWorld.component_type(c.Class));
+        sig.set(GameWorld.component_type(c.Kind));
         sig.set(GameWorld.component_type(c.Team));
         sig.set(GameWorld.component_type(c.Owner));
         sig.set(GameWorld.component_type(c.PlayerMarker));
@@ -897,7 +887,7 @@ fn set_world_system_signatures(world: *GameWorld) void {
     }
     {
         var sig = @import("ecs_zig").Signature.initEmpty();
-        sig.set(GameWorld.component_type(c.Class));
+        sig.set(GameWorld.component_type(c.Kind));
         sig.set(GameWorld.component_type(c.Team));
         sig.set(GameWorld.component_type(c.EnemyMarker));
         world.set_system_signature(EnemyTeam, sig);

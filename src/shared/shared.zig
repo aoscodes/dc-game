@@ -12,7 +12,7 @@ pub const bots = @import("bots.zig");
 
 pub const Transport = transport.Transport;
 pub const BufferTransport = transport.BufferTransport;
-pub const ClassTag = components.ClassTag;
+pub const EntityKind = components.EntityKind;
 pub const TeamId = components.TeamId;
 pub const MsgTag = protocol.MsgTag;
 
