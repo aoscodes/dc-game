@@ -353,7 +353,16 @@ pub const Session = struct {
                 @memcpy(slot.name[0..n], p.name[0..n]);
                 slot.name_len = @intCast(n);
                 std.log.info("player {} name set: {s}", .{ player_id, slot.name[0..slot.name_len] });
-                try self.broadcast_lobby_update();
+                if (self.phase == .playing) {
+                    // Late joiner: spawn their entity, extend the HP pool max
+                    // only, then send them a game_start so their client enters
+                    // game phase.  Existing players are unaffected — no
+                    // lobby_update is broadcast.
+                    try self.spawn_player_midgame(player_id);
+                    try self.send_game_start_to(player_id);
+                } else {
+                    try self.broadcast_lobby_update();
+                }
             },
             .choose_class => {
                 const p = try proto.decode_choose_class(fbs.reader());
@@ -665,6 +674,46 @@ pub const Session = struct {
         try proto.encode(fbs.writer(), .game_over, proto.GameOver{ .winner = winner });
         try self.broadcast_raw(fbs.getWritten());
         try self.broadcast_lobby_update();
+    }
+
+    /// Spawn an ECS entity for a player who joined while the game is in progress.
+    /// Extends shared_hp.max by the class's max_hp but leaves current unchanged,
+    /// preserving the party's current health state.
+    fn spawn_player_midgame(self: *Session, player_id: u8) !void {
+        if (player_id >= MAX_PLAYERS) return;
+        const slot = &self.players[player_id];
+        const d = waves.class_defaults(slot.class);
+        const e = self.world.create_entity();
+        slot.entity = e;
+        self.world.add_component(e, c.Class{ .tag = slot.class });
+        self.world.add_component(e, c.Team{ .id = .players });
+        self.world.add_component(e, c.Owner{ .player_id = slot.player_id });
+        self.world.add_component(e, c.PlayerMarker{});
+        const new_max = @as(u32, self.shared_hp.max) + @as(u32, d.max_hp);
+        self.shared_hp.max = @intCast(@min(new_max, @as(u32, std.math.maxInt(u16))));
+        std.log.info("player {} joined mid-game — party pool now {}/{}", .{
+            player_id, self.shared_hp.current, self.shared_hp.max,
+        });
+    }
+
+    /// Send a game_start message to a single player so their client transitions
+    /// to game phase.  Used for late joiners while the session is already playing.
+    fn send_game_start_to(self: *Session, player_id: u8) !void {
+        if (player_id >= MAX_PLAYERS) return;
+        const slot = &self.players[player_id];
+        const t = slot.transport orelse return;
+        const wave = self.current_wave orelse return;
+        var buf: [64]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        var gs_msg = proto.GameStart{
+            .wave_label = [_]u8{0} ** 32,
+            .wave_label_len = @intCast(@min(wave.label.len, 32)),
+            .player_id = slot.player_id,
+            .round_duration = self.round_duration,
+        };
+        @memcpy(gs_msg.wave_label[0..gs_msg.wave_label_len], wave.label[0..gs_msg.wave_label_len]);
+        try proto.encode(fbs.writer(), .game_start, gs_msg);
+        try t.send(fbs.getWritten());
     }
 
     pub fn broadcast_lobby_update(self: *Session) !void {

@@ -169,6 +169,40 @@ function drawConnecting() {
   text("Connecting to server...", 40, 60, 24, C_TEXT);
 }
 
+// ---------------------------------------------------------------------------
+// Pre-lobby screen (create / join)
+// ---------------------------------------------------------------------------
+
+/**
+ * "choose"        — show Create / Join options
+ * "entering_code" — user is typing a 6-char lobby code
+ */
+let preLobbyMode  = "choose";
+let preLobbyCode  = "";
+let preLobbyError = "";
+
+function drawPreLobby() {
+  clear();
+  text("Dragoncon Game", 40, 60, 32, C_HEADER);
+
+  if (preLobbyMode === "choose") {
+    text("[C]  Create new lobby", 60, 160, 22, C_TEXT);
+    text("[J]  Join existing lobby", 60, 200, 22, C_TEXT);
+    if (preLobbyError) {
+      text(preLobbyError, 60, 260, 18, "rgba(255,100,100,1)");
+    }
+  } else {
+    text("Enter lobby code:", 60, 160, 22, C_TEXT);
+    // Show typed code + blinking underscore cursor.
+    const display = preLobbyCode.padEnd(6, "_");
+    text(display, 60, 210, 36, "rgba(255,255,100,1)");
+    text("[ENTER] to join    [ESC] back", 60, 270, 16, "rgba(170,170,170,1)");
+    if (preLobbyError) {
+      text(preLobbyError, 60, 310, 18, "rgba(255,100,100,1)");
+    }
+  }
+}
+
 function drawFull() {
   clear();
   text("Session full (max 6 players).", 40, SH / 2 - 16, 24, C_TEXT);
@@ -814,11 +848,12 @@ function renderFrame(msg, dt) {
   lastPhase = msg.phase;
 
   switch (msg.phase) {
+    case "pre_lobby":  drawPreLobby(); break;
     case "connecting": drawConnecting(); break;
-    case "lobby": drawLobby(msg.lobby); break;
-    case "game": drawGame(msg.game, dt); break;
-    case "game_over": drawGameOver(); break;
-    default: drawConnecting();
+    case "lobby":      drawLobby(msg.lobby); break;
+    case "game":       drawGame(msg.game, dt); break;
+    case "game_over":  drawGameOver(); break;
+    default:           drawConnecting();
   }
 }
 
@@ -846,8 +881,40 @@ function connect() {
   ws.addEventListener("message", (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.tag === "render") latestMsg = msg;
-    else if (msg.tag === "full") drawFull();
+
+    if (msg.tag === "render") {
+      latestMsg = msg;
+    } else if (msg.tag === "pre_lobby") {
+      // Bridge is asking us to pick a room.
+      // Reset pre-lobby UI state.
+      preLobbyMode  = "choose";
+      preLobbyCode  = "";
+      preLobbyError = "";
+      latestMsg = { phase: "pre_lobby" };
+    } else if (msg.tag === "joining") {
+      // Bridge confirmed the room exists and is connecting us.
+      // Switch to connecting screen immediately so the user gets feedback
+      // and any stale error text disappears.
+      preLobbyMode  = "choose";
+      preLobbyCode  = "";
+      preLobbyError = "";
+      latestMsg = { phase: "connecting" };
+    } else if (msg.tag === "error") {
+      // Only show an error to the user when they explicitly submitted a code.
+      // If the error came from an auto-reconnect (preLobbyMode === "choose" and
+      // preLobbyCode is empty), just clear stale localStorage silently.
+      const userInitiated = preLobbyMode === "entering_code" || preLobbyCode.length > 0;
+      if (msg.reason === "not_found") {
+        preLobbyError = userInitiated ? "Lobby not found." : "";
+      } else {
+        preLobbyError = userInitiated ? `Error: ${msg.reason}` : "";
+      }
+      preLobbyMode = "choose";
+      preLobbyCode = "";
+      latestMsg = { phase: "pre_lobby" };
+    } else if (msg.tag === "full") {
+      drawFull();
+    }
   });
 }
 
@@ -864,12 +931,71 @@ const FORWARDED_KEYS = new Set([
 ]);
 
 document.addEventListener("keydown", (e) => {
+  // During pre_lobby, handle input locally — do not forward to Zig.
+  if (latestMsg && latestMsg.phase === "pre_lobby") {
+    handlePreLobbyKey(e);
+    return;
+  }
+
   if (!FORWARDED_KEYS.has(e.key)) return;
   e.preventDefault();
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ key: e.key }));
   }
 });
+
+/**
+ * Handle a keydown event while the pre_lobby screen is shown.
+ * Input is handled entirely in the browser — nothing is forwarded to Zig.
+ * @param {KeyboardEvent} e
+ */
+function handlePreLobbyKey(e) {
+  e.preventDefault();
+
+  if (preLobbyMode === "choose") {
+    if (e.key === "c" || e.key === "C") {
+      preLobbyError = "";
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: "create" }));
+      }
+    } else if (e.key === "j" || e.key === "J") {
+      preLobbyMode  = "entering_code";
+      preLobbyCode  = "";
+      preLobbyError = "";
+    }
+    return;
+  }
+
+  if (preLobbyMode === "entering_code") {
+    if (e.key === "Escape") {
+      preLobbyMode  = "choose";
+      preLobbyCode  = "";
+      preLobbyError = "";
+      return;
+    }
+    if (e.key === "Backspace") {
+      preLobbyCode  = preLobbyCode.slice(0, -1);
+      preLobbyError = "";
+      return;
+    }
+    if (e.key === "Enter") {
+      if (preLobbyCode.length === 6) {
+        preLobbyError = "";
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ action: "join", code: preLobbyCode }));
+        }
+      } else {
+        preLobbyError = "Code must be 6 characters.";
+      }
+      return;
+    }
+    // Accept alphanumeric characters (auto-uppercase, max 6).
+    if (preLobbyCode.length < 6 && /^[a-zA-Z0-9]$/.test(e.key)) {
+      preLobbyCode  += e.key.toUpperCase();
+      preLobbyError = "";
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Boot: load assets, then start loop and connect

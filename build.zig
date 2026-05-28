@@ -101,6 +101,9 @@ pub fn build(b: *std.Build) !void {
         .name = "server",
         .root_module = server_mod,
     });
+    // Install server alongside client so `zig build` (and `zig build run`) always
+    // produce both binaries.  The bridge needs both at zig-out/bin/.
+    b.installArtifact(server_exe);
 
     const server_step = b.step("server", "Build and install the game server");
     const server_install = b.addInstallArtifact(server_exe, .{});

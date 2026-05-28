@@ -7,9 +7,18 @@
  * and a dedicated WebSocket connection to the game server.  The server sees
  * each tab as a distinct player.
  *
+ * Multiple lobbies are supported.  Each lobby runs its own Zig server process
+ * on a dedicated port.  The LobbyRegistry tracks all active lobbies by their
+ * 6-character join code.  Tabs are routed to a lobby via:
+ *   { action: "create" }                          — spawn a new server + join it
+ *   { action: "join",      code: "XXXXXX" }       — join an existing lobby by code
+ *   { action: "reconnect", code: "XXXXXX",
+ *              player_id: N }                      — rejoin after page refresh
+ *
  * Responsibilities per TabSession:
+ *   - Show pre_lobby screen until a room is chosen
  *   - Spawn ./zig-out/bin/client and manage its lifecycle
- *   - Connect to the game server WebSocket (owns reconnect loop)
+ *   - Connect to the chosen lobby's server WebSocket (owns reconnect loop)
  *   - Relay server frames → Zig stdin as  WIRE:<hex>\n
  *   - Relay Zig stdout send-frames → server WebSocket
  *   - Relay Zig stdout render-frames → the tab's browser WebSocket only
@@ -28,6 +37,7 @@
 
 const { spawn }   = require("child_process");
 const http        = require("http");
+const net         = require("net");
 const fs          = require("fs");
 const path        = require("path");
 const { WebSocketServer, WebSocket } = require("ws");
@@ -37,18 +47,31 @@ const { WebSocketServer, WebSocket } = require("ws");
 // ---------------------------------------------------------------------------
 
 const PORT        = parseInt(process.env.PORT || "3000", 10);
-const SERVER_URL  = process.env.SERVER_URL || "ws://127.0.0.1:9001";
-// Locally: zig build puts the binary at zig-out/bin/client (one level up from bridge/).
-// On the VPS: deploy installs it flat at /opt/dragoncon/client (same level as bridge/).
-// Try the flat path first; fall back to the local dev path.
-const _binFlat  = path.resolve(__dirname, "../client");
-const _binLocal = path.resolve(__dirname, "../zig-out/bin/client");
-const CLIENT_BIN = require("fs").existsSync(_binFlat) ? _binFlat : _binLocal;
+// Locally: zig build puts the binaries at zig-out/bin/ (one level up from bridge/).
+// On the VPS: deploy installs them flat at /opt/dragoncon/ (same level as bridge/).
+const _binDir     = path.resolve(__dirname, "..");
+const _binDirFlat = __dirname;
+
+function resolveBin(name) {
+  const flat  = path.join(_binDirFlat, name);
+  const local = path.join(_binDir, "zig-out", "bin", name);
+  return fs.existsSync(flat) ? flat : local;
+}
+
+const CLIENT_BIN  = resolveBin("client");
+const SERVER_BIN  = resolveBin("server");
 const WEB_DIR     = path.resolve(__dirname, "../web");
 
-const RECONNECT_INITIAL_MS = 1_000;
-const RECONNECT_MAX_MS     = 16_000;
-const MAX_SESSIONS         = 6;
+const RECONNECT_INITIAL_MS  = 1_000;
+const RECONNECT_MAX_MS      = 16_000;
+const MAX_SESSIONS          = 6;
+// Grace period before an empty lobby's server process is killed.
+const LOBBY_IDLE_TIMEOUT_MS = 30_000;
+// Port range for spawned server processes.
+const SERVER_PORT_BASE      = 9001;
+
+// Join-code charset — must match the one in server/main.zig.
+const CODE_CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 // ---------------------------------------------------------------------------
 // Static file server
@@ -62,28 +85,143 @@ const MIME = {
 };
 
 const httpServer = http.createServer((req, res) => {
-  // Default to index.html
-  const urlPath = req.url === "/" ? "/index.html" : req.url;
+  const urlPath  = req.url === "/" ? "/index.html" : req.url;
   const filePath = path.join(WEB_DIR, path.normalize(urlPath));
 
-  // Prevent path traversal outside WEB_DIR
   if (!filePath.startsWith(WEB_DIR)) {
-    res.writeHead(403);
-    res.end("Forbidden");
-    return;
+    res.writeHead(403); res.end("Forbidden"); return;
   }
 
   fs.readFile(filePath, (err, data) => {
-    if (err) {
-      res.writeHead(404);
-      res.end("Not found");
-      return;
-    }
+    if (err) { res.writeHead(404); res.end("Not found"); return; }
     const ext = path.extname(filePath);
     res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream" });
     res.end(data);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Port allocation
+// ---------------------------------------------------------------------------
+
+/** Ports currently claimed by a live server process. */
+const usedPorts = new Set();
+
+/**
+ * Find a TCP port that is both not in `usedPorts` and not already bound
+ * by another process.  Scans upward from SERVER_PORT_BASE.
+ * Returns a Promise<number>.
+ */
+function findFreePort() {
+  return new Promise((resolve, reject) => {
+    let candidate = SERVER_PORT_BASE;
+    const tryNext = () => {
+      if (usedPorts.has(candidate)) { candidate++; tryNext(); return; }
+      const srv = net.createServer();
+      srv.once("error", () => { candidate++; tryNext(); });
+      srv.once("listening", () => {
+        srv.close(() => resolve(candidate));
+      });
+      srv.listen(candidate, "0.0.0.0");
+    };
+    tryNext();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Lobby registry
+// ---------------------------------------------------------------------------
+
+/**
+ * @typedef {{
+ *   code:        string,
+ *   port:        number,
+ *   proc:        import("child_process").ChildProcess,
+ *   tabCount:    number,
+ *   idleTimer:   ReturnType<typeof setTimeout> | null,
+ * }} LobbyRoom
+ */
+
+/** @type {Map<string, LobbyRoom>} */
+const lobbyRegistry = new Map();
+
+/** Generate a random 6-char join code (same charset as Zig server). */
+function generateCode() {
+  let code = "";
+  for (let i = 0; i < 6; i++)
+    code += CODE_CHARSET[Math.floor(Math.random() * CODE_CHARSET.length)];
+  return code;
+}
+
+/** Generate a unique code not already in the registry. */
+function uniqueCode() {
+  let code;
+  do { code = generateCode(); } while (lobbyRegistry.has(code));
+  return code;
+}
+
+/**
+ * Spawn a new game server process for a lobby with the given code and port.
+ * Returns a LobbyRoom immediately (process may not be ready yet).
+ *
+ * @param {string} code
+ * @param {number} port
+ * @returns {LobbyRoom}
+ */
+function spawnLobbyServer(code, port) {
+  console.log(`[lobby] spawning server for code=${code} port=${port}`);
+  usedPorts.add(port);
+
+  const proc = spawn(SERVER_BIN, [String(port), "--join-code", code], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  proc.stdout.on("data", (d) => {
+    process.stdout.write(`[server:${code}] ${d}`);
+  });
+  proc.stderr.on("data", (d) => {
+    process.stderr.write(`[server:${code}] ${d}`);
+  });
+
+  proc.on("error", (err) => {
+    console.error(`[lobby] server proc error (${code}):`, err.message);
+  });
+
+  proc.on("exit", (code_) => {
+    console.log(`[lobby] server proc exited (${code}) code=${code_}`);
+    usedPorts.delete(port);
+    lobbyRegistry.delete(code);
+  });
+
+  /** @type {LobbyRoom} */
+  const room = { code, port, proc, tabCount: 0, idleTimer: null };
+  lobbyRegistry.set(code, room);
+  return room;
+}
+
+/** Decrement tab count for a room; schedule shutdown if it reaches 0. */
+function roomTabLeft(room) {
+  room.tabCount = Math.max(0, room.tabCount - 1);
+  if (room.tabCount === 0) {
+    room.idleTimer = setTimeout(() => {
+      if (room.tabCount === 0) {
+        console.log(`[lobby] idle timeout — killing server for code=${room.code}`);
+        room.proc.kill();
+        usedPorts.delete(room.port);
+        lobbyRegistry.delete(room.code);
+      }
+    }, LOBBY_IDLE_TIMEOUT_MS);
+  }
+}
+
+/** Cancel idle shutdown when a new tab joins a room. */
+function roomTabJoined(room) {
+  if (room.idleTimer !== null) {
+    clearTimeout(room.idleTimer);
+    room.idleTimer = null;
+  }
+  room.tabCount++;
+}
 
 // ---------------------------------------------------------------------------
 // Per-tab session
@@ -104,11 +242,13 @@ class TabSession {
     this.closed         = false;
     this.reconnectTimer = null;
     this.reconnectDelay = RECONNECT_INITIAL_MS;
+    /** @type {LobbyRoom | null} */
+    this.room           = null;
+    this.started        = false;
   }
 
   // ---- Zig stdin ----------------------------------------------------------
 
-  /** Write a line to this session's Zig stdin. */
   writeToZig(line) {
     if (this.zigProc && this.zigWritable) {
       this.zigProc.stdin.write(line);
@@ -119,7 +259,6 @@ class TabSession {
 
   // ---- Server WebSocket ---------------------------------------------------
 
-  /** Send raw bytes to this session's game server connection. */
   sendToServer(bytes) {
     if (this.serverWs && this.serverConnected &&
         this.serverWs.readyState === WebSocket.OPEN) {
@@ -129,9 +268,10 @@ class TabSession {
     }
   }
 
-  connectToServer() {
-    console.log(`[bridge] tab connecting to server ${SERVER_URL}`);
-    const ws = new WebSocket(SERVER_URL, { perMessageDeflate: false });
+  connectToServer(port) {
+    const url = `ws://127.0.0.1:${port}`;
+    console.log(`[bridge] tab connecting to server ${url}`);
+    const ws = new WebSocket(url, { perMessageDeflate: false });
     this.serverWs = ws;
 
     ws.on("open", () => {
@@ -139,7 +279,6 @@ class TabSession {
       console.log("[bridge] tab server connected");
       this.serverConnected = true;
       this.reconnectDelay  = RECONNECT_INITIAL_MS;
-      // Tell Zig the server is ready so it sends join_lobby / reconnect.
       this.writeToZig("READY\n");
     });
 
@@ -157,13 +296,12 @@ class TabSession {
       this.reconnectTimer = setTimeout(() => {
         this.reconnectTimer = null;
         this.reconnectDelay = Math.min(this.reconnectDelay * 2, RECONNECT_MAX_MS);
-        if (!this.closed) this.connectToServer();
+        if (!this.closed && this.room) this.connectToServer(this.room.port);
       }, this.reconnectDelay);
     });
 
     ws.on("error", (err) => {
       console.error("[bridge] tab server WS error:", err.message);
-      // 'close' fires after 'error' so reconnect is handled there.
     });
   }
 
@@ -171,7 +309,6 @@ class TabSession {
 
   spawnZig() {
     console.log(`[bridge] spawning ${CLIENT_BIN} for tab`);
-
     const proc = spawn(CLIENT_BIN, [], { stdio: ["pipe", "pipe", "inherit"] });
     this.zigProc     = proc;
     this.zigWritable = true;
@@ -186,7 +323,6 @@ class TabSession {
       this.zigWritable = false;
     });
 
-    // Read Zig stdout line by line.
     proc.stdout.on("data", (chunk) => {
       this.lineBuf += chunk.toString();
       let nl;
@@ -202,7 +338,6 @@ class TabSession {
       this.zigWritable = false;
       if (this.closed) return;
       console.warn(`[bridge] Zig client exited (code=${code}); restarting in 1s`);
-      // Reset reconnect backoff so the next server attempt starts fresh.
       this.reconnectDelay = RECONNECT_INITIAL_MS;
       setTimeout(() => { if (!this.closed) this.spawnZig(); }, 1_000);
     });
@@ -217,7 +352,6 @@ class TabSession {
     }
 
     if (msg.tag === "render") {
-      // Send render frame only to this tab's browser WebSocket.
       if (this.tabWs.readyState === WebSocket.OPEN) this.tabWs.send(line);
     } else if (msg.tag === "send" && typeof msg.bytes === "string") {
       const bytes = hexToBytes(msg.bytes);
@@ -227,23 +361,106 @@ class TabSession {
     }
   }
 
+  // ---- Room routing -------------------------------------------------------
+
+  /**
+   * Called once a room has been chosen.  Starts the Zig client and connects
+   * it to the room's server port.
+   * @param {LobbyRoom} room
+   */
+  startInRoom(room) {
+    if (this.started) return;
+    this.started = true;
+    this.room    = room;
+    roomTabJoined(room);
+    this.spawnZig();
+    // Small delay: give the server process a moment to bind its port if just spawned.
+    setTimeout(() => {
+      if (!this.closed) this.connectToServer(room.port);
+    }, 200);
+  }
+
+  /**
+   * Send a pre_lobby error to the browser and reset to pre_lobby state so the
+   * user can try again.
+   * @param {string} reason
+   */
+  sendPreLobbyError(reason) {
+    if (this.tabWs.readyState === WebSocket.OPEN) {
+      this.tabWs.send(JSON.stringify({ tag: "error", reason }));
+    }
+  }
+
+  /**
+   * Handle a browser action message while in the pre_lobby state.
+   * @param {{ action: string, code?: string, player_id?: number }} msg
+   */
+  async handlePreLobbyAction(msg) {
+    if (this.started) return; // already in a room
+
+    if (msg.action === "create") {
+      const code = uniqueCode();
+      let port;
+      try { port = await findFreePort(); } catch (err) {
+        console.error("[lobby] findFreePort failed:", err);
+        this.sendPreLobbyError("server_error");
+        return;
+      }
+      const room = spawnLobbyServer(code, port);
+      console.log(`[lobby] created room code=${code} port=${port}`);
+      // Acknowledge before the Zig client has connected so the browser
+      // transitions away from pre_lobby immediately.
+      if (this.tabWs.readyState === WebSocket.OPEN) {
+        this.tabWs.send(JSON.stringify({ tag: "joining" }));
+      }
+      this.startInRoom(room);
+      return;
+    }
+
+    if (msg.action === "join" || msg.action === "reconnect") {
+      const rawCode = (msg.code || "").toUpperCase().trim();
+      if (rawCode.length !== 6) {
+        this.sendPreLobbyError("invalid_code");
+        return;
+      }
+      const room = lobbyRegistry.get(rawCode);
+      if (!room) {
+        console.log(`[lobby] join/reconnect: code=${rawCode} not found; registry=${[...lobbyRegistry.keys()].join(",") || "(empty)"}`);
+        this.sendPreLobbyError("not_found");
+        return;
+      }
+      console.log(`[lobby] join/reconnect: code=${rawCode} found, routing tab`);
+      // Acknowledge immediately so the browser clears the pre_lobby screen
+      // before the Zig client finishes connecting to the server.
+      if (this.tabWs.readyState === WebSocket.OPEN) {
+        this.tabWs.send(JSON.stringify({ tag: "joining" }));
+      }
+      this.startInRoom(room);
+      return;
+    }
+
+    console.warn("[bridge] unknown pre_lobby action:", msg.action);
+  }
+
   // ---- Lifecycle ----------------------------------------------------------
 
-  start() {
-    this.spawnZig();
-    this.connectToServer();
+  /** Announce the pre_lobby state to the browser and wait for a room choice. */
+  sendPreLobby() {
+    if (this.tabWs.readyState === WebSocket.OPEN) {
+      this.tabWs.send(JSON.stringify({ tag: "pre_lobby" }));
+    }
   }
 
   teardown() {
     if (this.closed) return;
     this.closed = true;
-    // Cancel any pending reconnect timer immediately.
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
     if (this.zigProc)  { this.zigProc.kill();   this.zigProc  = null; }
     if (this.serverWs) { this.serverWs.close(); this.serverWs = null; }
+    if (this.room)     { roomTabLeft(this.room); this.room = null; }
     activeSessions.delete(this);
     console.log(`[bridge] tab session torn down (${activeSessions.size} active)`);
   }
@@ -257,8 +474,6 @@ const browserWss = new WebSocketServer({ server: httpServer, path: "/ws" });
 
 browserWss.on("connection", (tabWs) => {
   if (activeSessions.size >= MAX_SESSIONS) {
-    // Session is full — tell the browser before closing so it can render a
-    // "session full" screen instead of an empty reconnect loop.
     if (tabWs.readyState === WebSocket.OPEN) {
       tabWs.send(JSON.stringify({ tag: "full" }));
     }
@@ -276,20 +491,31 @@ browserWss.on("connection", (tabWs) => {
   tabWs.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
-    if (typeof msg.key === "string") session.writeToZig(`KEY:${msg.key}\n`);
+
+    // Key events are only forwarded once inside a room.
+    if (typeof msg.key === "string") {
+      if (session.started) session.writeToZig(`KEY:${msg.key}\n`);
+      return;
+    }
+
+    // Room-selection actions are handled before a room is chosen.
+    if (typeof msg.action === "string") {
+      session.handlePreLobbyAction(msg).catch((err) => {
+        console.error("[bridge] handlePreLobbyAction error:", err);
+        session.sendPreLobbyError("server_error");
+      });
+      return;
+    }
   });
 
-  session.start();
+  // Tell the browser to show the lobby-selection screen.
+  session.sendPreLobby();
 });
 
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
 
-/**
- * Decode a hex string to a Buffer.
- * Returns null (and logs) if the input is odd-length or contains non-hex chars.
- */
 function hexToBytes(hex) {
   if (hex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(hex)) {
     console.error("[bridge] hexToBytes: invalid hex string:", hex.slice(0, 40));

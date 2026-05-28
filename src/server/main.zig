@@ -45,7 +45,12 @@ const Handler = struct {
         if (sess.join(t, "")) |pid| {
             self.player_id = pid;
             std.log.info("player {} connected (slot reserved)", .{pid});
-            sess.broadcast_lobby_update() catch {};
+            // Don't broadcast lobby_update to in-game clients — it would reset
+            // their phase to lobby.  The late joiner gets game_start after
+            // they send join_lobby (name), which is the correct entry point.
+            if (sess.phase == .lobby) {
+                sess.broadcast_lobby_update() catch {};
+            }
         } else {
             std.log.warn("session full, rejecting connection", .{});
             self.conn.close(.{}) catch {};
@@ -130,6 +135,7 @@ pub fn main() !void {
 
     var port: u16 = DEFAULT_PORT;
     var round_duration: f32 = logic.ROUND_DURATION_DEFAULT_S;
+    var join_code_override: ?[6]u8 = null;
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // skip argv[0]
@@ -144,14 +150,28 @@ pub fn main() !void {
                     break :blk logic.ROUND_DURATION_DEFAULT_S;
                 };
             }
+        } else if (std.mem.eql(u8, arg, "--join-code")) {
+            if (args.next()) |val| {
+                if (val.len == 6) {
+                    var code: [6]u8 = undefined;
+                    @memcpy(&code, val[0..6]);
+                    join_code_override = code;
+                } else {
+                    std.log.warn("--join-code must be exactly 6 characters, ignoring '{s}'", .{val});
+                }
+            }
         }
     }
 
     var join_code: [6]u8 = undefined;
-    const charset = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    var rng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
-    for (&join_code) |*ch| {
-        ch.* = charset[rng.random().int(u8) % charset.len];
+    if (join_code_override) |override| {
+        join_code = override;
+    } else {
+        const charset = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+        var rng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+        for (&join_code) |*ch| {
+            ch.* = charset[rng.random().int(u8) % charset.len];
+        }
     }
 
     session = try Session.init(allocator, join_code);
