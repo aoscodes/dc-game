@@ -223,7 +223,7 @@ pub const Session = struct {
         for (&self.action_pool) |*a| a.* = @as(?c.ActionCombo, null);
         for (&self.enemy_combos) |*a| a.* = null;
         self.player_dot_stacks = [_]u16{0} ** 4;
-        self.enemy_dot_stacks  = [_]u16{0} ** 4;
+        self.enemy_dot_stacks = [_]u16{0} ** 4;
         self.tick_count = 0;
         self.round_count = 0;
 
@@ -412,14 +412,14 @@ pub const Session = struct {
         // cleanse trigger (heal+shield same element) are withheld from normal pools.
         // DoT-withheld damage → player_dot_dmg_by_key for the Step 3 shield-gate peek-net.
         // Cleanse-withheld heal+shield → player_cleanse_by_el for Step 2.5 stack removal.
-        var player_damage_by_key:  [5]u16 = [_]u16{0} ** 5;
-        var player_shield_by_key:  [5]u16 = [_]u16{0} ** 5;
+        var player_damage_by_key: [5]u16 = [_]u16{0} ** 5;
+        var player_shield_by_key: [5]u16 = [_]u16{0} ** 5;
         var player_dot_dmg_by_key: [5]u16 = [_]u16{0} ** 5;
-        var player_cleanse_by_el:  [4]u16 = [_]u16{0} ** 4; // indexed by Element ordinal 0-3
+        var player_cleanse_by_el: [4]u16 = [_]u16{0} ** 4; // indexed by Element ordinal 0-3
         var heal_pool: u16 = 0;
         for (&self.action_pool) |maybe_combo| {
             const combo = maybe_combo orelse continue;
-            const dot_mask     = logic.detect_dot_triggers(combo);
+            const dot_mask = logic.detect_dot_triggers(combo);
             const cleanse_mask = logic.detect_cleanse_triggers(combo);
             const n = logic.parse_combo(combo, &ea_buf);
             for (ea_buf[0..n]) |ea| {
@@ -428,7 +428,7 @@ pub const Session = struct {
                     @as(u4, 1) << @as(u2, @intCast(@intFromEnum(el)))
                 else
                     0;
-                const dot_withheld     = el_bit != 0 and (dot_mask     & el_bit) != 0 and ea.action != .shield;
+                const dot_withheld = el_bit != 0 and (dot_mask & el_bit) != 0 and ea.action != .shield;
                 const cleanse_withheld = el_bit != 0 and (cleanse_mask & el_bit) != 0 and ea.action != .damage;
                 if (dot_withheld) {
                     if (ea.action == .damage) player_dot_dmg_by_key[k] += 1;
@@ -444,21 +444,23 @@ pub const Session = struct {
                     switch (ea.action) {
                         .damage => player_damage_by_key[k] += 1,
                         .shield => player_shield_by_key[k] += 1,
-                        .heal   => heal_pool += 1,
+                        .heal => heal_pool += 1,
                     }
                 }
             }
         }
 
         // --- Step 2: Tally enemy actions by element (combos + structured intent) ---
-        var enemy_damage_by_key:  [5]u16 = [_]u16{0} ** 5;
-        var enemy_shield_by_key:  [5]u16 = [_]u16{0} ** 5;
+        var enemy_damage_by_key: [5]u16 = [_]u16{0} ** 5;
+        var enemy_shield_by_key: [5]u16 = [_]u16{0} ** 5;
         var enemy_dot_dmg_by_key: [5]u16 = [_]u16{0} ** 5;
-        var enemy_cleanse_by_el:  [4]u16 = [_]u16{0} ** 4;
+        var enemy_cleanse_by_el: [4]u16 = [_]u16{0} ** 4;
+        var enemy_heal_pool: u16 = 0;
+
         const em_size = self.world.component_arrays.enemy_marker.size;
         for (self.enemy_combos[0..em_size]) |maybe_combo| {
             const combo = maybe_combo orelse continue;
-            const dot_mask     = logic.detect_dot_triggers(combo);
+            const dot_mask = logic.detect_dot_triggers(combo);
             const cleanse_mask = logic.detect_cleanse_triggers(combo);
             const n = logic.parse_combo(combo, &ea_buf);
             for (ea_buf[0..n]) |ea| {
@@ -467,7 +469,7 @@ pub const Session = struct {
                     @as(u4, 1) << @as(u2, @intCast(@intFromEnum(el)))
                 else
                     0;
-                const dot_withheld     = el_bit != 0 and (dot_mask     & el_bit) != 0 and ea.action != .shield;
+                const dot_withheld = el_bit != 0 and (dot_mask & el_bit) != 0 and ea.action != .shield;
                 const cleanse_withheld = el_bit != 0 and (cleanse_mask & el_bit) != 0 and ea.action != .damage;
                 if (dot_withheld) {
                     if (ea.action == .damage) enemy_dot_dmg_by_key[k] += 1;
@@ -480,7 +482,7 @@ pub const Session = struct {
                     switch (ea.action) {
                         .damage => enemy_damage_by_key[k] += 1,
                         .shield => enemy_shield_by_key[k] += 1,
-                        .heal   => {}, // enemy heal not implemented
+                        .heal => enemy_heal_pool += 1,
                     }
                 }
             }
@@ -498,7 +500,7 @@ pub const Session = struct {
         // Stack removal happens before Step 4 injection so ticks are reduced accordingly.
         for (0..4) |i| {
             self.player_dot_stacks[i] -|= player_cleanse_by_el[i];
-            self.enemy_dot_stacks[i]  -|= enemy_cleanse_by_el[i];
+            self.enemy_dot_stacks[i] -|= enemy_cleanse_by_el[i];
         }
 
         // --- Step 3: Peek-nets for DoT trigger check ---
@@ -528,7 +530,7 @@ pub const Session = struct {
         for (0..4) |i| {
             const k: usize = i + 1;
             player_damage_by_key[k] +|= self.enemy_dot_stacks[i]; // enemy stacks hit players
-            enemy_damage_by_key[k]  +|= self.player_dot_stacks[i]; // player stacks hit enemies
+            enemy_damage_by_key[k] +|= self.player_dot_stacks[i]; // player stacks hit enemies
         }
 
         // --- Step 5: Net and apply to HP ---
@@ -594,6 +596,17 @@ pub const Session = struct {
                 });
             }
         }
+
+        // --- Enemy heal ---
+        if (enemy_heal_pool > 0) {
+            logic.resolve_heal_pool(&self.shared_hp, enemy_heal_pool);
+            try self.broadcast_action_result(.{
+                .tag = .heal,
+                .actor_entity = std.math.maxInt(u32),
+                .target_entity = std.math.maxInt(u32),
+                .value = enemy_heal_pool * logic.ACTION_EFFECT_VALUE,
+            });
+        }
     }
 
     /// Map a bucket index back to an optional Element.
@@ -626,17 +639,17 @@ pub const Session = struct {
         const em_arr = &self.world.component_arrays.enemy_marker;
         const slots: [c.MAX_COMBO_LEN]c.ComboSlot = if (self.round_count % 2 == 0)
             .{
-                .{ .element = .fire   },
-                .{ .action  = .damage },
-                .{ .action  = .heal   },
-                .{ .action  = .damage }, // pad — ignored (len = 3)
+                .{ .element = .fire },
+                .{ .action = .damage },
+                .{ .action = .heal },
+                .{ .action = .damage }, // pad — ignored (len = 3)
             }
         else
             .{
-                .{ .element = .fire   },
-                .{ .action  = .heal   },
-                .{ .action  = .shield },
-                .{ .action  = .damage }, // pad — ignored (len = 3)
+                .{ .element = .fire },
+                .{ .action = .heal },
+                .{ .action = .shield },
+                .{ .action = .damage }, // pad — ignored (len = 3)
             };
         for (0..em_arr.size) |i| {
             self.enemy_combos[i] = .{ .slots = slots, .len = 3 };
@@ -786,7 +799,7 @@ pub const Session = struct {
                 .hp_current = self.shared_enemy_hp.current,
                 .hp_max = self.shared_enemy_hp.max,
             },
-            .enemy_intent_damage  = self.pending_enemy_intent.damage_per_player,
+            .enemy_intent_damage = self.pending_enemy_intent.damage_per_player,
             .enemy_intent_element = intent_element_byte,
             .player_dot_stacks = .{
                 @intCast(@min(self.player_dot_stacks[0], 255)),
@@ -830,8 +843,7 @@ pub const Session = struct {
             const cl = self.world.get_component(e, c.Class);
             const enemy_combo = self.enemy_combos[i];
             const combo_len: u8 = if (enemy_combo) |ec| ec.len else 0;
-            const combo_slots = if (enemy_combo) |ec| ec.slots
-                else [_]c.ComboSlot{.{ .action = .damage }} ** c.MAX_COMBO_LEN;
+            const combo_slots = if (enemy_combo) |ec| ec.slots else [_]c.ComboSlot{.{ .action = .damage }} ** c.MAX_COMBO_LEN;
 
             snap.entities[snap.entity_count] = .{
                 .entity = e,
@@ -848,7 +860,6 @@ pub const Session = struct {
         var fbs = std.io.fixedBufferStream(&buf);
         try proto.encode(fbs.writer(), .game_state, snap);
         try self.broadcast_raw(fbs.getWritten());
-
     }
 
     fn broadcast_action_result(self: *Session, result: proto.ActionResult) !void {
