@@ -412,10 +412,10 @@ pub const Session = struct {
         // cleanse trigger (heal+shield same element) are withheld from normal pools.
         // DoT-withheld damage → player_dot_dmg_by_key for the Step 3 shield-gate peek-net.
         // Cleanse-withheld heal+shield → player_cleanse_by_el for Step 2.5 stack removal.
-        var player_damage_by_key: [5]u16 = [_]u16{0} ** 5;
-        var player_shield_by_key: [5]u16 = [_]u16{0} ** 5;
-        var player_dot_dmg_by_key: [5]u16 = [_]u16{0} ** 5;
-        var player_cleanse_by_el: [4]u16 = [_]u16{0} ** 4; // indexed by Element ordinal 0-3
+        var player_damage_by_key: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
+        var player_shield_by_key: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
+        var player_dot_dmg_by_el: [c.Element.size]u16 = [_]u16{0} ** c.Element.size;
+        var player_cleanse_by_el: [c.Element.size]u16 = [_]u16{0} ** c.Element.size; // indexed by Element ordinal 0-3
         var heal_pool: u16 = 0;
         for (&self.action_pool) |maybe_combo| {
             const combo = maybe_combo orelse continue;
@@ -431,7 +431,7 @@ pub const Session = struct {
                 const dot_withheld = el_bit != 0 and (dot_mask & el_bit) != 0 and ea.action != .shield;
                 const cleanse_withheld = el_bit != 0 and (cleanse_mask & el_bit) != 0 and ea.action != .damage;
                 if (dot_withheld) {
-                    if (ea.action == .damage) player_dot_dmg_by_key[k] += 1;
+                    if (ea.action == .damage) player_dot_dmg_by_el[k] += 1;
                     // withheld heal: dropped
                 } else if (cleanse_withheld) {
                     // heal+shield consumed by cleanse; counted in player_cleanse_by_el
@@ -451,10 +451,10 @@ pub const Session = struct {
         }
 
         // --- Step 2: Tally enemy actions by element (combos + structured intent) ---
-        var enemy_damage_by_key: [5]u16 = [_]u16{0} ** 5;
-        var enemy_shield_by_key: [5]u16 = [_]u16{0} ** 5;
-        var enemy_dot_dmg_by_key: [5]u16 = [_]u16{0} ** 5;
-        var enemy_cleanse_by_el: [4]u16 = [_]u16{0} ** 4;
+        var enemy_damage_by_key: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
+        var enemy_shield_by_key: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
+        var enemy_dot_dmg_by_el: [c.Element.size]u16 = [_]u16{0} ** c.Element.size;
+        var enemy_cleanse_by_el: [c.Element.size]u16 = [_]u16{0} ** c.Element.size;
         var enemy_heal_pool: u16 = 0;
 
         const em_size = self.world.component_arrays.enemy_marker.size;
@@ -472,7 +472,7 @@ pub const Session = struct {
                 const dot_withheld = el_bit != 0 and (dot_mask & el_bit) != 0 and ea.action != .shield;
                 const cleanse_withheld = el_bit != 0 and (cleanse_mask & el_bit) != 0 and ea.action != .damage;
                 if (dot_withheld) {
-                    if (ea.action == .damage) enemy_dot_dmg_by_key[k] += 1;
+                    if (ea.action == .damage) enemy_dot_dmg_by_el[k] += 1;
                 } else if (cleanse_withheld) {
                     if (ea.action == .heal) {
                         const i: usize = @intFromEnum(ea.element.?);
@@ -498,7 +498,7 @@ pub const Session = struct {
         // Each cleanse combo removes 1 stack of the matching DoT element from own side.
         // Cleanse is unconditional (no opponent-shield gate).
         // Stack removal happens before Step 4 injection so ticks are reduced accordingly.
-        for (0..4) |i| {
+        for (0..c.Element.size) |i| {
             self.player_dot_stacks[i] -|= player_cleanse_by_el[i];
             self.enemy_dot_stacks[i] -|= enemy_cleanse_by_el[i];
         }
@@ -508,17 +508,17 @@ pub const Session = struct {
         // combo survives the opponent's elemental shields.
         // player_dot_dmg_by_key[k] > 0 already implies both dmg and heal were present
         // (detect_dot_triggers guarantees the intersection).
-        for (0..4) |i| {
+        for (0..c.Element.size) |i| {
             const k: usize = i + 1; // element keys are 1-indexed; 0 = none
 
             // Player combo triggers DoT on enemies.
-            const player_dot_net = player_dot_dmg_by_key[k] -| enemy_shield_by_key[k];
+            const player_dot_net = player_dot_dmg_by_el[k] -| enemy_shield_by_key[k];
             if (player_dot_net > 0) {
                 self.enemy_dot_stacks[i] +|= 1;
             }
 
             // Enemy combo triggers DoT on players.
-            const enemy_dot_net = enemy_dot_dmg_by_key[k] -| player_shield_by_key[k];
+            const enemy_dot_net = enemy_dot_dmg_by_el[k] -| player_shield_by_key[k];
             if (enemy_dot_net > 0) {
                 self.player_dot_stacks[i] +|= 1;
             }
@@ -527,7 +527,7 @@ pub const Session = struct {
         // --- Step 4: Inject DoT ticks (including newly-added stacks) into damage pools ---
         // DoT is elemental; it feeds into the same buckets as direct damage so that
         // shields net against the combined total in the application step below.
-        for (0..4) |i| {
+        for (0..c.Element.size) |i| {
             const k: usize = i + 1;
             player_damage_by_key[k] +|= self.enemy_dot_stacks[i]; // enemy stacks hit players
             enemy_damage_by_key[k] +|= self.player_dot_stacks[i]; // player stacks hit enemies
@@ -536,7 +536,7 @@ pub const Session = struct {
         // --- Step 5: Net and apply to HP ---
 
         // Player damage (including DoT ticks on enemy) net against enemy shields → enemy HP.
-        for (0..5) |k| {
+        for (0..c.ElementKey.size) |k| {
             const net = player_damage_by_key[k] -| enemy_shield_by_key[k];
             if (net == 0) continue;
             const dealt = logic.resolve_damage_pool(&self.shared_enemy_hp, net, key_to_element(k));
@@ -587,7 +587,7 @@ pub const Session = struct {
             }
 
             if (logic.is_dead(self.shared_hp)) {
-                std.log.info("shared party pool depleted — enemies win", .{});
+                std.log.info("shared party pool depleted — anemies win", .{});
                 try self.broadcast_action_result(.{
                     .tag = .death,
                     .actor_entity = std.math.maxInt(u32),

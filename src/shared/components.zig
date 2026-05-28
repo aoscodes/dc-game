@@ -68,24 +68,30 @@ pub const ActionChoice = enum(u8) {
     damage = 0,
     shield = 1,
     heal = 2,
+
+    pub const size = @typeInfo(ElementKey).@"enum".fields.len;
 };
 
 /// Elemental modifier applied to following action slots in a combo.
 pub const Element = enum(u8) {
-    fire  = 0,
+    fire = 0,
     earth = 1,
-    wind  = 2,
+    wind = 2,
     water = 3,
+
+    pub const size = @typeInfo(ElementKey).@"enum".fields.len;
 };
 
 /// Array index for elemental shield buckets.  `none` covers non-elemental
 /// actions; the four element variants map 1-to-1 from `Element` ordinal + 1.
 pub const ElementKey = enum(u8) {
-    none  = 0,
-    fire  = 1,
+    none = 0,
+    fire = 1,
     earth = 2,
-    wind  = 3,
+    wind = 3,
     water = 4,
+
+    pub const size = @typeInfo(ElementKey).@"enum".fields.len;
 };
 
 /// Map an optional Element to the corresponding ElementKey bucket index.
@@ -97,7 +103,7 @@ pub fn element_key(e: ?Element) ElementKey {
 /// Wire encoding: action = raw ActionChoice value (0x00–0x02);
 ///                element = 0x80 | raw Element value (0x80–0x83).
 pub const ComboSlot = union(enum) {
-    action:  ActionChoice,
+    action: ActionChoice,
     element: Element,
 };
 
