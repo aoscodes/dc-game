@@ -6,6 +6,7 @@ pub const MsgTag = enum(u8) {
     ready_up = 0x03,
     choose_action = 0x04,
     reconnect = 0x05,
+    set_statblock = 0x06,
     choose_combo = 0x07,
     cancel_combo = 0x08,
 
@@ -20,6 +21,10 @@ pub const MsgTag = enum(u8) {
 pub const JoinLobby = struct {
     name: [16]u8,
     name_len: u8,
+};
+
+pub const SetStatblock = struct {
+    statblock: components.Statblock,
 };
 
 pub const ChooseAction = struct {
@@ -180,6 +185,7 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
         .ready_up => {},
         .choose_action => try writer.writeByte(@intFromEnum(payload.action)),
         .reconnect => try writer.writeByte(payload.player_id),
+        .set_statblock => try encode_statblock(writer, payload.statblock),
         .choose_combo => {
             try writer.writeByte(payload.combo.len);
             for (payload.combo.slots[0..payload.combo.len]) |slot|
@@ -309,6 +315,36 @@ pub fn decode_choose_combo(reader: anytype) !ChooseCombo {
         combo.slots[i] = try decode_combo_slot(byte);
     }
     return .{ .combo = combo };
+}
+
+fn encode_statblock(w: anytype, s: components.Statblock) !void {
+    try w.writeInt(u16, s.attack, .little);
+    try w.writeInt(u16, s.shield, .little);
+    try w.writeInt(u16, s.heal,   .little);
+    try w.writeInt(u16, s.fire,   .little);
+    try w.writeInt(u16, s.earth,  .little);
+    try w.writeInt(u16, s.wind,   .little);
+    try w.writeInt(u16, s.water,  .little);
+    try w.writeInt(u16, s.hp,     .little);
+    try w.writeInt(u16, s.level,  .little);
+}
+
+fn decode_statblock(r: anytype) !components.Statblock {
+    return .{
+        .attack = try r.readInt(u16, .little),
+        .shield = try r.readInt(u16, .little),
+        .heal   = try r.readInt(u16, .little),
+        .fire   = try r.readInt(u16, .little),
+        .earth  = try r.readInt(u16, .little),
+        .wind   = try r.readInt(u16, .little),
+        .water  = try r.readInt(u16, .little),
+        .hp     = try r.readInt(u16, .little),
+        .level  = try r.readInt(u16, .little),
+    };
+}
+
+pub fn decode_set_statblock(reader: anytype) !SetStatblock {
+    return .{ .statblock = try decode_statblock(reader) };
 }
 
 pub fn decode_reconnect(reader: anytype) !Reconnect {

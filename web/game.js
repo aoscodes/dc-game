@@ -176,10 +176,68 @@ function drawConnecting() {
 /**
  * "choose"        — show Create / Join options
  * "entering_code" — user is typing a 6-char lobby code
+ * "editing_stats" — player is adjusting their statblock before creating/joining
  */
 let preLobbyMode  = "choose";
 let preLobbyCode  = "";
 let preLobbyError = "";
+
+/** Ordered list of stat keys shown in the editor (display order). */
+const STAT_KEYS = ["hp", "attack", "shield", "heal", "fire", "earth", "wind", "water", "level"];
+
+/** Default statblock values (applied on each pre_lobby entry). */
+const DEFAULT_STATS = { hp: 120, attack: 1, shield: 1, heal: 1, fire: 1, earth: 1, wind: 1, water: 1, level: 1 };
+
+/** Reset all pre-lobby state (called on server pre_lobby / joining / error messages). */
+function resetPreLobby() {
+  _krStop();
+  preLobbyMode          = "choose";
+  preLobbyCode          = "";
+  preLobbyError         = "";
+  preLobbyStats         = { ...DEFAULT_STATS };
+  preLobbyPendingAction = null;
+  preLobbyStatCursor    = 0;
+}
+
+/** Mutable statblock for the current session (reset on pre_lobby entry). */
+let preLobbyStats = { hp: 120, attack: 1, shield: 1, heal: 1, fire: 1, earth: 1, wind: 1, water: 1, level: 1 };
+
+/** Index into STAT_KEYS indicating the currently selected row. */
+let preLobbyStatCursor = 0;
+
+/**
+ * Pending create-or-join action; stored while player edits stats.
+ * @type {{ action: string, code?: string } | null}
+ */
+let preLobbyPendingAction = null;
+
+// Key-repeat state for stat value adjustment (ArrowLeft / ArrowRight).
+let _krKey      = null;   // "ArrowLeft" | "ArrowRight" | null
+let _krTimer    = null;
+let _krStart    = 0;
+let _krDelta    = 0;      // +1 or -1
+
+function _krStop() {
+  _krKey = null;
+  if (_krTimer !== null) { clearTimeout(_krTimer); _krTimer = null; }
+}
+
+function _krSchedule() {
+  const elapsed = Date.now() - _krStart;
+  const delay   = Math.max(30, 400 - elapsed * 0.6);
+  _krTimer = setTimeout(_krTick, delay);
+}
+
+function _krTick() {
+  if (_krKey === null) return;
+  _adjustStat(_krDelta);
+  _krSchedule();
+}
+
+function _adjustStat(delta) {
+  const key = STAT_KEYS[preLobbyStatCursor];
+  preLobbyStats[key] = Math.max(1, Math.min(100, (preLobbyStats[key] || 1) + delta));
+}
 
 function drawPreLobby() {
   clear();
@@ -191,14 +249,49 @@ function drawPreLobby() {
     if (preLobbyError) {
       text(preLobbyError, 60, 260, 18, "rgba(255,100,100,1)");
     }
-  } else {
+  } else if (preLobbyMode === "entering_code") {
     text("Enter lobby code:", 60, 160, 22, C_TEXT);
     // Show typed code + blinking underscore cursor.
     const display = preLobbyCode.padEnd(6, "_");
     text(display, 60, 210, 36, "rgba(255,255,100,1)");
-    text("[ENTER] to join    [ESC] back", 60, 270, 16, "rgba(170,170,170,1)");
+    text("[ENTER] to confirm    [ESC] back", 60, 270, 16, "rgba(170,170,170,1)");
     if (preLobbyError) {
       text(preLobbyError, 60, 310, 18, "rgba(255,100,100,1)");
+    }
+  } else if (preLobbyMode === "editing_stats") {
+    text("Customise stats", 60, 100, 24, C_HEADER);
+    text("[UP/DOWN] change value    [ENTER] confirm    [ESC] back", 60, 130, 14, "rgba(170,170,170,1)");
+
+    const rowH = 38;
+    const startY = 168;
+    for (let i = 0; i < STAT_KEYS.length; i++) {
+      const key = STAT_KEYS[i];
+      const val = preLobbyStats[key] || 1;
+      const y   = startY + i * rowH;
+      const sel = i === preLobbyStatCursor;
+
+      if (sel) {
+        // Highlight row background.
+        ctx.save();
+        ctx.fillStyle = "rgba(255,255,100,0.12)";
+        ctx.fillRect(50, y - 14, 480, rowH - 4);
+        ctx.restore();
+      }
+
+      const label = key.charAt(0).toUpperCase() + key.slice(1);
+      text(label, 70, y, 20, sel ? C_CURSOR : C_TEXT);
+
+      // Value bar (0-100 mapped to 300px wide).
+      const barX = 220, barW = 300, barH = 14;
+      const barY = y - barH / 2 + 2;
+      ctx.save();
+      ctx.fillStyle = "rgba(60,60,80,0.7)";
+      ctx.fillRect(barX, barY, barW, barH);
+      ctx.fillStyle = sel ? "rgba(255,255,80,0.85)" : "rgba(80,180,255,0.75)";
+      ctx.fillRect(barX, barY, barW * (val / 100), barH);
+      ctx.restore();
+
+      text(String(val).padStart(3, " "), 534, y, 20, sel ? C_CURSOR : C_TEXT);
     }
   }
 }
@@ -886,31 +979,24 @@ function connect() {
       latestMsg = msg;
     } else if (msg.tag === "pre_lobby") {
       // Bridge is asking us to pick a room.
-      // Reset pre-lobby UI state.
-      preLobbyMode  = "choose";
-      preLobbyCode  = "";
-      preLobbyError = "";
+      resetPreLobby();
       latestMsg = { phase: "pre_lobby" };
     } else if (msg.tag === "joining") {
       // Bridge confirmed the room exists and is connecting us.
       // Switch to connecting screen immediately so the user gets feedback
       // and any stale error text disappears.
-      preLobbyMode  = "choose";
-      preLobbyCode  = "";
-      preLobbyError = "";
+      resetPreLobby();
       latestMsg = { phase: "connecting" };
     } else if (msg.tag === "error") {
       // Only show an error to the user when they explicitly submitted a code.
       // If the error came from an auto-reconnect (preLobbyMode === "choose" and
       // preLobbyCode is empty), just clear stale localStorage silently.
-      const userInitiated = preLobbyMode === "entering_code" || preLobbyCode.length > 0;
-      if (msg.reason === "not_found") {
-        preLobbyError = userInitiated ? "Lobby not found." : "";
-      } else {
-        preLobbyError = userInitiated ? `Error: ${msg.reason}` : "";
-      }
-      preLobbyMode = "choose";
-      preLobbyCode = "";
+      const userInitiated = preLobbyMode === "entering_code" ||
+                            preLobbyMode === "editing_stats"  ||
+                            preLobbyCode.length > 0;
+      const errMsg = msg.reason === "not_found" ? "Lobby not found." : `Error: ${msg.reason}`;
+      resetPreLobby();
+      preLobbyError = userInitiated ? errMsg : "";
       latestMsg = { phase: "pre_lobby" };
     } else if (msg.tag === "full") {
       drawFull();
@@ -944,6 +1030,13 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+document.addEventListener("keyup", (e) => {
+  // Stop key-repeat when ArrowLeft/Right released in stat editor.
+  if (preLobbyMode === "editing_stats" && e.key === _krKey) {
+    _krStop();
+  }
+});
+
 /**
  * Handle a keydown event while the pre_lobby screen is shown.
  * Input is handled entirely in the browser — nothing is forwarded to Zig.
@@ -954,10 +1047,10 @@ function handlePreLobbyKey(e) {
 
   if (preLobbyMode === "choose") {
     if (e.key === "c" || e.key === "C") {
-      preLobbyError = "";
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ action: "create" }));
-      }
+      preLobbyError         = "";
+      preLobbyPendingAction = { action: "create" };
+      preLobbyMode          = "editing_stats";
+      preLobbyStatCursor    = 0;
     } else if (e.key === "j" || e.key === "J") {
       preLobbyMode  = "entering_code";
       preLobbyCode  = "";
@@ -980,10 +1073,10 @@ function handlePreLobbyKey(e) {
     }
     if (e.key === "Enter") {
       if (preLobbyCode.length === 6) {
-        preLobbyError = "";
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ action: "join", code: preLobbyCode }));
-        }
+        preLobbyError         = "";
+        preLobbyPendingAction = { action: "join", code: preLobbyCode };
+        preLobbyMode          = "editing_stats";
+        preLobbyStatCursor    = 0;
       } else {
         preLobbyError = "Code must be 6 characters.";
       }
@@ -993,6 +1086,49 @@ function handlePreLobbyKey(e) {
     if (preLobbyCode.length < 6 && /^[a-zA-Z0-9]$/.test(e.key)) {
       preLobbyCode  += e.key.toUpperCase();
       preLobbyError = "";
+    }
+    return;
+  }
+
+  if (preLobbyMode === "editing_stats") {
+    if (e.key === "Escape") {
+      _krStop();
+      // Go back: to entering_code if joining, to choose if creating.
+      if (preLobbyPendingAction && preLobbyPendingAction.action === "join") {
+        preLobbyMode = "entering_code";
+      } else {
+        preLobbyMode = "choose";
+      }
+      return;
+    }
+    if (e.key === "Enter") {
+      _krStop();
+      if (preLobbyPendingAction && ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ ...preLobbyPendingAction, stats: { ...preLobbyStats } }));
+      }
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      preLobbyStatCursor = (preLobbyStatCursor - 1 + STAT_KEYS.length) % STAT_KEYS.length;
+      _krStop();
+      return;
+    }
+    if (e.key === "ArrowDown") {
+      preLobbyStatCursor = (preLobbyStatCursor + 1) % STAT_KEYS.length;
+      _krStop();
+      return;
+    }
+    // Key-repeat for value adjustment.
+    if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+      if (_krKey !== e.key) {
+        _krStop();
+        _krKey   = e.key;
+        _krDelta = e.key === "ArrowRight" ? 1 : -1;
+        _krStart = Date.now();
+        _adjustStat(_krDelta);
+        _krSchedule();
+      }
+      return;
     }
   }
 }

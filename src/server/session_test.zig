@@ -4,9 +4,9 @@
 //! Transport is a BufferTransport that accumulates outgoing bytes.
 //!
 //! Round mechanics under test:
-//!   - damage pool → net(damage - opposing_shield) * ACTION_EFFECT_VALUE applied to HP pool
+//!   - damage pool → net(damage - opposing_shield) * scale_damage applied to HP pool
 //!   - shield pool → cancels equal opposing damage this round; unused shields discarded
-//!   - heal pool   → shared party HP pool heals pool_size * ACTION_EFFECT_VALUE
+//!   - heal pool   → shared party HP pool heals scale_heal per action
 //!   - enemy intent → folded into enemy damage tally; netted against player shields
 //!   - configurable round_duration respected
 //!   - death/wave-chain/game-over paths
@@ -16,13 +16,16 @@ const shared = @import("shared");
 const proto = shared.protocol;
 const c = shared.components;
 const logic = shared.game_logic;
+const balance = shared.balance;
 const waves = shared.waves;
 
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 
 /// Shorthand for readability in expected-value calculations.
-const V = logic.ACTION_EFFECT_VALUE;
+/// Tracks the base damage unit; tests assume all statblocks have attack=1 so
+/// scale_damage(ctx) == V for every action.
+const V = balance.basic.damage;
 
 // ---------------------------------------------------------------------------
 // Minimal test waves
@@ -136,6 +139,7 @@ fn consume_payload(tag: proto.MsgTag, r: anytype) bool {
         .reconnect     => if (proto.decode_reconnect(r))     |_| true else |_| false,
         .ready_up      => true, // zero-payload
         .choose_combo  => if (proto.decode_choose_combo(r))  |_| true else |_| false,
+        .set_statblock => if (proto.decode_set_statblock(r)) |_| true else |_| false,
         .cancel_combo  => true, // zero-payload
         .lobby_update  => if (proto.decode_lobby_update(r))  |_| true else |_| false,
         .game_start    => if (proto.decode_game_start(r))    |_| true else |_| false,
@@ -1451,11 +1455,9 @@ test "DoT: two players both trigger same element → 2 stacks added" {
     try s.sess.start_game_wave(&test_wave_single);
     set_enemy_ai(&s.sess, 0); // no enemy shields
 
-    // Both players submit [fire, dmg, heal]; each contributes 1 fire-dmg + 1 fire-heal.
-    // Pooled fire-dmg = 2, enemy fire-shield = 0, net = 2 > 0 → trigger fires per trigger check.
-    // But the trigger fires once at the pool level (peek-net checks the pooled damage bucket).
-    // So enemy_dot_stacks[0] increments once per trigger, not per player.
-    // → We expect exactly 1 stack (pool-level trigger, not per-player).
+    // Both players submit [fire, dmg, heal]; each contributes scale_dot_stacks(ctx) = 1 stack
+    // (attack=1, dot_stacks_base=1).  The peek-net survives (no enemy shields), so the full
+    // pending total (2) is added.  → 2 stacks expected.
     const fire_combo = make_combo(&[_]c.ComboSlot{
         .{ .element = .fire  },
         .{ .action  = .damage },
@@ -1465,7 +1467,7 @@ test "DoT: two players both trigger same element → 2 stacks added" {
     try enqueue_combo(&s.sess, s.p[1].pid, fire_combo);
     try tick_n(&s.sess, 0.11, 1);
 
-    try std.testing.expectEqual(@as(u16, 1), s.sess.enemy_dot_stacks[0]);
+    try std.testing.expectEqual(@as(u16, 2), s.sess.enemy_dot_stacks[0]);
 }
 
 test "DoT: trigger fires on second round when re-triggered → stacks accumulate" {

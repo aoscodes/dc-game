@@ -245,6 +245,8 @@ class TabSession {
     /** @type {LobbyRoom | null} */
     this.room           = null;
     this.started        = false;
+    /** @type {object | null} Statblock from browser, sent to Zig before READY. */
+    this.pendingStats   = null;
   }
 
   // ---- Zig stdin ----------------------------------------------------------
@@ -279,6 +281,9 @@ class TabSession {
       console.log("[bridge] tab server connected");
       this.serverConnected = true;
       this.reconnectDelay  = RECONNECT_INITIAL_MS;
+      if (this.pendingStats) {
+        this.writeToZig(`STATBLOCK:${JSON.stringify(this.pendingStats)}\n`);
+      }
       this.writeToZig("READY\n");
     });
 
@@ -399,6 +404,7 @@ class TabSession {
     if (this.started) return; // already in a room
 
     if (msg.action === "create") {
+      if (msg.stats && typeof msg.stats === "object") this.pendingStats = msg.stats;
       const code = uniqueCode();
       let port;
       try { port = await findFreePort(); } catch (err) {
@@ -418,6 +424,7 @@ class TabSession {
     }
 
     if (msg.action === "join" || msg.action === "reconnect") {
+      if (msg.stats && typeof msg.stats === "object") this.pendingStats = msg.stats;
       const rawCode = (msg.code || "").toUpperCase().trim();
       if (rawCode.length !== 6) {
         this.sendPreLobbyError("invalid_code");

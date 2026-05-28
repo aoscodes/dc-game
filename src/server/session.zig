@@ -45,6 +45,7 @@ const shared = @import("shared");
 const c = shared.components;
 const proto = shared.protocol;
 const logic = shared.game_logic;
+const balance = shared.balance;
 const waves = shared.waves;
 const dbg = @import("debug_zig");
 
@@ -389,6 +390,26 @@ pub const Session = struct {
                     std.log.debug("player {} cancelled combo", .{player_id});
                 }
             },
+            .set_statblock => {
+                const p = try proto.decode_set_statblock(fbs.reader());
+                if (self.phase == .ended) {
+                    std.log.warn("player {} sent set_statblock in ended phase — ignored", .{player_id});
+                } else if (player_id < MAX_PLAYERS) {
+                    self.players[player_id].statblock = p.statblock;
+                    std.log.info("player {} statblock updated hp={} atk={}", .{
+                        player_id, p.statblock.hp, p.statblock.attack,
+                    });
+                    if (self.phase == .playing) {
+                        // Apply to live entity if already spawned.
+                        const slot = &self.players[player_id];
+                        if (slot.entity != std.math.maxInt(ecs.Entity) and
+                            self.world.component_arrays.statblock.has(slot.entity))
+                        {
+                            self.world.get_component(slot.entity, c.Statblock).* = p.statblock;
+                        }
+                    }
+                }
+            },
             .reconnect => {},
             else => {},
         }
@@ -398,19 +419,27 @@ pub const Session = struct {
         var ea_buf: [c.MAX_COMBO_LEN]logic.ElementedAction = undefined;
 
         // --- Step 1: Tally player actions by element ---
-        // Actions whose element participates in a DoT trigger (dmg+heal same element) or a
-        // cleanse trigger (heal+shield same element) are withheld from normal pools.
-        // DoT-withheld damage → player_dot_dmg_by_key for the Step 3 shield-gate peek-net.
-        // Cleanse-withheld heal+shield → player_cleanse_by_el for Step 2.5 stack removal.
+        // Each combo is checked against every trigger in balance.combo_triggers.
+        // Actions whose element matches a trigger's pattern are withheld from
+        // normal pools per trigger.withheld_*.  The contributing player's
+        // Statblock is used to scale each action's contribution.
         var player_damage_by_key: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
         var player_shield_by_key: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
         var player_dot_dmg_by_el: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
-        var player_cleanse_by_el: [c.Element.size]u16 = [_]u16{0} ** c.Element.size; // indexed by Element ordinal 0-3
+        // Stacks to add per element if withheld damage survives shields (Step 3 peek-net).
+        var player_dot_stacks_pending: [c.Element.size]u16 = [_]u16{0} ** c.Element.size;
+        var player_cleanse_by_el: [c.Element.size]u16 = [_]u16{0} ** c.Element.size;
         var heal_pool: u16 = 0;
-        for (&self.action_pool) |maybe_combo| {
+        for (&self.action_pool, 0..) |maybe_combo, player_idx| {
             const combo = maybe_combo orelse continue;
-            const dot_mask = logic.detect_dot_triggers(combo);
-            const cleanse_mask = logic.detect_cleanse_triggers(combo);
+            const sb = self.players[player_idx].statblock;
+
+            // Compute per-trigger bitmasks once per combo.
+            var trigger_masks: [balance.combo_triggers.len]u4 = undefined;
+            inline for (balance.combo_triggers, 0..) |trigger, ti| {
+                trigger_masks[ti] = logic.detect_triggers(combo, trigger);
+            }
+
             const n = logic.parse_combo(combo, &ea_buf);
             for (ea_buf[0..n]) |ea| {
                 const k = @intFromEnum(c.element_key(ea.element));
@@ -418,23 +447,52 @@ pub const Session = struct {
                     @as(u4, 1) << @as(u2, @intCast(@intFromEnum(el)))
                 else
                     0;
-                const dot_withheld = el_bit != 0 and (dot_mask & el_bit) != 0 and ea.action != .shield;
-                const cleanse_withheld = el_bit != 0 and (cleanse_mask & el_bit) != 0 and ea.action != .damage;
-                if (dot_withheld) {
-                    if (ea.action == .damage) player_dot_dmg_by_el[k] += 1;
-                    // withheld heal: dropped
-                } else if (cleanse_withheld) {
-                    // heal+shield consumed by cleanse; counted in player_cleanse_by_el
-                    if (ea.action == .heal) {
-                        const i: usize = @intFromEnum(ea.element.?);
-                        player_cleanse_by_el[i] += 1;
+
+                // Check if this action is withheld by any fired trigger.
+                var withheld = false;
+                if (el_bit != 0) {
+                    inline for (balance.combo_triggers, 0..) |trigger, ti| {
+                        if ((trigger_masks[ti] & el_bit) != 0) {
+                            const consumed = switch (ea.action) {
+                                .damage => trigger.withheld_damage,
+                                .shield => trigger.withheld_shield,
+                                .heal   => trigger.withheld_heal,
+                            };
+                            if (consumed) {
+                                withheld = true;
+                                if (trigger.kind == .dot and ea.action == .damage) {
+                                    // Accumulate withheld dmg (peek-net) and pending stacks.
+                                    const dmg_ctx = statblock_ctx(balance.basic.damage, sb, ea.element);
+                                    player_dot_dmg_by_el[k] +|= balance.scale_damage(dmg_ctx);
+                                    const stk_ctx = statblock_ctx(trigger.dot_stacks_base, sb, ea.element);
+                                    const el_i: usize = @intFromEnum(ea.element.?);
+                                    player_dot_stacks_pending[el_i] +|= balance.scale_dot_stacks(stk_ctx);
+                                }
+                                // Cleanse-withheld heal counted for Step 2.5.
+                                if (trigger.kind == .cleanse and ea.action == .heal) {
+                                    const i: usize = @intFromEnum(ea.element.?);
+                                    player_cleanse_by_el[i] +|= trigger.cleanse_stacks_removed;
+                                }
+                            }
+                        }
                     }
-                    // shield: counted implicitly via cleanse_mask; don't add to shield pool
-                } else {
+                }
+
+                if (!withheld) {
+                    const ctx = statblock_ctx(0, sb, ea.element);
                     switch (ea.action) {
-                        .damage => player_damage_by_key[k] += 1,
-                        .shield => player_shield_by_key[k] += 1,
-                        .heal => heal_pool += 1,
+                        .damage => player_damage_by_key[k] +|= balance.scale_damage(
+                            .{ .base = balance.basic.damage, .attack = ctx.attack,
+                               .shield_stat = ctx.shield_stat, .heal_stat = ctx.heal_stat,
+                               .element_stat = ctx.element_stat, .level = ctx.level }),
+                        .shield => player_shield_by_key[k] +|= balance.scale_shield(
+                            .{ .base = balance.basic.shield, .attack = ctx.attack,
+                               .shield_stat = ctx.shield_stat, .heal_stat = ctx.heal_stat,
+                               .element_stat = ctx.element_stat, .level = ctx.level }),
+                        .heal   => heal_pool +|= balance.scale_heal(
+                            .{ .base = balance.basic.heal, .attack = ctx.attack,
+                               .shield_stat = ctx.shield_stat, .heal_stat = ctx.heal_stat,
+                               .element_stat = ctx.element_stat, .level = ctx.level }),
                     }
                 }
             }
@@ -444,14 +502,23 @@ pub const Session = struct {
         var enemy_damage_by_key: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
         var enemy_shield_by_key: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
         var enemy_dot_dmg_by_el: [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size;
+        var enemy_dot_stacks_pending: [c.Element.size]u16 = [_]u16{0} ** c.Element.size;
         var enemy_cleanse_by_el: [c.Element.size]u16 = [_]u16{0} ** c.Element.size;
         var enemy_heal_pool: u16 = 0;
 
-        const em_size = self.world.component_arrays.enemy_marker.size;
-        for (self.enemy_combos[0..em_size]) |maybe_combo| {
+        const em_arr = &self.world.component_arrays.enemy_marker;
+        const em_size = em_arr.size;
+        for (self.enemy_combos[0..em_size], 0..) |maybe_combo, enemy_idx| {
             const combo = maybe_combo orelse continue;
-            const dot_mask = logic.detect_dot_triggers(combo);
-            const cleanse_mask = logic.detect_cleanse_triggers(combo);
+            // Fetch the enemy entity's statblock from the ECS.
+            const enemy_entity = em_arr.index_to_entity[enemy_idx];
+            const sb = self.world.get_component(enemy_entity, c.Statblock).*;
+
+            var trigger_masks: [balance.combo_triggers.len]u4 = undefined;
+            inline for (balance.combo_triggers, 0..) |trigger, ti| {
+                trigger_masks[ti] = logic.detect_triggers(combo, trigger);
+            }
+
             const n = logic.parse_combo(combo, &ea_buf);
             for (ea_buf[0..n]) |ea| {
                 const k = @intFromEnum(c.element_key(ea.element));
@@ -459,20 +526,49 @@ pub const Session = struct {
                     @as(u4, 1) << @as(u2, @intCast(@intFromEnum(el)))
                 else
                     0;
-                const dot_withheld = el_bit != 0 and (dot_mask & el_bit) != 0 and ea.action != .shield;
-                const cleanse_withheld = el_bit != 0 and (cleanse_mask & el_bit) != 0 and ea.action != .damage;
-                if (dot_withheld) {
-                    if (ea.action == .damage) enemy_dot_dmg_by_el[k] += 1;
-                } else if (cleanse_withheld) {
-                    if (ea.action == .heal) {
-                        const i: usize = @intFromEnum(ea.element.?);
-                        enemy_cleanse_by_el[i] += 1;
+
+                var withheld = false;
+                if (el_bit != 0) {
+                    inline for (balance.combo_triggers, 0..) |trigger, ti| {
+                        if ((trigger_masks[ti] & el_bit) != 0) {
+                            const consumed = switch (ea.action) {
+                                .damage => trigger.withheld_damage,
+                                .shield => trigger.withheld_shield,
+                                .heal   => trigger.withheld_heal,
+                            };
+                            if (consumed) {
+                                withheld = true;
+                                if (trigger.kind == .dot and ea.action == .damage) {
+                                    const dmg_ctx = statblock_ctx(balance.basic.damage, sb, ea.element);
+                                    enemy_dot_dmg_by_el[k] +|= balance.scale_damage(dmg_ctx);
+                                    const stk_ctx = statblock_ctx(trigger.dot_stacks_base, sb, ea.element);
+                                    const el_i: usize = @intFromEnum(ea.element.?);
+                                    enemy_dot_stacks_pending[el_i] +|= balance.scale_dot_stacks(stk_ctx);
+                                }
+                                if (trigger.kind == .cleanse and ea.action == .heal) {
+                                    const i: usize = @intFromEnum(ea.element.?);
+                                    enemy_cleanse_by_el[i] +|= trigger.cleanse_stacks_removed;
+                                }
+                            }
+                        }
                     }
-                } else {
+                }
+
+                if (!withheld) {
+                    const ctx = statblock_ctx(0, sb, ea.element);
                     switch (ea.action) {
-                        .damage => enemy_damage_by_key[k] += 1,
-                        .shield => enemy_shield_by_key[k] += 1,
-                        .heal => enemy_heal_pool += 1,
+                        .damage => enemy_damage_by_key[k] +|= balance.scale_damage(
+                            .{ .base = balance.basic.damage, .attack = ctx.attack,
+                               .shield_stat = ctx.shield_stat, .heal_stat = ctx.heal_stat,
+                               .element_stat = ctx.element_stat, .level = ctx.level }),
+                        .shield => enemy_shield_by_key[k] +|= balance.scale_shield(
+                            .{ .base = balance.basic.shield, .attack = ctx.attack,
+                               .shield_stat = ctx.shield_stat, .heal_stat = ctx.heal_stat,
+                               .element_stat = ctx.element_stat, .level = ctx.level }),
+                        .heal   => enemy_heal_pool +|= balance.scale_heal(
+                            .{ .base = balance.basic.heal, .attack = ctx.attack,
+                               .shield_stat = ctx.shield_stat, .heal_stat = ctx.heal_stat,
+                               .element_stat = ctx.element_stat, .level = ctx.level }),
                     }
                 }
             }
@@ -494,33 +590,33 @@ pub const Session = struct {
         }
 
         // --- Step 3: Peek-nets for DoT trigger check ---
-        // A DoT trigger fires for element i when the withheld elemental damage from that
-        // combo survives the opponent's elemental shields.
-        // player_dot_dmg_by_key[k] > 0 already implies both dmg and heal were present
-        // (detect_dot_triggers guarantees the intersection).
+        // A DoT trigger fires for element i when the withheld elemental damage
+        // survives the opponent's elemental shields.  The number of stacks added
+        // is scale_dot_stacks(ctx) accumulated into *_dot_stacks_pending above.
         for (0..c.Element.size) |i| {
             const k: usize = i + 1; // element keys are 1-indexed; 0 = none
 
             // Player combo triggers DoT on enemies.
             const player_dot_net = player_dot_dmg_by_el[k] -| enemy_shield_by_key[k];
             if (player_dot_net > 0) {
-                self.enemy_dot_stacks[i] +|= 1;
+                self.enemy_dot_stacks[i] +|= player_dot_stacks_pending[i];
             }
 
             // Enemy combo triggers DoT on players.
             const enemy_dot_net = enemy_dot_dmg_by_el[k] -| player_shield_by_key[k];
             if (enemy_dot_net > 0) {
-                self.player_dot_stacks[i] +|= 1;
+                self.player_dot_stacks[i] +|= enemy_dot_stacks_pending[i];
             }
         }
 
         // --- Step 4: Inject DoT ticks (including newly-added stacks) into damage pools ---
+        // Tick damage is flat: stack_count * balance.basic.dot_tick.
         // DoT is elemental; it feeds into the same buckets as direct damage so that
         // shields net against the combined total in the application step below.
         for (0..c.Element.size) |i| {
             const k: usize = i + 1;
-            player_damage_by_key[k] +|= self.enemy_dot_stacks[i]; // enemy stacks hit players
-            enemy_damage_by_key[k] +|= self.player_dot_stacks[i]; // player stacks hit enemies
+            player_damage_by_key[k] +|= self.enemy_dot_stacks[i] * balance.basic.dot_tick;
+            enemy_damage_by_key[k]  +|= self.player_dot_stacks[i] * balance.basic.dot_tick;
         }
 
         // --- Step 5: Net and apply to HP ---
@@ -556,7 +652,7 @@ pub const Session = struct {
                 .tag = .heal,
                 .actor_entity = std.math.maxInt(u32),
                 .target_entity = std.math.maxInt(u32),
-                .value = heal_pool * logic.ACTION_EFFECT_VALUE,
+                .value = heal_pool,
             });
         }
 
@@ -594,7 +690,7 @@ pub const Session = struct {
                 .tag = .heal,
                 .actor_entity = std.math.maxInt(u32),
                 .target_entity = std.math.maxInt(u32),
-                .value = enemy_heal_pool * logic.ACTION_EFFECT_VALUE,
+                .value = enemy_heal_pool,
             });
         }
     }
@@ -602,6 +698,29 @@ pub const Session = struct {
     /// Map a bucket index back to an optional Element.
     fn key_to_element(k: usize) ?c.Element {
         return if (k == 0) null else @enumFromInt(k - 1);
+    }
+
+    /// Return the Statblock field matching the given element (0 for null-element).
+    fn element_stat(sb: c.Statblock, el: ?c.Element) u16 {
+        return if (el) |e| switch (e) {
+            .fire  => sb.fire,
+            .earth => sb.earth,
+            .wind  => sb.wind,
+            .water => sb.water,
+        } else 0;
+    }
+
+    /// Build a FormulaCtx from a Statblock and optional element.
+    /// `base` is the ActionValues multiplier for this action type.
+    fn statblock_ctx(base: u16, sb: c.Statblock, el: ?c.Element) balance.FormulaCtx {
+        return .{
+            .base         = base,
+            .attack       = sb.attack,
+            .shield_stat  = sb.shield,
+            .heal_stat    = sb.heal,
+            .element_stat = element_stat(sb, el),
+            .level        = sb.level,
+        };
     }
 
     /// Count living enemies (by ECS array size — enemies are never removed, just die via HP).
@@ -619,30 +738,18 @@ pub const Session = struct {
 
     /// Generate the enemy combo for the current round.
     ///
-    /// Alternates by round_count parity so the enemy demonstrates both DoT and
-    /// cleanse mechanics:
-    ///   even round → [fire, damage, heal]  — triggers fire DoT on players
-    ///   odd  round → [fire, heal, shield]  — cleanses 1 fire stack from enemy side
-    ///
-    /// All enemies share the same combo each round.
+    /// Pattern is chosen from balance.enemy_sequences per element, cycling by
+    /// round_count.  All enemies share the same combo each round.
+    /// Null-element enemies use the fire sequence (index 0) as default.
     fn generate_enemy_combos(self: *Session) void {
         const em_arr = &self.world.component_arrays.enemy_marker;
-        const slots: [c.MAX_COMBO_LEN]c.ComboSlot = if (self.round_count % 2 == 0)
-            .{
-                .{ .element = .fire },
-                .{ .action = .damage },
-                .{ .action = .heal },
-                .{ .action = .damage }, // pad — ignored (len = 3)
-            }
-        else
-            .{
-                .{ .element = .fire },
-                .{ .action = .heal },
-                .{ .action = .shield },
-                .{ .action = .damage }, // pad — ignored (len = 3)
-            };
+        // Use fire sequence (0) as the default for all enemies for now.
+        // Future: per-entity element drives which sequence to use.
+        const seq = balance.enemy_sequences[0];
+        const pattern_idx = seq[self.round_count % seq.len];
+        const pattern = balance.enemy_patterns[pattern_idx];
         for (0..em_arr.size) |i| {
-            self.enemy_combos[i] = .{ .slots = slots, .len = 3 };
+            self.enemy_combos[i] = .{ .slots = pattern.slots, .len = pattern.len };
         }
     }
 
