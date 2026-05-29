@@ -29,11 +29,11 @@ const c = @import("components.zig");
 
 pub const ActionValues = struct {
     /// Damage dealt per damage action (before stat scaling).
-    damage:   u16,
+    damage: u16,
     /// Damage absorbed per shield action (before stat scaling).
-    shield:   u16,
+    shield: u16,
     /// HP restored per heal action (before stat scaling).
-    heal:     u16,
+    heal: u16,
     /// Flat damage per DoT stack per round (no stat scaling at tick time).
     dot_tick: u16,
 };
@@ -41,9 +41,9 @@ pub const ActionValues = struct {
 /// The default preset.  All values are 1 so the game plays like the original
 /// flat-count system until you start editing formulas or stats.
 pub const basic = ActionValues{
-    .damage   = 1,
-    .shield   = 1,
-    .heal     = 1,
+    .damage = 1,
+    .shield = 1,
+    .heal = 1,
     .dot_tick = 1,
 };
 
@@ -63,19 +63,19 @@ pub const TriggerKind = enum { dot, cleanse };
 ///   - For cleanse triggers: `cleanse_stacks_removed` stacks are removed from
 ///     own side's DoT array unconditionally (Step 2.5).
 pub const ComboTrigger = struct {
-    kind:   TriggerKind,
+    kind: TriggerKind,
     /// Exact action counts required in a single elemental group to match.
     damage: u8,
     shield: u8,
-    heal:   u8,
+    heal: u8,
     /// Which action types are consumed (not counted in normal pools) when this
     /// trigger matches.  Independent per type — set what makes sense per recipe.
     withheld_damage: bool,
     withheld_shield: bool,
-    withheld_heal:   bool,
+    withheld_heal: bool,
     /// Base stacks added to the opponent on a successful DoT trigger.
     /// Passed as `ctx.base` to `scale_dot_stacks`.  Ignored for cleanse.
-    dot_stacks_base:        u16,
+    dot_stacks_base: u16,
     /// Stacks unconditionally removed from own side on a cleanse trigger.
     cleanse_stacks_removed: u16,
 };
@@ -85,18 +85,26 @@ pub const ComboTrigger = struct {
 pub const combo_triggers = [_]ComboTrigger{
     // DoT: [element, damage, heal]  →  +dot_stacks on opponent; dmg+heal withheld.
     .{
-        .kind   = .dot,
-        .damage = 1, .shield = 0, .heal = 1,
-        .withheld_damage = true,  .withheld_shield = false, .withheld_heal = true,
-        .dot_stacks_base        = 1,
+        .kind = .dot,
+        .damage = 1,
+        .shield = 0,
+        .heal = 1,
+        .withheld_damage = true,
+        .withheld_shield = false,
+        .withheld_heal = true,
+        .dot_stacks_base = 1,
         .cleanse_stacks_removed = 0,
     },
     // Cleanse: [element, heal, shield]  →  remove 1 own stack; heal+shield withheld.
     .{
-        .kind   = .cleanse,
-        .damage = 0, .shield = 1, .heal = 1,
-        .withheld_damage = false, .withheld_shield = true,  .withheld_heal = true,
-        .dot_stacks_base        = 0,
+        .kind = .cleanse,
+        .damage = 0,
+        .shield = 1,
+        .heal = 1,
+        .withheld_damage = false,
+        .withheld_shield = true,
+        .withheld_heal = true,
+        .dot_stacks_base = 0,
         .cleanse_stacks_removed = 1,
     },
 };
@@ -106,30 +114,48 @@ pub const combo_triggers = [_]ComboTrigger{
 pub const EnemyPattern = struct {
     label: []const u8,
     slots: [c.MAX_COMBO_LEN]c.ComboSlot,
-    len:   u8,
+    len: u8,
 };
-
-/// All named enemy combo patterns.  Reference by index from `enemy_sequences`.
 pub const enemy_patterns = [_]EnemyPattern{
     .{
         .label = "fire_dot",
         .slots = .{
-            .{ .element = .fire   },
-            .{ .action  = .damage },
-            .{ .action  = .heal   },
-            .{ .action  = .damage }, // padding slot — ignored (len = 3)
+            .{ .element = .fire },
+            .{ .action = .damage },
+            .{ .action = .heal },
+            .{ .action = .damage },
         },
         .len = 3,
     },
     .{
         .label = "fire_cleanse",
         .slots = .{
-            .{ .element = .fire   },
-            .{ .action  = .heal   },
-            .{ .action  = .shield },
-            .{ .action  = .damage }, // padding slot — ignored (len = 3)
+            .{ .element = .fire },
+            .{ .action = .heal },
+            .{ .action = .shield },
+            .{ .action = .damage },
         },
         .len = 3,
+    },
+    .{
+        .label = "fire_attack",
+        .slots = .{
+            .{ .element = .fire },
+            .{ .action = .attack },
+            .{ .action = .attack },
+            .{ .action = .attack },
+        },
+    },
+    .{
+        .label = "big_heal",
+        .slots = .{
+            .{ .element = .wind },
+            .{ .action = .heal },
+            .{ .action = .heal },
+            .{ .action = .heal },
+            .{ .action = .heal },
+            //
+        },
     },
 };
 
@@ -143,10 +169,10 @@ pub const enemy_patterns = [_]EnemyPattern{
 /// Each element can have a completely different rotation — add patterns and
 /// edit these arrays to differentiate enemy types.
 pub const enemy_sequences = [c.Element.size][]const u8{
-    &[_]u8{ 0, 1 }, // fire:  dot → cleanse → dot → cleanse …
-    &[_]u8{ 0 },    // earth: always fire_dot (placeholder)
-    &[_]u8{ 0 },    // wind:  always fire_dot (placeholder)
-    &[_]u8{ 0 },    // water: always fire_dot (placeholder)
+    &[_]u8{ 0, 1, 2, 3 },
+    &[_]u8{0},
+    &[_]u8{0},
+    &[_]u8{0},
 };
 
 // ── 4. Stat-scaling formulas ──────────────────────────────────────────────
@@ -155,14 +181,14 @@ pub const enemy_sequences = [c.Element.size][]const u8{
 /// Passed to every `scale_*` function.
 pub const FormulaCtx = struct {
     /// Base value from ActionValues (damage / shield / heal / dot_stacks_base).
-    base:         u16,
-    attack:       u16,
-    shield_stat:  u16,
-    heal_stat:    u16,
+    base: u16,
+    attack: u16,
+    shield_stat: u16,
+    heal_stat: u16,
     /// The statblock field corresponding to the action's element
     /// (sb.fire / .earth / .wind / .water), or 0 for null-element actions.
     element_stat: u16,
-    level:        u16,
+    level: u16,
 };
 
 /// Damage contributed by one damage action from an entity with this context.
