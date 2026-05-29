@@ -10,11 +10,10 @@ const LAYOUT = {
   screen: { w: 1024, h: 768 },
   bg: "#14141e",
 
-  // Entity cell box (sprite drawn aspect-correct & centred inside it).
+  // Entity cell box
   cell: { w: 90, h: 100, sep: 12 },
 
-  // Team play areas.  Widened from the original 310px-wide zones and the
-  // 364px centre gap shrunk, so entities have room and rarely overlap.
+  // Team play areas.
   zones: {
     players: { x0: 30, x1: 470, y0: 200, y1: 620 },
     enemies: { x0: 554, x1: 994, y0: 200, y1: 620 },
@@ -28,7 +27,7 @@ const LAYOUT = {
   headers: { waveX: 40, waveY: 50, waveFont: 20, labelDy: -62, labelFont: 18 },
 
   // Aggregate team HP/heal bars (drawn above each zone).
-  teamBars: { dy: -42, barH: 10, gap: 4, labelW: 40, font: 10, dotGap: 38, dotDyPlayers: 30, dotDyEnemies: 16 },
+  teamBars: { dy: -42, barH: 10, gap: 4, labelW: 40, font: 10, dotGap: 38, dotDyPlayers: 40, dotDyEnemies: 26, effectFont: 20 },
 
   // Combo glyph row under each player entity.
   comboRow: { slotW: 18, maxSlots: 4, dy: 4, font: 14, textDy: 13 },
@@ -229,7 +228,7 @@ function clearEntityState() {
   animState.clear();
   floaters.length = 0;
   lastRoundSeen = -1;
-  lastEntitiesSnapshot    = [];
+  lastEntitiesSnapshot = [];
   lastEnemyIntentSnapshot = null;
 }
 
@@ -273,8 +272,8 @@ function drawConnecting() {
  * "entering_code" — user is typing a 6-char lobby code
  * "editing_stats" — player is adjusting their statblock before creating/joining
  */
-let preLobbyMode  = "choose";
-let preLobbyCode  = "";
+let preLobbyMode = "choose";
+let preLobbyCode = "";
 let preLobbyError = "";
 
 /** Ordered list of stat keys shown in the editor (display order). */
@@ -286,12 +285,12 @@ const DEFAULT_STATS = { hp: 120, attack: 1, shield: 1, heal: 1, fire: 1, earth: 
 /** Reset all pre-lobby state (called on server pre_lobby / joining / error messages). */
 function resetPreLobby() {
   _krStop();
-  preLobbyMode          = "choose";
-  preLobbyCode          = "";
-  preLobbyError         = "";
-  preLobbyStats         = { ...DEFAULT_STATS };
+  preLobbyMode = "choose";
+  preLobbyCode = "";
+  preLobbyError = "";
+  preLobbyStats = { ...DEFAULT_STATS };
   preLobbyPendingAction = null;
-  preLobbyStatCursor    = 0;
+  preLobbyStatCursor = 0;
 }
 
 /** Mutable statblock for the current session (reset on pre_lobby entry). */
@@ -307,10 +306,10 @@ let preLobbyStatCursor = 0;
 let preLobbyPendingAction = null;
 
 // Key-repeat state for stat value adjustment (ArrowLeft / ArrowRight).
-let _krKey      = null;   // "ArrowLeft" | "ArrowRight" | null
-let _krTimer    = null;
-let _krStart    = 0;
-let _krDelta    = 0;      // +1 or -1
+let _krKey = null;   // "ArrowLeft" | "ArrowRight" | null
+let _krTimer = null;
+let _krStart = 0;
+let _krDelta = 0;      // +1 or -1
 
 function _krStop() {
   _krKey = null;
@@ -319,7 +318,7 @@ function _krStop() {
 
 function _krSchedule() {
   const elapsed = Date.now() - _krStart;
-  const delay   = Math.max(30, 400 - elapsed * 0.6);
+  const delay = Math.max(30, 400 - elapsed * 0.6);
   _krTimer = setTimeout(_krTick, delay);
 }
 
@@ -361,7 +360,7 @@ function drawPreLobby() {
     for (let i = 0; i < STAT_KEYS.length; i++) {
       const key = STAT_KEYS[i];
       const val = preLobbyStats[key] || 1;
-      const y   = L.statStartY + i * L.statRowH;
+      const y = L.statStartY + i * L.statRowH;
       const sel = i === preLobbyStatCursor;
 
       if (sel) {
@@ -529,18 +528,18 @@ function drawTeam(game, team, dt) {
       // Intent: 1 damage of intent.element (shared across all enemies).
       const intent = game.enemy_intent;
       if (intent && intent.damage > 0) {
-        const el     = intent.element ?? null;
+        const el = intent.element ?? null;
         const elChar = el ? (ELEMENT_CHAR[el] ?? "") : "";
-        const color  = el ? (ELEMENT_COLOR[el] ?? ACTION_COLOR.damage) : ACTION_COLOR.damage;
+        const color = el ? (ELEMENT_COLOR[el] ?? ACTION_COLOR.damage) : ACTION_COLOR.damage;
         const prefix = elChar ? `${elChar} ` : "";
         lines.push({ str: `${prefix}dmg -1`, color });
       }
 
       // Combo: detect special groups first, then render remaining actions individually.
-      const combo           = e.combo ?? [];
-      const dotTriggers     = detectDotTriggers(combo);
+      const combo = e.combo ?? [];
+      const dotTriggers = detectDotTriggers(combo);
       const cleanseTriggers = detectCleanseTriggers(combo);
-      const consumed        = new Set([...dotTriggers, ...cleanseTriggers]);
+      const consumed = new Set([...dotTriggers, ...cleanseTriggers]);
 
       for (const el of dotTriggers) {
         lines.push({ str: `${ELEMENT_CHAR[el] ?? el} DoT +1`, color: ELEMENT_COLOR[el] ?? ACTION_COLOR.damage });
@@ -552,19 +551,19 @@ function drawTeam(game, team, dt) {
       for (const { action, element } of parseComboSlots(combo)) {
         if (element && consumed.has(element)) continue; // already shown as special label
         const elChar = element ? (ELEMENT_CHAR[element] ?? "") : "";
-        const color  = element ? (ELEMENT_COLOR[element] ?? ACTION_COLOR[action] ?? C_TEXT)
-                               : (ACTION_COLOR[action] ?? C_TEXT);
+        const color = element ? (ELEMENT_COLOR[element] ?? ACTION_COLOR[action] ?? C_TEXT)
+          : (ACTION_COLOR[action] ?? C_TEXT);
         const prefix = elChar ? `${elChar} ` : "";
-        const label  = action === "damage" ? "dmg"
-                     : action === "shield" ? "shld"
-                     : "heal";
-        const sign   = action === "damage" ? `-${ACTION_EFFECT_VALUE}` : `+${ACTION_EFFECT_VALUE}`;
+        const label = action === "damage" ? "dmg"
+          : action === "shield" ? "shld"
+            : "heal";
+        const sign = action === "damage" ? `-${ACTION_EFFECT_VALUE}` : `+${ACTION_EFFECT_VALUE}`;
         lines.push({ str: `${prefix}${label} ${sign}`, color });
       }
 
       // Render bottom-to-top above the sprite: last line sits just above cy.
       const IL = LAYOUT.intentLine;
-      const baseY  = cy + IL.baseDy;
+      const baseY = cy + IL.baseDy;
       for (let i = 0; i < lines.length; i++) {
         const lineY = baseY - (lines.length - 1 - i) * IL.lineH;
         text(lines[i].str, cx, lineY, IL.font, lines[i].color);
@@ -611,16 +610,16 @@ function tickFloaters(dt) {
 
 function drawFloaters() {
   for (const f of floaters) {
-    const frac     = f.age / f.lifetime;
-    const alpha    = frac > 0.6 ? 1 - (frac - 0.6) / 0.4 : 1.0;
-    const yOffset  = -LAYOUT.floater.drift * frac; // drift upward over lifetime
+    const frac = f.age / f.lifetime;
+    const alpha = frac > 0.6 ? 1 - (frac - 0.6) / 0.4 : 1.0;
+    const yOffset = -LAYOUT.floater.drift * frac; // drift upward over lifetime
 
     // Strip any existing alpha from the color string and reapply via globalAlpha.
     ctx.save();
     ctx.globalAlpha = alpha;
-    ctx.font        = `bold ${LAYOUT.floater.font}px monospace`;
-    ctx.fillStyle   = f.color;
-    ctx.textAlign   = "center";
+    ctx.font = `bold ${LAYOUT.floater.font}px monospace`;
+    ctx.fillStyle = f.color;
+    ctx.textAlign = "center";
     ctx.fillText(f.text, f.x, f.y + yOffset);
     ctx.restore();
   }
@@ -672,8 +671,8 @@ function detectSpecialGroups(slots, predicate) {
       flush();
       el = slot.element; dc = 0; hc = 0; sc = 0;
     } else if (slot.action !== undefined && el !== null) {
-      if      (slot.action === "damage") dc++;
-      else if (slot.action === "heal")   hc++;
+      if (slot.action === "damage") dc++;
+      else if (slot.action === "heal") hc++;
       else if (slot.action === "shield") sc++;
     }
   }
@@ -682,7 +681,7 @@ function detectSpecialGroups(slots, predicate) {
 }
 
 /** Returns Set of element names whose group is exactly {dmg, heal} → DoT trigger. */
-const detectDotTriggers     = s => detectSpecialGroups(s, (dc, hc, sc) => dc === 1 && hc === 1 && sc === 0);
+const detectDotTriggers = s => detectSpecialGroups(s, (dc, hc, sc) => dc === 1 && hc === 1 && sc === 0);
 
 /** Returns Set of element names whose group is exactly {heal, shield} → cleanse trigger. */
 const detectCleanseTriggers = s => detectSpecialGroups(s, (dc, hc, sc) => hc === 1 && sc === 1 && dc === 0);
@@ -736,7 +735,7 @@ function spawnRoundSummaryFloaters(game, prevEntities, prevEnemyIntent, prevDotS
   let floaterY = ey; // stack floaters vertically in the enemy zone
 
   for (const [element, counts] of tally) {
-    const elChar  = element === "none" ? ""   : (ELEMENT_CHAR[element]  ?? "");
+    const elChar = element === "none" ? "" : (ELEMENT_CHAR[element] ?? "");
     const elColor = element === "none" ? "rgba(255,100,100,1)" : (ELEMENT_COLOR[element] ?? "rgba(255,100,100,1)");
 
     if (counts.damage > 0) {
@@ -778,7 +777,7 @@ function spawnRoundSummaryFloaters(game, prevEntities, prevEnemyIntent, prevDotS
   // Enemy intent floater: use the snapshotted intent from the round that just resolved.
   const intent = prevEnemyIntent;
   if (intent && intent.damage > 0) {
-    const elChar  = intent.element ? (ELEMENT_CHAR[intent.element]  ?? "") : "";
+    const elChar = intent.element ? (ELEMENT_CHAR[intent.element] ?? "") : "";
     const elColor = intent.element ? (ELEMENT_COLOR[intent.element] ?? "rgba(255,80,80,1)") : "rgba(255,80,80,1)";
     const label = elChar ? `-${intent.damage} ${elChar}` : `-${intent.damage}`;
     spawnFloater(label, px + jitter(), py - STACK, elColor);
@@ -794,7 +793,7 @@ function spawnRoundSummaryFloaters(game, prevEntities, prevEnemyIntent, prevDotS
       const elName = ELEMENT_NAMES[i];
       const stacks = prevDotStacks.enemies[elName];
       if (!stacks || stacks === 0) continue;
-      const color  = ELEMENT_COLOR[elName] ?? "rgba(255,100,100,1)";
+      const color = ELEMENT_COLOR[elName] ?? "rgba(255,100,100,1)";
       spawnFloater(`${ELEMENT_CHAR[elName]} dot -${stacks * ACTION_EFFECT_VALUE}`, ex + jitter(), dotEnemyY, color);
       dotEnemyY += STACK;
     }
@@ -804,7 +803,7 @@ function spawnRoundSummaryFloaters(game, prevEntities, prevEnemyIntent, prevDotS
       const elName = ELEMENT_NAMES[i];
       const stacks = prevDotStacks.players[elName];
       if (!stacks || stacks === 0) continue;
-      const color  = ELEMENT_COLOR[elName] ?? "rgba(255,100,100,1)";
+      const color = ELEMENT_COLOR[elName] ?? "rgba(255,100,100,1)";
       spawnFloater(`${ELEMENT_CHAR[elName]} dot -${stacks * ACTION_EFFECT_VALUE}`, px + jitter(), dotPlayerY, color);
       dotPlayerY += STACK;
     }
@@ -815,7 +814,7 @@ function spawnRoundSummaryFloaters(game, prevEntities, prevEnemyIntent, prevDotS
 // Round tracking state
 // ---------------------------------------------------------------------------
 
-let lastRoundSeen    = -1;
+let lastRoundSeen = -1;
 /** Shallow copy of game.entities from the previous frame. */
 let lastEntitiesSnapshot = [];
 /** Copy of game.enemy_intent from the previous frame (used in round-boundary floaters). */
@@ -834,9 +833,9 @@ function updateRoundTracking(game) {
   }
   lastRoundSeen = game.round;
   // Snapshot current entities, intent and dot_stacks so they're available next frame if a round fires.
-  lastEntitiesSnapshot     = (game.entities ?? []).slice();
-  lastEnemyIntentSnapshot  = game.enemy_intent ?? null;
-  lastDotStacksSnapshot    = game.dot_stacks ?? null;
+  lastEntitiesSnapshot = (game.entities ?? []).slice();
+  lastEnemyIntentSnapshot = game.enemy_intent ?? null;
+  lastDotStacksSnapshot = game.dot_stacks ?? null;
 }
 
 /** Map ActionChoice enum string → display character. */
@@ -846,7 +845,7 @@ const ACTION_CHAR = { damage: "a", shield: "s", heal: "h" };
 const ACTION_COLOR = {
   damage: "rgba(255,100,100,1)",
   shield: "rgba(80,160,255,1)",
-  heal:   "rgba(100,220,100,1)",
+  heal: "rgba(100,220,100,1)",
 };
 
 /** Element ordinal → name string; matches protocol Element ordinal order. */
@@ -857,9 +856,9 @@ const ELEMENT_CHAR = { fire: "♦", earth: "▲", wind: "≋", water: "~" };
 
 /** Map Element enum string → highlight colour. */
 const ELEMENT_COLOR = {
-  fire:  "rgba(255,120,40,1)",
+  fire: "rgba(255,120,40,1)",
   earth: "rgba(160,120,60,1)",
-  wind:  "rgba(180,255,180,1)",
+  wind: "rgba(180,255,180,1)",
   water: "rgba(80,160,255,1)",
 };
 
@@ -916,8 +915,8 @@ function drawTeamBars(game) {
     // Two bars stacked; top sits just below the "ALLIES" label.
     const y = PLAYER_ZONE.y0 + LAYOUT.teamBars.dy;
     drawBars([
-      { label: "HP",   value: hp_current, frac: hp_current * scale, color: "rgba(60,200,60,0.9)",   bg: C_HP_BG },
-      { label: "Heal", value: projHeal,   frac: projHeal   * scale, color: "rgba(140,230,100,0.9)", bg: "rgba(20,50,20,0.6)" },
+      { label: "HP", value: hp_current, frac: hp_current * scale, color: "rgba(60,200,60,0.9)", bg: C_HP_BG },
+      { label: "Heal", value: projHeal, frac: projHeal * scale, color: "rgba(140,230,100,0.9)", bg: "rgba(20,50,20,0.6)" },
     ], PLAYER_ZONE.x0, PLAYER_ZONE.x1, y);
 
     // DoT stacks on the player party (applied by enemies).
@@ -927,7 +926,7 @@ function drawTeamBars(game) {
       for (let i = 0; i < 4; i++) {
         const elName = ELEMENT_NAMES[i];
         if (!dotP[elName]) continue;
-        text(`${ELEMENT_CHAR[elName]}×${dotP[elName]}`, dx, y + LAYOUT.teamBars.dotDyPlayers, LAYOUT.teamBars.font, ELEMENT_COLOR[elName]);
+        text(`${ELEMENT_CHAR[elName]}×${dotP[elName]}`, dx, y + LAYOUT.teamBars.dotDyPlayers, LAYOUT.teamBars.effectFont, ELEMENT_COLOR[elName]);
         dx += LAYOUT.teamBars.dotGap;
       }
     }
@@ -952,7 +951,7 @@ function drawTeamBars(game) {
       for (let i = 0; i < 4; i++) {
         const elName = ELEMENT_NAMES[i];
         if (!dotE[elName]) continue;
-        text(`${ELEMENT_CHAR[elName]}×${dotE[elName]}`, dx, y + LAYOUT.teamBars.dotDyEnemies, LAYOUT.teamBars.font, ELEMENT_COLOR[elName]);
+        text(`${ELEMENT_CHAR[elName]}×${dotE[elName]}`, dx, y + LAYOUT.teamBars.dotDyEnemies, LAYOUT.teamBars.effectFont, ELEMENT_COLOR[elName]);
         dx += LAYOUT.teamBars.dotGap;
       }
     }
@@ -971,7 +970,7 @@ function drawActionMenu(game) {
 
   const px = mx + M.padX;
   const aRowY = my + M.padTopY + M.actionRowDy;
-  text("[1] Atk",  px + M.actionCols[0], aRowY, M.actionFont, C_TEXT);
+  text("[1] Atk", px + M.actionCols[0], aRowY, M.actionFont, C_TEXT);
   text("[2] Shld", px + M.actionCols[1], aRowY, M.actionFont, C_TEXT);
   text("[3] Heal", px + M.actionCols[2], aRowY, M.actionFont, C_TEXT);
 
@@ -1042,12 +1041,12 @@ function renderFrame(msg, dt) {
   lastPhase = msg.phase;
 
   switch (msg.phase) {
-    case "pre_lobby":  drawPreLobby(); break;
+    case "pre_lobby": drawPreLobby(); break;
     case "connecting": drawConnecting(); break;
-    case "lobby":      drawLobby(msg.lobby); break;
-    case "game":       drawGame(msg.game, dt); break;
-    case "game_over":  drawGameOver(); break;
-    default:           drawConnecting();
+    case "lobby": drawLobby(msg.lobby); break;
+    case "game": drawGame(msg.game, dt); break;
+    case "game_over": drawGameOver(); break;
+    default: drawConnecting();
   }
 }
 
@@ -1093,8 +1092,8 @@ function connect() {
       // If the error came from an auto-reconnect (preLobbyMode === "choose" and
       // preLobbyCode is empty), just clear stale localStorage silently.
       const userInitiated = preLobbyMode === "entering_code" ||
-                            preLobbyMode === "editing_stats"  ||
-                            preLobbyCode.length > 0;
+        preLobbyMode === "editing_stats" ||
+        preLobbyCode.length > 0;
       const errMsg = msg.reason === "not_found" ? "Lobby not found." : `Error: ${msg.reason}`;
       resetPreLobby();
       preLobbyError = userInitiated ? errMsg : "";
@@ -1148,13 +1147,13 @@ function handlePreLobbyKey(e) {
 
   if (preLobbyMode === "choose") {
     if (e.key === "c" || e.key === "C") {
-      preLobbyError         = "";
+      preLobbyError = "";
       preLobbyPendingAction = { action: "create" };
-      preLobbyMode          = "editing_stats";
-      preLobbyStatCursor    = 0;
+      preLobbyMode = "editing_stats";
+      preLobbyStatCursor = 0;
     } else if (e.key === "j" || e.key === "J") {
-      preLobbyMode  = "entering_code";
-      preLobbyCode  = "";
+      preLobbyMode = "entering_code";
+      preLobbyCode = "";
       preLobbyError = "";
     }
     return;
@@ -1162,22 +1161,22 @@ function handlePreLobbyKey(e) {
 
   if (preLobbyMode === "entering_code") {
     if (e.key === "Escape") {
-      preLobbyMode  = "choose";
-      preLobbyCode  = "";
+      preLobbyMode = "choose";
+      preLobbyCode = "";
       preLobbyError = "";
       return;
     }
     if (e.key === "Backspace") {
-      preLobbyCode  = preLobbyCode.slice(0, -1);
+      preLobbyCode = preLobbyCode.slice(0, -1);
       preLobbyError = "";
       return;
     }
     if (e.key === "Enter") {
       if (preLobbyCode.length === 6) {
-        preLobbyError         = "";
+        preLobbyError = "";
         preLobbyPendingAction = { action: "join", code: preLobbyCode };
-        preLobbyMode          = "editing_stats";
-        preLobbyStatCursor    = 0;
+        preLobbyMode = "editing_stats";
+        preLobbyStatCursor = 0;
       } else {
         preLobbyError = "Code must be 6 characters.";
       }
@@ -1185,7 +1184,7 @@ function handlePreLobbyKey(e) {
     }
     // Accept alphanumeric characters (auto-uppercase, max 6).
     if (preLobbyCode.length < 6 && /^[a-zA-Z0-9]$/.test(e.key)) {
-      preLobbyCode  += e.key.toUpperCase();
+      preLobbyCode += e.key.toUpperCase();
       preLobbyError = "";
     }
     return;
@@ -1223,7 +1222,7 @@ function handlePreLobbyKey(e) {
     if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
       if (_krKey !== e.key) {
         _krStop();
-        _krKey   = e.key;
+        _krKey = e.key;
         _krDelta = e.key === "ArrowRight" ? 1 : -1;
         _krStart = Date.now();
         _adjustStat(_krDelta);
