@@ -22,15 +22,15 @@ const {
 const WS = require("ws");
 
 // ---------------------------------------------------------------------------
-// Layout constants (must match web/game.js)
+// Layout constants — must mirror LAYOUT.zones in web/game.js.
+//
+// Entities are placed at runtime within these team zones (random, collision-
+// avoided), so tests assert "a sprite was painted somewhere in the zone"
+// rather than at a fixed grid cell.
 // ---------------------------------------------------------------------------
 
-const PLAYER_GRID_X = 60;
-const PLAYER_GRID_Y = 180;
-const ENEMY_GRID_X  = 1024 - 60 - (90 + 6) * 3;
-const ENEMY_GRID_Y  = 180;
-const CELL_W = 90;
-const CELL_H = 100;
+const PLAYER_ZONE = { x0: 30, x1: 470, y0: 200, y1: 620 };
+const ENEMY_ZONE  = { x0: 554, x1: 994, y0: 200, y1: 620 };
 
 // ---------------------------------------------------------------------------
 // Per-test server+bridge lifecycle helpers.
@@ -112,50 +112,34 @@ test("canvas renders entity cells when in game phase", async ({ page }) => {
     // Give it a tick to paint.
     await page.waitForTimeout(300);
 
-    // Find an actual player entity in the frame and check its grid cell.
-    const playerEntity = gameFrame.game.entities.find((e) => e.team === "players");
-    const enemyEntity  = gameFrame.game.entities.find((e) => e.team === "enemies");
+    // Both teams have at least one entity in the frame.
+    expect(gameFrame.game.entities.some((e) => e.team === "players")).toBe(true);
+    expect(gameFrame.game.entities.some((e) => e.team === "enemies")).toBe(true);
 
-    // Ally cell — should be filled with a class colour (not background, not
-    // empty-cell grey rgba(40,40,55)).
-    const allyCx = PLAYER_GRID_X + playerEntity.col * (CELL_W + 6);
-    const allyCy = PLAYER_GRID_Y + playerEntity.row * (CELL_H + 6);
-    const allyHasEntity = await page.evaluate(
-      ({ x, y, w, h }) => {
-        const canvas = document.getElementById("canvas");
-        const ctx = canvas.getContext("2d");
-        const { data } = ctx.getImageData(x, y, w, h);
-        for (let i = 0; i < data.length; i += 4) {
-          const r = data[i], g = data[i + 1], b = data[i + 2];
-          const isBackground = r <= 25 && g <= 25 && b <= 35;
-          const isEmptyCell  = r >= 30 && r <= 60 && g >= 30 && g <= 60 && b >= 45 && b <= 70;
-          if (!isBackground && !isEmptyCell) return true;
-        }
-        return false;
-      },
-      { x: allyCx, y: allyCy, w: CELL_W, h: CELL_H },
-    );
-    expect(allyHasEntity).toBe(true);
+    // Entities are placed at runtime somewhere within their team zone, so we
+    // scan the whole zone rect for a painted sprite pixel rather than a fixed
+    // grid cell.  A "sprite" pixel is one that is neither the background nor
+    // the faint zone backdrop/border (both extremely close to background).
+    const zoneHasSprite = (zone) =>
+      page.evaluate(
+        ({ x0, y0, x1, y1 }) => {
+          const canvas = document.getElementById("canvas");
+          const ctx = canvas.getContext("2d");
+          const { data } = ctx.getImageData(x0, y0, x1 - x0, y1 - y0);
+          for (let i = 0; i < data.length; i += 4) {
+            const r = data[i], g = data[i + 1], b = data[i + 2];
+            // Background #14141e ≈ (20,20,30); faint backdrop/border stay very
+            // close to it.  A real sprite pixel is meaningfully brighter.
+            const nearBackdrop = r <= 45 && g <= 45 && b <= 60;
+            if (!nearBackdrop) return true;
+          }
+          return false;
+        },
+        zone,
+      );
 
-    // Enemy cell — same check on the enemy grid.
-    const enemyCx = ENEMY_GRID_X + enemyEntity.col * (CELL_W + 6);
-    const enemyCy = ENEMY_GRID_Y + enemyEntity.row * (CELL_H + 6);
-    const enemyHasEntity = await page.evaluate(
-      ({ x, y, w, h }) => {
-        const canvas = document.getElementById("canvas");
-        const ctx = canvas.getContext("2d");
-        const { data } = ctx.getImageData(x, y, w, h);
-        for (let i = 0; i < data.length; i += 4) {
-          const r = data[i], g = data[i + 1], b = data[i + 2];
-          const isBackground = r <= 25 && g <= 25 && b <= 35;
-          const isEmptyCell  = r >= 30 && r <= 60 && g >= 30 && g <= 60 && b >= 45 && b <= 70;
-          if (!isBackground && !isEmptyCell) return true;
-        }
-        return false;
-      },
-      { x: enemyCx, y: enemyCy, w: CELL_W, h: CELL_H },
-    );
-    expect(enemyHasEntity).toBe(true);
+    expect(await zoneHasSprite(PLAYER_ZONE)).toBe(true);
+    expect(await zoneHasSprite(ENEMY_ZONE)).toBe(true);
 
     botA.close();
     botB.close();

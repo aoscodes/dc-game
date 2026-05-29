@@ -371,6 +371,8 @@ exports.waitForFramePhase = async function waitForFramePhase(collector, phase, t
 
 const KNOWN_CLASSES = new Set(["fighter", "mage", "healer", "grunt", "archer", "shaman", "boss"]);
 const KNOWN_TEAMS = new Set(["players", "enemies"]);
+// Entity `kind` values as emitted by the Zig client (EntityKind tag names).
+const KNOWN_KINDS = new Set(["player", "grunt", "archer", "shaman", "boss"]);
 
 /**
  * Assert that a render frame in lobby phase has well-formed lobby fields.
@@ -393,7 +395,9 @@ exports.assertLobbyFrame = function assertLobbyFrame(frame) {
 
 /**
  * Assert that a render frame in game phase has well-formed game fields,
- * including at least one entity with valid team/class/position fields.
+ * matching the schema emitted by src/client/stdout_writer.zig (JsonGame /
+ * JsonEntity).  Entities carry {id, kind, team, owner, ...} — no positions or
+ * per-entity hp (the renderer lays them out itself; team hp is aggregate).
  * Throws with a descriptive message if anything is wrong.
  */
 exports.assertGameFrame = function assertGameFrame(frame) {
@@ -406,15 +410,16 @@ exports.assertGameFrame = function assertGameFrame(frame) {
   for (const e of G.entities) {
     if (typeof e.id !== "number")
       throw new Error(`assertGameFrame: entity.id not a number: ${JSON.stringify(e)}`);
-    if (typeof e.col !== "number" || typeof e.row !== "number")
-      throw new Error(`assertGameFrame: entity col/row not numbers: ${JSON.stringify(e)}`);
-    if (typeof e.hp !== "number" || typeof e.hp_max !== "number")
-      throw new Error(`assertGameFrame: entity hp/hp_max not numbers: ${JSON.stringify(e)}`);
     if (!KNOWN_TEAMS.has(e.team))
       throw new Error(`assertGameFrame: unknown team: ${e.team}`);
-    if (!KNOWN_CLASSES.has(e.class))
-      throw new Error(`assertGameFrame: unknown class: ${e.class}`);
+    if (!KNOWN_KINDS.has(e.kind))
+      throw new Error(`assertGameFrame: unknown kind: ${e.kind}`);
   }
+  // Aggregate team summaries carry hp.
+  if (!G.players || typeof G.players.hp_current !== "number" || typeof G.players.hp_max !== "number")
+    throw new Error(`assertGameFrame: players summary missing hp fields: ${JSON.stringify(G.players)}`);
+  if (!G.enemies || typeof G.enemies.hp_current !== "number" || typeof G.enemies.hp_max !== "number")
+    throw new Error(`assertGameFrame: enemies summary missing hp fields: ${JSON.stringify(G.enemies)}`);
   const hasPlayers = G.entities.some((e) => e.team === "players");
   const hasEnemies = G.entities.some((e) => e.team === "enemies");
   if (!hasPlayers) throw new Error("assertGameFrame: no player-team entities");

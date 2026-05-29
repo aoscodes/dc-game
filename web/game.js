@@ -1,16 +1,88 @@
 "use strict";
 
-const SW = 1024;
-const SH = 768;
+// ---------------------------------------------------------------------------
+// LAYOUT — single source of truth for every on-screen position, size, and font.
+//
+// Want to move something?  Edit it here.  No draw function hard-codes pixels;
+// they all read from this object.  Grouped by screen / region.
+// ---------------------------------------------------------------------------
+const LAYOUT = {
+  screen: { w: 1024, h: 768 },
+  bg: "#14141e",
 
-const CELL_W = 90;
-const CELL_H = 100;
+  // Entity cell box (sprite drawn aspect-correct & centred inside it).
+  cell: { w: 90, h: 100, sep: 12 },
 
-// Team placement zones (soft boundaries — no hard grid).
-const PLAYER_ZONE = { x0: 20, x1: 330, y0: 180, y1: 660 };
-const ENEMY_ZONE = { x0: 694, x1: 1004, y0: 180, y1: 660 };
+  // Team play areas.  Widened from the original 310px-wide zones and the
+  // 364px centre gap shrunk, so entities have room and rarely overlap.
+  zones: {
+    players: { x0: 30, x1: 470, y0: 200, y1: 620 },
+    enemies: { x0: 554, x1: 994, y0: 200, y1: 620 },
+    visible: true, // draw a faint backdrop + border so play areas are obvious
+    bgFill: "rgba(255,255,255,0.03)",
+    border: "rgba(180,200,255,0.18)",
+    borderW: 2,
+  },
 
-const C_BG = "#14141e";
+  // Game-screen headers.
+  headers: { waveX: 40, waveY: 50, waveFont: 20, labelDy: -62, labelFont: 18 },
+
+  // Aggregate team HP/heal bars (drawn above each zone).
+  teamBars: { dy: -42, barH: 10, gap: 4, labelW: 40, font: 10, dotGap: 38, dotDyPlayers: 30, dotDyEnemies: 16 },
+
+  // Combo glyph row under each player entity.
+  comboRow: { slotW: 18, maxSlots: 4, dy: 4, font: 14, textDy: 13 },
+
+  // Enemy intent / combo lines stacked above each enemy sprite.
+  intentLine: { lineH: 14, baseDy: -4, font: 11 },
+
+  // Bottom action menu + round timer.
+  actionMenu: {
+    w: 320, h: 90, marginBottom: 110,
+    padX: 10, padTopY: 14,
+    actionRowDy: 16, actionFont: 16, actionCols: [0, 106, 212],
+    elementRowDy: 34, elementFont: 13, elementCols: [0, 80, 160, 240],
+    cancelRowDy: 50, cancelFont: 12,
+    timerBarDy: 58, timerBarH: 10, timerTextDy: 82, timerTextFont: 13,
+  },
+
+  // Floating combat text.
+  floater: { font: 16, drift: 40, jitter: 40, stack: 22, lifetime: 1.5 },
+
+  // Pre-lobby / stat editor.
+  preLobby: {
+    titleX: 40, titleY: 60, titleFont: 32,
+    optX: 60, optY0: 160, optGap: 40, optFont: 22,
+    errorDy: 100, errorFont: 18,
+    codePromptY: 160, codeY: 210, codeFont: 36, codeHintY: 270, codeHintFont: 16,
+    statTitleY: 100, statTitleFont: 24, statHintY: 130, statHintFont: 14,
+    statRowH: 38, statStartY: 168, statLabelX: 70, statLabelFont: 20,
+    statHiX: 50, statHiW: 480,
+    statBarX: 220, statBarW: 300, statBarH: 14, statValX: 534,
+  },
+
+  // Lobby list.
+  lobby: {
+    titleX: 40, titleY: 52, titleFont: 32,
+    codeX: 40, codeY: 92, codeFont: 22,
+    listY: 130, rowGap: 36, rowDy: 20, rowX: 60, rowFont: 20,
+    readyDy: 20, readyFont: 18,
+  },
+
+  connecting: { x: 40, y: 60, font: 24 },
+  full: { x: 40, titleDy: -16, titleFont: 24, subDy: 16, subFont: 18 },
+  gameOver: { x: 40, font: 24 },
+};
+
+// Derived convenience aliases (read-only mirrors of LAYOUT).
+const SW = LAYOUT.screen.w;
+const SH = LAYOUT.screen.h;
+const CELL_W = LAYOUT.cell.w;
+const CELL_H = LAYOUT.cell.h;
+const PLAYER_ZONE = LAYOUT.zones.players;
+const ENEMY_ZONE = LAYOUT.zones.enemies;
+
+const C_BG = LAYOUT.bg ?? "#14141e";
 const C_HP_BG = "rgba(30,10,10,0.78)";
 const C_HP_FILL = "rgba(60,200,60,0.9)";
 const C_CURSOR = "rgba(255,255,100,0.7)";
@@ -107,27 +179,49 @@ const entityPositions = new Map();
 
 /**
  * Pick a random non-overlapping position within a zone for a new entity.
- * Uses rejection sampling; falls back to an unvalidated position after
- * MAX_TRIES attempts so crowded zones never deadlock.
+ *
+ * Uses rejection sampling with a *radial* separation test (so diagonal
+ * near-overlaps are also rejected, unlike the old axis-OR test).  If no
+ * fully-separated spot is found within MAX_TRIES, returns the best candidate
+ * seen (the one maximising distance to its nearest neighbour) rather than an
+ * unvalidated random point — so crowded zones degrade gracefully instead of
+ * piling sprites on top of each other.
  *
  * @param {{ x0:number, x1:number, y0:number, y1:number }} zone
  * @returns {{ x: number, y: number }}
  */
 function assignPosition(zone) {
-  const MAX_TRIES = 50;
-  const SEP = CELL_W + 8; // minimum center-to-center distance
+  const MAX_TRIES = 200;
+  const SEP = CELL_W + LAYOUT.cell.sep; // minimum centre-to-centre distance
+  const SEP2 = SEP * SEP;
   const existing = [...entityPositions.values()];
 
-  for (let i = 0; i < MAX_TRIES; i++) {
-    const x = zone.x0 + Math.random() * (zone.x1 - zone.x0 - CELL_W);
-    const y = zone.y0 + Math.random() * (zone.y1 - zone.y0 - CELL_H);
-    const ok = existing.every(p => Math.abs(p.x - x) >= SEP || Math.abs(p.y - y) >= SEP);
-    if (ok) return { x, y };
-  }
-  return {
-    x: zone.x0 + Math.random() * (zone.x1 - zone.x0 - CELL_W),
-    y: zone.y0 + Math.random() * (zone.y1 - zone.y0 - CELL_H),
+  const spanX = zone.x1 - zone.x0 - CELL_W;
+  const spanY = zone.y1 - zone.y0 - CELL_H;
+
+  // Nearest-neighbour squared distance for a candidate (Infinity if none).
+  const nearest2 = (x, y) => {
+    let best = Infinity;
+    for (const p of existing) {
+      const dx = p.x - x, dy = p.y - y;
+      const d2 = dx * dx + dy * dy;
+      if (d2 < best) best = d2;
+    }
+    return best;
   };
+
+  let bestPos = null;
+  let bestDist2 = -1;
+
+  for (let i = 0; i < MAX_TRIES; i++) {
+    const x = zone.x0 + Math.random() * Math.max(0, spanX);
+    const y = zone.y0 + Math.random() * Math.max(0, spanY);
+    const d2 = nearest2(x, y);
+    if (d2 >= SEP2) return { x, y };
+    if (d2 > bestDist2) { bestDist2 = d2; bestPos = { x, y }; }
+  }
+
+  return bestPos ?? { x: zone.x0, y: zone.y0 };
 }
 
 function clearEntityState() {
@@ -166,7 +260,8 @@ function rectStroke(x, y, w, h, lineW, color) {
 
 function drawConnecting() {
   clear();
-  text("Connecting to server...", 40, 60, 24, C_TEXT);
+  const L = LAYOUT.connecting;
+  text("Connecting to server...", L.x, L.y, L.font, C_TEXT);
 }
 
 // ---------------------------------------------------------------------------
@@ -241,107 +336,86 @@ function _adjustStat(delta) {
 
 function drawPreLobby() {
   clear();
-  text("Dragoncon Game", 40, 60, 32, C_HEADER);
+  const L = LAYOUT.preLobby;
+  text("Dragoncon Game", L.titleX, L.titleY, L.titleFont, C_HEADER);
 
   if (preLobbyMode === "choose") {
-    text("[C]  Create new lobby", 60, 160, 22, C_TEXT);
-    text("[J]  Join existing lobby", 60, 200, 22, C_TEXT);
+    text("[C]  Create new lobby", L.optX, L.optY0, L.optFont, C_TEXT);
+    text("[J]  Join existing lobby", L.optX, L.optY0 + L.optGap, L.optFont, C_TEXT);
     if (preLobbyError) {
-      text(preLobbyError, 60, 260, 18, "rgba(255,100,100,1)");
+      text(preLobbyError, L.optX, L.optY0 + L.optGap + L.errorDy, L.errorFont, "rgba(255,100,100,1)");
     }
   } else if (preLobbyMode === "entering_code") {
-    text("Enter lobby code:", 60, 160, 22, C_TEXT);
+    text("Enter lobby code:", L.optX, L.codePromptY, L.optFont, C_TEXT);
     // Show typed code + blinking underscore cursor.
     const display = preLobbyCode.padEnd(6, "_");
-    text(display, 60, 210, 36, "rgba(255,255,100,1)");
-    text("[ENTER] to confirm    [ESC] back", 60, 270, 16, "rgba(170,170,170,1)");
+    text(display, L.optX, L.codeY, L.codeFont, "rgba(255,255,100,1)");
+    text("[ENTER] to confirm    [ESC] back", L.optX, L.codeHintY, L.codeHintFont, "rgba(170,170,170,1)");
     if (preLobbyError) {
-      text(preLobbyError, 60, 310, 18, "rgba(255,100,100,1)");
+      text(preLobbyError, L.optX, L.codeHintY + 40, L.errorFont, "rgba(255,100,100,1)");
     }
   } else if (preLobbyMode === "editing_stats") {
-    text("Customise stats", 60, 100, 24, C_HEADER);
-    text("[UP/DOWN] change value    [ENTER] confirm    [ESC] back", 60, 130, 14, "rgba(170,170,170,1)");
+    text("Customise stats", L.optX, L.statTitleY, L.statTitleFont, C_HEADER);
+    text("[UP/DOWN] change value    [ENTER] confirm    [ESC] back", L.optX, L.statHintY, L.statHintFont, "rgba(170,170,170,1)");
 
-    const rowH = 38;
-    const startY = 168;
     for (let i = 0; i < STAT_KEYS.length; i++) {
       const key = STAT_KEYS[i];
       const val = preLobbyStats[key] || 1;
-      const y   = startY + i * rowH;
+      const y   = L.statStartY + i * L.statRowH;
       const sel = i === preLobbyStatCursor;
 
       if (sel) {
         // Highlight row background.
         ctx.save();
         ctx.fillStyle = "rgba(255,255,100,0.12)";
-        ctx.fillRect(50, y - 14, 480, rowH - 4);
+        ctx.fillRect(L.statHiX, y - 14, L.statHiW, L.statRowH - 4);
         ctx.restore();
       }
 
       const label = key.charAt(0).toUpperCase() + key.slice(1);
-      text(label, 70, y, 20, sel ? C_CURSOR : C_TEXT);
+      text(label, L.statLabelX, y, L.statLabelFont, sel ? C_CURSOR : C_TEXT);
 
-      // Value bar (0-100 mapped to 300px wide).
-      const barX = 220, barW = 300, barH = 14;
-      const barY = y - barH / 2 + 2;
+      // Value bar (0-100 mapped to statBarW px wide).
+      const barY = y - L.statBarH / 2 + 2;
       ctx.save();
       ctx.fillStyle = "rgba(60,60,80,0.7)";
-      ctx.fillRect(barX, barY, barW, barH);
+      ctx.fillRect(L.statBarX, barY, L.statBarW, L.statBarH);
       ctx.fillStyle = sel ? "rgba(255,255,80,0.85)" : "rgba(80,180,255,0.75)";
-      ctx.fillRect(barX, barY, barW * (val / 100), barH);
+      ctx.fillRect(L.statBarX, barY, L.statBarW * (val / 100), L.statBarH);
       ctx.restore();
 
-      text(String(val).padStart(3, " "), 534, y, 20, sel ? C_CURSOR : C_TEXT);
+      text(String(val).padStart(3, " "), L.statValX, y, L.statLabelFont, sel ? C_CURSOR : C_TEXT);
     }
   }
 }
 
 function drawFull() {
   clear();
-  text("Session full (max 6 players).", 40, SH / 2 - 16, 24, C_TEXT);
-  text("Close another tab to free a slot.", 40, SH / 2 + 16, 18, C_TEXT);
-}
-
-function drawLobbyGrid(lobby, ox, oy) {
-  const CW = 70, CH = 56, CP = 5;
-  const players = lobby.players || [];
-
-  // Build a lookup: "col,row" -> player info for occupied cells
-  const occupied = {};
-  for (const p of players) {
-    if (p.grid_col !== undefined && p.grid_row !== undefined) {
-      occupied[`${p.grid_col},${p.grid_row}`] = p;
-    }
-  }
-
-  const labelY = oy + 4 * (CH + CP) + 14;
-  for (let col = 0; col < 3; col++) {
-    const lx = ox + (2 - col) * (CW + CP) + CW / 2 - 14;
-    const label = col === 0 ? "FRONT" : col === 2 ? "BACK" : "";
-    if (label) text(label, lx, labelY, 11, "rgba(140,160,200,0.8)");
-  }
+  const L = LAYOUT.full;
+  text("Session full (max 6 players).", L.x, SH / 2 + L.titleDy, L.titleFont, C_TEXT);
+  text("Close another tab to free a slot.", L.x, SH / 2 + L.subDy, L.subFont, C_TEXT);
 }
 
 function drawLobby(lobby) {
   clear();
-  text("Dragoncon Game", 40, 52, 32, C_HEADER);
+  const L = LAYOUT.lobby;
+  text("Dragoncon Game", L.titleX, L.titleY, L.titleFont, C_HEADER);
 
   const joinCode = lobby.join_code || "??????";
-  text(`Room: ${joinCode}`, 40, 92, 22, C_TEXT);
+  text(`Room: ${joinCode}`, L.codeX, L.codeY, L.codeFont, C_TEXT);
 
-  const listY = 130;
   const players = lobby.players || [];
   players.forEach((p, i) => {
-    const y = listY + i * 36 + 20;
+    const y = L.listY + i * L.rowGap + L.rowDy;
     const color = p.id === lobby.player_id ? "rgba(255,255,100,1)" : C_TEXT;
     const ready = p.ready ? "[READY]" : "[     ]";
     const conn = p.connected ? "" : " (disconnected)";
-    text(`${p.name}  ${p.kind}  ${ready}${conn}`, 60, y, 20, color);
+    text(`${p.name}  ${p.kind}  ${ready}${conn}`, L.rowX, y, L.rowFont, color);
   });
 
-  const pickerY = listY + 6 * 36 + 20;
+  const pickerY = L.listY + 6 * L.rowGap + L.readyDy;
   const readyLabel = lobby.ready ? "Press ENTER to un-ready" : "Press ENTER when ready";
-  text(readyLabel, 60, pickerY, 18, C_TEXT);
+  text(readyLabel, L.rowX, pickerY, L.readyFont, C_TEXT);
 }
 
 /**
@@ -367,19 +441,35 @@ function drawEntitySprite(e, cx, cy, lastAction, dt, flip) {
   const srcX = frame * frame_w;
   const srcY = clip.row * frame_h;
 
+  // Fit the native sprite into the cell preserving aspect ratio (no stretch),
+  // then centre it within the cell box.
+  const scale = Math.min(CELL_W / frame_w, CELL_H / frame_h);
+  const dw = frame_w * scale;
+  const dh = frame_h * scale;
+  const dx = cx + (CELL_W - dw) / 2;
+  const dy = cy + (CELL_H - dh) / 2;
+
   ctx.save();
   ctx.imageSmoothingEnabled = false;
 
   if (flip) {
-    // Flip around the cell's horizontal centre.
-    ctx.translate(cx + CELL_W, cy);
+    // Flip around the destination rect's horizontal centre.
+    ctx.translate(dx + dw, dy);
     ctx.scale(-1, 1);
-    ctx.drawImage(img, srcX, srcY, frame_w, frame_h, 0, 0, CELL_W, CELL_H);
+    ctx.drawImage(img, srcX, srcY, frame_w, frame_h, 0, 0, dw, dh);
   } else {
-    ctx.drawImage(img, srcX, srcY, frame_w, frame_h, cx, cy, CELL_W, CELL_H);
+    ctx.drawImage(img, srcX, srcY, frame_w, frame_h, dx, dy, dw, dh);
   }
 
   ctx.restore();
+}
+
+/** Draw a faint backdrop + border for a team zone so play areas are obvious. */
+function drawZone(zone) {
+  const Z = LAYOUT.zones;
+  if (!Z.visible) return;
+  rect(zone.x0, zone.y0, zone.x1 - zone.x0, zone.y1 - zone.y0, Z.bgFill);
+  rectStroke(zone.x0, zone.y0, zone.x1 - zone.x0, zone.y1 - zone.y0, Z.borderW, Z.border);
 }
 
 function drawTeam(game, team, dt) {
@@ -410,23 +500,22 @@ function drawTeam(game, team, dt) {
     // snapshot so all players' combos are visible, not just the local one.
     if (team === "players") {
       const entityCombo = e.combo ?? [];
-      const SLOT_W = 18;
-      const MAX_SLOTS = 4;
-      const rowW = MAX_SLOTS * SLOT_W;
+      const CR = LAYOUT.comboRow;
+      const rowW = CR.maxSlots * CR.slotW;
       const rowX = cx + (CELL_W - rowW) / 2;
-      const rowY = cy + CELL_H + 4;
+      const rowY = cy + CELL_H + CR.dy;
 
-      for (let i = 0; i < MAX_SLOTS; i++) {
-        const slotX = rowX + i * SLOT_W;
+      for (let i = 0; i < CR.maxSlots; i++) {
+        const slotX = rowX + i * CR.slotW;
         const slot = entityCombo[i];
         if (slot && slot.action !== undefined) {
-          text(ACTION_CHAR[slot.action] ?? "?", slotX, rowY + 13, 14,
+          text(ACTION_CHAR[slot.action] ?? "?", slotX, rowY + CR.textDy, CR.font,
             ACTION_COLOR[slot.action] ?? C_TEXT);
         } else if (slot && slot.element !== undefined) {
-          text(ELEMENT_CHAR[slot.element] ?? "?", slotX, rowY + 13, 14,
+          text(ELEMENT_CHAR[slot.element] ?? "?", slotX, rowY + CR.textDy, CR.font,
             ELEMENT_COLOR[slot.element] ?? C_TEXT);
         } else {
-          text("·", slotX, rowY + 13, 14, "rgba(120,120,140,0.5)");
+          text("·", slotX, rowY + CR.textDy, CR.font, "rgba(120,120,140,0.5)");
         }
       }
     } else {
@@ -474,11 +563,11 @@ function drawTeam(game, team, dt) {
       }
 
       // Render bottom-to-top above the sprite: last line sits just above cy.
-      const LINE_H = 14;
-      const baseY  = cy - 4;
+      const IL = LAYOUT.intentLine;
+      const baseY  = cy + IL.baseDy;
       for (let i = 0; i < lines.length; i++) {
-        const lineY = baseY - (lines.length - 1 - i) * LINE_H;
-        text(lines[i].str, cx, lineY, 11, lines[i].color);
+        const lineY = baseY - (lines.length - 1 - i) * IL.lineH;
+        text(lines[i].str, cx, lineY, IL.font, lines[i].color);
       }
     }
   }
@@ -506,7 +595,7 @@ const floaters = [];
  * @param {string} color   - CSS color string (alpha overridden by fade)
  * @param {number} lifetime - seconds until fully faded (default 1.5)
  */
-function spawnFloater(text, x, y, color, lifetime = 1.5) {
+function spawnFloater(text, x, y, color, lifetime = LAYOUT.floater.lifetime) {
   floaters.push({ text, x, y, color, age: 0, lifetime });
 }
 
@@ -524,12 +613,12 @@ function drawFloaters() {
   for (const f of floaters) {
     const frac     = f.age / f.lifetime;
     const alpha    = frac > 0.6 ? 1 - (frac - 0.6) / 0.4 : 1.0;
-    const yOffset  = -40 * frac; // drift 40px upward over lifetime
+    const yOffset  = -LAYOUT.floater.drift * frac; // drift upward over lifetime
 
     // Strip any existing alpha from the color string and reapply via globalAlpha.
     ctx.save();
     ctx.globalAlpha = alpha;
-    ctx.font        = "bold 16px monospace";
+    ctx.font        = `bold ${LAYOUT.floater.font}px monospace`;
     ctx.fillStyle   = f.color;
     ctx.textAlign   = "center";
     ctx.fillText(f.text, f.x, f.y + yOffset);
@@ -641,7 +730,8 @@ function spawnRoundSummaryFloaters(game, prevEntities, prevEnemyIntent, prevDotS
   const py = (PLAYER_ZONE.y0 + PLAYER_ZONE.y1) / 2;
 
   // Small random X jitter so stacked floaters spread slightly.
-  const jitter = () => (Math.random() - 0.5) * 40;
+  const jitter = () => (Math.random() - 0.5) * LAYOUT.floater.jitter;
+  const STACK = LAYOUT.floater.stack;
 
   let floaterY = ey; // stack floaters vertically in the enemy zone
 
@@ -654,7 +744,7 @@ function spawnRoundSummaryFloaters(game, prevEntities, prevEnemyIntent, prevDotS
         ? `-${counts.damage}`
         : `-${counts.damage} ${elChar}`;
       spawnFloater(label, ex + jitter(), floaterY, elColor);
-      floaterY += 22;
+      floaterY += STACK;
     }
 
     // Show "blocked N" for the amount of enemy damage actually cancelled this round.
@@ -681,7 +771,7 @@ function spawnRoundSummaryFloaters(game, prevEntities, prevEnemyIntent, prevDotS
       const label = element === "none"
         ? `+${counts.heal} heal`
         : `+${counts.heal} heal ${elChar}`;
-      spawnFloater(label, px + jitter(), py + 22, "rgba(100,220,100,1)");
+      spawnFloater(label, px + jitter(), py + STACK, "rgba(100,220,100,1)");
     }
   }
 
@@ -691,7 +781,7 @@ function spawnRoundSummaryFloaters(game, prevEntities, prevEnemyIntent, prevDotS
     const elChar  = intent.element ? (ELEMENT_CHAR[intent.element]  ?? "") : "";
     const elColor = intent.element ? (ELEMENT_COLOR[intent.element] ?? "rgba(255,80,80,1)") : "rgba(255,80,80,1)";
     const label = elChar ? `-${intent.damage} ${elChar}` : `-${intent.damage}`;
-    spawnFloater(label, px + jitter(), py - 22, elColor);
+    spawnFloater(label, px + jitter(), py - STACK, elColor);
   }
 
   // DoT tick floaters — show elemental ticks on each side.
@@ -699,24 +789,24 @@ function spawnRoundSummaryFloaters(game, prevEntities, prevEnemyIntent, prevDotS
   // A non-zero stack on a side means it ticked damage this round.
   if (prevDotStacks) {
     // DoT on enemy side: stacks in prevDotStacks.enemies dealt damage to enemies.
-    let dotEnemyY = ey + 28;
+    let dotEnemyY = ey + STACK + 6;
     for (let i = 0; i < 4; i++) {
       const elName = ELEMENT_NAMES[i];
       const stacks = prevDotStacks.enemies[elName];
       if (!stacks || stacks === 0) continue;
       const color  = ELEMENT_COLOR[elName] ?? "rgba(255,100,100,1)";
       spawnFloater(`${ELEMENT_CHAR[elName]} dot -${stacks * ACTION_EFFECT_VALUE}`, ex + jitter(), dotEnemyY, color);
-      dotEnemyY += 22;
+      dotEnemyY += STACK;
     }
     // DoT on player side: stacks in prevDotStacks.players dealt damage to players.
-    let dotPlayerY = py + 50;
+    let dotPlayerY = py + STACK * 2 + 6;
     for (let i = 0; i < 4; i++) {
       const elName = ELEMENT_NAMES[i];
       const stacks = prevDotStacks.players[elName];
       if (!stacks || stacks === 0) continue;
       const color  = ELEMENT_COLOR[elName] ?? "rgba(255,100,100,1)";
       spawnFloater(`${ELEMENT_CHAR[elName]} dot -${stacks * ACTION_EFFECT_VALUE}`, px + jitter(), dotPlayerY, color);
-      dotPlayerY += 22;
+      dotPlayerY += STACK;
     }
   }
 }
@@ -783,22 +873,20 @@ const ELEMENT_COLOR = {
  * @param {number} y   - top of first bar
  */
 function drawBars(bars, x0, x1, y) {
-  const BAR_H = 10;
-  const GAP = 4;
-  const LABEL_W = 40;
-  const ROW_H = BAR_H + GAP;
-  const bx = x0 + LABEL_W;
-  const bw = (x1 - x0) - LABEL_W;
+  const TB = LAYOUT.teamBars;
+  const ROW_H = TB.barH + TB.gap;
+  const bx = x0 + TB.labelW;
+  const bw = (x1 - x0) - TB.labelW;
 
   for (let i = 0; i < bars.length; i++) {
     const { label, value, frac, color, bg } = bars[i];
     const by = y + i * ROW_H;
     const f = Math.max(0, Math.min(1, frac));
 
-    text(label, x0, by + BAR_H - 2, 10, "rgba(180,200,255,0.85)");
-    rect(bx, by, bw, BAR_H, bg);
-    if (f > 0) rect(bx, by, bw * f, BAR_H, color);
-    text(String(Math.round(value)), bx + bw + 4, by + BAR_H - 2, 10, "rgba(180,200,255,0.7)");
+    text(label, x0, by + TB.barH - 2, TB.font, "rgba(180,200,255,0.85)");
+    rect(bx, by, bw, TB.barH, bg);
+    if (f > 0) rect(bx, by, bw * f, TB.barH, color);
+    text(String(Math.round(value)), bx + bw + 4, by + TB.barH - 2, TB.font, "rgba(180,200,255,0.7)");
   }
 }
 
@@ -826,7 +914,7 @@ function drawTeamBars(game) {
     const projHeal = healCount * ACTION_EFFECT_VALUE;
 
     // Two bars stacked; top sits just below the "ALLIES" label.
-    const y = PLAYER_ZONE.y0 - 42;
+    const y = PLAYER_ZONE.y0 + LAYOUT.teamBars.dy;
     drawBars([
       { label: "HP",   value: hp_current, frac: hp_current * scale, color: "rgba(60,200,60,0.9)",   bg: C_HP_BG },
       { label: "Heal", value: projHeal,   frac: projHeal   * scale, color: "rgba(140,230,100,0.9)", bg: "rgba(20,50,20,0.6)" },
@@ -839,8 +927,8 @@ function drawTeamBars(game) {
       for (let i = 0; i < 4; i++) {
         const elName = ELEMENT_NAMES[i];
         if (!dotP[elName]) continue;
-        text(`${ELEMENT_CHAR[elName]}×${dotP[elName]}`, dx, y + 30, 10, ELEMENT_COLOR[elName]);
-        dx += 38;
+        text(`${ELEMENT_CHAR[elName]}×${dotP[elName]}`, dx, y + LAYOUT.teamBars.dotDyPlayers, LAYOUT.teamBars.font, ELEMENT_COLOR[elName]);
+        dx += LAYOUT.teamBars.dotGap;
       }
     }
   }
@@ -852,7 +940,7 @@ function drawTeamBars(game) {
     const scale = hp_max > 0 ? 1 / hp_max : 0;
 
     // One bar; vertically centred in the same strip.
-    const y = ENEMY_ZONE.y0 - 42;
+    const y = ENEMY_ZONE.y0 + LAYOUT.teamBars.dy;
     drawBars([
       { label: "HP", value: hp_current, frac: hp_current * scale, color: "rgba(255,100,60,0.9)", bg: C_HP_BG },
     ], ENEMY_ZONE.x0, ENEMY_ZONE.x1, y);
@@ -864,38 +952,45 @@ function drawTeamBars(game) {
       for (let i = 0; i < 4; i++) {
         const elName = ELEMENT_NAMES[i];
         if (!dotE[elName]) continue;
-        text(`${ELEMENT_CHAR[elName]}×${dotE[elName]}`, dx, y + 16, 10, ELEMENT_COLOR[elName]);
-        dx += 38;
+        text(`${ELEMENT_CHAR[elName]}×${dotE[elName]}`, dx, y + LAYOUT.teamBars.dotDyEnemies, LAYOUT.teamBars.font, ELEMENT_COLOR[elName]);
+        dx += LAYOUT.teamBars.dotGap;
       }
     }
   }
 }
 
 function drawActionMenu(game) {
-  const mx = SW / 2 - 160;
-  const my = SH - 110;
-  const mw = 320;
-  const mh = 90;
+  const M = LAYOUT.actionMenu;
+  const mx = SW / 2 - M.w / 2;
+  const my = SH - M.marginBottom;
+  const mw = M.w;
+  const mh = M.h;
 
   rect(mx, my, mw, mh, C_MENU_BG);
   rectStroke(mx, my, mw, mh, 2, C_MENU_BORDER);
 
-  text("[1] Atk",  mx + 10,       my + 14 + 16, 16, C_TEXT);
-  text("[2] Shld", mx + 10 + 106, my + 14 + 16, 16, C_TEXT);
-  text("[3] Heal", mx + 10 + 212, my + 14 + 16, 16, C_TEXT);
-  text("[Q]♦", mx + 10,        my + 14 + 34, 13, ELEMENT_COLOR.fire);
-  text("[W]▲", mx + 10 + 80,  my + 14 + 34, 13, ELEMENT_COLOR.earth);
-  text("[E]≋", mx + 10 + 160, my + 14 + 34, 13, ELEMENT_COLOR.wind);
-  text("[R]~", mx + 10 + 240, my + 14 + 34, 13, ELEMENT_COLOR.water);
-  text("[Esc] Cancel", mx + 10, my + 14 + 50, 12, "rgba(180,180,180,0.8)");
+  const px = mx + M.padX;
+  const aRowY = my + M.padTopY + M.actionRowDy;
+  text("[1] Atk",  px + M.actionCols[0], aRowY, M.actionFont, C_TEXT);
+  text("[2] Shld", px + M.actionCols[1], aRowY, M.actionFont, C_TEXT);
+  text("[3] Heal", px + M.actionCols[2], aRowY, M.actionFont, C_TEXT);
+
+  const eRowY = my + M.padTopY + M.elementRowDy;
+  text("[Q]♦", px + M.elementCols[0], eRowY, M.elementFont, ELEMENT_COLOR.fire);
+  text("[W]▲", px + M.elementCols[1], eRowY, M.elementFont, ELEMENT_COLOR.earth);
+  text("[E]≋", px + M.elementCols[2], eRowY, M.elementFont, ELEMENT_COLOR.wind);
+  text("[R]~", px + M.elementCols[3], eRowY, M.elementFont, ELEMENT_COLOR.water);
+
+  text("[Esc] Cancel", px, my + M.padTopY + M.cancelRowDy, M.cancelFont, "rgba(180,180,180,0.8)");
 
   // Round timer bar
   const timerFrac = game.round_duration > 0
     ? Math.max(0, Math.min(1, game.round_timer / game.round_duration))
     : 0;
-  rect(mx + 10, my + 58, mw - 20, 10, "rgba(30,30,30,0.8)");
-  rect(mx + 10, my + 58, (mw - 20) * timerFrac, 10, "rgba(255,200,50,0.9)");
-  text(`Round: ${game.round_timer !== undefined ? game.round_timer.toFixed(1) : "?"}s`, mx + 10, my + 82, 13, C_TEXT);
+  const tbw = mw - M.padX * 2;
+  rect(px, my + M.timerBarDy, tbw, M.timerBarH, "rgba(30,30,30,0.8)");
+  rect(px, my + M.timerBarDy, tbw * timerFrac, M.timerBarH, "rgba(255,200,50,0.9)");
+  text(`Round: ${game.round_timer !== undefined ? game.round_timer.toFixed(1) : "?"}s`, px, my + M.timerTextDy, M.timerTextFont, C_TEXT);
 }
 
 function drawGame(game, dt) {
@@ -905,11 +1000,16 @@ function drawGame(game, dt) {
 
   clear();
 
-  const wave = game.wave || "";
-  text(`Wave: ${wave}`, 40, 30 + 20, 20, C_HEADER);
+  // Faint backdrops so the play areas are obvious.
+  drawZone(PLAYER_ZONE);
+  drawZone(ENEMY_ZONE);
 
-  text("ALLIES", PLAYER_ZONE.x0, PLAYER_ZONE.y0 - 62, 18, C_HEADER);
-  text("ENEMIES", ENEMY_ZONE.x0, ENEMY_ZONE.y0 - 62, 18, C_ENEMY_HDR);
+  const H = LAYOUT.headers;
+  const wave = game.wave || "";
+  text(`Wave: ${wave}`, H.waveX, H.waveY, H.waveFont, C_HEADER);
+
+  text("ALLIES", PLAYER_ZONE.x0, PLAYER_ZONE.y0 + H.labelDy, H.labelFont, C_HEADER);
+  text("ENEMIES", ENEMY_ZONE.x0, ENEMY_ZONE.y0 + H.labelDy, H.labelFont, C_ENEMY_HDR);
 
   drawTeamBars(game);
 
@@ -924,7 +1024,8 @@ function drawGame(game, dt) {
 
 function drawGameOver() {
   clear();
-  text("Game Over!  Press any key to return to lobby.", 40, SH / 2, 24, C_TEXT);
+  const L = LAYOUT.gameOver;
+  text("Game Over!  Press any key to return to lobby.", L.x, SH / 2, L.font, C_TEXT);
 }
 
 // ---------------------------------------------------------------------------
