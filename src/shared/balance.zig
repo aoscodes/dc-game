@@ -141,9 +141,9 @@ pub const enemy_patterns = [_]EnemyPattern{
         .label = "fire_attack",
         .slots = .{
             .{ .element = .fire },
-            .{ .action = .attack },
-            .{ .action = .attack },
-            .{ .action = .attack },
+            .{ .action = .damage },
+            .{ .action = .damage },
+            .{ .action = .damage },
         },
     },
     .{
