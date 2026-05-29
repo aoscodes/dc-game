@@ -145,6 +145,7 @@ pub const enemy_patterns = [_]EnemyPattern{
             .{ .action = .damage },
             .{ .action = .damage },
         },
+        .len = 3,
     },
     .{
         .label = "big_heal",
@@ -153,9 +154,8 @@ pub const enemy_patterns = [_]EnemyPattern{
             .{ .action = .heal },
             .{ .action = .heal },
             .{ .action = .heal },
-            .{ .action = .heal },
-            //
         },
+        .len = 3,
     },
 };
 
