@@ -30,9 +30,6 @@ pub const wave_01_basic = Wave{
     .entries = &[_]SpawnEntry{
         .{ .kind = .grunt, .grid_col = 0, .grid_row = 0, .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
         .{ .kind = .grunt, .grid_col = 0, .grid_row = 0, .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
-        .{ .kind = .grunt, .grid_col = 0, .grid_row = 0, .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
-        .{ .kind = .grunt, .grid_col = 0, .grid_row = 0, .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
-        .{ .kind = .grunt, .grid_col = 0, .grid_row = 0, .stats = .{ .hp = 80, .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .level = 1 } },
     },
     .next_wave = null,
 };
