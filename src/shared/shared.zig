@@ -1,8 +1,3 @@
-//! Shared module root.  Re-exports all shared types for consumers.
-//!
-//! Import as: const shared = @import("shared");
-//! Then use:  shared.components.Health, shared.protocol.MsgTag, etc.
-
 pub const components = @import("components.zig");
 pub const protocol = @import("protocol.zig");
 pub const transport = @import("transport.zig");

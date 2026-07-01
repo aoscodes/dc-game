@@ -1,41 +1,23 @@
 "use strict";
 
-// ---------------------------------------------------------------------------
-// LAYOUT — single source of truth for every on-screen position, size, and font.
-//
-// Want to move something?  Edit it here.  No draw function hard-codes pixels;
-// they all read from this object.  Grouped by screen / region.
-// ---------------------------------------------------------------------------
 const LAYOUT = {
   screen: { w: 1024, h: 768 },
   bg: "#14141e",
-
-  // Entity cell box
   cell: { w: 90, h: 100, sep: 12 },
-
-  // Team play areas.
   zones: {
     players: { x0: 30, x1: 470, y0: 200, y1: 620 },
     enemies: { x0: 554, x1: 994, y0: 200, y1: 620 },
-    visible: true, // draw a faint backdrop + border so play areas are obvious
+    visible: true,
     bgFill: "rgba(255,255,255,0.03)",
     border: "rgba(180,200,255,0.18)",
     borderW: 2,
   },
 
-  // Game-screen headers.
   headers: { waveX: 40, waveY: 50, waveFont: 20, labelDy: -62, labelFont: 18 },
-
-  // Aggregate team HP/heal bars (drawn above each zone).
   teamBars: { dy: -42, barH: 10, gap: 4, labelW: 40, font: 10, dotGap: 38, dotDyPlayers: 40, dotDyEnemies: 26, effectFont: 20 },
-
-  // Combo glyph row under each player entity.
   comboRow: { slotW: 18, maxSlots: 4, dy: 4, font: 14, textDy: 13 },
-
-  // Enemy intent / combo lines stacked above each enemy sprite.
   intentLine: { lineH: 14, baseDy: -4, font: 11 },
 
-  // Bottom action menu + round timer.
   actionMenu: {
     w: 320, h: 90, marginBottom: 110,
     padX: 10, padTopY: 14,
@@ -45,10 +27,8 @@ const LAYOUT = {
     timerBarDy: 58, timerBarH: 10, timerTextDy: 82, timerTextFont: 13,
   },
 
-  // Floating combat text.
-  floater: { font: 16, drift: 40, jitter: 40, stack: 22, lifetime: 1.5 },
+  floater: { font: 16, drift: 40, jitter: 40, stack: 22, lifetime: 1.5, },
 
-  // Pre-lobby / stat editor.
   preLobby: {
     titleX: 40, titleY: 60, titleFont: 32,
     optX: 60, optY0: 160, optGap: 40, optFont: 22,
@@ -60,7 +40,6 @@ const LAYOUT = {
     statBarX: 220, statBarW: 300, statBarH: 14, statValX: 534,
   },
 
-  // Lobby list.
   lobby: {
     titleX: 40, titleY: 52, titleFont: 32,
     codeX: 40, codeY: 92, codeFont: 22,
@@ -124,10 +103,10 @@ const animState = new Map();
  * Advance the animator for one entity and return its current {clip, frame}.
  * Call once per entity per rendered frame.
  *
- * @param {number} id          - entity id
- * @param {string} cls         - class name (key into sprites map)
- * @param {string|null} lastAction - "attack"|"die"|null from server this tick
- * @param {number} dt          - seconds since last frame
+ * @param {number} id
+ * @param {string} cls
+ * @param {string|null} lastAction
+ * @param {number} dt
  */
 function tickAnimator(id, cls, lastAction, dt) {
   const sp = sprites.get(cls);
@@ -179,26 +158,18 @@ const entityPositions = new Map();
 /**
  * Pick a random non-overlapping position within a zone for a new entity.
  *
- * Uses rejection sampling with a *radial* separation test (so diagonal
- * near-overlaps are also rejected, unlike the old axis-OR test).  If no
- * fully-separated spot is found within MAX_TRIES, returns the best candidate
- * seen (the one maximising distance to its nearest neighbour) rather than an
- * unvalidated random point — so crowded zones degrade gracefully instead of
- * piling sprites on top of each other.
- *
  * @param {{ x0:number, x1:number, y0:number, y1:number }} zone
  * @returns {{ x: number, y: number }}
  */
 function assignPosition(zone) {
   const MAX_TRIES = 200;
-  const SEP = CELL_W + LAYOUT.cell.sep; // minimum centre-to-centre distance
+  const SEP = CELL_W + LAYOUT.cell.sep;
   const SEP2 = SEP * SEP;
   const existing = [...entityPositions.values()];
 
   const spanX = zone.x1 - zone.x0 - CELL_W;
   const spanY = zone.y1 - zone.y0 - CELL_H;
 
-  // Nearest-neighbour squared distance for a candidate (Infinity if none).
   const nearest2 = (x, y) => {
     let best = Infinity;
     for (const p of existing) {

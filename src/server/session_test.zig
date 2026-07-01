@@ -32,9 +32,15 @@ const V = balance.basic.damage;
 // ---------------------------------------------------------------------------
 
 const default_stats = c.Statblock{
-    .attack = 1, .shield = 1, .heal = 1,
-    .fire = 1, .earth = 1, .wind = 1, .water = 1,
-    .hp = 0, .level = 1,
+    .attack = 1,
+    .shield = 1,
+    .heal = 1,
+    .fire = 1,
+    .earth = 1,
+    .wind = 1,
+    .water = 1,
+    .hp = 0,
+    .level = 1,
 };
 
 /// One grunt that survives many rounds (HP = 100 * V, attack = 1).
@@ -45,7 +51,11 @@ const test_wave_single = waves.Wave{
         .kind = .grunt,
         .grid_col = 0,
         .grid_row = 0,
-        .stats = blk: { var s = default_stats; s.hp = V * 100; break :blk s; },
+        .stats = blk: {
+            var s = default_stats;
+            s.hp = V * 100;
+            break :blk s;
+        },
     }},
     .next_wave = null,
 };
@@ -57,7 +67,11 @@ const test_wave_one_hp = waves.Wave{
         .kind = .grunt,
         .grid_col = 0,
         .grid_row = 0,
-        .stats = blk: { var s = default_stats; s.hp = V; break :blk s; },
+        .stats = blk: {
+            var s = default_stats;
+            s.hp = V;
+            break :blk s;
+        },
     }},
     .next_wave = null,
 };
@@ -69,7 +83,11 @@ const test_wave_to_real = waves.Wave{
         .kind = .grunt,
         .grid_col = 0,
         .grid_row = 0,
-        .stats = blk: { var s = default_stats; s.hp = 1; break :blk s; },
+        .stats = blk: {
+            var s = default_stats;
+            s.hp = 1;
+            break :blk s;
+        },
     }},
     .next_wave = "wave_01_basic",
 };
@@ -134,19 +152,19 @@ fn drain(raw: []const u8, arena: std.mem.Allocator) ![]Msg {
 /// Returns false if decoding fails (truncated stream).
 fn consume_payload(tag: proto.MsgTag, r: anytype) bool {
     return switch (tag) {
-        .join_lobby    => if (proto.decode_join_lobby(r))    |_| true else |_| false,
+        .join_lobby => if (proto.decode_join_lobby(r)) |_| true else |_| false,
         .choose_action => if (proto.decode_choose_action(r)) |_| true else |_| false,
-        .reconnect     => if (proto.decode_reconnect(r))     |_| true else |_| false,
-        .ready_up      => true, // zero-payload
-        .choose_combo  => if (proto.decode_choose_combo(r))  |_| true else |_| false,
+        .reconnect => if (proto.decode_reconnect(r)) |_| true else |_| false,
+        .ready_up => true, // zero-payload
+        .choose_combo => if (proto.decode_choose_combo(r)) |_| true else |_| false,
         .set_statblock => if (proto.decode_set_statblock(r)) |_| true else |_| false,
-        .cancel_combo  => true, // zero-payload
-        .lobby_update  => if (proto.decode_lobby_update(r))  |_| true else |_| false,
-        .game_start    => if (proto.decode_game_start(r))    |_| true else |_| false,
-        .game_state    => if (proto.decode_game_state(r))    |_| true else |_| false,
+        .cancel_combo => true, // zero-payload
+        .lobby_update => if (proto.decode_lobby_update(r)) |_| true else |_| false,
+        .game_start => if (proto.decode_game_start(r)) |_| true else |_| false,
+        .game_state => if (proto.decode_game_state(r)) |_| true else |_| false,
         .action_result => if (proto.decode_action_result(r)) |_| true else |_| false,
-        .round_reset   => true, // zero-payload
-        .game_over     => if (proto.decode_game_over(r))     |_| true else |_| false,
+        .round_reset => true, // zero-payload
+        .game_over => if (proto.decode_game_over(r)) |_| true else |_| false,
     };
 }
 
@@ -1238,9 +1256,9 @@ test "element combo [fire, damage, damage] → damage_pool = 2" {
 
     // [fire, damage, damage] → 2 fire-elemented actions → damage_pool = 2
     try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .damage },
-        .{ .action  = .damage },
+        .{ .element = .fire },
+        .{ .action = .damage },
+        .{ .action = .damage },
     }));
     try tick_n(&s.sess, 0.11, 1);
 
@@ -1265,8 +1283,8 @@ test "element-mismatched shield does not cancel enemy damage" {
     const hp_before = s.sess.shared_hp.current;
 
     try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
-        .{ .element = .earth  },
-        .{ .action  = .shield },
+        .{ .element = .earth },
+        .{ .action = .shield },
     }));
     try tick_n(&s.sess, 0.11, 1);
 
@@ -1290,8 +1308,8 @@ test "trailing element in combo is ignored — damage_pool unchanged" {
 
     // [damage, wind] — trailing element → only 1 damage action counted
     try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
-        .{ .action  = .damage },
-        .{ .element = .wind   },
+        .{ .action = .damage },
+        .{ .element = .wind },
     }));
     try tick_n(&s.sess, 0.11, 1);
 
@@ -1314,9 +1332,9 @@ test "DoT: player [fire,dmg,heal] with no enemy shield → enemy gains 1 fire st
 
     // [fire, damage, heal] → direct net = 1, heal_element_mask has fire → trigger
     try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire  },
-        .{ .action  = .damage },
-        .{ .action  = .heal   },
+        .{ .element = .fire },
+        .{ .action = .damage },
+        .{ .action = .heal },
     }));
     try tick_n(&s.sess, 0.11, 1);
 
@@ -1335,15 +1353,15 @@ test "DoT: player fire trigger blocked by enemy fire shield → no stack" {
     // Enemy has 1 fire shield — exactly cancels the 1 fire damage.
     s.sess.pending_enemy_intent = .{ .damage_per_player = 0, .element = null };
     s.sess.enemy_combos[0] = make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire  },
-        .{ .action  = .shield },
+        .{ .element = .fire },
+        .{ .action = .shield },
     });
 
     // Player: [fire, dmg, heal] → direct net = 1 - 1 = 0 → no trigger
     try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire  },
-        .{ .action  = .damage },
-        .{ .action  = .heal   },
+        .{ .element = .fire },
+        .{ .action = .damage },
+        .{ .action = .heal },
     }));
     try tick_n(&s.sess, 0.11, 1);
 
@@ -1362,9 +1380,9 @@ test "DoT: stacks persist across rounds without re-trigger" {
 
     // Round 1: trigger fire DoT
     try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire  },
-        .{ .action  = .damage },
-        .{ .action  = .heal   },
+        .{ .element = .fire },
+        .{ .action = .damage },
+        .{ .action = .heal },
     }));
     try tick_n(&s.sess, 0.11, 1);
     try std.testing.expectEqual(@as(u16, 1), s.sess.enemy_dot_stacks[0]);
@@ -1414,8 +1432,8 @@ test "DoT: enemy fire stack partially mitigated by player fire shield" {
 
     // Player submits 1 fire shield
     try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire  },
-        .{ .action  = .shield },
+        .{ .element = .fire },
+        .{ .action = .shield },
     }));
     try tick_n(&s.sess, 0.11, 1);
 
@@ -1434,9 +1452,9 @@ test "DoT: enemy [fire,dmg,heal] triggers player fire stack (symmetric)" {
     // Enemy has [fire, dmg, heal]; no player shields
     s.sess.pending_enemy_intent = .{ .damage_per_player = 0, .element = null };
     s.sess.enemy_combos[0] = make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire  },
-        .{ .action  = .damage },
-        .{ .action  = .heal   },
+        .{ .element = .fire },
+        .{ .action = .damage },
+        .{ .action = .heal },
     });
 
     // No player shields
@@ -1459,9 +1477,9 @@ test "DoT: two players both trigger same element → 2 stacks added" {
     // (attack=1, dot_stacks_base=1).  The peek-net survives (no enemy shields), so the full
     // pending total (2) is added.  → 2 stacks expected.
     const fire_combo = make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire  },
-        .{ .action  = .damage },
-        .{ .action  = .heal   },
+        .{ .element = .fire },
+        .{ .action = .damage },
+        .{ .action = .heal },
     });
     try enqueue_combo(&s.sess, s.p[0].pid, fire_combo);
     try enqueue_combo(&s.sess, s.p[1].pid, fire_combo);
@@ -1481,9 +1499,9 @@ test "DoT: trigger fires on second round when re-triggered → stacks accumulate
     set_enemy_ai(&s.sess, 0);
 
     const fire_combo = make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire  },
-        .{ .action  = .damage },
-        .{ .action  = .heal   },
+        .{ .element = .fire },
+        .{ .action = .damage },
+        .{ .action = .heal },
     });
 
     // Round 1: trigger → 1 stack
@@ -1516,9 +1534,9 @@ test "cleanse: [fire,heal,shield] removes 1 fire stack from player side" {
     s.sess.player_dot_stacks[0] = 2; // 2 fire stacks on players
 
     try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .heal   },
-        .{ .action  = .shield },
+        .{ .element = .fire },
+        .{ .action = .heal },
+        .{ .action = .shield },
     }));
     try tick_n(&s.sess, 0.11, 1);
 
@@ -1540,9 +1558,9 @@ test "cleanse: cleansed stack does not tick this round" {
 
     // Cleanse the only fire stack; nothing else damages players
     try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .heal   },
-        .{ .action  = .shield },
+        .{ .element = .fire },
+        .{ .action = .heal },
+        .{ .action = .shield },
     }));
     try tick_n(&s.sess, 0.11, 1);
 
@@ -1563,9 +1581,9 @@ test "cleanse: cannot cleanse below 0 stacks (saturating)" {
     // player_dot_stacks[0] = 0; cleanse should not underflow
 
     try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .heal   },
-        .{ .action  = .shield },
+        .{ .element = .fire },
+        .{ .action = .heal },
+        .{ .action = .shield },
     }));
     try tick_n(&s.sess, 0.11, 1);
 
@@ -1587,9 +1605,9 @@ test "cleanse: partial — 2 stacks, cleanse 1, remaining tick still fires" {
 
     // Cleanse 1 of the 2 stacks
     try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .heal   },
-        .{ .action  = .shield },
+        .{ .element = .fire },
+        .{ .action = .heal },
+        .{ .action = .shield },
     }));
     try tick_n(&s.sess, 0.11, 1);
 
@@ -1610,9 +1628,9 @@ test "cleanse: two players each cleanse → 2 stacks removed" {
     s.sess.player_dot_stacks[0] = 3; // 3 stacks; both players cleanse → 1 remains
 
     const cleanse = make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .heal   },
-        .{ .action  = .shield },
+        .{ .element = .fire },
+        .{ .action = .heal },
+        .{ .action = .shield },
     });
     try enqueue_combo(&s.sess, s.p[0].pid, cleanse);
     try enqueue_combo(&s.sess, s.p[1].pid, cleanse);
@@ -1631,9 +1649,9 @@ test "cleanse: enemy [fire,heal,shield] removes 1 enemy fire stack (symmetric)" 
     try s.sess.start_game_wave(&test_wave_single);
     s.sess.pending_enemy_intent = .{ .damage_per_player = 0, .element = null };
     s.sess.enemy_combos[0] = make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .heal   },
-        .{ .action  = .shield },
+        .{ .element = .fire },
+        .{ .action = .heal },
+        .{ .action = .shield },
     });
     s.sess.enemy_dot_stacks[0] = 2; // 2 fire stacks on enemies
 
@@ -1656,9 +1674,9 @@ test "cleanse: heal and shield are withheld — no HP recovery, no shield pool c
 
     // Cleanse combo: heal and shield are withheld, so no shield blocks enemy damage
     try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .heal   },
-        .{ .action  = .shield },
+        .{ .element = .fire },
+        .{ .action = .heal },
+        .{ .action = .shield },
     }));
     try tick_n(&s.sess, 0.11, 1);
 
@@ -1693,9 +1711,9 @@ test "enemy AI: round 0 DoT trigger, round 1 cleanse" {
 
     // Round 0: player triggers fire DoT on enemies; enemy AI triggers fire DoT on players.
     try enqueue_combo(&s.sess, s.p[0].pid, make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .damage },
-        .{ .action  = .heal   },
+        .{ .element = .fire },
+        .{ .action = .damage },
+        .{ .action = .heal },
     }));
     try tick_n(&s.sess, 0.11, 1);
 

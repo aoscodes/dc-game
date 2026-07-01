@@ -83,21 +83,21 @@ pub fn drain_into_combo(queue: *KeyQueue, combo: *ComboBuffer) DrainResult {
             // Action keys: 1=damage  2=shield  3=heal
             .one, .two, .three => {
                 const action: c.ActionChoice = switch (key) {
-                    .one   => .damage,
-                    .two   => .shield,
+                    .one => .damage,
+                    .two => .shield,
                     .three => .heal,
-                    else   => unreachable,
+                    else => unreachable,
                 };
                 if (combo.push(.{ .action = action })) result = .appended;
             },
             // Element keys: Q=fire  W=earth  E=wind  R=water
             .q, .w, .e, .r => {
                 const element: c.Element = switch (key) {
-                    .q    => .fire,
-                    .w    => .earth,
-                    .e    => .wind,
-                    .r    => .water,
-                    else  => unreachable,
+                    .q => .fire,
+                    .w => .earth,
+                    .e => .wind,
+                    .r => .water,
+                    else => unreachable,
                 };
                 if (combo.push(.{ .element = element })) result = .appended;
             },

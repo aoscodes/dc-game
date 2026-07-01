@@ -31,10 +31,10 @@ pub const Health = struct {
 
 pub const EntityKind = enum(u8) {
     player = 0,
-    grunt  = 1,
+    grunt = 1,
     archer = 2,
     shaman = 3,
-    boss   = 4,
+    boss = 4,
 };
 
 pub const Kind = struct {
@@ -44,13 +44,13 @@ pub const Kind = struct {
 pub const Statblock = struct {
     attack: u16,
     shield: u16,
-    heal:   u16,
-    fire:   u16,
-    earth:  u16,
-    wind:   u16,
-    water:  u16,
-    hp:     u16,
-    level:  u16,
+    heal: u16,
+    fire: u16,
+    earth: u16,
+    wind: u16,
+    water: u16,
+    hp: u16,
+    level: u16,
 };
 
 pub const TeamId = enum(u8) {

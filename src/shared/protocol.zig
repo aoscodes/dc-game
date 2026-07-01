@@ -35,17 +35,13 @@ pub const ChooseCombo = struct {
     combo: components.ActionCombo,
 };
 
-/// Encode one ComboSlot to a single byte.
-/// Action slots use raw ActionChoice value (0x00–0x02).
-/// Element slots use 0x80 | raw Element value (0x80–0x83).
 fn encode_combo_slot(w: anytype, slot: components.ComboSlot) !void {
     switch (slot) {
-        .action  => |a| try w.writeByte(@intFromEnum(a)),
+        .action => |a| try w.writeByte(@intFromEnum(a)),
         .element => |e| try w.writeByte(0x80 | @intFromEnum(e)),
     }
 }
 
-/// Decode one ComboSlot byte. Returns error on unknown values.
 fn decode_combo_slot(byte: u8) !components.ComboSlot {
     if (byte & 0x80 != 0) {
         const raw: u8 = byte & 0x7F;
@@ -99,13 +95,12 @@ pub const EntitySnapshot = struct {
     combo_len: u8,
     combo_slots: [components.MAX_COMBO_LEN]components.ComboSlot,
 
-    /// A safe blank value (cannot use std.mem.zeroes because ComboSlot is a union).
     pub const blank = EntitySnapshot{
-        .entity     = 0,
-        .kind       = .grunt,
-        .team       = .players,
-        .owner      = 0xFF,
-        .combo_len  = 0,
+        .entity = 0,
+        .kind = .grunt,
+        .team = .players,
+        .owner = 0xFF,
+        .combo_len = 0,
         .combo_slots = [_]components.ComboSlot{.{ .action = .damage }} ** components.MAX_COMBO_LEN,
     };
 };
@@ -124,30 +119,24 @@ pub const GameState = struct {
     entities: [MAX_ENTITIES_WIRE]EntitySnapshot,
     players: TeamSummary,
     enemies: TeamSummary,
-    /// Total damage the enemy team intends to deal this round (living enemy count).
     enemy_intent_damage: u16,
-    /// Element of the enemy intent: 0xFF = non-elemental, else raw Element ordinal (0–3).
     enemy_intent_element: u8,
-    /// Damage-over-time stacks currently on the player party, indexed by Element ordinal
-    /// (0=fire, 1=earth, 2=wind, 3=water).  Each stack deals 1 damage of that element
-    /// per round.  Saturated to u8 from the session's u16 counter.
     player_dot_stacks: [4]u8,
-    /// DoT stacks currently on the enemy side; same layout as player_dot_stacks.
     enemy_dot_stacks: [4]u8,
 
     pub const INTENT_ELEMENT_NONE: u8 = 0xFF;
 
     pub const blank = GameState{
-        .tick                = 0,
-        .round_timer         = 0,
-        .entity_count        = 0,
-        .entities            = [_]EntitySnapshot{EntitySnapshot.blank} ** MAX_ENTITIES_WIRE,
-        .players             = .{ .hp_current = 0, .hp_max = 0 },
-        .enemies             = .{ .hp_current = 0, .hp_max = 0 },
-        .enemy_intent_damage  = 0,
+        .tick = 0,
+        .round_timer = 0,
+        .entity_count = 0,
+        .entities = [_]EntitySnapshot{EntitySnapshot.blank} ** MAX_ENTITIES_WIRE,
+        .players = .{ .hp_current = 0, .hp_max = 0 },
+        .enemies = .{ .hp_current = 0, .hp_max = 0 },
+        .enemy_intent_damage = 0,
         .enemy_intent_element = INTENT_ELEMENT_NONE,
-        .player_dot_stacks    = [_]u8{0} ** 4,
-        .enemy_dot_stacks     = [_]u8{0} ** 4,
+        .player_dot_stacks = [_]u8{0} ** 4,
+        .enemy_dot_stacks = [_]u8{0} ** 4,
     };
 };
 
@@ -320,26 +309,26 @@ pub fn decode_choose_combo(reader: anytype) !ChooseCombo {
 fn encode_statblock(w: anytype, s: components.Statblock) !void {
     try w.writeInt(u16, s.attack, .little);
     try w.writeInt(u16, s.shield, .little);
-    try w.writeInt(u16, s.heal,   .little);
-    try w.writeInt(u16, s.fire,   .little);
-    try w.writeInt(u16, s.earth,  .little);
-    try w.writeInt(u16, s.wind,   .little);
-    try w.writeInt(u16, s.water,  .little);
-    try w.writeInt(u16, s.hp,     .little);
-    try w.writeInt(u16, s.level,  .little);
+    try w.writeInt(u16, s.heal, .little);
+    try w.writeInt(u16, s.fire, .little);
+    try w.writeInt(u16, s.earth, .little);
+    try w.writeInt(u16, s.wind, .little);
+    try w.writeInt(u16, s.water, .little);
+    try w.writeInt(u16, s.hp, .little);
+    try w.writeInt(u16, s.level, .little);
 }
 
 fn decode_statblock(r: anytype) !components.Statblock {
     return .{
         .attack = try r.readInt(u16, .little),
         .shield = try r.readInt(u16, .little),
-        .heal   = try r.readInt(u16, .little),
-        .fire   = try r.readInt(u16, .little),
-        .earth  = try r.readInt(u16, .little),
-        .wind   = try r.readInt(u16, .little),
-        .water  = try r.readInt(u16, .little),
-        .hp     = try r.readInt(u16, .little),
-        .level  = try r.readInt(u16, .little),
+        .heal = try r.readInt(u16, .little),
+        .fire = try r.readInt(u16, .little),
+        .earth = try r.readInt(u16, .little),
+        .wind = try r.readInt(u16, .little),
+        .water = try r.readInt(u16, .little),
+        .hp = try r.readInt(u16, .little),
+        .level = try r.readInt(u16, .little),
     };
 }
 
@@ -424,7 +413,7 @@ pub fn decode_game_state(reader: anytype) !GameState {
     }
     p.players = try decode_team_summary(reader);
     p.enemies = try decode_team_summary(reader);
-    p.enemy_intent_damage  = try reader.readInt(u16, .little);
+    p.enemy_intent_damage = try reader.readInt(u16, .little);
     p.enemy_intent_element = try reader.readByte();
     _ = try reader.readAll(&p.player_dot_stacks);
     _ = try reader.readAll(&p.enemy_dot_stacks);
@@ -503,10 +492,10 @@ test "round-trip: game_state — round_timer, team summaries, and combo survive"
         .entities = [_]EntitySnapshot{EntitySnapshot.blank} ** MAX_ENTITIES_WIRE,
         .players = .{ .hp_current = 80, .hp_max = 100 },
         .enemies = .{ .hp_current = 240, .hp_max = 240 },
-        .enemy_intent_damage  = 0,
+        .enemy_intent_damage = 0,
         .enemy_intent_element = GameState.INTENT_ELEMENT_NONE,
-        .player_dot_stacks    = [_]u8{0} ** 4,
-        .enemy_dot_stacks     = [_]u8{0} ** 4,
+        .player_dot_stacks = [_]u8{0} ** 4,
+        .enemy_dot_stacks = [_]u8{0} ** 4,
     };
     gs.entities[0] = EntitySnapshot{
         .entity = 7,
@@ -614,7 +603,7 @@ test "round-trip: choose_combo [damage, shield, heal]" {
     try std.testing.expectEqual(@as(u8, 3), decoded.combo.len);
     try std.testing.expectEqual(components.ActionChoice.damage, decoded.combo.slots[0].action);
     try std.testing.expectEqual(components.ActionChoice.shield, decoded.combo.slots[1].action);
-    try std.testing.expectEqual(components.ActionChoice.heal,   decoded.combo.slots[2].action);
+    try std.testing.expectEqual(components.ActionChoice.heal, decoded.combo.slots[2].action);
 }
 
 test "round-trip: choose_combo len=4 all damage" {
@@ -640,10 +629,10 @@ test "round-trip: choose_combo with element slots [fire, damage, water, shield]"
 
     const combo = components.ActionCombo{
         .slots = [_]components.ComboSlot{
-            .{ .element = .fire   },
-            .{ .action  = .damage },
-            .{ .element = .water  },
-            .{ .action  = .shield },
+            .{ .element = .fire },
+            .{ .action = .damage },
+            .{ .element = .water },
+            .{ .action = .shield },
         },
         .len = 4,
     };
@@ -652,10 +641,10 @@ test "round-trip: choose_combo with element slots [fire, damage, water, shield]"
     _ = try read_tag(fbs.reader());
     const decoded = try decode_choose_combo(fbs.reader());
     try std.testing.expectEqual(@as(u8, 4), decoded.combo.len);
-    try std.testing.expectEqual(components.Element.fire,          decoded.combo.slots[0].element);
-    try std.testing.expectEqual(components.ActionChoice.damage,   decoded.combo.slots[1].action);
-    try std.testing.expectEqual(components.Element.water,         decoded.combo.slots[2].element);
-    try std.testing.expectEqual(components.ActionChoice.shield,   decoded.combo.slots[3].action);
+    try std.testing.expectEqual(components.Element.fire, decoded.combo.slots[0].element);
+    try std.testing.expectEqual(components.ActionChoice.damage, decoded.combo.slots[1].action);
+    try std.testing.expectEqual(components.Element.water, decoded.combo.slots[2].element);
+    try std.testing.expectEqual(components.ActionChoice.shield, decoded.combo.slots[3].action);
 }
 
 test "round-trip: game_state snapshot with element slot" {
@@ -668,23 +657,23 @@ test "round-trip: game_state snapshot with element slot" {
         .entity_count = 1,
         .entities = [_]EntitySnapshot{EntitySnapshot.blank} ** MAX_ENTITIES_WIRE,
         .players = .{ .hp_current = 10, .hp_max = 10 },
-        .enemies = .{ .hp_current = 5,  .hp_max = 5  },
-        .enemy_intent_damage  = 0,
+        .enemies = .{ .hp_current = 5, .hp_max = 5 },
+        .enemy_intent_damage = 0,
         .enemy_intent_element = GameState.INTENT_ELEMENT_NONE,
-        .player_dot_stacks    = [_]u8{0} ** 4,
-        .enemy_dot_stacks     = [_]u8{0} ** 4,
+        .player_dot_stacks = [_]u8{0} ** 4,
+        .enemy_dot_stacks = [_]u8{0} ** 4,
     };
     gs.entities[0] = EntitySnapshot{
         .entity = 1,
-        .kind   = .player,
-        .team   = .players,
-        .owner  = 0,
+        .kind = .player,
+        .team = .players,
+        .owner = 0,
         .combo_len = 2,
         .combo_slots = [_]components.ComboSlot{
-            .{ .element = .earth  },
-            .{ .action  = .damage },
-            .{ .action  = .damage },
-            .{ .action  = .damage },
+            .{ .element = .earth },
+            .{ .action = .damage },
+            .{ .action = .damage },
+            .{ .action = .damage },
         },
     };
 
@@ -693,8 +682,8 @@ test "round-trip: game_state snapshot with element slot" {
     _ = try read_tag(fbs.reader());
     const decoded = try decode_game_state(fbs.reader());
     try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].combo_len);
-    try std.testing.expectEqual(components.Element.earth,        decoded.entities[0].combo_slots[0].element);
-    try std.testing.expectEqual(components.ActionChoice.damage,  decoded.entities[0].combo_slots[1].action);
+    try std.testing.expectEqual(components.Element.earth, decoded.entities[0].combo_slots[0].element);
+    try std.testing.expectEqual(components.ActionChoice.damage, decoded.entities[0].combo_slots[1].action);
 }
 
 test "decode_choose_combo: len=0 returns InvalidComboLen" {
@@ -733,7 +722,7 @@ test "round-trip: game_state enemy_intent_element fire survives" {
 
     var gs = GameState.blank;
     gs.tick = 7;
-    gs.enemy_intent_damage  = 3;
+    gs.enemy_intent_damage = 3;
     gs.enemy_intent_element = @intFromEnum(components.Element.fire); // 0
 
     try encode(fbs.writer(), .game_state, gs);
@@ -751,7 +740,7 @@ test "round-trip: game_state enemy_intent_element none (0xFF) survives" {
     var fbs = std.io.fixedBufferStream(&buf);
 
     var gs = GameState.blank;
-    gs.enemy_intent_damage  = 5;
+    gs.enemy_intent_damage = 5;
     gs.enemy_intent_element = GameState.INTENT_ELEMENT_NONE;
 
     try encode(fbs.writer(), .game_state, gs);
@@ -789,7 +778,7 @@ test "round-trip: game_state dot stacks survive encode/decode" {
 
     var gs = GameState.blank;
     gs.player_dot_stacks = .{ 3, 0, 1, 0 }; // 3 fire stacks, 1 wind stack on players
-    gs.enemy_dot_stacks  = .{ 0, 2, 0, 4 }; // 2 earth, 4 water stacks on enemies
+    gs.enemy_dot_stacks = .{ 0, 2, 0, 4 }; // 2 earth, 4 water stacks on enemies
 
     try encode(fbs.writer(), .game_state, gs);
     fbs.reset();
@@ -797,5 +786,5 @@ test "round-trip: game_state dot stacks survive encode/decode" {
     const decoded = try decode_game_state(fbs.reader());
 
     try std.testing.expectEqualSlices(u8, &gs.player_dot_stacks, &decoded.player_dot_stacks);
-    try std.testing.expectEqualSlices(u8, &gs.enemy_dot_stacks,  &decoded.enemy_dot_stacks);
+    try std.testing.expectEqualSlices(u8, &gs.enemy_dot_stacks, &decoded.enemy_dot_stacks);
 }

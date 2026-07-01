@@ -1,13 +1,3 @@
-//! Scripted enemy wave definitions.
-//!
-//! A Wave is a comptime constant slice of SpawnEntry values describing the
-//! initial enemy composition for one battle encounter.  The server loads a
-//! wave by label at game-start and again whenever `next_wave` is non-null and
-//! all enemies from the previous wave are dead.
-//!
-//! Adding a new wave: append a new `pub const wave_XX` below, then add it to
-//! `ALL_WAVES`.  No other file needs to change.
-
 const components = @import("components.zig");
 const EntityKind = components.EntityKind;
 const Statblock = components.Statblock;
