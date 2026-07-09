@@ -221,8 +221,8 @@ fn process_recv() void {
                 g_state.game.player_id = p.player_id;
                 g_state.game.round_timer = p.round_duration;
                 g_state.game.round_duration = p.round_duration;
-                g_state.game.wave_label_len = p.wave_label_len;
-                @memcpy(g_state.game.wave_label[0..p.wave_label_len], p.wave_label[0..p.wave_label_len]);
+                g_state.game.encounter_label_len = p.encounter_label_len;
+                @memcpy(g_state.game.encounter_label[0..p.encounter_label_len], p.encounter_label[0..p.encounter_label_len]);
                 g_state.phase = .game;
             },
             .game_state => {
@@ -232,13 +232,13 @@ fn process_recv() void {
             },
             .game_over => {
                 const p = proto.decode_game_over(r) catch continue;
-                g_state.game.winner = p.winner;
+                g_state.game.final_score = p.score;
                 g_state.phase = .game_over;
             },
             .action_result => {
                 const p = proto.decode_action_result(r) catch continue;
                 const anim: c.ActionAnimation = switch (p.tag) {
-                    .damage, .shield, .heal => .attack,
+                    .damage, .shield, .heal, .cast => .attack,
                     .death => .die,
                 };
                 // Record actor animation (pool actions have no specific actor).
@@ -261,6 +261,14 @@ fn process_recv() void {
             .round_reset => {
                 g_state.game.round += 1;
                 g_state.game.pending_combo.clear();
+            },
+            .cast_committed => {
+                const p = proto.decode_cast_committed(r) catch continue;
+                // Our pending combo was committed server-side; clear the
+                // local buffer so the next spell starts fresh.
+                if (p.player_id == g_state.player_id) {
+                    g_state.game.pending_combo.clear();
+                }
             },
             else => {},
         }

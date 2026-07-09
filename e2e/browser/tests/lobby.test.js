@@ -9,7 +9,7 @@
  *   2. Open browser page — bridge connects, Zig client sends join_lobby,
  *      server replies with lobby_update, client emits lobby render frame.
  *   3. Assert canvas shows lobby content (non-blank, correct colours, phase=lobby).
- *   4. Assert lobby frame fields are well-formed (join_code, selected_class, etc.).
+ *   4. Assert lobby frame fields are well-formed (join_code, players, ready).
  *   5. Send key events via the bridge WS and confirm internal state updates.
  */
 
@@ -58,9 +58,9 @@ test("canvas renders lobby phase after server connection", async ({ page }) => {
   }
 });
 
-test("canvas shows 'Dragoncon Game' title in C_HEADER colour", async ({ page }) => {
+test("canvas shows 'Slime Feast' title in C_HEADER colour", async ({ page }) => {
   // C_HEADER = rgba(180,200,255,1) — the title text colour.
-  // drawLobby: text("Dragoncon Game", 40, 52, 32, C_HEADER)
+  // drawLobby: text("Slime Feast", 40, 52, 32, C_HEADER)
   // The text baseline is at y=52; with a 32px font glyphs extend up to ~y=20.
   // Sample the region x=40..400, y=20..60.
   const collector = openFrameCollector(BRIDGE_PORT);
@@ -82,37 +82,6 @@ test("canvas shows 'Dragoncon Game' title in C_HEADER colour", async ({ page }) 
   } finally {
     collector.close();
   }
-});
-
-test("key event forwarding: KEY:2 reaches Zig and updates render frame", async ({ page }) => {
-  await page.goto(`http://localhost:${BRIDGE_PORT}/`);
-  await waitForCanvasContent(page, 10_000);
-
-  // Connect a second browser WS client to capture render frames directly.
-  await page.evaluate((bridgePort) => {
-    window.__testWs = new WebSocket(`ws://localhost:${bridgePort}/ws`);
-    window.__testWs.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.tag === "render" && msg.lobby) {
-          window.__lastClass = msg.lobby.selected_class;
-        }
-      } catch {}
-    };
-  }, BRIDGE_PORT);
-
-  // Wait for at least one lobby frame so we have a baseline.
-  await page.waitForFunction(() => !!window.__lastClass, { timeout: 8_000 });
-
-  // Press '2' in the browser — game.js forwards KEY:2 → bridge → Zig stdin.
-  await page.keyboard.press("2");
-
-  // Wait for selected_class to change to 'mage'.
-  await page.waitForFunction(
-    () => window.__lastClass === "mage",
-    { timeout: 5_000 },
-  );
-  expect(await page.evaluate(() => window.__lastClass)).toBe("mage");
 });
 
 test("Enter key toggles ready state", async ({ page }) => {

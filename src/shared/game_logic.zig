@@ -1,12 +1,27 @@
+//! Pure resolution logic for the Slime Feast encounter.
+//!
+//! Round resolution pipeline (driven by session.resolve_round):
+//!   1. `match_recipes`   — convert the round's committed casts into one
+//!                          AgentOutput (team recipes → player recipes →
+//!                          flat fallback; team recipes need distinct players).
+//!   2. `apply_medicine`  — heal the hunger bar, capped by the healable
+//!                          (modified-slime) portion.
+//!   3. `resolve_zone`    — neutralize matching-color slime with the agent
+//!                          units, then consume the whole zone: compute
+//!                          hunger added (normal + extra) and score.
+//!
+//! All functions here are pure/deterministic and unit-testable without a
+//! session.
+
 const std = @import("std");
 const c = @import("components.zig");
 const balance = @import("balance.zig");
 
-pub const ROUND_DURATION_DEFAULT_S: f32 = 3.0;
+pub const ROUND_DURATION_DEFAULT_S: f32 = 15.0;
 
 /// An action slot with its resolved element modifier (null = no element).
 pub const ElementedAction = struct {
-    action:  c.ActionChoice,
+    action: c.ActionChoice,
     element: ?c.Element,
 };
 
@@ -27,7 +42,7 @@ pub fn parse_combo(combo: c.ActionCombo, out: []ElementedAction) usize {
     for (combo.slots[0..combo.len]) |slot| {
         switch (slot) {
             .element => |el| current_element = el,
-            .action  => |ac| {
+            .action => |ac| {
                 out[count] = .{ .action = ac, .element = current_element };
                 count += 1;
                 // Element persists — do NOT reset current_element here.
@@ -37,321 +52,216 @@ pub fn parse_combo(combo: c.ActionCombo, out: []ElementedAction) usize {
     return count;
 }
 
-pub fn apply_damage(health: *c.Health, damage: u16) void {
-    health.current = if (health.current > damage) health.current - damage else 0;
-}
+// ---------------------------------------------------------------------------
+// Combo → AgentOutput conversion
+// ---------------------------------------------------------------------------
 
-pub fn apply_heal(health: *c.Health, amount: u16) void {
-    const restored = @as(u32, health.current) + @as(u32, amount);
-    health.current = @intCast(@min(restored, @as(u32, health.max)));
-}
-
-pub fn is_dead(health: c.Health) bool {
-    return health.current == 0;
-}
-
-/// Apply `net_damage` to `health`.
-/// Caller is responsible for netting damage against shield actions before calling.
-/// Returns HP damage dealt.
-pub fn resolve_damage_pool(
-    health: *c.Health,
-    net_damage: u16,
-    element: ?c.Element,
-) u16 {
-    _ = element; // element is metadata only; callers track it for floaters/logs
-    if (net_damage == 0) return 0;
-    apply_damage(health, net_damage);
-    return net_damage;
-}
-
-pub fn resolve_heal_pool(health: *c.Health, heal_amount: u16) void {
-    apply_heal(health, heal_amount);
-}
-
-pub const EnemyIntent = struct {
-    damage_per_player: u16,
-    /// null = non-elemental.  Chosen per-round by the session; extensible for future AI.
-    element: ?c.Element,
-};
-
-pub fn compute_enemy_intent(living_enemy_count: u16, element: ?c.Element) EnemyIntent {
-    return .{ .damage_per_player = living_enemy_count, .element = element };
-}
-
-/// Returns a bitmask (bit i = `@intFromEnum(Element)` ordinal i, 0=fire…3=water)
-/// of elements whose elemental group in `combo` exactly matches the action counts
-/// required by `trigger` (trigger.damage damage actions, trigger.shield shield
-/// actions, trigger.heal heal actions — no others in that group).
-///
-/// Null-element groups (actions before the first element token) never trigger.
-///
-/// Used by session.resolve_round to determine which special combos fired and
-/// which actions should be withheld from normal pools.
-pub fn detect_triggers(combo: c.ActionCombo, trigger: balance.ComboTrigger) u4 {
-    var trigger_mask: u4 = 0;
-    var current_el:   ?c.Element = null;
-    var dmg_count:    u8 = 0;
-    var shd_count:    u8 = 0;
-    var heal_count:   u8 = 0;
-
-    const flush = struct {
-        fn f(
-            mask:    *u4,
-            el:      c.Element,
-            dc:      u8,
-            sc:      u8,
-            hc:      u8,
-            t:       balance.ComboTrigger,
-        ) void {
-            if (dc == t.damage and sc == t.shield and hc == t.heal)
-                mask.* |= @as(u4, 1) << @as(u2, @intCast(@intFromEnum(el)));
-        }
-    }.f;
-
-    for (combo.slots[0..combo.len]) |slot| {
-        switch (slot) {
-            .element => |el| {
-                if (current_el) |prev|
-                    flush(&trigger_mask, prev, dmg_count, shd_count, heal_count, trigger);
-                current_el  = el;
-                dmg_count   = 0;
-                shd_count   = 0;
-                heal_count  = 0;
-            },
-            .action => |ac| {
-                if (current_el == null) continue; // null-element groups never trigger
-                switch (ac) {
-                    .damage => dmg_count  +|= 1,
-                    .shield => shd_count  +|= 1,
-                    .heal   => heal_count +|= 1,
-                }
-            },
-        }
+/// Exact structural equality: same length, same slots in the same order.
+pub fn combos_equal(a: c.ActionCombo, b: c.ActionCombo) bool {
+    if (a.len != b.len) return false;
+    for (a.slots[0..a.len], b.slots[0..b.len]) |x, y| {
+        if (!std.meta.eql(x, y)) return false;
     }
-    if (current_el) |prev|
-        flush(&trigger_mask, prev, dmg_count, shd_count, heal_count, trigger);
-    return trigger_mask;
+    return true;
 }
 
-// ---------------------------------------------------------------------------
-// Combo tallying
-// ---------------------------------------------------------------------------
-
-/// Map a bucket index back to an optional Element (inverse of element_key).
-pub fn key_to_element(k: usize) ?c.Element {
-    return if (k == 0) null else @enumFromInt(k - 1);
-}
-
-/// Return the Statblock field matching the given element (0 for null-element).
-fn element_stat(sb: c.Statblock, el: ?c.Element) u16 {
-    return if (el) |e| switch (e) {
-        .fire  => sb.fire,
-        .earth => sb.earth,
-        .wind  => sb.wind,
-        .water => sb.water,
-    } else 0;
-}
-
-/// Build a FormulaCtx from a Statblock and optional element.
-/// `base` is the ActionValues multiplier for this action type.
-fn statblock_ctx(base: u16, sb: c.Statblock, el: ?c.Element) balance.FormulaCtx {
-    return .{
-        .base         = base,
-        .attack       = sb.attack,
-        .shield_stat  = sb.shield,
-        .heal_stat    = sb.heal,
-        .element_stat = element_stat(sb, el),
-        .level        = sb.level,
-    };
-}
-
-/// Per-side accumulation of one round's combo contributions, bucketed by
-/// element.  Produced by repeated `tally_combo` calls; consumed by the
-/// netting/application steps in session.resolve_round.
-pub const SideTally = struct {
-    /// Direct damage per ElementKey bucket (0=none,1=fire…4=water).
-    damage_by_key:      [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size,
-    /// Shield absorb per ElementKey bucket.
-    shield_by_key:      [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size,
-    /// Withheld DoT-trigger damage per ElementKey bucket (peek-net in Step 3).
-    dot_dmg_by_key:     [c.ElementKey.size]u16 = [_]u16{0} ** c.ElementKey.size,
-    /// Stacks to add per Element if withheld damage survives shields (Step 3).
-    dot_stacks_pending: [c.Element.size]u16 = [_]u16{0} ** c.Element.size,
-    /// Cleanse stacks removed from own side per Element (Step 2.5).
-    cleanse_by_el:      [c.Element.size]u16 = [_]u16{0} ** c.Element.size,
-    /// Flat heal pool contributed this round.
-    heal_pool:          u16 = 0,
-};
-
-/// Tally one combo cast by an entity with statblock `sb` into `tally`.
-///
-/// Each action is checked against every trigger in balance.combo_triggers.
-/// Actions whose element matches a fired trigger's pattern are withheld from
-/// the normal pools per trigger.withheld_*.  Withheld DoT damage/stacks and
-/// cleanse stacks are accumulated separately for later resolution.  The
-/// caster's Statblock scales each surviving action's contribution.
-pub fn tally_combo(tally: *SideTally, combo: c.ActionCombo, sb: c.Statblock) void {
+/// Flat per-slot conversion for combos that match no recipe:
+///   - dispense with an element → UNITS_PER_SLOT agent units of that color
+///   - medicine with an element → MEDICINE_PER_SLOT medicine of that color
+///   - either action with NO element → wasted (both are color-bound)
+pub fn flat_convert(combo: c.ActionCombo) c.AgentOutput {
+    var out = c.AgentOutput{};
     var ea_buf: [c.MAX_COMBO_LEN]ElementedAction = undefined;
-
-    // Compute per-trigger bitmasks once per combo.
-    var trigger_masks: [balance.combo_triggers.len]u4 = undefined;
-    inline for (balance.combo_triggers, 0..) |trigger, ti| {
-        trigger_masks[ti] = detect_triggers(combo, trigger);
-    }
-
     const n = parse_combo(combo, &ea_buf);
     for (ea_buf[0..n]) |ea| {
-        const k = @intFromEnum(c.element_key(ea.element));
-        const el_bit: u4 = if (ea.element) |el|
-            @as(u4, 1) << @as(u2, @intCast(@intFromEnum(el)))
-        else
-            0;
-
-        // Check if this action is withheld by any fired trigger.
-        var withheld = false;
-        if (el_bit != 0) {
-            inline for (balance.combo_triggers, 0..) |trigger, ti| {
-                if ((trigger_masks[ti] & el_bit) != 0) {
-                    const consumed = switch (ea.action) {
-                        .damage => trigger.withheld_damage,
-                        .shield => trigger.withheld_shield,
-                        .heal   => trigger.withheld_heal,
-                    };
-                    if (consumed) {
-                        withheld = true;
-                        if (trigger.kind == .dot and ea.action == .damage) {
-                            // Accumulate withheld dmg (peek-net) and pending stacks.
-                            const dmg_ctx = statblock_ctx(balance.basic.damage, sb, ea.element);
-                            tally.dot_dmg_by_key[k] +|= balance.scale_damage(dmg_ctx);
-                            const stk_ctx = statblock_ctx(trigger.dot_stacks_base, sb, ea.element);
-                            const el_i: usize = @intFromEnum(ea.element.?);
-                            tally.dot_stacks_pending[el_i] +|= balance.scale_dot_stacks(stk_ctx);
-                        }
-                        // Cleanse-withheld heal counted for Step 2.5.
-                        if (trigger.kind == .cleanse and ea.action == .heal) {
-                            const i: usize = @intFromEnum(ea.element.?);
-                            tally.cleanse_by_el[i] +|= trigger.cleanse_stacks_removed;
-                        }
-                    }
-                }
-            }
+        const el = ea.element orelse continue; // colorless actions wasted
+        switch (ea.action) {
+            .dispense => out.units[@intFromEnum(el)] +|= balance.UNITS_PER_SLOT,
+            .medicine => out.medicine[@intFromEnum(el)] +|= balance.MEDICINE_PER_SLOT,
         }
+    }
+    return out;
+}
 
-        if (!withheld) {
-            const ctx = statblock_ctx(0, sb, ea.element);
-            switch (ea.action) {
-                .damage => tally.damage_by_key[k] +|= balance.scale_damage(
-                    .{ .base = balance.basic.damage, .attack = ctx.attack,
-                       .shield_stat = ctx.shield_stat, .heal_stat = ctx.heal_stat,
-                       .element_stat = ctx.element_stat, .level = ctx.level }),
-                .shield => tally.shield_by_key[k] +|= balance.scale_shield(
-                    .{ .base = balance.basic.shield, .attack = ctx.attack,
-                       .shield_stat = ctx.shield_stat, .heal_stat = ctx.heal_stat,
-                       .element_stat = ctx.element_stat, .level = ctx.level }),
-                .heal   => tally.heal_pool +|= balance.scale_heal(
-                    .{ .base = balance.basic.heal, .attack = ctx.attack,
-                       .shield_stat = ctx.shield_stat, .heal_stat = ctx.heal_stat,
-                       .element_stat = ctx.element_stat, .level = ctx.level }),
+/// One committed spell: the combo plus its caster (recipes that span players
+/// must be cast by distinct players).
+pub const Cast = struct {
+    player_id: u8,
+    combo: c.ActionCombo,
+};
+
+/// Maximum casts per round == max players × casts each; sized for the
+/// consumed-flag arrays.
+const MAX_CASTS: usize = 64;
+
+/// Convert one round's committed casts into the team's combined AgentOutput.
+///
+/// Matching order (a cast is consumed by at most one recipe):
+///   1. Team recipes, greedily in balance.team_recipes order.  Each pattern
+///      must be matched exactly by a DISTINCT player's cast — one player
+///      casting both halves does not trigger a team recipe.  A recipe
+///      repeats while disjoint groups keep matching.
+///   2. Player recipes in balance.player_recipes order (exact match).
+///   3. Flat conversion fallback (flat_convert).
+pub fn match_recipes(casts: []const Cast) c.AgentOutput {
+    std.debug.assert(casts.len <= MAX_CASTS);
+    var out = c.AgentOutput{};
+    var consumed = [_]bool{false} ** MAX_CASTS;
+
+    // 1. Team recipes — greedy, repeatable, table order, distinct players.
+    for (balance.team_recipes) |tr| {
+        matching: while (true) {
+            var picks: [MAX_CASTS]usize = undefined;
+            var picked = [_]bool{false} ** MAX_CASTS;
+            for (tr.patterns, 0..) |pattern, pi| {
+                const found = for (casts, 0..) |cast, ci| {
+                    if (consumed[ci] or picked[ci]) continue;
+                    // Distinct players: skip casts by anyone already picked
+                    // for this recipe instance.
+                    const player_taken = for (picks[0..pi]) |prev| {
+                        if (casts[prev].player_id == cast.player_id) break true;
+                    } else false;
+                    if (player_taken) continue;
+                    if (combos_equal(cast.combo, pattern)) break ci;
+                } else null;
+                const ci = found orelse break :matching;
+                picks[pi] = ci;
+                picked[ci] = true;
+            }
+            for (tr.patterns, 0..) |_, pi| consumed[picks[pi]] = true;
+            out.add(tr.output);
+        }
+    }
+
+    // 2. Player recipes.
+    for (casts, 0..) |cast, ci| {
+        if (consumed[ci]) continue;
+        for (balance.player_recipes) |pr| {
+            if (combos_equal(cast.combo, pr.pattern)) {
+                out.add(pr.output);
+                consumed[ci] = true;
+                break;
             }
         }
     }
+
+    // 3. Flat fallback.
+    for (casts, 0..) |cast, ci| {
+        if (consumed[ci]) continue;
+        out.add(flat_convert(cast.combo));
+    }
+
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Hunger + zone consumption
+// ---------------------------------------------------------------------------
+
+/// Heal the hunger bar with per-color medicine pools.  Medicine is
+/// symmetrical: the color-X pool heals only `healable[X]` — the hunger
+/// attributable to eating un-neutralized color-X Modified Slime — and is
+/// further capped by the current hunger level.  Overheal is discarded.
+/// Returns the total amount actually healed.
+pub fn apply_medicine(
+    hunger: *c.Health,
+    healable: *[c.Element.size]u16,
+    pools: [c.Element.size]u32,
+) u16 {
+    var total: u16 = 0;
+    for (pools, 0..) |pool, i| {
+        const cap = @min(@as(u32, healable[i]), @as(u32, hunger.current));
+        const heal: u16 = @intCast(@min(pool, cap));
+        hunger.current -= heal;
+        healable[i] -= heal;
+        total += heal;
+    }
+    return total;
+}
+
+/// Add hunger, clamping at max.
+pub fn add_hunger(hunger: *c.Health, amount: u32) void {
+    const total = @min(@as(u32, hunger.current) + amount, @as(u32, hunger.max));
+    hunger.current = @intCast(total);
+}
+
+pub fn hunger_full(hunger: c.Health) bool {
+    return hunger.max > 0 and hunger.current >= hunger.max;
+}
+
+pub const ZoneOutcome = struct {
+    /// Modified units neutralized per color this round.
+    neutralized: [c.Element.size]u16,
+    /// Modified units consumed WITHOUT neutralization (extra hunger).
+    modified_consumed: u32,
+    /// Hunger from consuming every unit at the normal rate (never healable).
+    hunger_normal: u32,
+    /// Extra hunger per color from un-neutralized modified units of that
+    /// color.  Healable only by matching-color medicine.
+    hunger_extra: [c.Element.size]u32,
+    /// Score gained: neutralized units + naturally-neutral units.
+    score: u32,
+
+    pub fn hunger_extra_total(self: ZoneOutcome) u32 {
+        var total: u32 = 0;
+        for (self.hunger_extra) |e| total += e;
+        return total;
+    }
+};
+
+/// Resolve the end-of-round consumption of `zone` given the team's agent
+/// units.  `neutralized[color] = min(agents[color], zone.modified[color])`;
+/// excess and wrong-color agents are wasted.  The ENTIRE zone is consumed:
+/// every unit costs HUNGER_COST_NORMAL, and each un-neutralized modified
+/// unit additionally costs HUNGER_COST_MODIFIED_EXTRA (healable, tracked
+/// per color).
+pub fn resolve_zone(zone: c.ZoneDef, agents: [c.Element.size]u32) ZoneOutcome {
+    var neutralized = [_]u16{0} ** c.Element.size;
+    var hunger_extra = [_]u32{0} ** c.Element.size;
+    var neutralized_total: u32 = 0;
+    var modified_consumed: u32 = 0;
+    for (zone.modified, 0..) |mod, i| {
+        const n: u16 = @intCast(@min(agents[i], @as(u32, mod)));
+        neutralized[i] = n;
+        neutralized_total += n;
+        const missed = mod - n;
+        modified_consumed += missed;
+        hunger_extra[i] = @as(u32, missed) * balance.HUNGER_COST_MODIFIED_EXTRA;
+    }
+    return .{
+        .neutralized = neutralized,
+        .modified_consumed = modified_consumed,
+        .hunger_normal = zone.total_units() * balance.HUNGER_COST_NORMAL,
+        .hunger_extra = hunger_extra,
+        .score = neutralized_total + zone.neutral,
+    };
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-test "apply_damage: no underflow" {
-    var h = c.Health{ .current = 5, .max = 100 };
-    apply_damage(&h, 999);
-    try std.testing.expectEqual(@as(u16, 0), h.current);
-}
-
-test "apply_heal: no overflow" {
-    var h = c.Health{ .current = 95, .max = 100 };
-    apply_heal(&h, 999);
-    try std.testing.expectEqual(@as(u16, 100), h.current);
-}
-
-test "resolve_damage_pool: applies net damage" {
-    var h = c.Health{ .current = 10, .max = 10 };
-    const dealt = resolve_damage_pool(&h, 3, null);
-    try std.testing.expectEqual(@as(u16, 3), dealt);
-    try std.testing.expectEqual(@as(u16, 7), h.current);
-}
-
-test "resolve_damage_pool: zero net — no change" {
-    var h = c.Health{ .current = 10, .max = 10 };
-    const dealt = resolve_damage_pool(&h, 0, null);
-    try std.testing.expectEqual(@as(u16, 0), dealt);
-    try std.testing.expectEqual(@as(u16, 10), h.current);
-}
-
-test "resolve_damage_pool: element arg is ignored (metadata only)" {
-    var h = c.Health{ .current = 5, .max = 5 };
-    const dealt = resolve_damage_pool(&h, 2, .fire);
-    try std.testing.expectEqual(@as(u16, 2), dealt);
-    try std.testing.expectEqual(@as(u16, 3), h.current);
-}
-
-test "resolve_heal_pool: heals" {
-    var h = c.Health{ .current = 5, .max = 10 };
-    resolve_heal_pool(&h, 1);
-    try std.testing.expectEqual(@as(u16, 6), h.current);
-}
-
-test "resolve_heal_pool: at max HP — no overflow" {
-    var h = c.Health{ .current = 100, .max = 100 };
-    resolve_heal_pool(&h, 10);
-    try std.testing.expectEqual(@as(u16, 100), h.current);
-}
-
-test "compute_enemy_intent: 1 dmg per living enemy" {
-    const intent = compute_enemy_intent(42, null);
-    try std.testing.expectEqual(@as(u16, 42), intent.damage_per_player);
-    try std.testing.expectEqual(@as(?c.Element, null), intent.element);
-}
-
-test "compute_enemy_intent: zero enemies — zero damage" {
-    const intent = compute_enemy_intent(0, null);
-    try std.testing.expectEqual(@as(u16, 0), intent.damage_per_player);
-}
-
-// ---------------------------------------------------------------------------
-// parse_combo tests
-// ---------------------------------------------------------------------------
-
-fn make_combo(comptime slots: []const c.ComboSlot) c.ActionCombo {
-    var combo = c.ActionCombo{
-        .slots = [_]c.ComboSlot{.{ .action = .damage }} ** c.MAX_COMBO_LEN,
-        .len   = @intCast(slots.len),
-    };
-    @memcpy(combo.slots[0..slots.len], slots);
-    return combo;
-}
+const mk = c.make_combo;
 
 test "parse_combo: action-only — element is null for all" {
-    const combo = make_combo(&[_]c.ComboSlot{
-        .{ .action = .damage },
-        .{ .action = .shield },
-        .{ .action = .heal },
+    const combo = mk(&.{
+        .{ .action = .dispense },
+        .{ .action = .medicine },
     });
     var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
     const n = parse_combo(combo, &out);
-    try std.testing.expectEqual(@as(usize, 3), n);
-    try std.testing.expectEqual(c.ActionChoice.damage, out[0].action);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(c.ActionChoice.dispense, out[0].action);
     try std.testing.expectEqual(@as(?c.Element, null), out[0].element);
-    try std.testing.expectEqual(c.ActionChoice.shield, out[1].action);
+    try std.testing.expectEqual(c.ActionChoice.medicine, out[1].action);
     try std.testing.expectEqual(@as(?c.Element, null), out[1].element);
-    try std.testing.expectEqual(c.ActionChoice.heal, out[2].action);
-    try std.testing.expectEqual(@as(?c.Element, null), out[2].element);
 }
 
 test "parse_combo: element persists across following actions" {
-    const combo = make_combo(&[_]c.ComboSlot{
+    const combo = mk(&.{
         .{ .element = .fire },
-        .{ .action  = .damage },
-        .{ .action  = .damage },
+        .{ .action = .dispense },
+        .{ .action = .dispense },
     });
     var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
     const n = parse_combo(combo, &out);
@@ -361,23 +271,23 @@ test "parse_combo: element persists across following actions" {
 }
 
 test "parse_combo: second element overrides first" {
-    const combo = make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire  },
-        .{ .action  = .damage },
+    const combo = mk(&.{
+        .{ .element = .fire },
+        .{ .action = .dispense },
         .{ .element = .water },
-        .{ .action  = .shield },
+        .{ .action = .dispense },
     });
     var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
     const n = parse_combo(combo, &out);
     try std.testing.expectEqual(@as(usize, 2), n);
-    try std.testing.expectEqual(c.Element.fire,  out[0].element.?);
+    try std.testing.expectEqual(c.Element.fire, out[0].element.?);
     try std.testing.expectEqual(c.Element.water, out[1].element.?);
 }
 
 test "parse_combo: trailing element is silently dropped" {
-    const combo = make_combo(&[_]c.ComboSlot{
-        .{ .action  = .damage },
-        .{ .element = .fire   },
+    const combo = mk(&.{
+        .{ .action = .dispense },
+        .{ .element = .fire },
     });
     var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
     const n = parse_combo(combo, &out);
@@ -385,266 +295,265 @@ test "parse_combo: trailing element is silently dropped" {
     try std.testing.expectEqual(@as(?c.Element, null), out[0].element);
 }
 
-test "parse_combo: mixed — fire persists, water overrides" {
-    const combo = make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire  },
-        .{ .action  = .damage },
+test "combos_equal: identical combos match" {
+    const a = mk(&.{ .{ .element = .fire }, .{ .action = .dispense } });
+    const b = mk(&.{ .{ .element = .fire }, .{ .action = .dispense } });
+    try std.testing.expect(combos_equal(a, b));
+}
+
+test "combos_equal: different length / slot / order do not match" {
+    const base = mk(&.{ .{ .element = .fire }, .{ .action = .dispense } });
+    const longer = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const other_el = mk(&.{ .{ .element = .water }, .{ .action = .dispense } });
+    const reordered = mk(&.{ .{ .action = .dispense }, .{ .element = .fire } });
+    try std.testing.expect(!combos_equal(base, longer));
+    try std.testing.expect(!combos_equal(base, other_el));
+    try std.testing.expect(!combos_equal(base, reordered));
+}
+
+test "flat_convert: elemental dispense yields UNITS_PER_SLOT per slot" {
+    const out = flat_convert(mk(&.{
+        .{ .element = .earth },
+        .{ .action = .dispense },
+        .{ .action = .dispense },
+    }));
+    try std.testing.expectEqual(2 * balance.UNITS_PER_SLOT, out.units[@intFromEnum(c.Element.earth)]);
+    for (out.medicine) |m| try std.testing.expectEqual(@as(u32, 0), m);
+}
+
+test "flat_convert: colorless dispense is wasted" {
+    const out = flat_convert(mk(&.{.{ .action = .dispense }}));
+    for (out.units) |u| try std.testing.expectEqual(@as(u32, 0), u);
+}
+
+test "flat_convert: medicine is color-bound; colorless medicine wasted" {
+    const out = flat_convert(mk(&.{
+        .{ .action = .medicine }, // colorless — wasted
+        .{ .element = .fire },
+        .{ .action = .medicine },
         .{ .element = .water },
-        .{ .action  = .shield },
-    });
-    var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
-    const n = parse_combo(combo, &out);
-    try std.testing.expectEqual(@as(usize, 2), n);
-    try std.testing.expectEqual(c.ActionChoice.damage, out[0].action);
-    try std.testing.expectEqual(c.Element.fire,        out[0].element.?);
-    try std.testing.expectEqual(c.ActionChoice.shield, out[1].action);
-    try std.testing.expectEqual(c.Element.water,       out[1].element.?);
+        .{ .action = .medicine },
+    }));
+    try std.testing.expectEqual(balance.MEDICINE_PER_SLOT, out.medicine[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(balance.MEDICINE_PER_SLOT, out.medicine[@intFromEnum(c.Element.water)]);
+    try std.testing.expectEqual(@as(u32, 0), out.medicine[@intFromEnum(c.Element.earth)]);
+    for (out.units) |u| try std.testing.expectEqual(@as(u32, 0), u);
 }
 
-// ---------------------------------------------------------------------------
-// detect_triggers tests — using the balance.combo_triggers table entries
-// ---------------------------------------------------------------------------
-
-const dot_trigger     = balance.combo_triggers[0]; // damage=1, shield=0, heal=1
-const cleanse_trigger = balance.combo_triggers[1]; // damage=0, shield=1, heal=1
-
-test "detect_triggers(dot): [fire,dmg,heal] → fire bit set" {
-    const mask = detect_triggers(make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .damage },
-        .{ .action  = .heal   },
-    }), dot_trigger);
-    try std.testing.expectEqual(@as(u4, 0b0001), mask);
+test "match_recipes: player recipe replaces flat conversion" {
+    // crimson_flood: [fire, dispense×3] → 20 fire units (flat would be 15).
+    const casts = [_]Cast{
+        .{ .player_id = 0, .combo = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }) },
+    };
+    const out = match_recipes(&casts);
+    try std.testing.expectEqual(@as(u32, 20), out.units[@intFromEnum(c.Element.fire)]);
 }
 
-test "detect_triggers(dot): [fire,dmg,earth,heal] → 0 (split group)" {
-    const mask = detect_triggers(make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .damage },
-        .{ .element = .earth  },
-        .{ .action  = .heal   },
-    }), dot_trigger);
-    try std.testing.expectEqual(@as(u4, 0), mask);
+test "match_recipes: non-recipe combo falls back to flat conversion" {
+    const casts = [_]Cast{
+        .{ .player_id = 0, .combo = mk(&.{ .{ .element = .wind }, .{ .action = .dispense } }) },
+    };
+    const out = match_recipes(&casts);
+    try std.testing.expectEqual(balance.UNITS_PER_SLOT, out.units[@intFromEnum(c.Element.wind)]);
 }
 
-test "detect_triggers(dot): [fire,dmg,shield] — no heal → 0" {
-    const mask = detect_triggers(make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .damage },
-        .{ .action  = .shield },
-    }), dot_trigger);
-    try std.testing.expectEqual(@as(u4, 0), mask);
+test "match_recipes: team recipe consumes both casts exactly once" {
+    // twin_flames: 2 × [fire, dispense, dispense] → 30 fire + 2 fire medicine.
+    const pat = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const casts = [_]Cast{
+        .{ .player_id = 0, .combo = pat },
+        .{ .player_id = 1, .combo = pat },
+    };
+    const out = match_recipes(&casts);
+    try std.testing.expectEqual(@as(u32, 30), out.units[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u32, 2), out.medicine[@intFromEnum(c.Element.fire)]);
 }
 
-test "detect_triggers(dot): [fire,dmg,shield,heal] → 0 (shield in group blocks)" {
-    const mask = detect_triggers(make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .damage },
-        .{ .action  = .shield },
-        .{ .action  = .heal   },
-    }), dot_trigger);
-    try std.testing.expectEqual(@as(u4, 0), mask);
+test "match_recipes: team recipe fires twice for two disjoint pairs" {
+    const pat = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const casts = [_]Cast{
+        .{ .player_id = 0, .combo = pat },
+        .{ .player_id = 1, .combo = pat },
+        .{ .player_id = 2, .combo = pat },
+        .{ .player_id = 3, .combo = pat },
+    };
+    const out = match_recipes(&casts);
+    try std.testing.expectEqual(@as(u32, 60), out.units[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u32, 4), out.medicine[@intFromEnum(c.Element.fire)]);
 }
 
-test "detect_triggers(dot): [fire,dmg,heal,wind] → fire bit only (trailing wind empty)" {
-    const mask = detect_triggers(make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .damage },
-        .{ .action  = .heal   },
-        .{ .element = .wind   },
-    }), dot_trigger);
-    try std.testing.expectEqual(@as(u4, 0b0001), mask);
+test "match_recipes: same player casting both halves does NOT fire team recipe" {
+    // Team recipes require distinct players; one player's two twin_flames
+    // halves fall back to flat conversion (2 × 2 × UNITS_PER_SLOT fire).
+    const pat = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const casts = [_]Cast{
+        .{ .player_id = 0, .combo = pat },
+        .{ .player_id = 0, .combo = pat },
+    };
+    const out = match_recipes(&casts);
+    try std.testing.expectEqual(4 * balance.UNITS_PER_SLOT, out.units[@intFromEnum(c.Element.fire)]);
+    for (out.medicine) |m| try std.testing.expectEqual(@as(u32, 0), m);
 }
 
-test "detect_triggers(dot): [fire,dmg,dmg,heal] → 0 (extra dmg)" {
-    const mask = detect_triggers(make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .damage },
-        .{ .action  = .damage },
-        .{ .action  = .heal   },
-    }), dot_trigger);
-    try std.testing.expectEqual(@as(u4, 0), mask);
+test "match_recipes: distinct-player pair still fires alongside same-player extras" {
+    // Players 0 and 1 form one twin_flames pair; player 0's second half has
+    // no distinct partner left and converts flat.
+    const pat = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const casts = [_]Cast{
+        .{ .player_id = 0, .combo = pat },
+        .{ .player_id = 0, .combo = pat },
+        .{ .player_id = 1, .combo = pat },
+    };
+    const out = match_recipes(&casts);
+    try std.testing.expectEqual(30 + 2 * balance.UNITS_PER_SLOT, out.units[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u32, 2), out.medicine[@intFromEnum(c.Element.fire)]);
 }
 
-test "detect_triggers(dot): null-element dmg+heal → 0 (no element)" {
-    const mask = detect_triggers(make_combo(&[_]c.ComboSlot{
-        .{ .action = .damage },
-        .{ .action = .heal   },
-    }), dot_trigger);
-    try std.testing.expectEqual(@as(u4, 0), mask);
+test "match_recipes: lone half of a team recipe falls back to flat" {
+    // One [fire, dispense, dispense] alone: no team match, no player recipe
+    // (crimson_flood needs 3 dispenses) → flat 2 × UNITS_PER_SLOT.
+    const casts = [_]Cast{
+        .{ .player_id = 0, .combo = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } }) },
+    };
+    const out = match_recipes(&casts);
+    try std.testing.expectEqual(2 * balance.UNITS_PER_SLOT, out.units[@intFromEnum(c.Element.fire)]);
+    for (out.medicine) |m| try std.testing.expectEqual(@as(u32, 0), m);
 }
 
-test "detect_triggers(cleanse): [fire,heal,shield] → fire bit set" {
-    const mask = detect_triggers(make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .heal   },
-        .{ .action  = .shield },
-    }), cleanse_trigger);
-    try std.testing.expectEqual(@as(u4, 0b0001), mask);
+test "match_recipes: mixed — team pair + independent flat combo" {
+    const pat = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const flat = mk(&.{ .{ .element = .water }, .{ .action = .dispense } });
+    const casts = [_]Cast{
+        .{ .player_id = 0, .combo = pat },
+        .{ .player_id = 1, .combo = flat },
+        .{ .player_id = 2, .combo = pat },
+    };
+    const out = match_recipes(&casts);
+    try std.testing.expectEqual(@as(u32, 30), out.units[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(balance.UNITS_PER_SLOT, out.units[@intFromEnum(c.Element.water)]);
 }
 
-test "detect_triggers(cleanse): [fire,heal,shield,wind] → fire bit only" {
-    const mask = detect_triggers(make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .heal   },
-        .{ .action  = .shield },
-        .{ .element = .wind   },
-    }), cleanse_trigger);
-    try std.testing.expectEqual(@as(u4, 0b0001), mask);
+test "apply_medicine: capped by matching-color healable portion" {
+    var hunger = c.Health{ .current = 50, .max = 100 };
+    var healable = [_]u16{0} ** c.Element.size;
+    healable[@intFromEnum(c.Element.fire)] = 10;
+    var pools = [_]u32{0} ** c.Element.size;
+    pools[@intFromEnum(c.Element.fire)] = 25;
+    const healed = apply_medicine(&hunger, &healable, pools);
+    try std.testing.expectEqual(@as(u16, 10), healed);
+    try std.testing.expectEqual(@as(u16, 40), hunger.current);
+    try std.testing.expectEqual(@as(u16, 0), healable[@intFromEnum(c.Element.fire)]);
 }
 
-test "detect_triggers(cleanse): [fire,heal,shield,dmg] → 0 (extra action)" {
-    const mask = detect_triggers(make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .heal   },
-        .{ .action  = .shield },
-        .{ .action  = .damage },
-    }), cleanse_trigger);
-    try std.testing.expectEqual(@as(u4, 0), mask);
+test "apply_medicine: asymmetric medicine heals nothing" {
+    // Water medicine vs fire healable hunger: no effect.
+    var hunger = c.Health{ .current = 50, .max = 100 };
+    var healable = [_]u16{0} ** c.Element.size;
+    healable[@intFromEnum(c.Element.fire)] = 20;
+    var pools = [_]u32{0} ** c.Element.size;
+    pools[@intFromEnum(c.Element.water)] = 99;
+    const healed = apply_medicine(&hunger, &healable, pools);
+    try std.testing.expectEqual(@as(u16, 0), healed);
+    try std.testing.expectEqual(@as(u16, 50), hunger.current);
+    try std.testing.expectEqual(@as(u16, 20), healable[@intFromEnum(c.Element.fire)]);
 }
 
-test "detect_triggers(cleanse): [fire,heal,heal,shield] → 0 (extra heal)" {
-    const mask = detect_triggers(make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .heal   },
-        .{ .action  = .heal   },
-        .{ .action  = .shield },
-    }), cleanse_trigger);
-    try std.testing.expectEqual(@as(u4, 0), mask);
+test "apply_medicine: multiple colors heal independently" {
+    var hunger = c.Health{ .current = 50, .max = 100 };
+    var healable = [_]u16{ 10, 0, 4, 8 };
+    const pools = [_]u32{ 3, 99, 99, 8 };
+    const healed = apply_medicine(&hunger, &healable, pools);
+    // fire 3 + earth 0 + wind 4 + water 8 = 15.
+    try std.testing.expectEqual(@as(u16, 15), healed);
+    try std.testing.expectEqual(@as(u16, 35), hunger.current);
+    try std.testing.expectEqual(@as(u16, 7), healable[0]);
+    try std.testing.expectEqual(@as(u16, 0), healable[2]);
+    try std.testing.expectEqual(@as(u16, 0), healable[3]);
 }
 
-test "detect_triggers(cleanse): [fire,dmg,heal,shield] → 0 (damage present)" {
-    const mask = detect_triggers(make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .damage },
-        .{ .action  = .heal   },
-        .{ .action  = .shield },
-    }), cleanse_trigger);
-    try std.testing.expectEqual(@as(u4, 0), mask);
+test "apply_medicine: capped by current hunger" {
+    var hunger = c.Health{ .current = 3, .max = 100 };
+    var healable = [_]u16{0} ** c.Element.size;
+    healable[@intFromEnum(c.Element.fire)] = 50;
+    var pools = [_]u32{0} ** c.Element.size;
+    pools[@intFromEnum(c.Element.fire)] = 25;
+    const healed = apply_medicine(&hunger, &healable, pools);
+    try std.testing.expectEqual(@as(u16, 3), healed);
+    try std.testing.expectEqual(@as(u16, 0), hunger.current);
+    try std.testing.expectEqual(@as(u16, 47), healable[@intFromEnum(c.Element.fire)]);
 }
 
-test "detect_triggers(cleanse): [heal,shield] → 0 (no element token)" {
-    const mask = detect_triggers(make_combo(&[_]c.ComboSlot{
-        .{ .action = .heal   },
-        .{ .action = .shield },
-    }), cleanse_trigger);
-    try std.testing.expectEqual(@as(u4, 0), mask);
+test "apply_medicine: zero healable — neutral consumption not healable" {
+    var hunger = c.Health{ .current = 80, .max = 100 };
+    var healable = [_]u16{0} ** c.Element.size;
+    const pools = [_]u32{99} ** c.Element.size;
+    const healed = apply_medicine(&hunger, &healable, pools);
+    try std.testing.expectEqual(@as(u16, 0), healed);
+    try std.testing.expectEqual(@as(u16, 80), hunger.current);
 }
 
-test "detect_triggers: dot does not match cleanse pattern and vice versa" {
-    const dot_combo = make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .damage },
-        .{ .action  = .heal   },
-    });
-    const cleanse_combo = make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .heal   },
-        .{ .action  = .shield },
-    });
-    // dot combo should not match cleanse trigger
-    try std.testing.expectEqual(@as(u4, 0), detect_triggers(dot_combo, cleanse_trigger));
-    // cleanse combo should not match dot trigger
-    try std.testing.expectEqual(@as(u4, 0), detect_triggers(cleanse_combo, dot_trigger));
+test "add_hunger: clamps at max" {
+    var hunger = c.Health{ .current = 190, .max = 200 };
+    add_hunger(&hunger, 50);
+    try std.testing.expectEqual(@as(u16, 200), hunger.current);
+    try std.testing.expect(hunger_full(hunger));
 }
 
-// ---------------------------------------------------------------------------
-// key_to_element tests
-// ---------------------------------------------------------------------------
-
-test "key_to_element: 0 → null, 1..4 → fire..water" {
-    try std.testing.expectEqual(@as(?c.Element, null), key_to_element(0));
-    try std.testing.expectEqual(c.Element.fire,  key_to_element(1).?);
-    try std.testing.expectEqual(c.Element.earth, key_to_element(2).?);
-    try std.testing.expectEqual(c.Element.wind,  key_to_element(3).?);
-    try std.testing.expectEqual(c.Element.water, key_to_element(4).?);
+test "resolve_zone: partial neutralization (25 of 50)" {
+    var zone = c.ZoneDef{};
+    zone.modified[@intFromEnum(c.Element.fire)] = 50;
+    var agents = [_]u32{0} ** c.Element.size;
+    agents[@intFromEnum(c.Element.fire)] = 25;
+    const outcome = resolve_zone(zone, agents);
+    try std.testing.expectEqual(@as(u16, 25), outcome.neutralized[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u32, 25), outcome.modified_consumed);
+    try std.testing.expectEqual(50 * balance.HUNGER_COST_NORMAL, outcome.hunger_normal);
+    try std.testing.expectEqual(25 * balance.HUNGER_COST_MODIFIED_EXTRA, outcome.hunger_extra[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(25 * balance.HUNGER_COST_MODIFIED_EXTRA, outcome.hunger_extra_total());
+    try std.testing.expectEqual(@as(u32, 25), outcome.score);
 }
 
-test "key_to_element: round-trips element_key" {
-    inline for (.{ null, c.Element.fire, c.Element.earth, c.Element.wind, c.Element.water }) |el| {
-        const k = @intFromEnum(c.element_key(el));
-        try std.testing.expectEqual(@as(?c.Element, el), key_to_element(k));
-    }
+test "resolve_zone: excess agents are wasted" {
+    var zone = c.ZoneDef{};
+    zone.modified[@intFromEnum(c.Element.water)] = 10;
+    var agents = [_]u32{0} ** c.Element.size;
+    agents[@intFromEnum(c.Element.water)] = 999;
+    const outcome = resolve_zone(zone, agents);
+    try std.testing.expectEqual(@as(u16, 10), outcome.neutralized[@intFromEnum(c.Element.water)]);
+    try std.testing.expectEqual(@as(u32, 0), outcome.modified_consumed);
+    try std.testing.expectEqual(@as(u32, 0), outcome.hunger_extra_total());
+    try std.testing.expectEqual(@as(u32, 10), outcome.score);
 }
 
-// ---------------------------------------------------------------------------
-// tally_combo tests
-// ---------------------------------------------------------------------------
-
-/// Unit statblock: every scaling stat is 1, so each surviving action
-/// contributes exactly its `basic` base value (also 1).
-const unit_sb = c.Statblock{
-    .attack = 1, .shield = 1, .heal = 1,
-    .fire = 1, .earth = 1, .wind = 1, .water = 1,
-    .hp = 120, .level = 1,
-};
-
-test "tally_combo: plain elemental damage lands in damage bucket" {
-    var t = SideTally{};
-    tally_combo(&t, make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .damage },
-    }), unit_sb);
-    const fire_k = @intFromEnum(c.element_key(.fire));
-    try std.testing.expectEqual(@as(u16, balance.basic.damage), t.damage_by_key[fire_k]);
-    try std.testing.expectEqual(@as(u16, 0), t.heal_pool);
+test "resolve_zone: wrong-color agents have no effect" {
+    var zone = c.ZoneDef{};
+    zone.modified[@intFromEnum(c.Element.fire)] = 20;
+    var agents = [_]u32{0} ** c.Element.size;
+    agents[@intFromEnum(c.Element.water)] = 20;
+    const outcome = resolve_zone(zone, agents);
+    try std.testing.expectEqual(@as(u16, 0), outcome.neutralized[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u32, 20), outcome.modified_consumed);
+    try std.testing.expectEqual(20 * balance.HUNGER_COST_MODIFIED_EXTRA, outcome.hunger_extra[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u32, 0), outcome.hunger_extra[@intFromEnum(c.Element.water)]);
+    try std.testing.expectEqual(@as(u32, 0), outcome.score);
 }
 
-test "tally_combo: null-element shield + heal" {
-    var t = SideTally{};
-    tally_combo(&t, make_combo(&[_]c.ComboSlot{
-        .{ .action = .shield },
-        .{ .action = .heal   },
-    }), unit_sb);
-    const none_k = @intFromEnum(c.element_key(null));
-    try std.testing.expectEqual(@as(u16, balance.basic.shield), t.shield_by_key[none_k]);
-    try std.testing.expectEqual(@as(u16, balance.basic.heal), t.heal_pool);
+test "resolve_zone: naturally-neutral slime counts toward score, costs normal hunger" {
+    const zone = c.ZoneDef{ .neutral = 15 };
+    const agents = [_]u32{0} ** c.Element.size;
+    const outcome = resolve_zone(zone, agents);
+    try std.testing.expectEqual(@as(u32, 15), outcome.score);
+    try std.testing.expectEqual(15 * balance.HUNGER_COST_NORMAL, outcome.hunger_normal);
+    try std.testing.expectEqual(@as(u32, 0), outcome.hunger_extra_total());
 }
 
-test "tally_combo: DoT trigger withholds dmg+heal, records pending stacks" {
-    var t = SideTally{};
-    // [fire, damage, heal] matches the dot trigger.
-    tally_combo(&t, make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .damage },
-        .{ .action  = .heal   },
-    }), unit_sb);
-    const fire_k = @intFromEnum(c.element_key(.fire));
-    const fire_i: usize = @intFromEnum(c.Element.fire);
-    // Withheld: nothing in normal pools.
-    try std.testing.expectEqual(@as(u16, 0), t.damage_by_key[fire_k]);
-    try std.testing.expectEqual(@as(u16, 0), t.heal_pool);
-    // Withheld dmg recorded for peek-net, and pending stacks set.
-    try std.testing.expectEqual(@as(u16, balance.basic.damage), t.dot_dmg_by_key[fire_k]);
-    try std.testing.expect(t.dot_stacks_pending[fire_i] > 0);
-}
-
-test "tally_combo: cleanse trigger withholds heal+shield, records cleanse" {
-    var t = SideTally{};
-    // [fire, heal, shield] matches the cleanse trigger.
-    tally_combo(&t, make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .heal   },
-        .{ .action  = .shield },
-    }), unit_sb);
-    const fire_k = @intFromEnum(c.element_key(.fire));
-    const fire_i: usize = @intFromEnum(c.Element.fire);
-    try std.testing.expectEqual(@as(u16, 0), t.heal_pool);
-    try std.testing.expectEqual(@as(u16, 0), t.shield_by_key[fire_k]);
-    try std.testing.expectEqual(
-        @as(u16, balance.combo_triggers[1].cleanse_stacks_removed),
-        t.cleanse_by_el[fire_i],
-    );
-}
-
-test "tally_combo: accumulates across multiple calls" {
-    var t = SideTally{};
-    const dmg_combo = make_combo(&[_]c.ComboSlot{
-        .{ .element = .fire   },
-        .{ .action  = .damage },
-    });
-    tally_combo(&t, dmg_combo, unit_sb);
-    tally_combo(&t, dmg_combo, unit_sb);
-    const fire_k = @intFromEnum(c.element_key(.fire));
-    try std.testing.expectEqual(@as(u16, 2 * balance.basic.damage), t.damage_by_key[fire_k]);
+test "resolve_zone: mixed zone full clear" {
+    var zone = c.ZoneDef{ .neutral = 5 };
+    zone.modified = .{ 10, 20, 0, 0 };
+    const agents = [_]u32{ 10, 20, 0, 0 };
+    const outcome = resolve_zone(zone, agents);
+    try std.testing.expectEqual(@as(u32, 0), outcome.modified_consumed);
+    try std.testing.expectEqual(@as(u32, 35), outcome.score);
+    try std.testing.expectEqual(35 * balance.HUNGER_COST_NORMAL, outcome.hunger_normal);
+    try std.testing.expectEqual(@as(u32, 0), outcome.hunger_extra_total());
 }

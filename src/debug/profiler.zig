@@ -106,7 +106,7 @@ test "profiler: zones record and report" {
     var p = Profiler(Zones).init();
 
     p.begin(.alpha);
-    std.time.sleep(1_000); // 1 µs
+    std.Thread.sleep(1_000); // 1 µs
     p.end(.alpha);
 
     p.begin(.beta);

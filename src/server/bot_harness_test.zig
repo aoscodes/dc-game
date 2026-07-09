@@ -1,36 +1,28 @@
 //! Bot test harness: injects bots into PlayerSlots in place of real clients.
 //!
-//! Each bot is driven by a `Profile` (a repeating action sequence from
-//! bots.zig). On every round the harness encodes the bot's next `Move` as a
-//! `choose_action` protocol message and enqueues it into the session, exactly
+//! Each bot is driven by a `Profile` (a repeating combo sequence from
+//! bots.zig). On every round the harness encodes the bot's next combo as a
+//! `choose_combo` protocol message and enqueues it into the session, exactly
 //! replicating what a real WebSocket client would send.
 //!
 //! ## Usage
 //!
-//!   var h = try BotHarness.init(allocator, &bots.team_all_damage, wave, "BOTKEY".*);
+//!   var h = try BotHarness.init(allocator, &bots.team_mixed, encounter, "BOTKEY".*, .{});
 //!   defer h.deinit();
-//!   // advance one full round (inject actions + tick past timer):
+//!   // advance one full round (inject combos + tick past timer):
 //!   try h.step();
 //!   // check game state via h.session ...
-//!
-//! ## Relation to the wave harness
-//!
-//! The wave harness (waves.zig + session.spawn_wave) configures the *enemy*
-//! side.  This harness configures the *player* side.  Both can be combined:
-//! BotHarness.init accepts any *const waves.Wave, so you can test any
-//! bot-team / enemy-wave pairing.
 
 const std = @import("std");
 const shared = @import("shared");
 const proto = shared.protocol;
 const c = shared.components;
-const waves = shared.waves;
+const enc = shared.encounter;
 const bots = shared.bots;
+const balance = shared.balance;
 
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
-const GameWorld = session_mod.GameWorld;
-const PlayerTeam = session_mod.PlayerTeam;
 
 // ---------------------------------------------------------------------------
 // BotHarness
@@ -64,14 +56,8 @@ const BotState = struct {
 /// can use `.{}` for standard behaviour.
 pub const BotHarnessOptions = struct {
     /// Round duration in seconds applied to the session before the game starts.
-    /// Default matches ROUND_DURATION_DEFAULT_S (3 s) — appropriate for
-    /// real-time watching against a live server.  Set to a small value
-    /// (e.g. 0.001) for fast headless CI runs.
-    round_duration: f32 = shared.game_logic.ROUND_DURATION_DEFAULT_S,
-    /// When non-null, overrides the random enemy intent after every reset so
-    /// tests that depend on exact HP/shield arithmetic are deterministic.
-    /// Uses null element (no elemental type) so null-element player shields absorb.
-    fixed_enemy_intent_damage: ?u16 = null,
+    /// Set to a small value (e.g. 0.001) for fast headless CI runs.
+    round_duration: f32 = 0.001,
 };
 
 pub const BotHarness = struct {
@@ -81,31 +67,27 @@ pub const BotHarness = struct {
     bot_states: []BotState,
     /// Number of rounds that have been resolved (incremented by step()).
     round: u32,
-    /// If non-null, overrides random enemy intent before each round resolves.
-    fixed_enemy_intent_damage: ?u16,
 
     /// Initialise the harness.
     ///
     /// - Joins each bot from `team` as an occupied, connected PlayerSlot.
-    /// - Sets HP from BotEntry.stats.max_hp (Kind is forced to .player
-    ///   as a placeholder; entity kind is otherwise irrelevant since stat overrides
-    ///   are applied directly in spawn_bots below).
-    /// - Starts the game against `wave` directly, bypassing the lobby ready flow.
+    /// - Starts the game against `encounter` directly, bypassing the lobby
+    ///   ready flow.
     ///
     /// Asserts:
     ///   - team.bots.len >= 1
     ///   - team.bots.len <= MAX_PLAYERS
-    ///   - every profile has at least one move
+    ///   - every profile has at least one combo
     pub fn init(
         allocator: std.mem.Allocator,
         team: *const bots.BotTeam,
-        wave: *const waves.Wave,
+        encounter: *const enc.Encounter,
         join_code: [6]u8,
         opts: BotHarnessOptions,
     ) !BotHarness {
         std.debug.assert(team.bots.len >= 1);
         std.debug.assert(team.bots.len <= session_mod.MAX_PLAYERS);
-        for (team.bots) |b| std.debug.assert(b.profile.moves.len >= 1);
+        for (team.bots) |b| std.debug.assert(b.profile.combos.len >= 1);
 
         const bot_states = try allocator.alloc(BotState, team.bots.len);
         errdefer allocator.free(bot_states);
@@ -128,28 +110,14 @@ pub const BotHarness = struct {
         sess.round_duration = opts.round_duration;
         sess.round_timer = opts.round_duration;
 
-        // Start the game, spawning enemies from `wave`.  Then replace player
-        // entities with ones whose HP comes from BotStats rather than class defaults.
-        try sess.start_game_wave(wave);
-        try respawn_bots(&sess, team, bot_states);
+        try sess.start_game_encounter(encounter);
 
-        var h = BotHarness{
+        return BotHarness{
             .allocator = allocator,
             .session = sess,
             .bot_states = bot_states,
             .round = 0,
-            .fixed_enemy_intent_damage = opts.fixed_enemy_intent_damage,
         };
-        // Apply fixed intent for the very first round (set by start_game_wave).
-        h.apply_fixed_intent();
-        return h;
-    }
-
-    /// Override pending_enemy_intent and clear enemy_combos if fixed intent is set.
-    fn apply_fixed_intent(self: *BotHarness) void {
-        const dmg = self.fixed_enemy_intent_damage orelse return;
-        self.session.pending_enemy_intent = .{ .damage_per_player = dmg, .element = null };
-        for (&self.session.enemy_combos) |*ec| ec.* = null;
     }
 
     pub fn deinit(self: *BotHarness) void {
@@ -158,18 +126,13 @@ pub const BotHarness = struct {
         self.allocator.free(self.bot_states);
     }
 
-    /// Encode each bot's next move as a single-slot combo and enqueue it.
+    /// Encode each bot's combo for this round and enqueue it.
     /// Call this before ticking past the round timer, or use step() which
     /// does both.
     pub fn inject_actions(self: *BotHarness) !void {
         for (self.bot_states) |*bs| {
-            const move = bs.profile.moves[self.round % bs.profile.moves.len];
-            const combo = c.ActionCombo{
-                .slots = [_]c.ComboSlot{.{ .action = move }} ++
-                         [_]c.ComboSlot{.{ .action = .damage }} ** (c.MAX_COMBO_LEN - 1),
-                .len = 1,
-            };
-            var buf: [8]u8 = undefined;
+            const combo = bs.profile.combos[self.round % bs.profile.combos.len];
+            var buf: [16]u8 = undefined;
             var fbs = std.io.fixedBufferStream(&buf);
             try proto.encode(fbs.writer(), .choose_combo, proto.ChooseCombo{ .combo = combo });
             self.session.enqueue_message(bs.player_id, fbs.getWritten());
@@ -178,8 +141,7 @@ pub const BotHarness = struct {
 
     /// Advance the session by exactly one full round:
     ///   1. inject_actions() for every bot
-    ///   2. tick past the round timer (round resolves, then reset_round regenerates AI)
-    ///   3. re-apply fixed intent (if set) so next round is also deterministic
+    ///   2. tick past the round timer (round resolves, then reset_round)
     ///
     /// Increments self.round after resolution.
     pub fn step(self: *BotHarness) !void {
@@ -187,8 +149,6 @@ pub const BotHarness = struct {
         // Tick with dt = round_duration + epsilon so the timer expires in one tick.
         const dt = self.session.round_duration + 0.001;
         try self.session.tick(dt);
-        // reset_round() just regenerated random AI; override it for the next round.
-        self.apply_fixed_intent();
         self.round += 1;
     }
 
@@ -202,204 +162,98 @@ pub const BotHarness = struct {
         }
         return r;
     }
-
 };
 
 // ---------------------------------------------------------------------------
-// Internal: respawn player entities with BotStats HP
+// Test encounters
 // ---------------------------------------------------------------------------
 
-/// After start_game_wave() spawns players, this function destroys those entities
-/// and recreates them with the HP values from BotStats.
-/// This is done after start_game_wave (not before) so the world is fully
-/// initialised and system signatures are set.
-fn respawn_bots(
-    sess: *Session,
-    team: *const bots.BotTeam,
-    bot_states: []const BotState,
-) !void {
-    // Rebuild player entities with bot-specific owner; HP lives in shared pool.
-    // Recompute shared_hp from bot stats.
-    sess.shared_hp = .{ .current = 0, .max = 0 };
-    for (team.bots, bot_states) |entry, bs| {
-        const slot = &sess.players[bs.player_id];
-        // Destroy the entity created by spawn_players().
-        if (slot.entity != std.math.maxInt(u32)) {
-            sess.world.destroy_entity(slot.entity);
-        }
-        // Create a fresh entity — shared pool tracks HP.
-        const e = sess.world.create_entity();
-        slot.entity = e;
-        sess.world.add_component(e, c.Kind{ .tag = .player });
-        sess.world.add_component(e, c.Team{ .id = .players });
-        sess.world.add_component(e, c.Owner{ .player_id = bs.player_id });
-        sess.world.add_component(e, c.PlayerMarker{});
-        // Accumulate this bot's max HP into the shared pool.
-        const new_max = @as(u32, sess.shared_hp.max) + @as(u32, entry.stats.max_hp);
-        sess.shared_hp.max = @intCast(@min(new_max, @as(u32, std.math.maxInt(u16))));
-        sess.shared_hp.current = sess.shared_hp.max;
-    }
-}
+/// Fire-only field: exactly matched by two twin_flames rounds (30 agents/round).
+const enc_fire_field = enc.Encounter{
+    .label = "bot_fire_field",
+    .hunger_max = 1000,
+    .zones = &[_]c.ZoneDef{
+        .{ .modified = .{ 30, 0, 0, 0 } },
+        .{ .modified = .{ 30, 0, 0, 0 } },
+    },
+};
+
+/// Un-winnable hunger budget when idle; survivable when neutralized:
+/// idle: 20 normal + 40 extra = 60 ≥ 50.  Neutralized: 20 < 50.
+const enc_survival = enc.Encounter{
+    .label = "bot_survival",
+    .hunger_max = 50,
+    .zones = &[_]c.ZoneDef{
+        .{ .modified = .{ 20, 0, 0, 0 } },
+    },
+};
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-const base_enemy_stats = c.Statblock{
-    .attack = 1, .shield = 1, .heal = 1,
-    .fire = 1, .earth = 1, .wind = 1, .water = 1,
-    .hp = 0, .level = 1,
-};
-
-/// One enemy with HP = V so a single damage action depletes the shared enemy pool.
-const wave_one_shot = waves.Wave{
-    .label = "bot_one_shot",
-    .entries = &[_]waves.SpawnEntry{.{
-        .kind = .grunt,
-        .grid_col = 0,
-        .grid_row = 0,
-        .stats = blk: { var s = base_enemy_stats; s.hp = shared.game_logic.ACTION_EFFECT_VALUE; break :blk s; },
-    }},
-    .next_wave = null,
-};
-
-/// Single tanky grunt that cannot be killed — used to test multi-round survival.
-/// HP set high enough that no realistic bot team kills it within test rounds.
-const wave_unkillable = waves.Wave{
-    .label = "bot_unkillable",
-    .entries = &[_]waves.SpawnEntry{.{
-        .kind = .grunt,
-        .grid_col = 0,
-        .grid_row = 0,
-        .stats = blk: { var s = base_enemy_stats; s.hp = 60_000; break :blk s; },
-    }},
-    .next_wave = null,
-};
-
-/// Unkillable enemy pool — shared_enemy_hp far too high to deplete in tests.
-/// Enemy intent = 1 dmg/round to party (pool is alive, entity count irrelevant).
-/// Used by survival tests that need a permanent attacker.
-const wave_overwhelming = waves.Wave{
-    .label = "bot_overwhelming",
-    .entries = &[_]waves.SpawnEntry{
-        .{ .kind = .grunt, .grid_col = 0, .grid_row = 0, .stats = blk: { var s = base_enemy_stats; s.hp = 60_000; break :blk s; } },
-    },
-    .next_wave = null,
-};
-
-const wave_lethal_pack = wave_overwhelming;
-
-/// Two killable grunts — shared_enemy_hp = 160 (2 × 80).
-/// Used to verify mixed teams can actually win.
-const wave_two_grunts = waves.Wave{
-    .label = "bot_two_grunts",
-    .entries = &[_]waves.SpawnEntry{
-        .{ .kind = .grunt, .grid_col = 0, .grid_row = 0, .stats = blk: { var s = base_enemy_stats; s.hp = 80; break :blk s; } },
-        .{ .kind = .grunt, .grid_col = 1, .grid_row = 0, .stats = blk: { var s = base_enemy_stats; s.hp = 80; break :blk s; } },
-    },
-    .next_wave = null,
-};
-
-test "all_damage team beats a beatable wave" {
-    // Two damage bots vs a single 40-HP grunt.
-    // shared_enemy_hp = 40. damage_pool = 2/round → 20 rounds to deplete.
-    // Party pool = 2 × fighter_hp. 1 enemy deals 1 dmg/round → party survives easily.
+test "twin_flames pair fully neutralizes the fire field" {
     const allocator = std.testing.allocator;
-    const wave_beatable = waves.Wave{
-        .label = "bot_beatable",
-        .entries = &[_]waves.SpawnEntry{.{
-            .kind = .grunt,
-            .grid_col = 0,
-            .grid_row = 0,
-            .stats = blk: { var s = base_enemy_stats; s.hp = 40; break :blk s; },
-        }},
-        .next_wave = null,
-    };
-    var h = try BotHarness.init(allocator, &bots.team_all_damage, &wave_beatable, "BOTKEY".*,
-        .{ .fixed_enemy_intent_damage = 1 });
+    var h = try BotHarness.init(allocator, &bots.team_fire_pair, &enc_fire_field, "BOTKEY".*, .{});
     defer h.deinit();
 
-    const rounds = try h.run_to_completion(200);
+    const rounds = try h.run_to_completion(10);
 
-    try std.testing.expect(rounds < 200);
+    // One zone per round; ends when both zones are consumed.
+    try std.testing.expectEqual(@as(u32, 2), rounds);
     try std.testing.expectEqual(session_mod.SessionPhase.lobby, h.session.phase);
-    try std.testing.expectEqual(@as(u16, 0), h.session.shared_enemy_hp.current);
+    // Every modified unit neutralized → full score, zero healable hunger.
+    try std.testing.expectEqual(@as(u32, 60), h.session.score);
+    for (h.session.hunger_healable) |healable|
+        try std.testing.expectEqual(@as(u16, 0), healable);
+    try std.testing.expectEqual(
+        @as(u16, @intCast(60 * balance.HUNGER_COST_NORMAL)),
+        h.session.hunger.current,
+    );
 }
 
-
-test "mixed team beats two-grunt wave" {
-    // team_mixed: tank (damage), medic (heal), cannon (damage).
-    // wave_two_grunts: 2 grunts × 80 HP = 160 shared_enemy_hp.
-    // damage_pool = 2/round → 80 rounds to deplete.
-    // fixed_enemy_intent_damage = 2 clears random enemy combos so DoT stacks
-    // don't accumulate and overwhelm the team's heal output.
+test "neutralizing bots survive a hunger budget that idle play fails" {
     const allocator = std.testing.allocator;
-    var h = try BotHarness.init(allocator, &bots.team_mixed, &wave_two_grunts, "BOTKEY".*,
-        .{ .fixed_enemy_intent_damage = 2 });
+
+    // Idle team: submits nothing (empty session, no combos injected).
+    var idle_sess = try Session.init(allocator, "BOTK01".*);
+    defer idle_sess.deinit();
+    var idle_bot = BotState{ .player_id = 0xFF, .profile = &bots.profile_fire_dispenser, .buf = .empty, .bt = undefined };
+    idle_bot.init(allocator, 0xFF, &bots.profile_fire_dispenser);
+    defer idle_bot.deinit(allocator);
+    _ = idle_sess.join(idle_bot.transport(), "Idle") orelse return error.JoinFailed;
+    idle_sess.round_duration = 0.001;
+    idle_sess.round_timer = 0.001;
+    try idle_sess.start_game_encounter(&enc_survival);
+    try idle_sess.tick(0.01); // round resolves with no combos
+    try std.testing.expectEqual(session_mod.SessionPhase.lobby, idle_sess.phase);
+    try std.testing.expect(idle_sess.hunger.current >= idle_sess.hunger.max);
+    try std.testing.expectEqual(@as(u32, 0), idle_sess.score);
+
+    // Active pair: twin_flames neutralizes everything → survives with full score.
+    var h = try BotHarness.init(allocator, &bots.team_fire_pair, &enc_survival, "BOTK02".*, .{});
+    defer h.deinit();
+    const rounds = try h.run_to_completion(10);
+    try std.testing.expectEqual(@as(u32, 1), rounds);
+    try std.testing.expectEqual(@as(u32, 20), h.session.score);
+    try std.testing.expect(h.session.hunger.current < h.session.hunger.max);
+}
+
+test "mixed team completes the default encounter with a positive score" {
+    const allocator = std.testing.allocator;
+    var h = try BotHarness.init(allocator, &bots.team_mixed, enc.DEFAULT_ENCOUNTER, "BOTKEY".*, .{});
     defer h.deinit();
 
-    const rounds = try h.run_to_completion(200);
+    const rounds = try h.run_to_completion(@intCast(enc.DEFAULT_ENCOUNTER.zones.len + 2));
 
-    try std.testing.expect(rounds < 200);
+    try std.testing.expect(rounds <= enc.DEFAULT_ENCOUNTER.zones.len);
     try std.testing.expectEqual(session_mod.SessionPhase.lobby, h.session.phase);
-    try std.testing.expectEqual(@as(u16, 0), h.session.shared_enemy_hp.current);
-}
-
-test "tank bot absorbs incoming damage with shield rotation" {
-    // One bot with the 'tank' profile ({shield, shield, damage}).
-    // wave_lethal_pack: unkillable enemy pool → 1 dmg/round to party pool (fixed intent).
-    //
-    // Damage-only bot (pool = 30 HP, no shields):
-    //   Takes 1 damage every round → pool gone in 30 rounds.
-    //
-    // Tank bot (pool = 30 HP, {shield, shield, damage} cycle):
-    //   Round 1: 1 shield cancels 1 intent → net 0 dmg → pool 30
-    //   Round 2: same → pool 30
-    //   Round 3: damage action, no shield → net 1 dmg → pool 29
-    //   ... cycles: shield rounds break even; damage rounds cost 1 HP.
-    //   Survives at least as many rounds as the damage-only bot.
-    //
-    // We assert tank_rounds >= dmg_rounds (not exact values, robust to tuning).
-
-    const allocator = std.testing.allocator;
-
-    const tank_team = bots.BotTeam{
-        .label = "tank_only",
-        .bots = &[_]bots.BotEntry{.{
-            .name = "TankBot",
-            .stats = .{ .max_hp = 30 },
-            .profile = &bots.profile_tank,
-        }},
-    };
-
-    const damage_team = bots.BotTeam{
-        .label = "damage_only",
-        .bots = &[_]bots.BotEntry{.{
-            .name = "DmgBot",
-            .stats = .{ .max_hp = 30 },
-            .profile = &bots.profile_all_damage,
-        }},
-    };
-
-    var h_tank = try BotHarness.init(allocator, &tank_team,  &wave_lethal_pack, "BOTK01".*, .{ .fixed_enemy_intent_damage = 1 });
-    defer h_tank.deinit();
-    var h_dmg  = try BotHarness.init(allocator, &damage_team, &wave_lethal_pack, "BOTK02".*, .{ .fixed_enemy_intent_damage = 1 });
-    defer h_dmg.deinit();
-
-    const tank_rounds = try h_tank.run_to_completion(100);
-    const dmg_rounds = try h_dmg.run_to_completion(100);
-
-    // Both must finish (not time out).
-    try std.testing.expect(tank_rounds < 100);
-    try std.testing.expect(dmg_rounds < 100);
-    // The tank profile must buy more time than pure damage.
-    try std.testing.expect(tank_rounds >= dmg_rounds);
+    // Naturally-neutral slime alone guarantees score > 0 on any consumed zone.
+    try std.testing.expect(h.session.score > 0);
 }
 
 test "profile cycles correctly across rounds" {
-    // Verify the balanced profile (damage, damage, shield, heal) cycles:
-    // round 0 → damage, round 1 → damage, round 2 → shield, round 3 → heal,
-    // round 4 → damage again.
+    // Verify the rainbow profile cycles through its combos round by round.
     //
     // Injection flow: enqueue_message() places bytes in the slot's msg_queue.
     // The session only drains msg_queue during tick() via drain_queues(), so
@@ -407,23 +261,30 @@ test "profile cycles correctly across rounds" {
     // dt=0 to flush the queue without firing round resolution, then read.
     const allocator = std.testing.allocator;
 
-    const balanced_team = bots.BotTeam{
-        .label = "balanced_cycle",
+    const rainbow_team = bots.BotTeam{
+        .label = "rainbow_cycle",
         .bots = &[_]bots.BotEntry{.{
-            .name = "BalBot",
-            .stats = .{ .max_hp = 1000 },
-            .profile = &bots.profile_balanced,
+            .name = "RainBot",
+            .profile = &bots.profile_rainbow,
         }},
     };
 
-    var h = try BotHarness.init(allocator, &balanced_team, &wave_unkillable, "BOTKEY".*, .{});
+    // Big field so the game outlasts the checks.
+    const big_field = enc.Encounter{
+        .label = "bot_big_field",
+        .hunger_max = 60000,
+        .zones = &[_]c.ZoneDef{
+            .{ .neutral = 1 }, .{ .neutral = 1 }, .{ .neutral = 1 },
+            .{ .neutral = 1 }, .{ .neutral = 1 }, .{ .neutral = 1 },
+        },
+    };
+
+    var h = try BotHarness.init(allocator, &rainbow_team, &big_field, "BOTKEY".*, .{ .round_duration = 1.0 });
     defer h.deinit();
 
-    const expected = [_]c.ActionChoice{ .damage, .damage, .shield, .heal, .damage };
-
-    for (expected, 0..) |want, i| {
-        _ = i;
-        // 1. Enqueue the bot's action message for this round.
+    for (0..5) |i| {
+        const expected = bots.profile_rainbow.combos[i % bots.profile_rainbow.combos.len];
+        // 1. Enqueue the bot's combo message for this round.
         try h.inject_actions();
         // 2. Tick with dt=0: drains msg_queue (populating action_pool) without
         //    expiring the round timer (round_timer > 0 after reset).
@@ -431,8 +292,7 @@ test "profile cycles correctly across rounds" {
         // 3. Verify the pool was set correctly before round resolution fires.
         const pid = h.bot_states[0].player_id;
         const got = h.session.action_pool[pid] orelse return error.NoAction;
-        try std.testing.expectEqual(@as(u8, 1), got.len);
-        try std.testing.expectEqual(want, got.slots[0].action);
+        try std.testing.expect(shared.game_logic.combos_equal(expected, got));
         // 4. Fire round resolution by ticking past the timer, then advance h.round.
         try h.session.tick(h.session.round_duration + 0.001);
         h.round += 1;

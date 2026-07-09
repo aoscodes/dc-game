@@ -1,6 +1,7 @@
 const std = @import("std");
 const proto = @import("shared").protocol;
 const c = @import("shared").components;
+const balance = @import("shared").balance;
 const inp = @import("input.zig");
 
 /// JSON serialisation for ComboSlot.
@@ -67,9 +68,10 @@ pub const GameState = struct {
     pending_combo: inp.ComboBuffer = .{},
     round_timer: f32 = 0.0,
     round_duration: f32 = 0.0,
-    wave_label: [32]u8 = [_]u8{0} ** 32,
-    wave_label_len: u8 = 0,
-    winner: ?proto.WinnerId = null,
+    encounter_label: [32]u8 = [_]u8{0} ** 32,
+    encounter_label_len: u8 = 0,
+    /// Final score from game_over (null until the encounter ends).
+    final_score: ?u32 = null,
     last_action_count: u8 = 0,
     last_actions: [proto.MAX_ENTITIES_WIRE]LastActionEntry = undefined,
     /// Incremented each time a round_reset message is received.
@@ -94,8 +96,6 @@ fn write_render_inner(
             .kind = p.kind,
             .ready = p.ready,
             .connected = p.connected,
-            .grid_col = p.grid_col,
-            .grid_row = p.grid_row,
         };
     }
 
@@ -117,8 +117,8 @@ fn write_render_inner(
         entities_buf[i] = .{
             .id = e.entity,
             .kind = e.kind,
-            .team = e.team,
             .owner = e.owner,
+            .casts_used = e.casts_used,
             .last_action = anim,
             .combo = slot_bufs[i][0..e.combo_len],
         };
@@ -128,6 +128,18 @@ fn write_render_inner(
     var pending_slots_buf: [c.MAX_COMBO_LEN]JsonComboSlot = undefined;
     for (game.pending_combo.slots[0..game.pending_combo.len], 0..) |s, i| {
         pending_slots_buf[i] = .{ .slot = s };
+    }
+
+    // Convert zone snapshots for JSON (named per agent color).
+    var zones_buf: [proto.MAX_ZONES_WIRE]JsonZone = undefined;
+    for (game.snapshot.zones[0..game.snapshot.zone_count], 0..) |z, i| {
+        zones_buf[i] = .{
+            .fire = z.modified[0],
+            .earth = z.modified[1],
+            .wind = z.modified[2],
+            .water = z.modified[3],
+            .neutral = z.neutral,
+        };
     }
 
     const frame = JsonRenderFrame{
@@ -141,42 +153,31 @@ fn write_render_inner(
             .players = players_buf[0..lobby.update.player_count],
         } else null,
         .game = if (phase == .game) JsonGame{
-            .wave = game.wave_label[0..game.wave_label_len],
+            .encounter = game.encounter_label[0..game.encounter_label_len],
             .player_id = game.player_id,
             .pending_combo = pending_slots_buf[0..game.pending_combo.len],
             .round_timer = game.round_timer,
             .round_duration = game.round_duration,
+            .cast_timer = game.snapshot.cast_timer,
+            .casts_per_round = balance.CASTS_PER_ROUND,
             .tick = game.snapshot.tick,
             .round = game.round,
             .entities = entities_buf[0..game.snapshot.entity_count],
-            .players = .{
-                .hp_current = game.snapshot.players.hp_current,
-                .hp_max = game.snapshot.players.hp_max,
-            },
-            .enemies = .{
-                .hp_current = game.snapshot.enemies.hp_current,
-                .hp_max = game.snapshot.enemies.hp_max,
-            },
-            .enemy_intent = .{
-                .damage      = game.snapshot.enemy_intent_damage,
-                .element_raw = game.snapshot.enemy_intent_element,
-            },
-            .dot_stacks = .{
-                .players = .{
-                    .fire  = game.snapshot.player_dot_stacks[0],
-                    .earth = game.snapshot.player_dot_stacks[1],
-                    .wind  = game.snapshot.player_dot_stacks[2],
-                    .water = game.snapshot.player_dot_stacks[3],
-                },
-                .enemies = .{
-                    .fire  = game.snapshot.enemy_dot_stacks[0],
-                    .earth = game.snapshot.enemy_dot_stacks[1],
-                    .wind  = game.snapshot.enemy_dot_stacks[2],
-                    .water = game.snapshot.enemy_dot_stacks[3],
+            .hunger = .{
+                .current = game.snapshot.hunger.current,
+                .max = game.snapshot.hunger.max,
+                .healable = .{
+                    .fire = game.snapshot.hunger_healable[0],
+                    .earth = game.snapshot.hunger_healable[1],
+                    .wind = game.snapshot.hunger_healable[2],
+                    .water = game.snapshot.hunger_healable[3],
                 },
             },
+            .score = game.snapshot.score,
+            .zone_index = game.snapshot.zone_index,
+            .zones = zones_buf[0..game.snapshot.zone_count],
         } else null,
-        .winner = if (phase == .game_over) game.winner else null,
+        .score = if (phase == .game_over) game.final_score else null,
     };
 
     try std.json.Stringify.value(frame, .{ .emit_null_optional_fields = false }, w);
@@ -204,7 +205,7 @@ const JsonRenderFrame = struct {
     phase: ClientPhaseTag,
     lobby: ?JsonLobby,
     game: ?JsonGame,
-    winner: ?proto.WinnerId,
+    score: ?u32,
 };
 
 const JsonLobby = struct {
@@ -221,69 +222,58 @@ const JsonPlayer = struct {
     kind: c.EntityKind,
     ready: bool,
     connected: bool,
-    grid_col: u8,
-    grid_row: u8,
 };
 
-const JsonTeamSummary = struct {
-    hp_current: u16,
-    hp_max: u16,
-};
-
-/// DoT stacks broadcast each frame so the client can display and floater them.
-/// Named by element so Zig's JSON layer emits a proper object, not a byte-string.
-const JsonDotStackSide = struct {
-    fire:  u16,
+/// Portion of hunger healable by medicine, per slime color.  Only
+/// matching-color (symmetrical) medicine heals each bucket.
+const JsonHealable = struct {
+    fire: u16,
     earth: u16,
-    wind:  u16,
+    wind: u16,
     water: u16,
 };
-const JsonDotStacks = struct {
-    players: JsonDotStackSide,
-    enemies: JsonDotStackSide,
+
+/// Hunger bar: current fills toward max; `healable` = per-color portions
+/// medicine can heal.
+const JsonHunger = struct {
+    current: u16,
+    max: u16,
+    healable: JsonHealable,
 };
 
-/// Serialises enemy intent as `{"damage":N,"element":"fire"}` or `{"damage":N}` when non-elemental.
-const JsonEnemyIntent = struct {
-    damage: u16,
-    /// Raw element byte from protocol: 0xFF = non-elemental (omitted), 0–3 = Element ordinal.
-    element_raw: u8,
-
-    pub fn jsonStringify(self: JsonEnemyIntent, jws: anytype) !void {
-        try jws.beginObject();
-        try jws.objectField("damage");
-        try jws.write(self.damage);
-        if (self.element_raw != proto.GameState.INTENT_ELEMENT_NONE) {
-            const el = std.meta.intToEnum(c.Element, self.element_raw) catch null;
-            if (el) |e| {
-                try jws.objectField("element");
-                try jws.write(@tagName(e));
-            }
-        }
-        try jws.endObject();
-    }
+/// One zone's remaining slime, named per agent color + naturally-neutral.
+const JsonZone = struct {
+    fire: u16,
+    earth: u16,
+    wind: u16,
+    water: u16,
+    neutral: u16,
 };
 
 const JsonGame = struct {
-    wave: []const u8,
+    encounter: []const u8,
     player_id: u8,
     pending_combo: []const JsonComboSlot,
     round_timer: f32,
     round_duration: f32,
+    /// Countdown of the current cast window (round_duration / casts_per_round).
+    cast_timer: f32,
+    casts_per_round: u8,
     tick: u32,
     round: u32,
     entities: []const JsonEntity,
-    players: JsonTeamSummary,
-    enemies: JsonTeamSummary,
-    enemy_intent: JsonEnemyIntent,
-    dot_stacks: JsonDotStacks,
+    hunger: JsonHunger,
+    score: u32,
+    zone_index: u8,
+    zones: []const JsonZone,
 };
 
 const JsonEntity = struct {
     id: u32,
     kind: c.EntityKind,
-    team: c.TeamId,
     owner: u8,
+    /// Spells committed this round (0..casts_per_round).
+    casts_used: u8,
     last_action: ?c.ActionAnimation,
     combo: []const JsonComboSlot,
 };

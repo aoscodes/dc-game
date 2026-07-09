@@ -147,19 +147,20 @@ test "replay: record then play back" {
 
     var rec = try recorder(fbs_w.writer());
 
-    // Build two dummy GameState frames.
-    var gs1 = proto.GameState{
-        .tick = 1,
-        .round_timer = 3.0,
-        .entity_count = 1,
-        .entities = [_]proto.EntitySnapshot{proto.EntitySnapshot.blank} ** proto.MAX_ENTITIES_WIRE,
-        .players = .{ .hp_current = 100, .hp_max = 100, .shield_hp = 0 },
-        .enemies = .{ .hp_current = 0, .hp_max = 0, .shield_hp = 0 },
-    };
+    // Build two dummy Slime Feast GameState frames.
+    var gs1 = proto.GameState.blank;
+    gs1.tick = 1;
+    gs1.round_timer = 3.0;
+    gs1.entity_count = 1;
+    gs1.hunger = .{ .current = 40, .max = 200 };
+    gs1.hunger_healable = .{ 10, 0, 0, 0 };
+    gs1.score = 25;
+    gs1.zone_index = 1;
+    gs1.zone_count = 3;
+    gs1.zones[1] = .{ .modified = .{ 10, 0, 5, 0 }, .neutral = 15 };
     gs1.entities[0] = proto.EntitySnapshot.blank;
     gs1.entities[0].entity = 0;
     gs1.entities[0].kind = .player;
-    gs1.entities[0].team = .players;
     var gs2 = gs1;
     gs2.tick = 2;
     gs2.round_timer = 2.0;
@@ -175,10 +176,21 @@ test "replay: record then play back" {
     const f1 = (try play.next()) orelse return error.ExpectedFrame;
     try std.testing.expectEqual(@as(u32, 1), f1.tick);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), f1.round_timer, 0.001);
+    try std.testing.expectEqual(@as(u16, 40), f1.hunger.current);
+    try std.testing.expectEqual(@as(u16, 10), f1.hunger_healable[0]);
+    try std.testing.expectEqual(@as(u32, 25), f1.score);
+    try std.testing.expectEqual(@as(u8, 1), f1.zone_index);
+    try std.testing.expectEqual(@as(u16, 15), f1.zones[1].neutral);
 
     const f2 = (try play.next()) orelse return error.ExpectedFrame;
     try std.testing.expectEqual(@as(u32, 2), f2.tick);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), f2.round_timer, 0.001);
 
     try std.testing.expect((try play.next()) == null);
+}
+
+test "replay: bad magic rejected" {
+    var buf: [8]u8 = .{ 'N', 'O', 'P', 'E', 1, 0, 0, 0 };
+    var fbs = std.io.fixedBufferStream(&buf);
+    try std.testing.expectError(error.BadMagic, player(fbs.reader()));
 }

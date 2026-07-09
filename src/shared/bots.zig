@@ -1,44 +1,35 @@
 //! Bot team definitions for the server-side test harness.
 //!
-//! Mirrors the structure of waves.zig: comptime-constant data describing
+//! Mirrors the structure of encounter.zig: comptime-constant data describing
 //! player-side bot compositions.  The server harness (bot_harness_test.zig)
 //! reads these definitions to inject bots into PlayerSlots in place of real
 //! WebSocket clients.
 //!
 //! ## Concepts
 //!
-//! `Profile`   — a repeating action sequence; on round r the bot submits
-//!               moves[r % moves.len].  Profiles are shared across bots.
+//! `Profile`   — a repeating combo sequence; on round r the bot submits
+//!               combos[r % combos.len].  Profiles are shared across bots.
 //!
-//! `BotStats`  — explicit HP/attack/defense values with no ClassTag dependency.
-//!               attack and defense are stored for future use; only max_hp
-//!               affects current combat.
+//! `BotEntry`  — one slot in a BotTeam: profile + display name.
 //!
-//! `BotEntry`  — one slot in a BotTeam: stats + profile + display name.
-//!
-//! `BotTeam`   — the player-side analogue of Wave: a named slice of BotEntrys.
+//! `BotTeam`   — a named slice of BotEntrys.
 //!
 //! ## Adding profiles / teams
 //!
 //! Append a new `pub const profile_*` or `pub const team_*` below.
 //! No other file needs to change.
 
-const components = @import("components.zig");
+const c = @import("components.zig");
 
-pub const Move = components.ActionChoice;
+const mk = c.make_combo;
 
 pub const Profile = struct {
     label: []const u8,
-    moves: []const Move,
-};
-
-pub const BotStats = struct {
-    max_hp: u16,
+    combos: []const c.ActionCombo,
 };
 
 pub const BotEntry = struct {
     name: []const u8,
-    stats: BotStats,
     profile: *const Profile,
 };
 
@@ -47,44 +38,54 @@ pub const BotTeam = struct {
     bots: []const BotEntry,
 };
 
-pub const profile_all_damage = Profile{
-    .label = "all_damage",
-    .moves = &[_]Move{.damage},
+/// Dispenses fire agents every round (flat conversion: 2 slots).
+pub const profile_fire_dispenser = Profile{
+    .label = "fire_dispenser",
+    .combos = &[_]c.ActionCombo{
+        mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } }),
+    },
 };
 
-pub const profile_all_heal = Profile{
-    .label = "all_heal",
-    .moves = &[_]Move{.heal},
+/// Rotates through all four agent colors, one flood recipe per round.
+pub const profile_rainbow = Profile{
+    .label = "rainbow",
+    .combos = &[_]c.ActionCombo{
+        mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        mk(&.{ .{ .element = .earth }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        mk(&.{ .{ .element = .wind }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        mk(&.{ .{ .element = .water }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+    },
 };
 
-pub const profile_balanced = Profile{
-    .label = "balanced",
-    .moves = &[_]Move{ .damage, .damage, .shield, .heal },
+/// Casts medicine every round (panacea recipe).
+pub const profile_medic = Profile{
+    .label = "medic",
+    .combos = &[_]c.ActionCombo{
+        mk(&.{ .{ .element = .water }, .{ .action = .medicine }, .{ .action = .medicine } }),
+    },
 };
 
-pub const profile_tank = Profile{
-    .label = "tank",
-    .moves = &[_]Move{ .shield, .shield, .damage },
+/// One half of the twin_flames team recipe, every round.
+pub const profile_twin_flame = Profile{
+    .label = "twin_flame",
+    .combos = &[_]c.ActionCombo{
+        mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } }),
+    },
 };
 
-const fighter_stats = BotStats{ .max_hp = 120 };
-const tank_stats = BotStats{ .max_hp = 200 };
-const cannon_stats = BotStats{ .max_hp = 70 };
-const support_stats = BotStats{ .max_hp = 80 };
-
-pub const team_all_damage = BotTeam{
-    .label = "team_all_damage",
+pub const team_fire_pair = BotTeam{
+    .label = "team_fire_pair",
     .bots = &[_]BotEntry{
-        .{ .name = "DmgBot1", .stats = fighter_stats, .profile = &profile_all_damage },
-        .{ .name = "DmgBot2", .stats = fighter_stats, .profile = &profile_all_damage },
+        .{ .name = "FlameBotA", .profile = &profile_twin_flame },
+        .{ .name = "FlameBotB", .profile = &profile_twin_flame },
     },
 };
 
 pub const team_mixed = BotTeam{
     .label = "team_mixed",
     .bots = &[_]BotEntry{
-        .{ .name = "Tank", .stats = tank_stats, .profile = &profile_all_damage },
-        .{ .name = "Medic", .stats = support_stats, .profile = &profile_all_heal },
-        .{ .name = "Cannon", .stats = cannon_stats, .profile = &profile_all_damage },
+        .{ .name = "Rainbow", .profile = &profile_rainbow },
+        .{ .name = "Medic", .profile = &profile_medic },
+        .{ .name = "Sprayer", .profile = &profile_fire_dispenser },
     },
 };

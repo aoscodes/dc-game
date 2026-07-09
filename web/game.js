@@ -3,28 +3,47 @@
 const LAYOUT = {
   screen: { w: 1024, h: 768 },
   bg: "#14141e",
-  cell: { w: 90, h: 100, sep: 12 },
-  zones: {
-    players: { x0: 30, x1: 470, y0: 200, y1: 620 },
-    enemies: { x0: 554, x1: 994, y0: 200, y1: 620 },
-    visible: true,
-    bgFill: "rgba(255,255,255,0.03)",
-    border: "rgba(180,200,255,0.18)",
-    borderW: 2,
+
+  // Slime field: zone columns eaten left-to-right, one per round.
+  slimeField: {
+    x0: 40, x1: 984, y0: 220, y1: 620,
+    labelDy: 24, labelFont: 14,
+    activeBorder: "rgba(255,255,100,0.85)",
+    border: "rgba(180,200,255,0.25)",
+    eatenFill: "rgba(20,20,30,0.75)",
+    blobMinR: 10, blobRScale: 4.5,
+    blobFont: 12,
   },
 
-  headers: { waveX: 40, waveY: 50, waveFont: 20, labelDy: -62, labelFont: 18 },
-  teamBars: { dy: -42, barH: 10, gap: 4, labelW: 40, font: 10, dotGap: 38, dotDyPlayers: 40, dotDyEnemies: 26, effectFont: 20 },
-  comboRow: { slotW: 18, maxSlots: 4, dy: 4, font: 14, textDy: 13 },
-  intentLine: { lineH: 14, baseDy: -4, font: 11 },
+  hungerBar: {
+    x0: 40, x1: 984, y: 150, h: 18,
+    labelFont: 14, labelDy: -8,
+    bg: "rgba(30,10,10,0.78)",
+    fill: "rgba(255,150,50,0.9)",
+    danger: "rgba(255,60,60,0.95)",
+    textFont: 13,
+  },
+
+  score: { x: 40, y: 90, font: 20 },
+
+  headers: { waveX: 40, waveY: 50, waveFont: 20, labelDy: -30, labelFont: 18 },
+
+  // Per-player pending-combo rows, bottom-left beside the action menu.
+  comboPanel: { x: 24, y0: 652, rowH: 18, font: 13, slotW: 14, nameW: 42 },
+
+  // Cosmetic critters: one spawns per player entity (see tickLilGuys).
+  lilGuys: { size: 48, speed: 60, chompMin: 0.9, chompMax: 2.2 },
 
   actionMenu: {
-    w: 320, h: 90, marginBottom: 110,
+    w: 340, h: 108, marginBottom: 128,
     padX: 10, padTopY: 14,
-    actionRowDy: 16, actionFont: 16, actionCols: [0, 106, 212],
+    actionRowDy: 16, actionFont: 16, actionCols: [0, 150],
     elementRowDy: 34, elementFont: 13, elementCols: [0, 80, 160, 240],
-    cancelRowDy: 50, cancelFont: 12,
-    timerBarDy: 58, timerBarH: 10, timerTextDy: 82, timerTextFont: 13,
+    cancelRowDy: 48, cancelFont: 12,
+    castBarDy: 56, castBarH: 6,
+    timerBarDy: 66, timerBarH: 6,
+    timerTextDy: 86, timerTextFont: 13,
+    previewDy: 102, previewFont: 13,
   },
 
   floater: { font: 16, drift: 40, jitter: 40, stack: 22, lifetime: 1.5, },
@@ -49,30 +68,28 @@ const LAYOUT = {
 
   connecting: { x: 40, y: 60, font: 24 },
   full: { x: 40, titleDy: -16, titleFont: 24, subDy: 16, subFont: 18 },
-  gameOver: { x: 40, font: 24 },
+  gameOver: { x: 40, font: 24, scoreDy: 40, scoreFont: 32 },
 };
 
 // Derived convenience aliases (read-only mirrors of LAYOUT).
 const SW = LAYOUT.screen.w;
 const SH = LAYOUT.screen.h;
-const CELL_W = LAYOUT.cell.w;
-const CELL_H = LAYOUT.cell.h;
-const PLAYER_ZONE = LAYOUT.zones.players;
-const ENEMY_ZONE = LAYOUT.zones.enemies;
+const FIELD = LAYOUT.slimeField;
 
 const C_BG = LAYOUT.bg ?? "#14141e";
-const C_HP_BG = "rgba(30,10,10,0.78)";
-const C_HP_FILL = "rgba(60,200,60,0.9)";
 const C_CURSOR = "rgba(255,255,100,0.7)";
 const C_TEXT = "rgba(230,230,230,1)";
 const C_HEADER = "rgba(180,200,255,1)";
-const C_ENEMY_HDR = "rgba(255,120,80,1)";
-const C_OWN_BORDER = "rgba(255,255,60,0.78)";
+const C_SLIME_HDR = "rgba(160,255,140,1)";
+const C_OWN_ROW = "rgba(255,255,60,0.9)";
 const C_MENU_BG = "rgba(20,20,40,0.86)";
 const C_MENU_BORDER = C_HEADER;
-const C_SEL = C_CURSOR;
 
-const CLASSES = ["player", "grunt", "archer", "shaman", "boss"];
+/** Sprite used for the cosmetic Lil Guys roaming the slime field. */
+const LIL_GUY_SPRITE = "grunt";
+
+/** Sprite sheets to load; Lil Guys are the only sprites rendered. */
+const CLASSES = [LIL_GUY_SPRITE];
 
 const sprites = new Map();
 
@@ -152,55 +169,14 @@ function tickAnimator(id, cls, lastAction, dt) {
   return { clip: s.clip, frame: s.frame };
 }
 
-/** @type {Map<number, {x: number, y: number}>} */
-const entityPositions = new Map();
-
-/**
- * Pick a random non-overlapping position within a zone for a new entity.
- *
- * @param {{ x0:number, x1:number, y0:number, y1:number }} zone
- * @returns {{ x: number, y: number }}
- */
-function assignPosition(zone) {
-  const MAX_TRIES = 200;
-  const SEP = CELL_W + LAYOUT.cell.sep;
-  const SEP2 = SEP * SEP;
-  const existing = [...entityPositions.values()];
-
-  const spanX = zone.x1 - zone.x0 - CELL_W;
-  const spanY = zone.y1 - zone.y0 - CELL_H;
-
-  const nearest2 = (x, y) => {
-    let best = Infinity;
-    for (const p of existing) {
-      const dx = p.x - x, dy = p.y - y;
-      const d2 = dx * dx + dy * dy;
-      if (d2 < best) best = d2;
-    }
-    return best;
-  };
-
-  let bestPos = null;
-  let bestDist2 = -1;
-
-  for (let i = 0; i < MAX_TRIES; i++) {
-    const x = zone.x0 + Math.random() * Math.max(0, spanX);
-    const y = zone.y0 + Math.random() * Math.max(0, spanY);
-    const d2 = nearest2(x, y);
-    if (d2 >= SEP2) return { x, y };
-    if (d2 > bestDist2) { bestDist2 = d2; bestPos = { x, y }; }
-  }
-
-  return bestPos ?? { x: zone.x0, y: zone.y0 };
-}
-
 function clearEntityState() {
-  entityPositions.clear();
   animState.clear();
   floaters.length = 0;
   lastRoundSeen = -1;
-  lastEntitiesSnapshot = [];
-  lastEnemyIntentSnapshot = null;
+  lastScoreSeen = 0;
+  lastHungerSeen = 0;
+  lastZoneIndexSeen = 0;
+  lilGuys.length = 0;
 }
 
 const canvas = document.getElementById("canvas");
@@ -307,7 +283,7 @@ function _adjustStat(delta) {
 function drawPreLobby() {
   clear();
   const L = LAYOUT.preLobby;
-  text("Dragoncon Game", L.titleX, L.titleY, L.titleFont, C_HEADER);
+  text("Slime Feast", L.titleX, L.titleY, L.titleFont, C_HEADER);
 
   if (preLobbyMode === "choose") {
     text("[C]  Create new lobby", L.optX, L.optY0, L.optFont, C_TEXT);
@@ -369,7 +345,7 @@ function drawFull() {
 function drawLobby(lobby) {
   clear();
   const L = LAYOUT.lobby;
-  text("Dragoncon Game", L.titleX, L.titleY, L.titleFont, C_HEADER);
+  text("Slime Feast", L.titleX, L.titleY, L.titleFont, C_HEADER);
 
   const joinCode = lobby.join_code || "??????";
   text(`Room: ${joinCode}`, L.codeX, L.codeY, L.codeFont, C_TEXT);
@@ -389,35 +365,35 @@ function drawLobby(lobby) {
 }
 
 /**
- * Draw one entity's sprite into its cell, scaled to CELL_W × CELL_H.
- * Enemies are flipped horizontally so they face the player team.
+ * Draw one sprite into a cell box, scaled preserving aspect ratio.
  *
- * @param {object} e   - entity from game.entities
+ * @param {number} id  - animator id
+ * @param {string} kind - sprite class name
  * @param {number} cx  - cell top-left x
  * @param {number} cy  - cell top-left y
- * @param {string} lastAction - "attack"|"die"|null
+ * @param {number} cw  - cell width
+ * @param {number} ch  - cell height
+ * @param {string|null} lastAction - "attack"|"die"|null
  * @param {number} dt  - seconds since last frame
- * @param {boolean} flip - mirror horizontally (enemies)
+ * @param {boolean} flip - mirror horizontally
  */
-function drawEntitySprite(e, cx, cy, lastAction, dt, flip) {
-  const sp = sprites.get(e.kind);
+function drawSprite(id, kind, cx, cy, cw, ch, lastAction, dt, flip) {
+  const sp = sprites.get(kind);
   if (!sp) return;
 
   const { img, meta } = sp;
   const { frame_w, frame_h, clips } = meta;
-  const { frame } = tickAnimator(e.id, e.kind, lastAction, dt);
-  const clip = clips[animState.get(e.id)?.clip ?? "idle"] ?? clips["idle"];
+  const { frame } = tickAnimator(id, kind, lastAction, dt);
+  const clip = clips[animState.get(id)?.clip ?? "idle"] ?? clips["idle"];
 
   const srcX = frame * frame_w;
   const srcY = clip.row * frame_h;
 
-  // Fit the native sprite into the cell preserving aspect ratio (no stretch),
-  // then centre it within the cell box.
-  const scale = Math.min(CELL_W / frame_w, CELL_H / frame_h);
+  const scale = Math.min(cw / frame_w, ch / frame_h);
   const dw = frame_w * scale;
   const dh = frame_h * scale;
-  const dx = cx + (CELL_W - dw) / 2;
-  const dy = cy + (CELL_H - dh) / 2;
+  const dx = cx + (cw - dw) / 2;
+  const dy = cy + (ch - dh) / 2;
 
   ctx.save();
   ctx.imageSmoothingEnabled = false;
@@ -434,117 +410,55 @@ function drawEntitySprite(e, cx, cy, lastAction, dt, flip) {
   ctx.restore();
 }
 
-/** Draw a faint backdrop + border for a team zone so play areas are obvious. */
-function drawZone(zone) {
-  const Z = LAYOUT.zones;
-  if (!Z.visible) return;
-  rect(zone.x0, zone.y0, zone.x1 - zone.x0, zone.y1 - zone.y0, Z.bgFill);
-  rectStroke(zone.x0, zone.y0, zone.x1 - zone.x0, zone.y1 - zone.y0, Z.borderW, Z.border);
+/**
+ * Server marks casters via action_result .cast → entity.last_action for one
+ * render frame.  With no player sprites, visualise the cast as a floater
+ * rising from the caster's combo-panel row.
+ */
+function spawnCastFloaters(game) {
+  const CP = LAYOUT.comboPanel;
+  (game.entities || []).forEach((e, i) => {
+    if (!e.last_action) return;
+    const y = CP.y0 + i * CP.rowH;
+    const x = CP.x + CP.nameW + 5 * CP.slotW + 24;
+    spawnFloater("✦ cast", x, y, C_OWN_ROW, 1.0);
+  });
 }
 
-function drawTeam(game, team, dt) {
-  const zone = team === "players" ? PLAYER_ZONE : ENEMY_ZONE;
-  const flip = team === "enemies";
-  const summary = team === "enemies" ? game.enemies : game.players;
-  const teamAlive = summary && summary.hp_current > 0;
+/**
+ * Compact per-player pending-combo rows (bottom-left UI panel).  No player
+ * sprites are rendered — combos are the only per-player element on screen.
+ * The local player's row is highlighted.
+ */
+function drawComboPanel(game) {
+  const CP = LAYOUT.comboPanel;
+  const castsPerRound = game.casts_per_round ?? 3;
+  const entities = game.entities || [];
+  entities.forEach((e, i) => {
+    const y = CP.y0 + i * CP.rowH;
+    const own = e.owner === game.player_id;
+    text(`P${e.owner}`, CP.x, y, CP.font, own ? C_OWN_ROW : "rgba(180,200,255,0.75)");
 
-  const entities = (game.entities || []).filter(e => e.team === team);
-  for (const e of entities) {
-    if (!teamAlive) continue;
-
-    // Assign position on first sight; never move it.
-    if (!entityPositions.has(e.id)) {
-      entityPositions.set(e.id, assignPosition(zone));
-    }
-    const { x: cx, y: cy } = entityPositions.get(e.id);
-
-    // Sprite
-    drawEntitySprite(e, cx, cy, e.last_action ?? null, dt, flip);
-
-    // Player-owned entity border
-    if (e.owner === game.player_id && team === "players") {
-      rectStroke(cx, cy, CELL_W, CELL_H, 2, C_OWN_BORDER);
-    }
-
-    // Combo slot row under every player entity, sourced from per-entity
-    // snapshot so all players' combos are visible, not just the local one.
-    if (team === "players") {
-      const entityCombo = e.combo ?? [];
-      const CR = LAYOUT.comboRow;
-      const rowW = CR.maxSlots * CR.slotW;
-      const rowX = cx + (CELL_W - rowW) / 2;
-      const rowY = cy + CELL_H + CR.dy;
-
-      for (let i = 0; i < CR.maxSlots; i++) {
-        const slotX = rowX + i * CR.slotW;
-        const slot = entityCombo[i];
-        if (slot && slot.action !== undefined) {
-          text(ACTION_CHAR[slot.action] ?? "?", slotX, rowY + CR.textDy, CR.font,
-            ACTION_COLOR[slot.action] ?? C_TEXT);
-        } else if (slot && slot.element !== undefined) {
-          text(ELEMENT_CHAR[slot.element] ?? "?", slotX, rowY + CR.textDy, CR.font,
-            ELEMENT_COLOR[slot.element] ?? C_TEXT);
-        } else {
-          text("·", slotX, rowY + CR.textDy, CR.font, "rgba(120,120,140,0.5)");
-        }
-      }
-    } else {
-      // Enemy: show per-action lines above the sprite.
-      // Format per line: "[element_char] action_label [±value]"
-      // Intent contributes 1 damage action of intent.element per entity.
-      // Combo contributes its parsed elemented actions.
-      // Colour: element colour if elemental, else action colour.
-      const lines = [];
-
-      // Intent: 1 damage of intent.element (shared across all enemies).
-      const intent = game.enemy_intent;
-      if (intent && intent.damage > 0) {
-        const el = intent.element ?? null;
-        const elChar = el ? (ELEMENT_CHAR[el] ?? "") : "";
-        const color = el ? (ELEMENT_COLOR[el] ?? ACTION_COLOR.damage) : ACTION_COLOR.damage;
-        const prefix = elChar ? `${elChar} ` : "";
-        lines.push({ str: `${prefix}dmg -1`, color });
-      }
-
-      // Combo: detect special groups first, then render remaining actions individually.
-      const combo = e.combo ?? [];
-      const dotTriggers = detectDotTriggers(combo);
-      const cleanseTriggers = detectCleanseTriggers(combo);
-      const consumed = new Set([...dotTriggers, ...cleanseTriggers]);
-
-      for (const el of dotTriggers) {
-        lines.push({ str: `${ELEMENT_CHAR[el] ?? el} DoT +1`, color: ELEMENT_COLOR[el] ?? ACTION_COLOR.damage });
-      }
-      for (const el of cleanseTriggers) {
-        lines.push({ str: `${ELEMENT_CHAR[el] ?? el} Clr 1`, color: ELEMENT_COLOR[el] ?? ACTION_COLOR.heal });
-      }
-
-      for (const { action, element } of parseComboSlots(combo)) {
-        if (element && consumed.has(element)) continue; // already shown as special label
-        const elChar = element ? (ELEMENT_CHAR[element] ?? "") : "";
-        const color = element ? (ELEMENT_COLOR[element] ?? ACTION_COLOR[action] ?? C_TEXT)
-          : (ACTION_COLOR[action] ?? C_TEXT);
-        const prefix = elChar ? `${elChar} ` : "";
-        const label = action === "damage" ? "dmg"
-          : action === "shield" ? "shld"
-            : "heal";
-        const sign = action === "damage" ? `-${ACTION_EFFECT_VALUE}` : `+${ACTION_EFFECT_VALUE}`;
-        lines.push({ str: `${prefix}${label} ${sign}`, color });
-      }
-
-      // Render bottom-to-top above the sprite: last line sits just above cy.
-      const IL = LAYOUT.intentLine;
-      const baseY = cy + IL.baseDy;
-      for (let i = 0; i < lines.length; i++) {
-        const lineY = baseY - (lines.length - 1 - i) * IL.lineH;
-        text(lines[i].str, cx, lineY, IL.font, lines[i].color);
+    const combo = e.combo ?? [];
+    for (let s = 0; s < 5; s++) {
+      const slotX = CP.x + CP.nameW + s * CP.slotW;
+      const slot = combo[s];
+      if (slot && slot.action !== undefined) {
+        text(ACTION_CHAR[slot.action] ?? "?", slotX, y, CP.font,
+          ACTION_COLOR[slot.action] ?? C_TEXT);
+      } else if (slot && slot.element !== undefined) {
+        text(ELEMENT_CHAR[slot.element] ?? "?", slotX, y, CP.font,
+          ELEMENT_COLOR[slot.element] ?? C_TEXT);
+      } else {
+        text("·", slotX, y, CP.font, "rgba(120,120,140,0.5)");
       }
     }
-  }
+
+    // Spells committed this round.
+    const usedX = CP.x + CP.nameW + 5 * CP.slotW + 8;
+    text(`${e.casts_used ?? 0}/${castsPerRound}`, usedX, y, CP.font, "rgba(160,170,200,0.8)");
+  });
 }
-
-// Must match game_logic.zig ACTION_EFFECT_VALUE.
-const ACTION_EFFECT_VALUE = 1;
 
 // ---------------------------------------------------------------------------
 // Floater system
@@ -585,7 +499,6 @@ function drawFloaters() {
     const alpha = frac > 0.6 ? 1 - (frac - 0.6) / 0.4 : 1.0;
     const yOffset = -LAYOUT.floater.drift * frac; // drift upward over lifetime
 
-    // Strip any existing alpha from the color string and reapply via globalAlpha.
     ctx.save();
     ctx.globalAlpha = alpha;
     ctx.font = `bold ${LAYOUT.floater.font}px monospace`;
@@ -597,7 +510,7 @@ function drawFloaters() {
 }
 
 // ---------------------------------------------------------------------------
-// Round resolution floaters
+// Combo parsing + recipe preview (mirrors game_logic.zig / balance.zig)
 // ---------------------------------------------------------------------------
 
 /**
@@ -624,310 +537,417 @@ function parseComboSlots(slots) {
   return out;
 }
 
-/**
- * Group combo slots by element token and return element names that satisfy
- * `predicate(dmgCount, healCount, shieldCount)`.  Mirrors the Zig
- * detect_dot_triggers / detect_cleanse_triggers group semantics exactly.
- *
- * @param {Array<{action?:string, element?:string}>} slots
- * @param {(dc:number, hc:number, sc:number) => boolean} predicate
- * @returns {Set<string>}
- */
-function detectSpecialGroups(slots, predicate) {
-  const result = new Set();
-  let el = null, dc = 0, hc = 0, sc = 0;
-  const flush = () => { if (el && predicate(dc, hc, sc)) result.add(el); };
-  for (const slot of slots) {
-    if (slot.element !== undefined) {
-      flush();
-      el = slot.element; dc = 0; hc = 0; sc = 0;
-    } else if (slot.action !== undefined && el !== null) {
-      if (slot.action === "damage") dc++;
-      else if (slot.action === "heal") hc++;
-      else if (slot.action === "shield") sc++;
-    }
+// Must match balance.zig flat conversion rates.
+const UNITS_PER_SLOT = 5;
+const MEDICINE_PER_SLOT = 3;
+
+const el = (e) => ({ element: e });
+const ac = (a) => ({ action: a });
+
+/** Mirrors balance.player_recipes (exact patterns → outputs).
+ *  `medicine` is per color: color-X medicine heals only color-X healable
+ *  hunger (symmetrical healing). */
+const PLAYER_RECIPES = [
+  { label: "crimson_flood", pattern: [el("fire"), ac("dispense"), ac("dispense"), ac("dispense")], output: { units: { fire: 20 }, medicine: {} } },
+  { label: "verdant_flood", pattern: [el("earth"), ac("dispense"), ac("dispense"), ac("dispense")], output: { units: { earth: 20 }, medicine: {} } },
+  { label: "gale_flood", pattern: [el("wind"), ac("dispense"), ac("dispense"), ac("dispense")], output: { units: { wind: 20 }, medicine: {} } },
+  { label: "tide_flood", pattern: [el("water"), ac("dispense"), ac("dispense"), ac("dispense")], output: { units: { water: 20 }, medicine: {} } },
+  { label: "prism_mist", pattern: [el("fire"), ac("dispense"), el("water"), ac("dispense")], output: { units: { fire: 6, earth: 6, wind: 6, water: 6 }, medicine: {} } },
+  { label: "panacea", pattern: [el("water"), ac("medicine"), ac("medicine")], output: { units: {}, medicine: { water: 10 } } },
+];
+
+/** Mirrors balance.team_recipes. */
+const TEAM_RECIPES = [
+  {
+    label: "twin_flames",
+    patterns: [
+      [el("fire"), ac("dispense"), ac("dispense")],
+      [el("fire"), ac("dispense"), ac("dispense")],
+    ],
+    output: { units: { fire: 30 }, medicine: { fire: 2 } },
+  },
+  {
+    label: "mudslide",
+    patterns: [
+      [el("water"), ac("dispense"), ac("dispense")],
+      [el("earth"), ac("dispense"), ac("dispense")],
+    ],
+    output: { units: { earth: 18, water: 18 }, medicine: {} },
+  },
+];
+
+function slotsEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].action !== b[i].action || a[i].element !== b[i].element) return false;
   }
-  flush();
-  return result;
+  return true;
 }
 
-/** Returns Set of element names whose group is exactly {dmg, heal} → DoT trigger. */
-const detectDotTriggers = s => detectSpecialGroups(s, (dc, hc, sc) => dc === 1 && hc === 1 && sc === 0);
-
-/** Returns Set of element names whose group is exactly {heal, shield} → cleanse trigger. */
-const detectCleanseTriggers = s => detectSpecialGroups(s, (dc, hc, sc) => hc === 1 && sc === 1 && dc === 0);
-
-/**
- * Given a list of entity snapshots (from the prior frame), tally all
- * elemented actions across every player entity's combo.
- *
- * Returns a Map<element|"none", {damage:n, shield:n, heal:n}>.
- */
-function tallyPlayerActions(entities) {
-  const tally = new Map();
-
-  const get = (key) => {
-    if (!tally.has(key)) tally.set(key, { damage: 0, shield: 0, heal: 0 });
-    return tally.get(key);
-  };
-
-  for (const e of entities) {
-    if (e.team !== "players") continue;
-    const acts = parseComboSlots(e.combo ?? []);
-    for (const { action, element } of acts) {
-      const key = element ?? "none";
-      get(key)[action] = (get(key)[action] ?? 0) + 1;
+/** Flat per-slot conversion (mirrors game_logic.flat_convert).
+ *  Both actions are color-bound; colorless slots are wasted. */
+function flatConvert(slots) {
+  const out = { units: {}, medicine: {}, labels: [] };
+  for (const { action, element } of parseComboSlots(slots)) {
+    if (element === null) continue; // colorless actions wasted
+    if (action === "dispense") {
+      out.units[element] = (out.units[element] ?? 0) + UNITS_PER_SLOT;
+    } else if (action === "medicine") {
+      out.medicine[element] = (out.medicine[element] ?? 0) + MEDICINE_PER_SLOT;
     }
   }
-  return tally;
+  return out;
+}
+
+function addOutput(sum, output, label) {
+  for (const [e, n] of Object.entries(output.units ?? {})) {
+    sum.units[e] = (sum.units[e] ?? 0) + n;
+  }
+  for (const [e, n] of Object.entries(output.medicine ?? {})) {
+    sum.medicine[e] = (sum.medicine[e] ?? 0) + n;
+  }
+  if (label) sum.labels.push(label);
 }
 
 /**
- * Called once per round resolution (when game.round increases).
- * Reads lastEntitiesSnapshot to derive what the resolved round contained,
- * then spawns floaters accordingly.
+ * Convert all players' pending combos into the projected team AgentOutput.
+ * Mirrors game_logic.match_recipes: team recipes (greedy, repeatable, table
+ * order) → player recipes → flat fallback.
  *
- * @param {object} game   - current game frame (used for enemy count/intent)
- * @param {Array}  prevEntities - entity snapshot from the frame before round_reset
+ * @param {Array<Array<{action?:string, element?:string}>>} combos
+ * @returns {{units: Object<string,number>, medicine: number, labels: string[]}}
  */
-function spawnRoundSummaryFloaters(game, prevEntities, prevEnemyIntent, prevDotStacks) {
-  const tally = tallyPlayerActions(prevEntities);
+function matchRecipes(combos) {
+  const sum = { units: {}, medicine: {}, labels: [] };
+  const consumed = combos.map(() => false);
 
-  // Centre points for spawn zones.
-  const ex = (ENEMY_ZONE.x0 + ENEMY_ZONE.x1) / 2;
-  const ey = (ENEMY_ZONE.y0 + ENEMY_ZONE.y1) / 2;
-  const px = (PLAYER_ZONE.x0 + PLAYER_ZONE.x1) / 2;
-  const py = (PLAYER_ZONE.y0 + PLAYER_ZONE.y1) / 2;
-
-  // Small random X jitter so stacked floaters spread slightly.
-  const jitter = () => (Math.random() - 0.5) * LAYOUT.floater.jitter;
-  const STACK = LAYOUT.floater.stack;
-
-  let floaterY = ey; // stack floaters vertically in the enemy zone
-
-  for (const [element, counts] of tally) {
-    const elChar = element === "none" ? "" : (ELEMENT_CHAR[element] ?? "");
-    const elColor = element === "none" ? "rgba(255,100,100,1)" : (ELEMENT_COLOR[element] ?? "rgba(255,100,100,1)");
-
-    if (counts.damage > 0) {
-      const label = element === "none"
-        ? `-${counts.damage}`
-        : `-${counts.damage} ${elChar}`;
-      spawnFloater(label, ex + jitter(), floaterY, elColor);
-      floaterY += STACK;
-    }
-
-    // Show "blocked N" for the amount of enemy damage actually cancelled this round.
-    // blocked = min(player shield count, enemy damage of same element).
-    // Enemy damage for this element = intent damage (if intent.element matches) + 0 (no enemy combos shown client-side).
-    // We approximate using prevEnemyIntent element match for the "none" bucket only;
-    // for other elements the intent element may differ, so we use Math.min conservatively.
-    const intentMatchesElement = prevEnemyIntent
-      ? ((prevEnemyIntent.element ?? null) === (element === "none" ? null : element))
-      : false;
-    const intentDmgForElement = (intentMatchesElement && prevEnemyIntent) ? prevEnemyIntent.damage : 0;
-    const blocked = Math.min(counts.shield, intentDmgForElement);
-    if (blocked > 0) {
-      const shieldColor = element === "none"
-        ? "rgba(80,160,255,1)"
-        : (ELEMENT_COLOR[element] ?? "rgba(80,160,255,1)");
-      const label = element === "none"
-        ? `blocked ${blocked * ACTION_EFFECT_VALUE}`
-        : `blocked ${blocked * ACTION_EFFECT_VALUE} ${elChar}`;
-      spawnFloater(label, px + jitter(), py, shieldColor);
-    }
-
-    if (counts.heal > 0) {
-      const label = element === "none"
-        ? `+${counts.heal} heal`
-        : `+${counts.heal} heal ${elChar}`;
-      spawnFloater(label, px + jitter(), py + STACK, "rgba(100,220,100,1)");
+  for (const tr of TEAM_RECIPES) {
+    for (;;) {
+      const picked = combos.map(() => false);
+      const picks = [];
+      let ok = true;
+      for (const pattern of tr.patterns) {
+        let found = -1;
+        for (let ci = 0; ci < combos.length; ci++) {
+          if (consumed[ci] || picked[ci]) continue;
+          if (combos[ci].length > 0 && slotsEqual(combos[ci], pattern)) { found = ci; break; }
+        }
+        if (found === -1) { ok = false; break; }
+        picks.push(found);
+        picked[found] = true;
+      }
+      if (!ok) break;
+      for (const ci of picks) consumed[ci] = true;
+      addOutput(sum, tr.output, tr.label);
     }
   }
 
-  // Enemy intent floater: use the snapshotted intent from the round that just resolved.
-  const intent = prevEnemyIntent;
-  if (intent && intent.damage > 0) {
-    const elChar = intent.element ? (ELEMENT_CHAR[intent.element] ?? "") : "";
-    const elColor = intent.element ? (ELEMENT_COLOR[intent.element] ?? "rgba(255,80,80,1)") : "rgba(255,80,80,1)";
-    const label = elChar ? `-${intent.damage} ${elChar}` : `-${intent.damage}`;
-    spawnFloater(label, px + jitter(), py - STACK, elColor);
+  for (let ci = 0; ci < combos.length; ci++) {
+    if (consumed[ci] || combos[ci].length === 0) continue;
+    for (const pr of PLAYER_RECIPES) {
+      if (slotsEqual(combos[ci], pr.pattern)) {
+        addOutput(sum, pr.output, pr.label);
+        consumed[ci] = true;
+        break;
+      }
+    }
   }
 
-  // DoT tick floaters — show elemental ticks on each side.
-  // prevDotStacks contains the stack counts at the moment the round fired.
-  // A non-zero stack on a side means it ticked damage this round.
-  if (prevDotStacks) {
-    // DoT on enemy side: stacks in prevDotStacks.enemies dealt damage to enemies.
-    let dotEnemyY = ey + STACK + 6;
-    for (let i = 0; i < 4; i++) {
-      const elName = ELEMENT_NAMES[i];
-      const stacks = prevDotStacks.enemies[elName];
-      if (!stacks || stacks === 0) continue;
-      const color = ELEMENT_COLOR[elName] ?? "rgba(255,100,100,1)";
-      spawnFloater(`${ELEMENT_CHAR[elName]} dot -${stacks * ACTION_EFFECT_VALUE}`, ex + jitter(), dotEnemyY, color);
-      dotEnemyY += STACK;
-    }
-    // DoT on player side: stacks in prevDotStacks.players dealt damage to players.
-    let dotPlayerY = py + STACK * 2 + 6;
-    for (let i = 0; i < 4; i++) {
-      const elName = ELEMENT_NAMES[i];
-      const stacks = prevDotStacks.players[elName];
-      if (!stacks || stacks === 0) continue;
-      const color = ELEMENT_COLOR[elName] ?? "rgba(255,100,100,1)";
-      spawnFloater(`${ELEMENT_CHAR[elName]} dot -${stacks * ACTION_EFFECT_VALUE}`, px + jitter(), dotPlayerY, color);
-      dotPlayerY += STACK;
-    }
+  for (let ci = 0; ci < combos.length; ci++) {
+    if (consumed[ci] || combos[ci].length === 0) continue;
+    addOutput(sum, flatConvert(combos[ci]), null);
   }
+
+  return sum;
 }
 
 // ---------------------------------------------------------------------------
-// Round tracking state
+// Round tracking (score / hunger deltas → floaters over the eaten zone)
 // ---------------------------------------------------------------------------
 
 let lastRoundSeen = -1;
-/** Shallow copy of game.entities from the previous frame. */
-let lastEntitiesSnapshot = [];
-/** Copy of game.enemy_intent from the previous frame (used in round-boundary floaters). */
-let lastEnemyIntentSnapshot = null;
-/** Copy of game.dot_stacks from the previous frame (used in round-boundary floaters). */
-let lastDotStacksSnapshot = null;
+let lastScoreSeen = 0;
+let lastHungerSeen = 0;
+let lastZoneIndexSeen = 0;
 
 /**
  * Call at the start of every drawGame frame.
- * Detects round boundary, spawns floaters from the previous frame's entities,
- * then updates the snapshot for the next round.
+ * Detects round boundary and spawns summary floaters over the zone that was
+ * just consumed, using score/hunger deltas from the previous frame.
  */
 function updateRoundTracking(game) {
   if (game.round !== lastRoundSeen && lastRoundSeen !== -1) {
-    spawnRoundSummaryFloaters(game, lastEntitiesSnapshot, lastEnemyIntentSnapshot, lastDotStacksSnapshot);
+    const zoneRect = zoneColumnRect(lastZoneIndexSeen, Math.max(game.zones?.length ?? 1, 1));
+    const cx = (zoneRect.x0 + zoneRect.x1) / 2;
+    const cy = (zoneRect.y0 + zoneRect.y1) / 2;
+    const jitter = () => (Math.random() - 0.5) * LAYOUT.floater.jitter;
+    const STACK = LAYOUT.floater.stack;
+
+    const scoreGain = (game.score ?? 0) - lastScoreSeen;
+    const hungerGain = (game.hunger?.current ?? 0) - lastHungerSeen;
+
+    // Chomp burst over the consumed zone.
+    for (let i = 0; i < 4; i++) {
+      spawnFloater("chomp!", cx + jitter() * 2, cy + jitter() * 2, "rgba(255,255,255,0.9)", 1.0);
+    }
+    if (scoreGain > 0) {
+      spawnFloater(`+${scoreGain} score`, cx + jitter(), cy - STACK, "rgba(100,220,100,1)");
+    }
+    if (hungerGain > 0) {
+      spawnFloater(`+${hungerGain} hunger`, cx + jitter(), cy + STACK, "rgba(255,150,50,1)");
+    } else if (hungerGain < 0) {
+      spawnFloater(`${hungerGain} hunger (medicine)`, cx + jitter(), cy + STACK, "rgba(255,80,180,1)");
+    }
   }
   lastRoundSeen = game.round;
-  // Snapshot current entities, intent and dot_stacks so they're available next frame if a round fires.
-  lastEntitiesSnapshot = (game.entities ?? []).slice();
-  lastEnemyIntentSnapshot = game.enemy_intent ?? null;
-  lastDotStacksSnapshot = game.dot_stacks ?? null;
+  lastScoreSeen = game.score ?? 0;
+  lastHungerSeen = game.hunger?.current ?? 0;
+  lastZoneIndexSeen = Math.min(game.zone_index ?? 0, Math.max((game.zones?.length ?? 1) - 1, 0));
 }
 
 /** Map ActionChoice enum string → display character. */
-const ACTION_CHAR = { damage: "a", shield: "s", heal: "h" };
+const ACTION_CHAR = { dispense: "d", medicine: "m" };
 
 /** Map ActionChoice enum string → highlight colour. */
 const ACTION_COLOR = {
-  damage: "rgba(255,100,100,1)",
-  shield: "rgba(80,160,255,1)",
-  heal: "rgba(100,220,100,1)",
+  dispense: "rgba(160,220,255,1)",
+  medicine: "rgba(255,80,180,1)",
 };
 
 /** Element ordinal → name string; matches protocol Element ordinal order. */
 const ELEMENT_NAMES = ["fire", "earth", "wind", "water"];
 
-/** Map Element enum string → display character (Unicode symbols). */
+/** Map Element (agent color) enum string → display character. */
 const ELEMENT_CHAR = { fire: "♦", earth: "▲", wind: "≋", water: "~" };
 
-/** Map Element enum string → highlight colour. */
+/** Map Element (agent color / slime type) → colour.  Matches the whiteboard:
+ *  red / yellow / green / blue scribbles. */
 const ELEMENT_COLOR = {
-  fire: "rgba(255,120,40,1)",
-  earth: "rgba(160,120,60,1)",
-  wind: "rgba(180,255,180,1)",
-  water: "rgba(80,160,255,1)",
+  fire: "rgba(255,90,90,1)",
+  earth: "rgba(250,210,80,1)",
+  wind: "rgba(130,230,130,1)",
+  water: "rgba(110,160,255,1)",
 };
 
+const NEUTRAL_COLOR = "rgba(190,190,200,1)";
+
+// ---------------------------------------------------------------------------
+// Hunger bar + score
+// ---------------------------------------------------------------------------
+
 /**
- * Draw stacked status bars confined to a horizontal span [x0, x1].
- * Each bar has a short left label and a numeric value on the right.
- *
- * @param {{ label:string, value:number, frac:number, color:string, bg:string }[]} bars
- * @param {number} x0  - left edge
- * @param {number} x1  - right edge
- * @param {number} y   - top of first bar
+ * Draw the Total Hunger bar.  Fills left→right as slime is consumed; the
+ * healable (modified-slime) portion sits at the right end of the fill as
+ * color-coded segments — one per slime color — since only matching-color
+ * medicine can heal each segment.
  */
-function drawBars(bars, x0, x1, y) {
-  const TB = LAYOUT.teamBars;
-  const ROW_H = TB.barH + TB.gap;
-  const bx = x0 + TB.labelW;
-  const bw = (x1 - x0) - TB.labelW;
+function drawHungerBar(game) {
+  const H = LAYOUT.hungerBar;
+  const hunger = game.hunger ?? { current: 0, max: 0, healable: {} };
+  const healable = hunger.healable ?? {};
+  const w = H.x1 - H.x0;
+  const frac = hunger.max > 0 ? Math.min(1, hunger.current / hunger.max) : 0;
 
-  for (let i = 0; i < bars.length; i++) {
-    const { label, value, frac, color, bg } = bars[i];
-    const by = y + i * ROW_H;
-    const f = Math.max(0, Math.min(1, frac));
+  const healableTotal = ELEMENT_NAMES.reduce((t, name) => t + (healable[name] ?? 0), 0);
+  const healFracTotal = hunger.max > 0 ? Math.min(frac, healableTotal / hunger.max) : 0;
 
-    text(label, x0, by + TB.barH - 2, TB.font, "rgba(180,200,255,0.85)");
-    rect(bx, by, bw, TB.barH, bg);
-    if (f > 0) rect(bx, by, bw * f, TB.barH, color);
-    text(String(Math.round(value)), bx + bw + 4, by + TB.barH - 2, TB.font, "rgba(180,200,255,0.7)");
+  text("TOTAL HUNGER", H.x0, H.y + H.labelDy, H.labelFont, C_HEADER);
+
+  rect(H.x0, H.y, w, H.h, H.bg);
+  const fillColor = frac > 0.85 ? H.danger : H.fill;
+  if (frac > 0) rect(H.x0, H.y, w * frac, H.h, fillColor);
+
+  // Healable segments: right end of the current fill, one per slime color.
+  // Scale segments proportionally if the fill clamped at the bar edge.
+  if (healFracTotal > 0 && healableTotal > 0) {
+    const scale = (w * healFracTotal) / healableTotal;
+    let x = H.x0 + w * (frac - healFracTotal);
+    for (const name of ELEMENT_NAMES) {
+      const units = healable[name] ?? 0;
+      if (units === 0) continue;
+      const segW = units * scale;
+      rect(x, H.y, segW, H.h, ELEMENT_COLOR[name]);
+      x += segW;
+    }
   }
+  rectStroke(H.x0, H.y, w, H.h, 1, "rgba(255,255,255,0.25)");
+
+  text(`${hunger.current}/${hunger.max}  (healable ${healableTotal})`,
+    H.x0 + w + 6 - 230, H.y + H.h + 14, H.textFont, "rgba(200,200,210,0.9)");
+}
+
+function drawScore(game) {
+  const S = LAYOUT.score;
+  text(`Score: ${game.score ?? 0}`, S.x, S.y, S.font, C_SLIME_HDR);
+}
+
+// ---------------------------------------------------------------------------
+// Slime field (zone columns)
+// ---------------------------------------------------------------------------
+
+/** Rect for zone column `i` of `count` within the slime field. */
+function zoneColumnRect(i, count) {
+  const w = (FIELD.x1 - FIELD.x0) / Math.max(count, 1);
+  return { x0: FIELD.x0 + i * w, x1: FIELD.x0 + (i + 1) * w, y0: FIELD.y0, y1: FIELD.y1 };
 }
 
 /**
- * Draw aggregate player-team bars (HP, projected heal) above the player zone.
- * Draw aggregate enemy-team HP bar above the enemy zone.
- * Shield pools are removed — shields cancel damage within the round, no bar needed.
+ * Draw one slime blob (filled circle + unit count).
  */
-function drawTeamBars(game) {
-  const entities = game.entities || [];
-  const players = entities.filter(e => e.team === "players");
-  const enemies = entities.filter(e => e.team === "enemies");
+function drawBlob(x, y, units, color) {
+  const r = FIELD.blobMinR + Math.sqrt(units) * FIELD.blobRScale;
+  ctx.save();
+  ctx.fillStyle = color;
+  ctx.globalAlpha = 0.85;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.globalAlpha = 1.0;
+  ctx.fillStyle = "rgba(10,10,20,0.95)";
+  ctx.font = `bold ${FIELD.blobFont}px monospace`;
+  ctx.textAlign = "center";
+  ctx.fillText(String(units), x, y + 4);
+  ctx.restore();
+}
 
-  // --- Player bars ---
-  const playerSummary = game.players;
-  if (players.length > 0 && playerSummary && playerSummary.hp_max > 0) {
-    let healCount = 0;
-    for (const e of players) {
-      for (const slot of (e.combo ?? [])) {
-        if (slot.action === "heal") healCount++;
+/**
+ * Draw the slime field: one column per zone, colored blobs sized by remaining
+ * units (color = slime type = required agent), grey blob = naturally-neutral.
+ * Consumed zones are dimmed; the active zone is highlighted.
+ */
+function drawSlimeField(game) {
+  const zones = game.zones ?? [];
+  const count = zones.length;
+  if (count === 0) return;
+  const zoneIndex = game.zone_index ?? 0;
+
+  for (let i = 0; i < count; i++) {
+    const rectZ = zoneColumnRect(i, count);
+    const zw = rectZ.x1 - rectZ.x0;
+    const zh = rectZ.y1 - rectZ.y0;
+
+    rect(rectZ.x0, rectZ.y0, zw, zh, "rgba(255,255,255,0.03)");
+
+    if (i < zoneIndex) {
+      // Consumed zone.
+      rect(rectZ.x0, rectZ.y0, zw, zh, FIELD.eatenFill);
+      ctx.save();
+      ctx.fillStyle = "rgba(150,150,160,0.7)";
+      ctx.font = `bold 16px monospace`;
+      ctx.textAlign = "center";
+      ctx.fillText("EATEN", (rectZ.x0 + rectZ.x1) / 2, (rectZ.y0 + rectZ.y1) / 2);
+      ctx.restore();
+    } else {
+      // Blobs: fire, earth, wind, water, neutral stacked vertically.
+      const z = zones[i];
+      const entries = [
+        { units: z.fire, color: ELEMENT_COLOR.fire },
+        { units: z.earth, color: ELEMENT_COLOR.earth },
+        { units: z.wind, color: ELEMENT_COLOR.wind },
+        { units: z.water, color: ELEMENT_COLOR.water },
+        { units: z.neutral, color: NEUTRAL_COLOR },
+      ].filter(b => b.units > 0);
+
+      const cx = (rectZ.x0 + rectZ.x1) / 2;
+      for (let b = 0; b < entries.length; b++) {
+        const by = rectZ.y0 + zh * (b + 1) / (entries.length + 1);
+        // Slight horizontal wobble so columns don't look like bar charts.
+        const bx = cx + ((b % 2 === 0) ? -1 : 1) * zw * 0.12;
+        drawBlob(bx, by, entries[b].units, entries[b].color);
       }
     }
-    const { hp_current, hp_max } = playerSummary;
-    const scale = hp_max > 0 ? 1 / hp_max : 0;
-    const projHeal = healCount * ACTION_EFFECT_VALUE;
 
-    // Two bars stacked; top sits just below the "ALLIES" label.
-    const y = PLAYER_ZONE.y0 + LAYOUT.teamBars.dy;
-    drawBars([
-      { label: "HP", value: hp_current, frac: hp_current * scale, color: "rgba(60,200,60,0.9)", bg: C_HP_BG },
-      { label: "Heal", value: projHeal, frac: projHeal * scale, color: "rgba(140,230,100,0.9)", bg: "rgba(20,50,20,0.6)" },
-    ], PLAYER_ZONE.x0, PLAYER_ZONE.x1, y);
+    const isActive = i === zoneIndex;
+    rectStroke(rectZ.x0, rectZ.y0, zw, zh, isActive ? 3 : 1,
+      isActive ? FIELD.activeBorder : FIELD.border);
 
-    // DoT stacks on the player party (applied by enemies).
-    const dotP = game.dot_stacks?.players;
-    if (dotP) {
-      let dx = PLAYER_ZONE.x0;
-      for (let i = 0; i < 4; i++) {
-        const elName = ELEMENT_NAMES[i];
-        if (!dotP[elName]) continue;
-        text(`${ELEMENT_CHAR[elName]}×${dotP[elName]}`, dx, y + LAYOUT.teamBars.dotDyPlayers, LAYOUT.teamBars.effectFont, ELEMENT_COLOR[elName]);
-        dx += LAYOUT.teamBars.dotGap;
-      }
-    }
+    // Round label under the column.
+    ctx.save();
+    ctx.fillStyle = isActive ? "rgba(255,255,120,0.95)" : "rgba(170,180,220,0.7)";
+    ctx.font = `${FIELD.labelFont}px monospace`;
+    ctx.textAlign = "center";
+    ctx.fillText(`round ${i + 1}`, (rectZ.x0 + rectZ.x1) / 2, rectZ.y1 + FIELD.labelDy);
+    ctx.restore();
   }
+}
 
-  // --- Enemy HP bar ---
-  const enemySummary = game.enemies;
-  if (enemies.length > 0 && enemySummary && enemySummary.hp_max > 0) {
-    const { hp_current, hp_max } = enemySummary;
-    const scale = hp_max > 0 ? 1 / hp_max : 0;
+// ---------------------------------------------------------------------------
+// Cosmetic Lil Guys (roam the active zone; purely client-side)
+// ---------------------------------------------------------------------------
 
-    // One bar; vertically centred in the same strip.
-    const y = ENEMY_ZONE.y0 + LAYOUT.teamBars.dy;
-    drawBars([
-      { label: "HP", value: hp_current, frac: hp_current * scale, color: "rgba(255,100,60,0.9)", bg: C_HP_BG },
-    ], ENEMY_ZONE.x0, ENEMY_ZONE.x1, y);
+/**
+ * @typedef {{ x:number, y:number, tx:number, ty:number, chomp:number, id:number }} LilGuy
+ */
 
-    // DoT stacks on the enemy side (applied by players).
-    const dotE = game.dot_stacks?.enemies;
-    if (dotE) {
-      let dx = ENEMY_ZONE.x0;
-      for (let i = 0; i < 4; i++) {
-        const elName = ELEMENT_NAMES[i];
-        if (!dotE[elName]) continue;
-        text(`${ELEMENT_CHAR[elName]}×${dotE[elName]}`, dx, y + LAYOUT.teamBars.dotDyEnemies, LAYOUT.teamBars.effectFont, ELEMENT_COLOR[elName]);
-        dx += LAYOUT.teamBars.dotGap;
-      }
+/** @type {LilGuy[]} */
+const lilGuys = [];
+
+function randIn(lo, hi) { return lo + Math.random() * (hi - lo); }
+
+function lilGuyTarget(rectZ) {
+  const G = LAYOUT.lilGuys;
+  return {
+    tx: randIn(rectZ.x0, rectZ.x1 - G.size),
+    ty: randIn(rectZ.y0, rectZ.y1 - G.size),
+  };
+}
+
+function tickLilGuys(game, dt) {
+  const G = LAYOUT.lilGuys;
+  const zones = game.zones ?? [];
+  const count = Math.max(zones.length, 1);
+  const zoneIndex = Math.min(game.zone_index ?? 0, count - 1);
+  const rectZ = zoneColumnRect(zoneIndex, count);
+
+  // One Lil Guy per player entity (late joiners get one too).
+  const wanted = (game.entities ?? []).length;
+  while (lilGuys.length < wanted) {
+    const t = lilGuyTarget(rectZ);
+    lilGuys.push({
+      x: randIn(rectZ.x0, rectZ.x1 - G.size),
+      y: randIn(rectZ.y0, rectZ.y1 - G.size),
+      ...t,
+      chomp: randIn(G.chompMin, G.chompMax),
+      id: 1_000_000 + lilGuys.length, // animator ids far above entity ids
+    });
+  }
+  if (lilGuys.length > wanted) lilGuys.length = wanted;
+
+  for (const g of lilGuys) {
+    // Retarget if the active zone moved or we arrived.
+    const outside = g.tx < rectZ.x0 || g.tx > rectZ.x1 || g.ty < rectZ.y0 || g.ty > rectZ.y1;
+    const dx = g.tx - g.x, dy = g.ty - g.y;
+    const dist = Math.hypot(dx, dy);
+    if (outside || dist < 4) {
+      const t = lilGuyTarget(rectZ);
+      g.tx = t.tx;
+      g.ty = t.ty;
+      continue;
+    }
+    const step = Math.min(G.speed * dt, dist);
+    g.x += (dx / dist) * step;
+    g.y += (dy / dist) * step;
+
+    // Cosmetic chomping while the round is live.
+    g.chomp -= dt;
+    if (g.chomp <= 0) {
+      g.chomp = randIn(G.chompMin, G.chompMax);
+      spawnFloater("chomp", g.x + G.size / 2, g.y, "rgba(230,230,240,0.85)", 0.8);
     }
   }
 }
+
+function drawLilGuys(dt) {
+  const G = LAYOUT.lilGuys;
+  for (const g of lilGuys) {
+    const flip = g.tx < g.x;
+    drawSprite(g.id, LIL_GUY_SPRITE, g.x, g.y, G.size, G.size, null, dt, flip);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Action menu + projected agent preview
+// ---------------------------------------------------------------------------
 
 function drawActionMenu(game) {
   const M = LAYOUT.actionMenu;
@@ -941,9 +961,8 @@ function drawActionMenu(game) {
 
   const px = mx + M.padX;
   const aRowY = my + M.padTopY + M.actionRowDy;
-  text("[1] Atk", px + M.actionCols[0], aRowY, M.actionFont, C_TEXT);
-  text("[2] Shld", px + M.actionCols[1], aRowY, M.actionFont, C_TEXT);
-  text("[3] Heal", px + M.actionCols[2], aRowY, M.actionFont, C_TEXT);
+  text("[1] Dispense", px + M.actionCols[0], aRowY, M.actionFont, ACTION_COLOR.dispense);
+  text("[2] Medicine", px + M.actionCols[1], aRowY, M.actionFont, ACTION_COLOR.medicine);
 
   const eRowY = my + M.padTopY + M.elementRowDy;
   text("[Q]♦", px + M.elementCols[0], eRowY, M.elementFont, ELEMENT_COLOR.fire);
@@ -953,49 +972,98 @@ function drawActionMenu(game) {
 
   text("[Esc] Cancel", px, my + M.padTopY + M.cancelRowDy, M.cancelFont, "rgba(180,180,180,0.8)");
 
+  const tbw = mw - M.padX * 2;
+
+  // Cast-window timer bar (round_duration / casts_per_round per window).
+  // Pending combo commits as a spell when it empties.
+  const castsPerRound = game.casts_per_round ?? 3;
+  const castDuration = game.round_duration > 0 ? game.round_duration / castsPerRound : 0;
+  const castFrac = castDuration > 0
+    ? Math.max(0, Math.min(1, (game.cast_timer ?? 0) / castDuration))
+    : 0;
+  rect(px, my + M.castBarDy, tbw, M.castBarH, "rgba(30,30,30,0.8)");
+  rect(px, my + M.castBarDy, tbw * castFrac, M.castBarH, "rgba(120,220,255,0.9)");
+
   // Round timer bar
   const timerFrac = game.round_duration > 0
     ? Math.max(0, Math.min(1, game.round_timer / game.round_duration))
     : 0;
-  const tbw = mw - M.padX * 2;
   rect(px, my + M.timerBarDy, tbw, M.timerBarH, "rgba(30,30,30,0.8)");
   rect(px, my + M.timerBarDy, tbw * timerFrac, M.timerBarH, "rgba(255,200,50,0.9)");
-  text(`Round: ${game.round_timer !== undefined ? game.round_timer.toFixed(1) : "?"}s`, px, my + M.timerTextDy, M.timerTextFont, C_TEXT);
+
+  const own = (game.entities ?? []).find(e => e.owner === game.player_id);
+  const castsUsed = own ? (own.casts_used ?? 0) : 0;
+  const castText = game.cast_timer !== undefined ? game.cast_timer.toFixed(1) : "?";
+  const roundText = game.round_timer !== undefined ? game.round_timer.toFixed(1) : "?";
+  text(`Cast: ${castText}s (${castsUsed}/${castsPerRound})  ·  Round: ${roundText}s`,
+    px, my + M.timerTextDy, M.timerTextFont, C_TEXT);
+
+  // Projected team output from everyone's PENDING combos (recipe-aware).
+  // Already-committed casts this round are not in the snapshot, so this
+  // previews only the current cast window.
+  const combos = (game.entities ?? []).map(e => e.combo ?? []);
+  const projected = matchRecipes(combos);
+
+  const parts = [];
+  for (const name of ELEMENT_NAMES) {
+    const n = projected.units[name];
+    if (n) parts.push({ str: `${ELEMENT_CHAR[name]}${n}`, color: ELEMENT_COLOR[name] });
+  }
+  // Medicine is per color: shown in the color of the healable bucket it heals.
+  for (const name of ELEMENT_NAMES) {
+    const n = projected.medicine[name];
+    if (n) parts.push({ str: `med${ELEMENT_CHAR[name]}${n}`, color: ELEMENT_COLOR[name] });
+  }
+
+  let dx = px;
+  const pvY = my + M.previewDy;
+  text("Team:", dx, pvY, M.previewFont, "rgba(180,200,255,0.85)");
+  dx += 52;
+  if (parts.length === 0) {
+    text("—", dx, pvY, M.previewFont, "rgba(120,120,140,0.7)");
+  } else {
+    for (const p of parts) {
+      text(p.str, dx, pvY, M.previewFont, p.color);
+      dx += ctx.measureText(p.str).width + 12;
+    }
+  }
+  if (projected.labels.length > 0) {
+    text(projected.labels.join(", "), dx + 8, pvY, M.previewFont, "rgba(255,255,140,0.9)");
+  }
 }
 
 function drawGame(game, dt) {
   // Must come first: detects round boundary using previous frame's data.
   updateRoundTracking(game);
   tickFloaters(dt);
+  tickLilGuys(game, dt);
+  spawnCastFloaters(game);
 
   clear();
 
-  // Faint backdrops so the play areas are obvious.
-  drawZone(PLAYER_ZONE);
-  drawZone(ENEMY_ZONE);
-
   const H = LAYOUT.headers;
-  const wave = game.wave || "";
-  text(`Wave: ${wave}`, H.waveX, H.waveY, H.waveFont, C_HEADER);
+  const encounter = game.encounter || "";
+  text(`Encounter: ${encounter}`, H.waveX, H.waveY, H.waveFont, C_HEADER);
 
-  text("ALLIES", PLAYER_ZONE.x0, PLAYER_ZONE.y0 + H.labelDy, H.labelFont, C_HEADER);
-  text("ENEMIES", ENEMY_ZONE.x0, ENEMY_ZONE.y0 + H.labelDy, H.labelFont, C_ENEMY_HDR);
+  text("SLIME FIELD", FIELD.x0, FIELD.y0 + H.labelDy, H.labelFont, C_SLIME_HDR);
 
-  drawTeamBars(game);
-
-  drawTeam(game, "players", dt);
-  drawTeam(game, "enemies", dt);
-
+  drawScore(game);
+  drawHungerBar(game);
+  drawSlimeField(game);
+  drawLilGuys(dt);
+  drawComboPanel(game);
   drawActionMenu(game);
 
   // Floaters drawn last so they appear on top of everything.
   drawFloaters();
 }
 
-function drawGameOver() {
+function drawGameOver(msg) {
   clear();
   const L = LAYOUT.gameOver;
-  text("Game Over!  Press any key to return to lobby.", L.x, SH / 2, L.font, C_TEXT);
+  text("Encounter over!  Press any key to return to lobby.", L.x, SH / 2, L.font, C_TEXT);
+  const score = msg && msg.score !== undefined && msg.score !== null ? msg.score : "?";
+  text(`Neutral slime consumed: ${score}`, L.x, SH / 2 + L.scoreDy, L.scoreFont, C_SLIME_HDR);
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,7 +1084,7 @@ function renderFrame(msg, dt) {
     case "connecting": drawConnecting(); break;
     case "lobby": drawLobby(msg.lobby); break;
     case "game": drawGame(msg.game, dt); break;
-    case "game_over": drawGameOver(); break;
+    case "game_over": drawGameOver(msg); break;
     default: drawConnecting();
   }
 }
@@ -1080,11 +1148,9 @@ function connect() {
 // ---------------------------------------------------------------------------
 
 const FORWARDED_KEYS = new Set([
-  "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
   "Enter", "Escape",
-  "1", "2", "3",
+  "1", "2",
   "q", "w", "e", "r",
-  "z", "Z", "x", "X",
 ]);
 
 document.addEventListener("keydown", (e) => {

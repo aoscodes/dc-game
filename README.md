@@ -1,6 +1,6 @@
-# DragonCon RPG
+# Slime Feast
 
-Co-op RPG with ATB (Active Time Battle) combat. Up to 6 players vs scripted enemy waves.
+Co-op round-based support game. Up to 6 players help a horde of Lil Guys devour a slime field: dispense color-matched Neutralizing Agents to purify Modified Slime before each zone is eaten, and Medicine to heal the shared Hunger bar. Score = neutral slime consumed.
 
 Authoritative Zig server. Browser canvas renderer. Zig headless client ↔ Node bridge ↔ browser.
 
@@ -77,13 +77,7 @@ After the script:
    chmod 600 /home/deploy/.ssh/authorized_keys               # on VPS
    ```
 
-2. **Copy `waves.json`** to the VPS (managed separately, not deployed by CI):
-
-   ```
-   scp waves.json deploy@<vps-ip>:/opt/dragoncon/waves.json
-   ```
-
-3. **Add GitHub Actions secrets** in your repo settings:
+2. **Add GitHub Actions secrets** in your repo settings:
 
    | Secret        | Value                                  |
    | ------------- | -------------------------------------- |
@@ -117,49 +111,60 @@ Certbot adds `listen 443 ssl` and sets up auto-renew. `game.js` derives the WebS
 
 Until you have a domain, the game is playable over plain `http://`.
 
-### `waves.json`
+### Encounter tuning
 
-The server hot-reloads `/opt/dragoncon/waves.json` at runtime (mtime polling). Edit it on the VPS directly — changes take effect within 5 seconds without a restart. Intentionally excluded from CI deploys so wave tuning doesn't trigger a full rebuild.
+Encounter definitions (zones, slime amounts, hunger budget) are comptime Zig
+in `src/shared/encounter.zig`; recipes and costs live in
+`src/shared/balance.zig`. Retuning currently requires a rebuild+deploy.
+(A planned JSON hot-reload was never implemented.)
 
 ## Gameplay
 
 **Lobby**
 
-| Key             | Action                              |
-| --------------- | ----------------------------------- |
-| `1` / `2` / `3` | Pick class: Fighter / Mage / Healer |
-| `Enter`         | Toggle ready                        |
+| Key     | Action       |
+| ------- | ------------ |
+| `Enter` | Toggle ready |
 
-**Combat (ATB)**
+**Rounds (combo composition)**
 
-When your ATB bar fills the server sends `YourTurn`. Then:
+Each round (shared countdown timer) every player composes one combo — latest
+cast wins, `Esc` cancels:
 
-| Key             | Action        |
-| --------------- | ------------- |
-| Arrow keys      | Move cursor   |
-| `1`             | Select Attack |
-| `2`             | Select Defend |
-| `Enter` or `Z`  | Confirm       |
-| `Escape` or `X` | Cancel        |
+| Key                       | Action                                        |
+| ------------------------- | --------------------------------------------- |
+| `1`                       | Dispense (Neutralizing Agent of current color) |
+| `2`                       | Medicine (heals the Hunger bar)                |
+| `Q` / `W` / `E` / `R`     | Agent color: fire / earth / wind / water       |
+| `Escape`                  | Cancel combo                                   |
 
-- **Fighter** — single-target melee attack; Defend shields allies in the row behind.
-- **Mage** — 2×2 AoE on the enemy grid.
-- **Healer** — 2×2 AoE heal on the player grid.
+At round end the current zone is consumed in its entirety:
 
-Six scripted enemy waves (`wave_01_basic` through `wave_05_boss_plus_grunts`); clearing all waves wins.
+- Matching-color agent units neutralize Modified Slime (`min(agents, slime)`;
+  excess and wrong-color agents are wasted).
+- Every unit costs normal hunger; un-neutralized modified units cost extra
+  hunger, and only that extra portion is healable by Medicine.
+- Score += neutralized + naturally-neutral units.
+
+Exact combos can match hard-coded **recipes** (`balance.zig`) that replace the
+flat per-slot conversion — including **team recipes** matched across multiple
+players' combos in the same round (e.g. `twin_flames`).
+
+The encounter ends when all zones are consumed or the Hunger bar fills; the
+final shared score is broadcast either way.
 
 ## Architecture
 
 ```
-shared/      pure Zig: ECS components, ATB/combat math, wire protocol, wave scripts
+shared/      pure Zig: ECS components, recipe/zone resolution math, wire protocol, encounter defs
 client/      headless Zig stdio binary — game logic + UI state, no window/GPU
-server/      authoritative game loop, lobby state machine, AI, broadcasts
+server/      authoritative game loop, lobby state machine, round resolution, broadcasts
 bridge/      Node.js: spawns client, owns both WebSocket connections, serves web/
 web/         static HTML + JS canvas renderer (no build step)
 e2e/         Zig bot e2e (src/e2e/) + Playwright browser e2e (e2e/browser/)
 ```
 
-All game logic runs on the server. Clients send inputs only (`JoinLobby`, `ChooseClass`, `ReadyUp`, `ChooseAction`, `Reconnect`). The server broadcasts `LobbyUpdate`, `GameState` snapshots, `YourTurn`, `ActionResult`, `GameOver`.
+All game logic runs on the server. Clients send inputs only (`JoinLobby`, `ReadyUp`, `ChooseCombo`, `CancelCombo`, `SetStatblock`, `Reconnect`). The server broadcasts `LobbyUpdate`, `GameState` snapshots, `RoundReset`, `ActionResult`, `GameOver` (final score).
 
 Wire protocol is binary, little-endian, no allocations on the hot path. See `src/shared/protocol.zig`.
 
@@ -180,19 +185,22 @@ src/
   root.zig               ECS core (Austin Morlan-style, comptime)
   shared/
     shared.zig           module root
-    components.zig       all ECS component types
-    game_logic.zig       ATB, combat math, grid helpers
+    components.zig       component types + combo/zone/agent model
+    game_logic.zig       combo parsing, recipe matching, zone/hunger resolution
+    balance.zig          tunables + recipe tables (player + team)
     protocol.zig         binary wire protocol + round-trip tests
     transport.zig        abstract Transport interface
-    waves.zig            6 scripted enemy wave definitions
+    encounter.zig        encounter (slime field) definitions
+    bots.zig             bot profiles/teams for the test harness
   client/
     main.zig             entry point, ClientState, stdin reader, game loop
     stdout_writer.zig    JSON render/send frame serialiser
-    input.zig            key name → InputEvent
+    input.zig            key name → combo slot mapping
   server/
     main.zig             server entry point
-    session.zig          Session: lobby, ATB tick, AI, action resolution, broadcasts
-    session_test.zig     13 in-process integration tests (no network)
+    session.zig          Session: lobby, round timer, zone resolution, broadcasts
+    session_test.zig     in-process integration tests (no network)
+    bot_harness_test.zig bot-driven session tests
   e2e/
     e2e_test.zig         Zig e2e: spawns server + 2 bots, full game loop
   debug/

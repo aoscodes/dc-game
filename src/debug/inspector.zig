@@ -33,9 +33,12 @@ pub fn inspect(world: anytype, entity: ecs.Entity, writer: anytype) void {
 
     inline for (fields) |f| {
         const arr = &@field(comp_arrays, f.name);
-        if (!arr.has(entity)) continue;
-        const val = arr.get(entity).*;
-        writer.print("  [{s}]  {}\n", .{ f.name, val }) catch {};
+        // No `continue` here: comptime-unrolled loops forbid runtime control
+        // flow that skips the unrolling, so branch instead.
+        if (arr.has(entity)) {
+            const val = arr.get(entity).*;
+            writer.print("  [{s}]  {}\n", .{ f.name, val }) catch {};
+        }
     }
 }
 

@@ -118,8 +118,8 @@ exports.waitForPort = function waitForPort(port, timeoutMs = 5_000) {
 const WS = require("ws");
 
 /**
- * Minimal bot that connects directly to the game server, sends join/class/
- * ready, and drives combat automatically (always attacks first enemy).
+ * Minimal bot that connects directly to the game server, sends join/ready,
+ * and dispenses fire agents each round (Slime Feast combo protocol).
  *
  * Usage:
  *   const bot = new Bot(serverPort, "BotA");
@@ -132,7 +132,6 @@ class Bot {
     this.serverPort = serverPort;
     this.name = name;
     this._ws = null;
-    this._enemies = [];
     this._sentJoin = false;
     this._sentReady = false;
     this._inGame = false;
@@ -174,12 +173,10 @@ class Bot {
         break;
       case 0x11: // game_start
         this._inGame = true;
+        this._sendCombo();
         break;
-      case 0x12: // game_state
-        this._onGameState(payload);
-        break;
-      case 0x14: // your_turn
-        this._onYourTurn();
+      case 0x14: // round_reset — cast again each round
+        if (this._inGame) this._sendCombo();
         break;
       case 0x15: // game_over
         if (this._gameOverResolve) this._gameOverResolve();
@@ -189,41 +186,16 @@ class Bot {
 
   _onLobbyUpdate(payload) {
     if (this._inGame) return;
-    let off = 0;
     // join_code(6), player_count(1), player_id(1)
     const playerCount = payload[6];
     if (!this._sentJoin) {
       this._sendJoin();
-      this._sendClass(0); // fighter
       this._sentJoin = true;
     }
     if (!this._sentReady && playerCount >= 2) {
       this._sendReady();
       this._sentReady = true;
     }
-    void off; // suppress unused warning
-  }
-
-  _onGameState(payload) {
-    this._enemies = [];
-    let off = 5; // tick(4) + entity_count(1)
-    const count = payload[4];
-    for (let i = 0; i < count; i++) {
-      const entityId = payload.readUInt32LE(off); off += 4;
-      off += 2; // col, row
-      off += 4; // hp_current, hp_max
-      off += 4; // atb_gauge (f32)
-      off += 1; // action_state
-      off += 1; // class
-      const team = payload[off]; off += 1;
-      off += 1; // owner
-      if (team === 1) this._enemies.push(entityId); // enemies team = 1
-    }
-  }
-
-  _onYourTurn() {
-    const target = this._enemies[0] ?? 0;
-    this._sendAction(0, target); // attack
   }
 
   _sendJoin() {
@@ -235,20 +207,14 @@ class Bot {
     this._send(buf);
   }
 
-  _sendClass(classIdx) {
-    this._send(Buffer.from([0x02, classIdx]));
-  }
-
   _sendReady() {
     this._send(Buffer.from([0x03]));
   }
 
-  _sendAction(action, targetEntity) {
-    const buf = Buffer.allocUnsafe(6);
-    buf[0] = 0x04; // choose_action
-    buf[1] = action;
-    buf.writeUInt32LE(targetEntity, 2);
-    this._send(buf);
+  /** choose_combo: [fire, dispense, dispense] — twin_flames half. */
+  _sendCombo() {
+    // 0x07 tag, len=3, slots: element fire = 0x80|0, dispense = 0x00.
+    this._send(Buffer.from([0x07, 0x03, 0x80, 0x00, 0x00]));
   }
 }
 
@@ -369,10 +335,8 @@ exports.waitForFramePhase = async function waitForFramePhase(collector, phase, t
 // Frame content assertions
 // ---------------------------------------------------------------------------
 
-const KNOWN_CLASSES = new Set(["fighter", "mage", "healer", "grunt", "archer", "shaman", "boss"]);
-const KNOWN_TEAMS = new Set(["players", "enemies"]);
 // Entity `kind` values as emitted by the Zig client (EntityKind tag names).
-const KNOWN_KINDS = new Set(["player", "grunt", "archer", "shaman", "boss"]);
+const KNOWN_KINDS = new Set(["player"]);
 
 /**
  * Assert that a render frame in lobby phase has well-formed lobby fields.
@@ -387,17 +351,14 @@ exports.assertLobbyFrame = function assertLobbyFrame(frame) {
     throw new Error(`assertLobbyFrame: join_code not a string: ${JSON.stringify(L.join_code)}`);
   if (!Array.isArray(L.players))
     throw new Error("assertLobbyFrame: players is not an array");
-  if (!KNOWN_CLASSES.has(L.selected_class))
-    throw new Error(`assertLobbyFrame: unknown selected_class: ${L.selected_class}`);
   if (typeof L.ready !== "boolean")
     throw new Error(`assertLobbyFrame: ready not boolean: ${L.ready}`);
 };
 
 /**
- * Assert that a render frame in game phase has well-formed game fields,
- * matching the schema emitted by src/client/stdout_writer.zig (JsonGame /
- * JsonEntity).  Entities carry {id, kind, team, owner, ...} — no positions or
- * per-entity hp (the renderer lays them out itself; team hp is aggregate).
+ * Assert that a render frame in game phase has well-formed Slime Feast game
+ * fields, matching the schema emitted by src/client/stdout_writer.zig
+ * (JsonGame / JsonEntity / JsonHunger / JsonZone).
  * Throws with a descriptive message if anything is wrong.
  */
 exports.assertGameFrame = function assertGameFrame(frame) {
@@ -410,18 +371,24 @@ exports.assertGameFrame = function assertGameFrame(frame) {
   for (const e of G.entities) {
     if (typeof e.id !== "number")
       throw new Error(`assertGameFrame: entity.id not a number: ${JSON.stringify(e)}`);
-    if (!KNOWN_TEAMS.has(e.team))
-      throw new Error(`assertGameFrame: unknown team: ${e.team}`);
     if (!KNOWN_KINDS.has(e.kind))
       throw new Error(`assertGameFrame: unknown kind: ${e.kind}`);
   }
-  // Aggregate team summaries carry hp.
-  if (!G.players || typeof G.players.hp_current !== "number" || typeof G.players.hp_max !== "number")
-    throw new Error(`assertGameFrame: players summary missing hp fields: ${JSON.stringify(G.players)}`);
-  if (!G.enemies || typeof G.enemies.hp_current !== "number" || typeof G.enemies.hp_max !== "number")
-    throw new Error(`assertGameFrame: enemies summary missing hp fields: ${JSON.stringify(G.enemies)}`);
-  const hasPlayers = G.entities.some((e) => e.team === "players");
-  const hasEnemies = G.entities.some((e) => e.team === "enemies");
-  if (!hasPlayers) throw new Error("assertGameFrame: no player-team entities");
-  if (!hasEnemies) throw new Error("assertGameFrame: no enemy-team entities");
+  // Hunger bar summary.
+  if (!G.hunger || typeof G.hunger.current !== "number" || typeof G.hunger.max !== "number" ||
+      typeof G.hunger.healable !== "number")
+    throw new Error(`assertGameFrame: hunger summary malformed: ${JSON.stringify(G.hunger)}`);
+  // Shared score + zone data.
+  if (typeof G.score !== "number")
+    throw new Error(`assertGameFrame: score not a number: ${G.score}`);
+  if (typeof G.zone_index !== "number")
+    throw new Error(`assertGameFrame: zone_index not a number: ${G.zone_index}`);
+  if (!Array.isArray(G.zones) || G.zones.length === 0)
+    throw new Error("assertGameFrame: zones is empty or not an array");
+  for (const z of G.zones) {
+    for (const key of ["fire", "earth", "wind", "water", "neutral"]) {
+      if (typeof z[key] !== "number")
+        throw new Error(`assertGameFrame: zone.${key} not a number: ${JSON.stringify(z)}`);
+    }
+  }
 };

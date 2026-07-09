@@ -14,8 +14,7 @@
 #
 # After this script:
 #   1. Add the GitHub Actions public key to /home/deploy/.ssh/authorized_keys
-#   2. Copy waves.json to /opt/dragoncon/waves.json
-#   3. Once DNS is live: certbot --nginx -d <your-domain>
+#   2. Once DNS is live: certbot --nginx -d <your-domain>
 
 set -euo pipefail
 
@@ -38,11 +37,6 @@ fi
 
 mkdir -p /opt/dragoncon/bridge /var/www/dragoncon
 chown -R dragoncon:dragoncon /opt/dragoncon
-
-# waves.json lives here; managed manually (not deployed by CI)
-touch /opt/dragoncon/waves.json
-chown dragoncon:dragoncon /opt/dragoncon/waves.json
-echo "NOTE: populate /opt/dragoncon/waves.json with your wave definitions"
 
 # ---------------------------------------------------------------------------
 # Deploy user — used by GitHub Actions (SCP + SSH)
@@ -161,9 +155,6 @@ echo "  1. echo '<your-pubkey>' >> /home/deploy/.ssh/authorized_keys"
 echo "     chown deploy:deploy /home/deploy/.ssh/authorized_keys"
 echo "     chmod 600 /home/deploy/.ssh/authorized_keys"
 echo ""
-echo "  2. cp waves.json /opt/dragoncon/waves.json"
-echo "     chown dragoncon:dragoncon /opt/dragoncon/waves.json"
-echo ""
-echo "  3. Add GitHub secrets: VPS_HOST, VPS_USER=deploy, VPS_SSH_KEY"
+echo "  2. Add GitHub secrets: VPS_HOST, VPS_USER=deploy, VPS_SSH_KEY"
 echo ""
 echo "  4. After DNS propagates: certbot --nginx -d <your-domain>"

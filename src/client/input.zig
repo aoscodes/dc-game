@@ -8,7 +8,6 @@ pub fn parse_key_name(name: []const u8) ?RawKey {
     if (std.mem.eql(u8, name, "Escape")) return .escape;
     if (std.mem.eql(u8, name, "1")) return .one;
     if (std.mem.eql(u8, name, "2")) return .two;
-    if (std.mem.eql(u8, name, "3")) return .three;
     if (std.mem.eql(u8, name, "q")) return .q;
     if (std.mem.eql(u8, name, "w")) return .w;
     if (std.mem.eql(u8, name, "e")) return .e;
@@ -17,7 +16,7 @@ pub fn parse_key_name(name: []const u8) ?RawKey {
     return null;
 }
 
-pub const RawKey = enum { enter, escape, one, two, three, q, w, e, r };
+pub const RawKey = enum { enter, escape, one, two, q, w, e, r };
 
 pub const KeyQueue = struct {
     buf: [64]RawKey = undefined,
@@ -61,7 +60,7 @@ pub const ComboBuffer = struct {
 
     pub fn to_combo(self: *const ComboBuffer) c.ActionCombo {
         var out = c.ActionCombo{
-            .slots = [_]ComboSlot{.{ .action = .damage }} ** c.MAX_COMBO_LEN,
+            .slots = [_]ComboSlot{.{ .action = .dispense }} ** c.MAX_COMBO_LEN,
             .len = self.len,
         };
         @memcpy(out.slots[0..self.len], self.slots[0..self.len]);
@@ -80,17 +79,16 @@ pub fn drain_into_combo(queue: *KeyQueue, combo: *ComboBuffer) DrainResult {
     while (queue.pop()) |key| {
         switch (key) {
             .escape => return .cancelled,
-            // Action keys: 1=damage  2=shield  3=heal
-            .one, .two, .three => {
+            // Action keys: 1=dispense  2=medicine
+            .one, .two => {
                 const action: c.ActionChoice = switch (key) {
-                    .one => .damage,
-                    .two => .shield,
-                    .three => .heal,
+                    .one => .dispense,
+                    .two => .medicine,
                     else => unreachable,
                 };
                 if (combo.push(.{ .action = action })) result = .appended;
             },
-            // Element keys: Q=fire  W=earth  E=wind  R=water
+            // Agent color keys: Q=fire  W=earth  E=wind  R=water
             .q, .w, .e, .r => {
                 const element: c.Element = switch (key) {
                     .q => .fire,

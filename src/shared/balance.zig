@@ -1,135 +1,118 @@
+//! Tuning tables for the Slime Feast encounter.
+//!
+//! Everything gameplay-numeric lives here so designers can tune without
+//! touching resolution logic:
+//!   - flat per-slot conversion rates (non-recipe combos)
+//!   - hunger costs for neutral vs modified slime
+//!   - hard-coded recipe tables (player + team)
+//!
+//! ## Recipes
+//!
+//! A recipe is an *exact* combo pattern (same slots, same order, same
+//! length).  When a submitted combo matches a recipe, the recipe's
+//! AgentOutput REPLACES the combo's flat conversion.
+//!
+//! Team recipes match sets of combos cast by distinct players in the same
+//! round.  They are checked first, greedily, in table order; each player's
+//! combo can be consumed by at most one recipe per round.  A team recipe may
+//! fire multiple times per round if several disjoint player groups match.
+//! Player recipes are checked next, then any unmatched combo falls back to
+//! flat conversion (see game_logic.flat_convert).
+
 const c = @import("components.zig");
 
-pub const ActionValues = struct {
-    damage: u16,
-    shield: u16,
-    heal: u16,
-    dot_tick: u16,
-};
+// ---------------------------------------------------------------------------
+// Flat conversion + hunger costs — TODO tune (arbitrary starting values)
+// ---------------------------------------------------------------------------
 
-pub const basic = ActionValues{
-    .damage = 1,
-    .shield = 1,
-    .heal = 1,
-    .dot_tick = 1,
-};
+/// Spells (combos) each player may commit per round.  The cast window is
+/// round_duration / CASTS_PER_ROUND; the pending combo commits when the
+/// window closes.
+pub const CASTS_PER_ROUND: u8 = 3;
 
-pub const TriggerKind = enum { dot, cleanse };
+/// Agent units released per elemental dispense slot in a non-recipe combo.
+pub const UNITS_PER_SLOT: u32 = 5;
+/// Medicine contributed per elemental medicine slot in a non-recipe combo.
+/// Medicine carries the combo's current element; colorless slots are wasted.
+pub const MEDICINE_PER_SLOT: u32 = 3;
+/// Hunger cost per slime unit consumed (any unit — never healable).
+pub const HUNGER_COST_NORMAL: u32 = 1;
+/// EXTRA hunger per un-neutralized modified unit consumed (healable portion).
+pub const HUNGER_COST_MODIFIED_EXTRA: u32 = 2;
 
-pub const ComboTrigger = struct {
-    kind: TriggerKind,
-    damage: u8,
-    shield: u8,
-    heal: u8,
-    withheld_damage: bool,
-    withheld_shield: bool,
-    withheld_heal: bool,
-    dot_stacks_base: u16,
-    cleanse_stacks_removed: u16,
-};
+// ---------------------------------------------------------------------------
+// Recipes
+// ---------------------------------------------------------------------------
 
-pub const combo_triggers = [_]ComboTrigger{
-    .{
-        .kind = .dot,
-        .damage = 1,
-        .shield = 0,
-        .heal = 1,
-        .withheld_damage = true,
-        .withheld_shield = false,
-        .withheld_heal = true,
-        .dot_stacks_base = 1,
-        .cleanse_stacks_removed = 0,
-    },
-    .{
-        .kind = .cleanse,
-        .damage = 0,
-        .shield = 1,
-        .heal = 1,
-        .withheld_damage = false,
-        .withheld_shield = true,
-        .withheld_heal = true,
-        .dot_stacks_base = 0,
-        .cleanse_stacks_removed = 1,
-    },
-};
-
-pub const EnemyPattern = struct {
+pub const PlayerRecipe = struct {
     label: []const u8,
-    slots: [c.MAX_COMBO_LEN]c.ComboSlot,
-    len: u8,
-};
-pub const enemy_patterns = [_]EnemyPattern{
-    .{
-        .label = "fire_dot",
-        .slots = .{
-            .{ .element = .fire },
-            .{ .action = .damage },
-            .{ .action = .heal },
-            .{ .action = .damage },
-        },
-        .len = 3,
-    },
-    .{
-        .label = "fire_cleanse",
-        .slots = .{
-            .{ .element = .fire },
-            .{ .action = .heal },
-            .{ .action = .shield },
-            .{ .action = .damage },
-        },
-        .len = 3,
-    },
-    .{
-        .label = "fire_attack",
-        .slots = .{
-            .{ .element = .fire },
-            .{ .action = .damage },
-            .{ .action = .damage },
-            .{ .action = .damage },
-        },
-        .len = 3,
-    },
-    .{
-        .label = "big_heal",
-        .slots = .{
-            .{ .element = .wind },
-            .{ .action = .heal },
-            .{ .action = .heal },
-            .{ .action = .heal },
-        },
-        .len = 3,
-    },
+    pattern: c.ActionCombo,
+    output: c.AgentOutput,
 };
 
-pub const enemy_sequences = [c.Element.size][]const u8{
-    &[_]u8{ 0, 1, 2, 3 },
-    &[_]u8{0},
-    &[_]u8{0},
-    &[_]u8{0},
+/// `patterns` — one exact combo per participating player (distinct players).
+pub const TeamRecipe = struct {
+    label: []const u8,
+    patterns: []const c.ActionCombo,
+    output: c.AgentOutput,
 };
 
-pub const FormulaCtx = struct {
-    base: u16,
-    attack: u16,
-    shield_stat: u16,
-    heal_stat: u16,
-    element_stat: u16,
-    level: u16,
+const mk = c.make_combo;
+
+// Starter recipe set — TODO tune with playtesting.
+pub const player_recipes = [_]PlayerRecipe{
+    // Mono-color burst: beats flat conversion (3 slots × 5 = 15 → 20).
+    .{
+        .label = "crimson_flood",
+        .pattern = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        .output = .{ .units = .{ 20, 0, 0, 0 } },
+    },
+    .{
+        .label = "verdant_flood",
+        .pattern = mk(&.{ .{ .element = .earth }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        .output = .{ .units = .{ 0, 20, 0, 0 } },
+    },
+    .{
+        .label = "gale_flood",
+        .pattern = mk(&.{ .{ .element = .wind }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        .output = .{ .units = .{ 0, 0, 20, 0 } },
+    },
+    .{
+        .label = "tide_flood",
+        .pattern = mk(&.{ .{ .element = .water }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        .output = .{ .units = .{ 0, 0, 0, 20 } },
+    },
+    // Multi-color mist: covers every color at once.
+    .{
+        .label = "prism_mist",
+        .pattern = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .element = .water }, .{ .action = .dispense } }),
+        .output = .{ .units = .{ 6, 6, 6, 6 } },
+    },
+    // Concentrated water medicine: beats flat conversion (2 slots × 3 = 6 → 10).
+    .{
+        .label = "panacea",
+        .pattern = mk(&.{ .{ .element = .water }, .{ .action = .medicine }, .{ .action = .medicine } }),
+        .output = .{ .medicine = .{ 0, 0, 0, 10 } },
+    },
 };
 
-pub fn scale_damage(ctx: FormulaCtx) u16 {
-    return ctx.base * @max(1, ctx.attack);
-}
-
-pub fn scale_shield(ctx: FormulaCtx) u16 {
-    return ctx.base * @max(1, ctx.shield_stat);
-}
-
-pub fn scale_heal(ctx: FormulaCtx) u16 {
-    return ctx.base * @max(1, ctx.heal_stat);
-}
-
-pub fn scale_dot_stacks(ctx: FormulaCtx) u16 {
-    _ = ctx.element_stat; // available for future formulas
-    return ctx.base * @max(1, ctx.attack);
-}
+pub const team_recipes = [_]TeamRecipe{
+    // Two players each cast [fire, dispense, dispense] in the same round.
+    .{
+        .label = "twin_flames",
+        .patterns = &.{
+            mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } }),
+            mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        },
+        .output = .{ .units = .{ 30, 0, 0, 0 }, .medicine = .{ 2, 0, 0, 0 } },
+    },
+    // One dispenses water, one dispenses earth — combined downpour.
+    .{
+        .label = "mudslide",
+        .patterns = &.{
+            mk(&.{ .{ .element = .water }, .{ .action = .dispense }, .{ .action = .dispense } }),
+            mk(&.{ .{ .element = .earth }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        },
+        .output = .{ .units = .{ 0, 18, 0, 18 } },
+    },
+};

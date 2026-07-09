@@ -22,3 +22,13 @@ pub const tracking_allocator = @import("tracking_allocator.zig");
 // Re-export the most-used types at module level for convenience.
 pub const Profiler = profiler.Profiler;
 pub const TrackingAllocator = tracking_allocator.TrackingAllocator;
+
+// Pull every sub-module's tests into `zig build debug-test` so they can't
+// rot silently (unreferenced files are never semantically analysed).
+test {
+    _ = profiler;
+    _ = inspector;
+    _ = snapshot;
+    _ = replay;
+    _ = tracking_allocator;
+}

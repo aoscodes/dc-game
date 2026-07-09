@@ -5,22 +5,28 @@
 //! Neither client nor server may define additional game-state components
 //! outside this file.
 //!
+//! ## Slime Feast model
+//!
+//! Players support a horde of cosmetic "Lil Guys" that devour a slime field
+//! split into zones.  Each round the current zone is consumed in its
+//! entirety.  Modified Slime (colored, per-Element) costs extra hunger
+//! unless players neutralize it first by dispensing matching-color
+//! Neutralizing Agents.  Medicine heals the hunger bar, but only the
+//! portion attributable to modified-slime consumption.
+//!
 //! ## Combo slot model
 //!
 //! A combo is a sequence of up to MAX_COMBO_LEN `ComboSlot` values.
-//! Each slot is either an `ActionChoice` (damage/shield/heal) or an
-//! `Element` modifier (fire/earth/wind/water).  An element token applies
-//! to all following action tokens until the next element token or end of
-//! combo.  Trailing element tokens with no following action are ignored
-//! during resolution.  See `game_logic.parse_combo` for the canonical
-//! interpretation.
+//! Each slot is either an `ActionChoice` (dispense/medicine) or an
+//! `Element` modifier (fire/earth/wind/water — the four agent colors).
+//! An element token applies to all following action tokens until the next
+//! element token or end of combo.  Trailing element tokens with no
+//! following action are ignored during resolution.  See
+//! `game_logic.parse_combo` for the canonical interpretation.
 //!
-//! ## Elemental shields
-//!
-//! Shield actions cancel matching-element damage actions within the same round.
-//! `ElementKey` and `element_key` index the 5-bucket tally arrays used during
-//! round resolution.  Shields do not persist between rounds; unused cancellation
-//! capacity is silently discarded.
+//! Exact combos may match hard-coded recipes (balance.player_recipes /
+//! balance.team_recipes) which *replace* the combo's flat per-slot
+//! conversion with a tuned AgentOutput.
 
 const std = @import("std");
 
@@ -29,12 +35,11 @@ pub const Health = struct {
     max: u16,
 };
 
+/// Kind of entity on the wire.  Only players exist server-side; the browser
+/// renders cosmetic Lil Guys/slime itself.  Extend when new server-side
+/// entity kinds appear.
 pub const EntityKind = enum(u8) {
     player = 0,
-    grunt = 1,
-    archer = 2,
-    shaman = 3,
-    boss = 4,
 };
 
 pub const Kind = struct {
@@ -53,36 +58,30 @@ pub const Statblock = struct {
     level: u16,
 };
 
-pub const TeamId = enum(u8) {
-    players = 0,
-    enemies = 1,
-};
-
-pub const Team = struct {
-    id: TeamId,
-};
-
-/// Zero-size marker component. Present only on player-team entities.
-/// Distinguishes the PlayerTeam system signature from EnemyTeam.
+/// Zero-size marker component. Present on every player entity; drives the
+/// PlayerTeam system signature.
 pub const PlayerMarker = struct {};
-
-/// Zero-size marker component. Present only on enemy-team entities.
-/// Distinguishes the EnemyTeam system signature from PlayerTeam.
-pub const EnemyMarker = struct {};
 
 pub const Owner = struct {
     player_id: u8,
 };
 
+/// Player actions:
+///   dispense — release Neutralizing Agent units of the current combo element
+///              (agent color) onto the current round's zone.
+///   medicine — contribute to the round's medicine pool OF THE CURRENT combo
+///              element.  Medicine is symmetrical: color-X medicine heals
+///              only the hunger caused by eating un-neutralized color-X
+///              Modified Slime.  Colorless medicine is wasted.
 pub const ActionChoice = enum(u8) {
-    damage = 0,
-    shield = 1,
-    heal = 2,
+    dispense = 0,
+    medicine = 1,
 
     pub const size = @typeInfo(ActionChoice).@"enum".fields.len;
 };
 
-/// Elemental modifier applied to following action slots in a combo.
+/// Agent color / Modified Slime type.  Reskinned elements: the color of a
+/// slime communicates which Neutralizing Agent it requires.
 pub const Element = enum(u8) {
     fire = 0,
     earth = 1,
@@ -92,40 +91,63 @@ pub const Element = enum(u8) {
     pub const size = @typeInfo(Element).@"enum".fields.len;
 };
 
-/// Array index for elemental shield buckets.  `none` covers non-elemental
-/// actions; the four element variants map 1-to-1 from `Element` ordinal + 1.
-pub const ElementKey = enum(u8) {
-    none = 0,
-    fire = 1,
-    earth = 2,
-    wind = 3,
-    water = 4,
-
-    pub const size = @typeInfo(ElementKey).@"enum".fields.len;
-};
-
-/// Map an optional Element to the corresponding ElementKey bucket index.
-pub fn element_key(e: ?Element) ElementKey {
-    return if (e) |el| @enumFromInt(@intFromEnum(el) + 1) else .none;
-}
-
 /// One slot in a combo: either an action or an element modifier.
-/// Wire encoding: action = raw ActionChoice value (0x00–0x02);
+/// Wire encoding: action = raw ActionChoice value (0x00–0x01);
 ///                element = 0x80 | raw Element value (0x80–0x83).
 pub const ComboSlot = union(enum) {
     action: ActionChoice,
     element: Element,
 };
 
-pub const MAX_COMBO_LEN: u8 = 4;
+pub const MAX_COMBO_LEN: u8 = 5;
 
 /// An ordered sequence of 1–MAX_COMBO_LEN combo slots submitted by a player
-/// for one round.  Slots are action tokens (damage/shield/heal) optionally
+/// for one round.  Slots are action tokens (dispense/medicine) optionally
 /// preceded by element modifier tokens.  See `game_logic.parse_combo` for
 /// the resolution rules.
 pub const ActionCombo = struct {
     slots: [MAX_COMBO_LEN]ComboSlot,
     len: u8, // 1..MAX_COMBO_LEN
+};
+
+/// Build an ActionCombo from a slice of slots (must be 1..MAX_COMBO_LEN).
+/// Unused trailing slots are padded with a harmless dispense action.
+pub fn make_combo(slots: []const ComboSlot) ActionCombo {
+    std.debug.assert(slots.len >= 1 and slots.len <= MAX_COMBO_LEN);
+    var combo = ActionCombo{
+        .slots = [_]ComboSlot{.{ .action = .dispense }} ** MAX_COMBO_LEN,
+        .len = @intCast(slots.len),
+    };
+    @memcpy(combo.slots[0..slots.len], slots);
+    return combo;
+}
+
+/// One zone of the slime field.  `modified[e]` = units of Modified Slime of
+/// color `e` (Element ordinal); `neutral` = units of naturally-neutral slime.
+/// The entire zone is consumed at the end of its round.
+pub const ZoneDef = struct {
+    modified: [Element.size]u16 = [_]u16{0} ** Element.size,
+    neutral: u16 = 0,
+
+    pub fn total_units(self: ZoneDef) u32 {
+        var total: u32 = self.neutral;
+        for (self.modified) |m| total += m;
+        return total;
+    }
+};
+
+/// Result of converting one round's combos: Neutralizing Agent units and
+/// medicine pools, both per color.  Color-X medicine heals only the healable
+/// hunger caused by color-X modified slime (symmetrical healing).  Produced
+/// per-combo (flat conversion or recipe output) and summed across the team.
+pub const AgentOutput = struct {
+    units: [Element.size]u32 = [_]u32{0} ** Element.size,
+    medicine: [Element.size]u32 = [_]u32{0} ** Element.size,
+
+    pub fn add(self: *AgentOutput, other: AgentOutput) void {
+        for (&self.units, other.units) |*u, o| u.* +|= o;
+        for (&self.medicine, other.medicine) |*m, o| m.* +|= o;
+    }
 };
 
 /// Animation to play on an entity, signalled by the server via action_result

@@ -1,5 +1,6 @@
 //! End-to-end test: spawn a real server, connect two bot clients over
-//! WebSocket, play through wave_01_basic, assert players win.
+//! WebSocket, play through the default Slime Feast encounter, assert the
+//! game ends with a positive shared score.
 //!
 //! Run with:  zig build e2e
 //!
@@ -10,6 +11,7 @@ const std = @import("std");
 const ws = @import("websocket");
 const shared = @import("shared");
 const proto = shared.protocol;
+const c = shared.components;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -18,6 +20,8 @@ const proto = shared.protocol;
 const PORT: u16 = 19001;
 const SERVER_STARTUP_TIMEOUT_MS: u64 = 3000;
 const BOT_TIMEOUT_MS: u32 = 30_000;
+/// Fast rounds so the encounter completes quickly.
+const ROUND_DURATION_S = "0.3";
 
 // ---------------------------------------------------------------------------
 // Bot result (written by bot thread, read by main after join)
@@ -26,8 +30,8 @@ const BOT_TIMEOUT_MS: u32 = 30_000;
 const BotResult = struct {
     err: ?anyerror = null,
     got_game_over: bool = false,
-    winner: proto.WinnerId = .enemies,
-    damage_count: u32 = 0,
+    score: u32 = 0,
+    hunger_events: u32 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -57,10 +61,13 @@ pub fn main() !void {
     std.debug.print("[e2e] server binary: {s}\n", .{server_path});
 
     // ---- Kill any stale server on the test port ----------------------------
-    _ = std.process.Child.run(.{
+    if (std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "pkill", "-f", "server" },
-    }) catch {};
+    })) |res| {
+        allocator.free(res.stdout);
+        allocator.free(res.stderr);
+    } else |_| {}
     std.Thread.sleep(100 * std.time.ns_per_ms);
 
     // ---- Spawn server -------------------------------------------------------
@@ -68,7 +75,7 @@ pub fn main() !void {
     defer allocator.free(port_str);
 
     var server_child = std.process.Child.init(
-        &.{ server_path, port_str },
+        &.{ server_path, port_str, "--round-duration", ROUND_DURATION_S },
         allocator,
     );
     server_child.stdout_behavior = .Ignore;
@@ -108,20 +115,18 @@ pub fn main() !void {
             failed = true;
             continue;
         }
-        if (ctx.result.winner != .players) {
-            std.debug.print("[e2e] FAIL {s}: winner={s}, want players\n", .{
-                ctx.name, @tagName(ctx.result.winner),
-            });
+        if (ctx.result.score == 0) {
+            std.debug.print("[e2e] FAIL {s}: final score is 0, want > 0\n", .{ctx.name});
             failed = true;
             continue;
         }
-        if (ctx.result.damage_count == 0) {
-            std.debug.print("[e2e] FAIL {s}: no damage action_results seen\n", .{ctx.name});
+        if (ctx.result.hunger_events == 0) {
+            std.debug.print("[e2e] FAIL {s}: no hunger action_results seen\n", .{ctx.name});
             failed = true;
             continue;
         }
-        std.debug.print("[e2e] OK   {s}: players win, {} damage events\n", .{
-            ctx.name, ctx.result.damage_count,
+        std.debug.print("[e2e] OK   {s}: score={}, {} hunger events\n", .{
+            ctx.name, ctx.result.score, ctx.result.hunger_events,
         });
     }
 
@@ -162,12 +167,10 @@ fn run_bot_inner(ctx: *BotCtx) !void {
     try client.readTimeout(BOT_TIMEOUT_MS);
 
     // ---- Message loop -------------------------------------------------------
-    // Tracks the last known set of living enemy entity IDs from game_state.
-    var enemies: [64]u32 = undefined;
-    var enemy_count: usize = 0;
     var sent_join: bool = false;
     var sent_ready: bool = false;
     var in_game: bool = false;
+    var last_zone: u8 = 0xFF;
 
     while (true) {
         const msg = try client.read() orelse continue;
@@ -208,24 +211,18 @@ fn run_bot_inner(ctx: *BotCtx) !void {
             },
 
             .game_state => {
-                // Decode the entity snapshot and collect living enemy IDs.
                 var fbs = std.io.fixedBufferStream(payload);
                 const gs = proto.decode_game_state(fbs.reader()) catch continue;
-                enemy_count = 0;
-                var i: u8 = 0;
-                while (i < gs.entity_count) : (i += 1) {
-                    const e = &gs.entities[i];
-                    if (e.team == .enemies) {
-                        if (enemy_count < enemies.len) {
-                            enemies[enemy_count] = e.entity;
-                            enemy_count += 1;
-                        }
-                    }
-                }
-                // Bots always choose damage each round.
-                if (in_game and enemy_count > 0) {
-                    std.debug.print("[e2e] {s} submitting damage action\n", .{ctx.name});
-                    try send_choose_action(&client, .damage);
+                // Once per zone: both bots cast the twin_flames half so the
+                // team recipe fires and fire slime gets neutralized.
+                if (in_game and gs.zone_index != last_zone and gs.zone_index < gs.zone_count) {
+                    last_zone = gs.zone_index;
+                    std.debug.print("[e2e] {s} dispensing for zone {}\n", .{ ctx.name, gs.zone_index });
+                    try send_combo(&client, c.make_combo(&.{
+                        .{ .element = .fire },
+                        .{ .action = .dispense },
+                        .{ .action = .dispense },
+                    }));
                 }
             },
 
@@ -233,7 +230,7 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                 var fbs = std.io.fixedBufferStream(payload);
                 const ar = proto.decode_action_result(fbs.reader()) catch continue;
                 if (ar.tag == .damage) {
-                    ctx.result.damage_count += 1;
+                    ctx.result.hunger_events += 1;
                 }
             },
 
@@ -241,10 +238,8 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                 var fbs = std.io.fixedBufferStream(payload);
                 const go = proto.decode_game_over(fbs.reader()) catch continue;
                 ctx.result.got_game_over = true;
-                ctx.result.winner = go.winner;
-                std.debug.print("[e2e] {s} game_over: {s} win\n", .{
-                    ctx.name, @tagName(go.winner),
-                });
+                ctx.result.score = go.score;
+                std.debug.print("[e2e] {s} game_over: score={}\n", .{ ctx.name, go.score });
                 break;
             },
 
@@ -274,10 +269,10 @@ fn send_ready_up(client: *ws.Client) !void {
     try client.writeBin(fbs.getWritten());
 }
 
-fn send_choose_action(client: *ws.Client, action: shared.components.ActionChoice) !void {
-    var buf: [4]u8 = undefined;
+fn send_combo(client: *ws.Client, combo: c.ActionCombo) !void {
+    var buf: [16]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    try proto.encode(fbs.writer(), .choose_action, proto.ChooseAction{ .action = action });
+    try proto.encode(fbs.writer(), .choose_combo, proto.ChooseCombo{ .combo = combo });
     try client.writeBin(fbs.getWritten());
 }
 
