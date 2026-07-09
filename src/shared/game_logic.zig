@@ -428,16 +428,21 @@ test "match_recipes: non-recipe combo falls back to flat conversion" {
     try std.testing.expectEqual(balance.UNITS_PER_SLOT, out.units[@intFromEnum(c.Element.wind)]);
 }
 
+/// twin_flames (balance.team_recipes[0]) output, fire channel — tests derive
+/// expectations from the table so balance tuning can't break them.
+const twin_flames_units = balance.team_recipes[0].output.units[@intFromEnum(c.Element.fire)];
+const twin_flames_med = balance.team_recipes[0].output.medicine[@intFromEnum(c.Element.fire)];
+
 test "match_recipes: team recipe consumes both casts exactly once" {
-    // twin_flames: 2 × [fire, dispense, dispense] → 30 fire + 2 fire medicine.
+    // twin_flames: 2 × [fire, dispense, dispense] → one recipe output, once.
     const pat = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
     const casts = [_]Cast{
         .{ .player_id = 0, .combo = pat },
         .{ .player_id = 1, .combo = pat },
     };
     const out = match_recipes(&casts, null);
-    try std.testing.expectEqual(@as(u32, 30), out.units[@intFromEnum(c.Element.fire)]);
-    try std.testing.expectEqual(@as(u32, 2), out.medicine[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(twin_flames_units, out.units[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(twin_flames_med, out.medicine[@intFromEnum(c.Element.fire)]);
 }
 
 test "match_recipes: team recipe fires twice for two disjoint pairs" {
@@ -449,8 +454,8 @@ test "match_recipes: team recipe fires twice for two disjoint pairs" {
         .{ .player_id = 3, .combo = pat },
     };
     const out = match_recipes(&casts, null);
-    try std.testing.expectEqual(@as(u32, 60), out.units[@intFromEnum(c.Element.fire)]);
-    try std.testing.expectEqual(@as(u32, 4), out.medicine[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(2 * twin_flames_units, out.units[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(2 * twin_flames_med, out.medicine[@intFromEnum(c.Element.fire)]);
 }
 
 test "match_recipes: same player casting both halves does NOT fire team recipe" {
@@ -476,8 +481,8 @@ test "match_recipes: distinct-player pair still fires alongside same-player extr
         .{ .player_id = 1, .combo = pat },
     };
     const out = match_recipes(&casts, null);
-    try std.testing.expectEqual(30 + 2 * balance.UNITS_PER_SLOT, out.units[@intFromEnum(c.Element.fire)]);
-    try std.testing.expectEqual(@as(u32, 2), out.medicine[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(twin_flames_units + 2 * balance.UNITS_PER_SLOT, out.units[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(twin_flames_med, out.medicine[@intFromEnum(c.Element.fire)]);
 }
 
 test "match_recipes: lone half of a team recipe falls back to flat" {
@@ -500,7 +505,7 @@ test "match_recipes: mixed — team pair + independent flat combo" {
         .{ .player_id = 2, .combo = pat },
     };
     const out = match_recipes(&casts, null);
-    try std.testing.expectEqual(@as(u32, 30), out.units[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(twin_flames_units, out.units[@intFromEnum(c.Element.fire)]);
     try std.testing.expectEqual(balance.UNITS_PER_SLOT, out.units[@intFromEnum(c.Element.water)]);
 }
 
