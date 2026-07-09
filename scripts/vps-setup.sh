@@ -52,9 +52,8 @@ chown deploy:deploy /home/deploy/.ssh
 # Sudoers: deploy can install binaries, sync bridge files, restart services,
 # and run npm as the dragoncon user.
 cat > /etc/sudoers.d/deploy <<'EOF'
-# Server
+# Server binary (spawned per-lobby by the bridge; no standalone service)
 deploy ALL=(root) NOPASSWD: /usr/bin/install -o dragoncon -g dragoncon -m 755 /tmp/dragoncon-deploy/zig-out/bin/server /opt/dragoncon/server
-deploy ALL=(root) NOPASSWD: /bin/systemctl restart dragoncon-server
 
 # Client binary + Node bridge
 deploy ALL=(root) NOPASSWD: /usr/bin/install -o dragoncon -g dragoncon -m 755 /tmp/dragoncon-deploy/zig-out/bin/client /opt/dragoncon/client
@@ -68,35 +67,23 @@ echo "ACTION REQUIRED: add the GitHub Actions public key to /home/deploy/.ssh/au
 # ---------------------------------------------------------------------------
 # systemd units
 # ---------------------------------------------------------------------------
-cat > /etc/systemd/system/dragoncon-server.service <<'EOF'
-[Unit]
-Description=DragonCon Game Server
-After=network.target
-
-[Service]
-User=dragoncon
-ExecStart=/opt/dragoncon/server
-WorkingDirectory=/opt/dragoncon
-Restart=always
-RestartSec=5
-TimeoutStartSec=10
-
-[Install]
-WantedBy=multi-user.target
-EOF
+# Legacy: the standalone game-server service is gone — the bridge now spawns
+# a server process per lobby.  Remove the old unit if this is a re-run.
+if systemctl list-unit-files dragoncon-server.service &>/dev/null; then
+    systemctl disable --now dragoncon-server 2>/dev/null || true
+fi
+rm -f /etc/systemd/system/dragoncon-server.service
 
 cat > /etc/systemd/system/dragoncon-bridge.service <<'EOF'
 [Unit]
 Description=DragonCon Node Bridge
 After=network.target
-Wants=dragoncon-server.service
 
 [Service]
 User=dragoncon
 ExecStart=/usr/bin/node /opt/dragoncon/bridge/index.js
 WorkingDirectory=/opt/dragoncon
 Environment=PORT=3000
-Environment=SERVER_URL=ws://127.0.0.1:9001
 Restart=always
 RestartSec=5
 TimeoutStartSec=10
@@ -106,7 +93,7 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable dragoncon-server dragoncon-bridge
+systemctl enable dragoncon-bridge
 
 # ---------------------------------------------------------------------------
 # Nginx site config
@@ -129,6 +116,16 @@ server {
         # Keep long-lived WS connections alive through the proxy
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
+    }
+
+    # index.html must revalidate so the game.js?v=<sha> cache buster is seen
+    # on every deploy.  The versioned game.js itself can be cached forever.
+    location = /index.html {
+        add_header Cache-Control "no-cache";
+    }
+    location = / {
+        add_header Cache-Control "no-cache";
+        try_files /index.html =404;
     }
 
     # Static assets served directly from /var/www/dragoncon (deployed by CI)

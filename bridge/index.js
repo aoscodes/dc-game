@@ -50,10 +50,9 @@ const PORT        = parseInt(process.env.PORT || "3000", 10);
 // Locally: zig build puts the binaries at zig-out/bin/ (one level up from bridge/).
 // On the VPS: deploy installs them flat at /opt/dragoncon/ (same level as bridge/).
 const _binDir     = path.resolve(__dirname, "..");
-const _binDirFlat = __dirname;
 
 function resolveBin(name) {
-  const flat  = path.join(_binDirFlat, name);
+  const flat  = path.join(_binDir, name);
   const local = path.join(_binDir, "zig-out", "bin", name);
   return fs.existsSync(flat) ? flat : local;
 }
@@ -85,7 +84,9 @@ const MIME = {
 };
 
 const httpServer = http.createServer((req, res) => {
-  const urlPath  = req.url === "/" ? "/index.html" : req.url;
+  // Strip the query string (e.g. game.js?v=<sha> cache buster).
+  const rawPath  = req.url.split("?")[0];
+  const urlPath  = rawPath === "/" ? "/index.html" : rawPath;
   const filePath = path.join(WEB_DIR, path.normalize(urlPath));
 
   if (!filePath.startsWith(WEB_DIR)) {
@@ -184,7 +185,15 @@ function spawnLobbyServer(code, port) {
   });
 
   proc.on("error", (err) => {
+    // Spawn failure (e.g. ENOENT: binary missing) emits 'error' without 'exit',
+    // so clean up here and bounce affected tabs back to pre_lobby instead of
+    // leaving them stuck on the connecting screen forever.
     console.error(`[lobby] server proc error (${code}):`, err.message);
+    usedPorts.delete(port);
+    lobbyRegistry.delete(code);
+    for (const s of activeSessions) {
+      if (s.room && s.room.code === code) s.failToPreLobby("server_error");
+    }
   });
 
   proc.on("exit", (code_) => {
@@ -206,7 +215,7 @@ function roomTabLeft(room) {
     room.idleTimer = setTimeout(() => {
       if (room.tabCount === 0) {
         console.log(`[lobby] idle timeout — killing server for code=${room.code}`);
-        room.proc.kill();
+        if (room.proc.pid !== undefined) room.proc.kill();
         usedPorts.delete(room.port);
         lobbyRegistry.delete(room.code);
       }
@@ -319,8 +328,11 @@ class TabSession {
     this.zigWritable = true;
 
     proc.on("error", (err) => {
+      // Spawn failure (e.g. ENOENT: binary missing) emits 'error' without
+      // 'exit' — without handling, the tab hangs on "Connecting..." forever.
       console.error("[bridge] Zig spawn error:", err.message);
       this.zigWritable = false;
+      this.failToPreLobby("server_error");
     });
 
     proc.stdin.on("error", (err) => {
@@ -458,6 +470,42 @@ class TabSession {
     }
   }
 
+  /**
+   * Abort the current room attempt and return the tab to the pre_lobby
+   * screen with an error, so the user can retry without a page refresh.
+   * Unlike teardown(), the browser WebSocket stays open.
+   * @param {string} reason
+   */
+  failToPreLobby(reason) {
+    if (this.closed) return;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    if (this.zigProc) {
+      // Drop the 'exit' listener so killing it doesn't trigger a restart.
+      this.zigProc.removeAllListeners("exit");
+      // Only signal procs that actually spawned: pid is undefined when spawn
+      // failed (e.g. ENOENT), and calling kill() before the pending 'error'
+      // event fires wedges the node process.
+      if (this.zigProc.pid !== undefined) this.zigProc.kill();
+      this.zigProc = null;
+    }
+    this.zigWritable = false;
+    if (this.serverWs) {
+      // Drop the 'close' listener so closing doesn't trigger a reconnect.
+      this.serverWs.removeAllListeners("close");
+      this.serverWs.close();
+      this.serverWs = null;
+    }
+    this.serverConnected = false;
+    if (this.room) { roomTabLeft(this.room); this.room = null; }
+    this.started      = false;
+    this.pendingStats = null;
+    console.warn(`[bridge] tab bounced to pre_lobby (${reason})`);
+    this.sendPreLobbyError(reason);
+  }
+
   teardown() {
     if (this.closed) return;
     this.closed = true;
@@ -465,7 +513,12 @@ class TabSession {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    if (this.zigProc)  { this.zigProc.kill();   this.zigProc  = null; }
+    if (this.zigProc)  {
+      // pid is undefined when spawn failed; kill() before the pending
+      // 'error' event fires wedges the node process.
+      if (this.zigProc.pid !== undefined) this.zigProc.kill();
+      this.zigProc = null;
+    }
     if (this.serverWs) { this.serverWs.close(); this.serverWs = null; }
     if (this.room)     { roomTabLeft(this.room); this.room = null; }
     activeSessions.delete(this);

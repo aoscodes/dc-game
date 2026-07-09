@@ -65,7 +65,7 @@ SSH in as root and run the setup script:
 bash scripts/vps-setup.sh
 ```
 
-This installs Nginx and Node.js, creates a `dragoncon` service user, writes two systemd units (`dragoncon-server` and `dragoncon-bridge`), and configures Nginx to serve `web/` static files and proxy `/ws` to the bridge.
+This installs Nginx and Node.js, creates a `dragoncon` service user, writes the `dragoncon-bridge` systemd unit (the bridge spawns a game-server process per lobby), and configures Nginx to serve `web/` static files and proxy `/ws` to the bridge.
 
 After the script:
 
@@ -93,7 +93,7 @@ After the script:
 2. Builds `zig-out/bin/server` (`-Doptimize=ReleaseSafe`)
 3. Builds `zig-out/bin/client` (`-Doptimize=ReleaseSafe`) and bundles it with `bridge/`
 4. Browser e2e (Playwright, 14 tests) — deploy aborts if any fail
-5. SCPs server binary → VPS, restarts `dragoncon-server.service`
+5. SCPs server binary → VPS (no restart; new lobbies spawn the new binary)
 6. SCPs client binary + bridge → VPS, runs `npm ci`, restarts `dragoncon-bridge.service`
 7. SCPs `web/` static files → `/var/www/dragoncon/`
 

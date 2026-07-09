@@ -150,17 +150,18 @@ jobs:
           target: "/tmp/dragoncon-deploy/zig-out/bin/"
           strip_components: 1
 
-      - name: install binary and restart service
+      - name: install binary
         uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           script: |
+            # No service restart: the bridge spawns a server process per lobby,
+            # so new lobbies pick up the new binary automatically.
             sudo /usr/bin/install -o dragoncon -g dragoncon -m 755 \
               /tmp/dragoncon-deploy/zig-out/bin/server \
               /opt/dragoncon/server
-            sudo systemctl restart dragoncon-server
             rm -rf /tmp/dragoncon-deploy
 
   deploy-client:
@@ -206,6 +207,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: stamp cache buster with commit sha
+        run: sed -i "s/game\.js?v=dev/game.js?v=${GITHUB_SHA::12}/" web/index.html
 
       - name: scp static web assets to VPS
         uses: appleboy/scp-action@v1
