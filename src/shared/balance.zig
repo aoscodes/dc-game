@@ -104,7 +104,7 @@ pub const team_recipes = [_]TeamRecipe{
             mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } }),
             mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } }),
         },
-        .output = .{ .units = .{ 30, 0, 0, 0 }, .medicine = .{ 2, 0, 0, 0 } },
+        .output = .{ .units = .{ 30, 0, 0, 0 }, .medicine = .{ 20, 0, 0, 0 } },
     },
     // One dispenses water, one dispenses earth — combined downpour.
     .{
@@ -113,6 +113,6 @@ pub const team_recipes = [_]TeamRecipe{
             mk(&.{ .{ .element = .water }, .{ .action = .dispense }, .{ .action = .dispense } }),
             mk(&.{ .{ .element = .earth }, .{ .action = .dispense }, .{ .action = .dispense } }),
         },
-        .output = .{ .units = .{ 0, 18, 0, 18 } },
+        .output = .{ .units = .{ 0, 40, 0, 40 } },
     },
 };

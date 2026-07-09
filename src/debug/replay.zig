@@ -157,7 +157,11 @@ test "replay: record then play back" {
     gs1.score = 25;
     gs1.zone_index = 1;
     gs1.zone_count = 3;
-    gs1.zones[1] = .{ .modified = .{ 10, 0, 5, 0 }, .neutral = 15 };
+    gs1.zones[1] = .{
+        .modified = .{ 10, 0, 5, 0 },
+        .neutralized = .{ 4, 0, 0, 0 },
+        .neutral = 15,
+    };
     gs1.entities[0] = proto.EntitySnapshot.blank;
     gs1.entities[0].entity = 0;
     gs1.entities[0].kind = .player;

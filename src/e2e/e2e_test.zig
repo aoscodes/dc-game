@@ -32,6 +32,8 @@ const BotResult = struct {
     got_game_over: bool = false,
     score: u32 = 0,
     hunger_events: u32 = 0,
+    stats_rounds: u8 = 0,
+    stats_neutralized: u32 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -125,8 +127,16 @@ pub fn main() !void {
             failed = true;
             continue;
         }
-        std.debug.print("[e2e] OK   {s}: score={}, {} hunger events\n", .{
+        if (ctx.result.stats_rounds == 0 or ctx.result.stats_neutralized == 0) {
+            std.debug.print("[e2e] FAIL {s}: empty match stats (rounds={}, neutralized={})\n", .{
+                ctx.name, ctx.result.stats_rounds, ctx.result.stats_neutralized,
+            });
+            failed = true;
+            continue;
+        }
+        std.debug.print("[e2e] OK   {s}: score={}, {} hunger events, {} rounds, {} neutralized\n", .{
             ctx.name, ctx.result.score, ctx.result.hunger_events,
+            ctx.result.stats_rounds, ctx.result.stats_neutralized,
         });
     }
 
@@ -239,7 +249,13 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                 const go = proto.decode_game_over(fbs.reader()) catch continue;
                 ctx.result.got_game_over = true;
                 ctx.result.score = go.score;
-                std.debug.print("[e2e] {s} game_over: score={}\n", .{ ctx.name, go.score });
+                ctx.result.stats_rounds = go.stats.rounds;
+                for (go.stats.round_stats[0..go.stats.rounds]) |rs| {
+                    for (rs.neutralized) |n| ctx.result.stats_neutralized += n;
+                }
+                std.debug.print("[e2e] {s} game_over: score={} reason={s} rounds={} neutralized={}\n", .{
+                    ctx.name, go.score, @tagName(go.stats.reason), go.stats.rounds, ctx.result.stats_neutralized,
+                });
                 break;
             },
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const components = @import("components.zig");
 const encounter = @import("encounter.zig");
+const balance = @import("balance.zig");
 
 pub const MsgTag = enum(u8) {
     join_lobby = 0x01,
@@ -20,6 +21,12 @@ pub const MsgTag = enum(u8) {
     /// A player's pending combo was committed as a spell (cast window closed).
     /// Payload: player_id.  The owning client clears its pending combo.
     cast_committed = 0x16,
+    /// A player's pending combo had zero possible output and was DISCARDED at
+    /// window close without consuming a cast.  Payload: player_id.
+    cast_fizzled = 0x17,
+    /// A recipe fired during a cast window.  Payload: kind (player/team) +
+    /// index into the corresponding balance recipe table.
+    recipe_fired = 0x18,
 };
 
 pub const JoinLobby = struct {
@@ -65,6 +72,34 @@ pub const CastCommitted = struct {
 
 pub fn decode_cast_committed(reader: anytype) !CastCommitted {
     return .{ .player_id = try reader.readByte() };
+}
+
+pub const CastFizzled = struct {
+    player_id: u8,
+};
+
+pub fn decode_cast_fizzled(reader: anytype) !CastFizzled {
+    return .{ .player_id = try reader.readByte() };
+}
+
+pub const RecipeKind = enum(u8) {
+    player = 0,
+    team = 1,
+};
+
+/// A recipe fired: `index` refers to the balance table for `kind`
+/// (player_recipes / team_recipes, table order — same convention as the
+/// match-stats hit arrays and the JS mirror tables).
+pub const RecipeFired = struct {
+    kind: RecipeKind,
+    index: u8,
+};
+
+pub fn decode_recipe_fired(reader: anytype) !RecipeFired {
+    const kind_byte = try reader.readByte();
+    const kind = std.meta.intToEnum(RecipeKind, kind_byte) catch
+        return DecodeError.InvalidRecipeKind;
+    return .{ .kind = kind, .index = try reader.readByte() };
 }
 
 pub const MAX_PLAYERS: u8 = 6;
@@ -121,13 +156,17 @@ pub const BarSummary = struct {
     max: u16,
 };
 
-/// Per-zone slime contents on the wire.  Consumed zones are all zeros.
+/// Per-zone slime contents on the wire.  `neutralized` = modified units
+/// transmuted by agents this round (per original color), consumed at round
+/// end.  Consumed zones are all zeros.
 pub const ZoneSnapshot = struct {
     modified: [components.Element.size]u16,
+    neutralized: [components.Element.size]u16,
     neutral: u16,
 
     pub const blank = ZoneSnapshot{
         .modified = [_]u16{0} ** components.Element.size,
+        .neutralized = [_]u16{0} ** components.Element.size,
         .neutral = 0,
     };
 };
@@ -173,10 +212,10 @@ pub const ActionResultTag = enum(u8) {
     damage = 0,
     /// Medicine healed the hunger bar (value = amount healed).
     heal = 1,
-    /// Slime neutralized this round (value = total units neutralized).
-    shield = 2,
+    // 0x02 was `shield` (units neutralized per round); retired — clients
+    // read transmutation live from zone snapshots instead.
     death = 4,
-    /// A player's combo fired at round resolution.  actor_entity = the
+    /// A player's spell committed (cast window closed).  actor_entity = the
     /// caster's entity; clients play the cast/attack animation on it.
     cast = 5,
 };
@@ -188,9 +227,71 @@ pub const ActionResult = struct {
     value: u16,
 };
 
+pub const EndReason = enum(u8) {
+    hunger_full = 0,
+    field_cleared = 1,
+};
+
+/// One resolved round's tuning numbers (all per-color arrays use Element
+/// ordinal order: fire, earth, wind, water).
+pub const RoundStats = struct {
+    /// Spells committed this round.
+    casts: u8 = 0,
+    /// Team agent output after recipe conversion.
+    agents_dispensed: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
+    medicine_dispensed: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
+    /// Actually healed; overheal = dispensed - healed (derived client-side).
+    medicine_healed: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
+    neutralized: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
+    /// Modified slime eaten un-neutralized.
+    modified_escaped: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
+    neutral_consumed: u16 = 0,
+    hunger_normal: u16 = 0,
+    hunger_extra: u16 = 0,
+    /// Hunger bar level after this round resolved.
+    hunger_after: u16 = 0,
+};
+
+/// Per-player tuning numbers.  Slot counts are RAW (pre-recipe) per-color
+/// counts from committed combos, so attribution is unambiguous.
+pub const PlayerStats = struct {
+    name: [16]u8 = [_]u8{0} ** 16,
+    name_len: u8 = 0,
+    casts: u16 = 0,
+    dispense_slots: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
+    medicine_slots: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
+    /// Casts consumed by any recipe (player or team).
+    recipe_casts: u16 = 0,
+    /// Zero-output combos discarded at window close (did not cost a cast).
+    fizzles: u16 = 0,
+};
+
+/// Full-match tuning report broadcast with game_over.  Rounds are bounded by
+/// MAX_ZONES (one zone per round).  Match totals are derived client-side by
+/// summing round_stats.
+pub const MatchStats = struct {
+    reason: EndReason = .field_cleared,
+    /// Rounds resolved; round_stats[0..rounds] are valid.
+    rounds: u8 = 0,
+    zone_count: u8 = 0,
+    hunger_final: u16 = 0,
+    hunger_max: u16 = 0,
+    round_stats: [encounter.MAX_ZONES]RoundStats = [_]RoundStats{.{}} ** encounter.MAX_ZONES,
+    player_count: u8 = 0,
+    players: [MAX_PLAYERS]PlayerStats = [_]PlayerStats{.{}} ** MAX_PLAYERS,
+    /// Fire counts per balance recipe table entry (table order — the JS
+    /// mirror in web/game.js resolves labels by index).
+    player_recipe_hits: [balance.player_recipes.len]u16 =
+        [_]u16{0} ** balance.player_recipes.len,
+    team_recipe_hits: [balance.team_recipes.len]u16 =
+        [_]u16{0} ** balance.team_recipes.len,
+    casts_total: u16 = 0,
+};
+
 pub const GameOver = struct {
     /// Final shared score: neutral slime units consumed.
     score: u32,
+    stats: MatchStats = .{},
 };
 
 pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
@@ -212,12 +313,20 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
         .cancel_combo => {},
         .round_reset => {},
         .cast_committed => try writer.writeByte(payload.player_id),
+        .cast_fizzled => try writer.writeByte(payload.player_id),
+        .recipe_fired => {
+            try writer.writeByte(@intFromEnum(payload.kind));
+            try writer.writeByte(payload.index);
+        },
 
         .lobby_update => try encode_lobby_update(writer, payload),
         .game_start => try encode_game_start(writer, payload),
         .game_state => try encode_game_state(writer, payload),
         .action_result => try encode_action_result(writer, payload),
-        .game_over => try writer.writeInt(u32, payload.score, .little),
+        .game_over => {
+            try writer.writeInt(u32, payload.score, .little);
+            try encode_match_stats(writer, payload.stats);
+        },
     }
 }
 
@@ -257,6 +366,7 @@ fn encode_bar_summary(w: anytype, s: BarSummary) !void {
 
 fn encode_zone_snapshot(w: anytype, z: ZoneSnapshot) !void {
     for (z.modified) |m| try w.writeInt(u16, m, .little);
+    for (z.neutralized) |n| try w.writeInt(u16, n, .little);
     try w.writeInt(u16, z.neutral, .little);
 }
 
@@ -287,6 +397,115 @@ fn encode_game_state(w: anytype, p: GameState) !void {
         try encode_zone_snapshot(w, p.zones[z]);
 }
 
+fn encode_u16_colors(w: anytype, values: [components.Element.size]u16) !void {
+    for (values) |v| try w.writeInt(u16, v, .little);
+}
+
+fn decode_u16_colors(r: anytype) ![components.Element.size]u16 {
+    var values: [components.Element.size]u16 = undefined;
+    for (&values) |*v| v.* = try r.readInt(u16, .little);
+    return values;
+}
+
+fn encode_round_stats(w: anytype, rs: RoundStats) !void {
+    try w.writeByte(rs.casts);
+    try encode_u16_colors(w, rs.agents_dispensed);
+    try encode_u16_colors(w, rs.medicine_dispensed);
+    try encode_u16_colors(w, rs.medicine_healed);
+    try encode_u16_colors(w, rs.neutralized);
+    try encode_u16_colors(w, rs.modified_escaped);
+    try w.writeInt(u16, rs.neutral_consumed, .little);
+    try w.writeInt(u16, rs.hunger_normal, .little);
+    try w.writeInt(u16, rs.hunger_extra, .little);
+    try w.writeInt(u16, rs.hunger_after, .little);
+}
+
+fn decode_round_stats(r: anytype) !RoundStats {
+    return .{
+        .casts = try r.readByte(),
+        .agents_dispensed = try decode_u16_colors(r),
+        .medicine_dispensed = try decode_u16_colors(r),
+        .medicine_healed = try decode_u16_colors(r),
+        .neutralized = try decode_u16_colors(r),
+        .modified_escaped = try decode_u16_colors(r),
+        .neutral_consumed = try r.readInt(u16, .little),
+        .hunger_normal = try r.readInt(u16, .little),
+        .hunger_extra = try r.readInt(u16, .little),
+        .hunger_after = try r.readInt(u16, .little),
+    };
+}
+
+fn encode_player_stats(w: anytype, ps: PlayerStats) !void {
+    try w.writeByte(ps.name_len);
+    try w.writeAll(ps.name[0..ps.name_len]);
+    try w.writeInt(u16, ps.casts, .little);
+    try encode_u16_colors(w, ps.dispense_slots);
+    try encode_u16_colors(w, ps.medicine_slots);
+    try w.writeInt(u16, ps.recipe_casts, .little);
+    try w.writeInt(u16, ps.fizzles, .little);
+}
+
+fn decode_player_stats(r: anytype) !PlayerStats {
+    var ps = PlayerStats{};
+    ps.name_len = try r.readByte();
+    if (ps.name_len > 16) return DecodeError.NameTooLong;
+    _ = try r.readAll(ps.name[0..ps.name_len]);
+    ps.casts = try r.readInt(u16, .little);
+    ps.dispense_slots = try decode_u16_colors(r);
+    ps.medicine_slots = try decode_u16_colors(r);
+    ps.recipe_casts = try r.readInt(u16, .little);
+    ps.fizzles = try r.readInt(u16, .little);
+    return ps;
+}
+
+fn encode_match_stats(w: anytype, ms: MatchStats) !void {
+    try w.writeByte(@intFromEnum(ms.reason));
+    try w.writeByte(ms.rounds);
+    try w.writeByte(ms.zone_count);
+    try w.writeInt(u16, ms.hunger_final, .little);
+    try w.writeInt(u16, ms.hunger_max, .little);
+    var i: u8 = 0;
+    while (i < ms.rounds) : (i += 1)
+        try encode_round_stats(w, ms.round_stats[i]);
+    try w.writeByte(ms.player_count);
+    i = 0;
+    while (i < ms.player_count) : (i += 1)
+        try encode_player_stats(w, ms.players[i]);
+    // Recipe hit arrays are length-prefixed so decoders can validate the
+    // balance tables have not drifted between builds.
+    try w.writeByte(@intCast(ms.player_recipe_hits.len));
+    for (ms.player_recipe_hits) |h| try w.writeInt(u16, h, .little);
+    try w.writeByte(@intCast(ms.team_recipe_hits.len));
+    for (ms.team_recipe_hits) |h| try w.writeInt(u16, h, .little);
+    try w.writeInt(u16, ms.casts_total, .little);
+}
+
+fn decode_match_stats(r: anytype) !MatchStats {
+    var ms = MatchStats{};
+    const reason_byte = try r.readByte();
+    ms.reason = std.meta.intToEnum(EndReason, reason_byte) catch
+        return DecodeError.InvalidEndReason;
+    ms.rounds = try r.readByte();
+    if (ms.rounds > encounter.MAX_ZONES) return DecodeError.TooManyZones;
+    ms.zone_count = try r.readByte();
+    ms.hunger_final = try r.readInt(u16, .little);
+    ms.hunger_max = try r.readInt(u16, .little);
+    var i: u8 = 0;
+    while (i < ms.rounds) : (i += 1)
+        ms.round_stats[i] = try decode_round_stats(r);
+    ms.player_count = try r.readByte();
+    if (ms.player_count > MAX_PLAYERS) return DecodeError.TooManyEntities;
+    i = 0;
+    while (i < ms.player_count) : (i += 1)
+        ms.players[i] = try decode_player_stats(r);
+    if ((try r.readByte()) != ms.player_recipe_hits.len) return DecodeError.RecipeTableMismatch;
+    for (&ms.player_recipe_hits) |*h| h.* = try r.readInt(u16, .little);
+    if ((try r.readByte()) != ms.team_recipe_hits.len) return DecodeError.RecipeTableMismatch;
+    for (&ms.team_recipe_hits) |*h| h.* = try r.readInt(u16, .little);
+    ms.casts_total = try r.readInt(u16, .little);
+    return ms;
+}
+
 fn encode_action_result(w: anytype, p: ActionResult) !void {
     try w.writeByte(@intFromEnum(p.tag));
     try w.writeInt(u32, p.actor_entity, .little);
@@ -304,6 +523,9 @@ pub const DecodeError = error{
     TooManyEntities,
     TooManyZones,
     InvalidComboLen,
+    InvalidEndReason,
+    RecipeTableMismatch,
+    InvalidRecipeKind,
 };
 
 pub fn read_tag(reader: anytype) !MsgTag {
@@ -413,6 +635,7 @@ fn decode_bar_summary(reader: anytype) !BarSummary {
 fn decode_zone_snapshot(reader: anytype) !ZoneSnapshot {
     var z = ZoneSnapshot.blank;
     for (&z.modified) |*m| m.* = try reader.readInt(u16, .little);
+    for (&z.neutralized) |*n| n.* = try reader.readInt(u16, .little);
     z.neutral = try reader.readInt(u16, .little);
     return z;
 }
@@ -469,7 +692,10 @@ pub fn decode_action_result(reader: anytype) !ActionResult {
 }
 
 pub fn decode_game_over(reader: anytype) !GameOver {
-    return .{ .score = try reader.readInt(u32, .little) };
+    return .{
+        .score = try reader.readInt(u32, .little),
+        .stats = try decode_match_stats(reader),
+    };
 }
 
 test "read_tag: retired choose_action byte (0x04) is UnknownTag" {
@@ -478,16 +704,65 @@ test "read_tag: retired choose_action byte (0x04) is UnknownTag" {
     try std.testing.expectError(DecodeError.UnknownTag, read_tag(fbs.reader()));
 }
 
-test "round-trip: game_over carries score" {
-    var buf: [8]u8 = undefined;
+test "round-trip: game_over carries score and match stats" {
+    var buf: [2048]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
 
-    try encode(fbs.writer(), .game_over, GameOver{ .score = 12345 });
+    var go = GameOver{ .score = 12345 };
+    go.stats.reason = .hunger_full;
+    go.stats.rounds = 2;
+    go.stats.zone_count = 3;
+    go.stats.hunger_final = 199;
+    go.stats.hunger_max = 200;
+    go.stats.round_stats[0] = .{
+        .casts = 4,
+        .agents_dispensed = .{ 30, 0, 5, 0 },
+        .medicine_dispensed = .{ 2, 0, 0, 10 },
+        .medicine_healed = .{ 2, 0, 0, 3 },
+        .neutralized = .{ 10, 0, 5, 0 },
+        .modified_escaped = .{ 0, 8, 0, 0 },
+        .neutral_consumed = 15,
+        .hunger_normal = 38,
+        .hunger_extra = 16,
+        .hunger_after = 49,
+    };
+    go.stats.round_stats[1] = .{ .casts = 1, .hunger_after = 99 };
+    go.stats.player_count = 2;
+    go.stats.players[0] = .{ .casts = 3, .dispense_slots = .{ 6, 0, 0, 0 }, .recipe_casts = 2, .fizzles = 1 };
+    @memcpy(go.stats.players[0].name[0..5], "Alice");
+    go.stats.players[0].name_len = 5;
+    go.stats.players[1] = .{ .casts = 2, .medicine_slots = .{ 0, 0, 0, 4 } };
+    go.stats.player_recipe_hits[0] = 1;
+    go.stats.team_recipe_hits[0] = 2;
+    go.stats.casts_total = 5;
+
+    try encode(fbs.writer(), .game_over, go);
     fbs.reset();
     const tag = try read_tag(fbs.reader());
     try std.testing.expectEqual(MsgTag.game_over, tag);
-    const decoded = try decode_game_over(fbs.reader());
-    try std.testing.expectEqual(@as(u32, 12345), decoded.score);
+    const d = try decode_game_over(fbs.reader());
+
+    try std.testing.expectEqual(@as(u32, 12345), d.score);
+    try std.testing.expectEqual(EndReason.hunger_full, d.stats.reason);
+    try std.testing.expectEqual(@as(u8, 2), d.stats.rounds);
+    try std.testing.expectEqual(@as(u8, 3), d.stats.zone_count);
+    try std.testing.expectEqual(@as(u16, 199), d.stats.hunger_final);
+    try std.testing.expectEqual(@as(u8, 4), d.stats.round_stats[0].casts);
+    try std.testing.expectEqual(@as(u16, 30), d.stats.round_stats[0].agents_dispensed[0]);
+    try std.testing.expectEqual(@as(u16, 3), d.stats.round_stats[0].medicine_healed[3]);
+    try std.testing.expectEqual(@as(u16, 8), d.stats.round_stats[0].modified_escaped[1]);
+    try std.testing.expectEqual(@as(u16, 15), d.stats.round_stats[0].neutral_consumed);
+    try std.testing.expectEqual(@as(u16, 99), d.stats.round_stats[1].hunger_after);
+    try std.testing.expectEqual(@as(u8, 2), d.stats.player_count);
+    try std.testing.expectEqualSlices(u8, "Alice", d.stats.players[0].name[0..d.stats.players[0].name_len]);
+    try std.testing.expectEqual(@as(u16, 3), d.stats.players[0].casts);
+    try std.testing.expectEqual(@as(u16, 6), d.stats.players[0].dispense_slots[0]);
+    try std.testing.expectEqual(@as(u16, 2), d.stats.players[0].recipe_casts);
+    try std.testing.expectEqual(@as(u16, 1), d.stats.players[0].fizzles);
+    try std.testing.expectEqual(@as(u16, 4), d.stats.players[1].medicine_slots[3]);
+    try std.testing.expectEqual(@as(u16, 1), d.stats.player_recipe_hits[0]);
+    try std.testing.expectEqual(@as(u16, 2), d.stats.team_recipe_hits[0]);
+    try std.testing.expectEqual(@as(u16, 5), d.stats.casts_total);
 }
 
 test "round-trip: join_lobby" {
@@ -521,8 +796,8 @@ test "round-trip: game_state — hunger, score, zones, and combo survive" {
     gs.zone_index = 1;
     gs.zone_count = 3;
     gs.zones[0] = ZoneSnapshot.blank; // consumed
-    gs.zones[1] = .{ .modified = .{ 10, 0, 5, 0 }, .neutral = 15 };
-    gs.zones[2] = .{ .modified = .{ 0, 20, 0, 8 }, .neutral = 5 };
+    gs.zones[1] = .{ .modified = .{ 10, 0, 5, 0 }, .neutralized = .{ 4, 0, 0, 0 }, .neutral = 15 };
+    gs.zones[2] = .{ .modified = .{ 0, 20, 0, 8 }, .neutralized = [_]u16{0} ** 4, .neutral = 5 };
     gs.entities[0] = EntitySnapshot{
         .entity = 7,
         .kind = .player,
@@ -557,6 +832,7 @@ test "round-trip: game_state — hunger, score, zones, and combo survive" {
     try std.testing.expectEqual(@as(u8, 1), decoded.zone_index);
     try std.testing.expectEqual(@as(u8, 3), decoded.zone_count);
     try std.testing.expectEqual(@as(u16, 10), decoded.zones[1].modified[0]);
+    try std.testing.expectEqual(@as(u16, 4), decoded.zones[1].neutralized[0]);
     try std.testing.expectEqual(@as(u16, 15), decoded.zones[1].neutral);
     try std.testing.expectEqual(@as(u16, 8), decoded.zones[2].modified[3]);
     try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].combo_len);
@@ -737,6 +1013,29 @@ test "round-trip: cast_committed carries player_id" {
     try std.testing.expectEqual(MsgTag.cast_committed, tag);
     const decoded = try decode_cast_committed(fbs.reader());
     try std.testing.expectEqual(@as(u8, 3), decoded.player_id);
+}
+
+test "round-trip: cast_fizzled carries player_id" {
+    var buf: [4]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try encode(fbs.writer(), .cast_fizzled, CastFizzled{ .player_id = 4 });
+    fbs.reset();
+    const tag = try read_tag(fbs.reader());
+    try std.testing.expectEqual(MsgTag.cast_fizzled, tag);
+    const decoded = try decode_cast_fizzled(fbs.reader());
+    try std.testing.expectEqual(@as(u8, 4), decoded.player_id);
+}
+
+test "round-trip: recipe_fired carries kind and table index" {
+    var buf: [4]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try encode(fbs.writer(), .recipe_fired, RecipeFired{ .kind = .team, .index = 1 });
+    fbs.reset();
+    const tag = try read_tag(fbs.reader());
+    try std.testing.expectEqual(MsgTag.recipe_fired, tag);
+    const decoded = try decode_recipe_fired(fbs.reader());
+    try std.testing.expectEqual(RecipeKind.team, decoded.kind);
+    try std.testing.expectEqual(@as(u8, 1), decoded.index);
 }
 
 test "round-trip: action_result cast tag carries actor entity" {

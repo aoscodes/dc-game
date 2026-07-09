@@ -123,15 +123,20 @@ pub fn make_combo(slots: []const ComboSlot) ActionCombo {
 }
 
 /// One zone of the slime field.  `modified[e]` = units of Modified Slime of
-/// color `e` (Element ordinal); `neutral` = units of naturally-neutral slime.
-/// The entire zone is consumed at the end of its round.
+/// color `e` (Element ordinal); `neutralized[e]` = modified units transmuted
+/// by Neutralizing Agents (tracked per original color, consumed at normal
+/// cost); `neutral` = units of naturally-neutral slime.  Transmutation
+/// happens per cast window; the entire zone is consumed at the end of its
+/// round.
 pub const ZoneDef = struct {
     modified: [Element.size]u16 = [_]u16{0} ** Element.size,
+    neutralized: [Element.size]u16 = [_]u16{0} ** Element.size,
     neutral: u16 = 0,
 
     pub fn total_units(self: ZoneDef) u32 {
         var total: u32 = self.neutral;
         for (self.modified) |m| total += m;
+        for (self.neutralized) |n| total += n;
         return total;
     }
 };

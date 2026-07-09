@@ -37,6 +37,8 @@ pub const Writer = struct {
         const out = std.fs.File.stdout();
         out.writeAll(w.buffered()) catch return;
         game.last_action_count = 0;
+        game.fizzle_count = 0;
+        game.recipe_count = 0;
     }
 
     pub fn write_send(self: Writer, bytes: []const u8) void {
@@ -72,11 +74,20 @@ pub const GameState = struct {
     encounter_label_len: u8 = 0,
     /// Final score from game_over (null until the encounter ends).
     final_score: ?u32 = null,
+    /// Full tuning report from game_over (null until the encounter ends).
+    final_stats: ?proto.MatchStats = null,
     last_action_count: u8 = 0,
     last_actions: [proto.MAX_ENTITIES_WIRE]LastActionEntry = undefined,
     /// Incremented each time a round_reset message is received.
     /// JS detects a change in this value to know a round just resolved.
     round: u32 = 0,
+    /// Player ids whose spells fizzled since the last render write
+    /// (transient, drained per frame like last_actions).
+    fizzles: [proto.MAX_PLAYERS]u8 = undefined,
+    fizzle_count: u8 = 0,
+    /// Recipes fired since the last render write (transient).
+    recipes_fired: [16]proto.RecipeFired = undefined,
+    recipe_count: u8 = 0,
 };
 
 fn write_render_inner(
@@ -124,6 +135,12 @@ fn write_render_inner(
         };
     }
 
+    // Convert transient recipe-fired events for JSON.
+    var recipes_buf: [16]JsonRecipeFired = undefined;
+    for (game.recipes_fired[0..game.recipe_count], 0..) |rf, i| {
+        recipes_buf[i] = .{ .kind = rf.kind, .index = rf.index };
+    }
+
     // Convert pending combo slots for JSON.
     var pending_slots_buf: [c.MAX_COMBO_LEN]JsonComboSlot = undefined;
     for (game.pending_combo.slots[0..game.pending_combo.len], 0..) |s, i| {
@@ -138,8 +155,53 @@ fn write_render_inner(
             .earth = z.modified[1],
             .wind = z.modified[2],
             .water = z.modified[3],
+            .neutralized = colors(z.neutralized),
             .neutral = z.neutral,
         };
+    }
+
+    // Build the game-over tuning report (per-round + per-player + recipes).
+    var rounds_buf: [proto.MAX_ZONES_WIRE]JsonRoundStats = undefined;
+    var pstats_buf: [proto.MAX_PLAYERS]JsonPlayerStats = undefined;
+    var json_stats: ?JsonMatchStats = null;
+    if (phase == .game_over) {
+        if (game.final_stats) |*ms| {
+            for (ms.round_stats[0..ms.rounds], 0..) |rs, i| {
+                rounds_buf[i] = .{
+                    .casts = rs.casts,
+                    .agents = colors(rs.agents_dispensed),
+                    .medicine = colors(rs.medicine_dispensed),
+                    .healed = colors(rs.medicine_healed),
+                    .neutralized = colors(rs.neutralized),
+                    .escaped = colors(rs.modified_escaped),
+                    .neutral = rs.neutral_consumed,
+                    .hunger_normal = rs.hunger_normal,
+                    .hunger_extra = rs.hunger_extra,
+                    .hunger_after = rs.hunger_after,
+                };
+            }
+            for (ms.players[0..ms.player_count], 0..) |ps, i| {
+                pstats_buf[i] = .{
+                    .name = ps.name[0..ps.name_len],
+                    .casts = ps.casts,
+                    .dispense = colors(ps.dispense_slots),
+                    .medicine = colors(ps.medicine_slots),
+                    .recipe_casts = ps.recipe_casts,
+                    .fizzles = ps.fizzles,
+                };
+            }
+            json_stats = .{
+                .reason = ms.reason,
+                .zone_count = ms.zone_count,
+                .hunger_final = ms.hunger_final,
+                .hunger_max = ms.hunger_max,
+                .rounds = rounds_buf[0..ms.rounds],
+                .players = pstats_buf[0..ms.player_count],
+                .player_recipe_hits = &ms.player_recipe_hits,
+                .team_recipe_hits = &ms.team_recipe_hits,
+                .casts_total = ms.casts_total,
+            };
+        }
     }
 
     const frame = JsonRenderFrame{
@@ -176,11 +238,24 @@ fn write_render_inner(
             .score = game.snapshot.score,
             .zone_index = game.snapshot.zone_index,
             .zones = zones_buf[0..game.snapshot.zone_count],
+            .fizzles = game.fizzles[0..game.fizzle_count],
+            .recipes_fired = recipes_buf[0..game.recipe_count],
         } else null,
         .score = if (phase == .game_over) game.final_score else null,
+        .stats = json_stats,
     };
 
     try std.json.Stringify.value(frame, .{ .emit_null_optional_fields = false }, w);
+}
+
+/// Convert a per-color u16 array into named JSON fields.
+fn colors(values: [c.Element.size]u16) JsonColors {
+    return .{
+        .fire = values[0],
+        .earth = values[1],
+        .wind = values[2],
+        .water = values[3],
+    };
 }
 
 const JsonSendFrame = struct {
@@ -206,6 +281,51 @@ const JsonRenderFrame = struct {
     lobby: ?JsonLobby,
     game: ?JsonGame,
     score: ?u32,
+    stats: ?JsonMatchStats,
+};
+
+/// Per-color values with named fields (Element ordinal order).
+const JsonColors = struct {
+    fire: u16,
+    earth: u16,
+    wind: u16,
+    water: u16,
+};
+
+const JsonRoundStats = struct {
+    casts: u8,
+    agents: JsonColors,
+    medicine: JsonColors,
+    healed: JsonColors,
+    neutralized: JsonColors,
+    escaped: JsonColors,
+    neutral: u16,
+    hunger_normal: u16,
+    hunger_extra: u16,
+    hunger_after: u16,
+};
+
+const JsonPlayerStats = struct {
+    name: []const u8,
+    casts: u16,
+    dispense: JsonColors,
+    medicine: JsonColors,
+    recipe_casts: u16,
+    fizzles: u16,
+};
+
+/// End-of-game tuning report.  Recipe hit arrays are in balance table order;
+/// web/game.js resolves labels by index via its mirror tables.
+const JsonMatchStats = struct {
+    reason: proto.EndReason,
+    zone_count: u8,
+    hunger_final: u16,
+    hunger_max: u16,
+    rounds: []const JsonRoundStats,
+    players: []const JsonPlayerStats,
+    player_recipe_hits: []const u16,
+    team_recipe_hits: []const u16,
+    casts_total: u16,
 };
 
 const JsonLobby = struct {
@@ -241,12 +361,14 @@ const JsonHunger = struct {
     healable: JsonHealable,
 };
 
-/// One zone's remaining slime, named per agent color + naturally-neutral.
+/// One zone's remaining slime: modified units named per agent color, plus
+/// transmuted (`neutralized`, per original color) and naturally-neutral.
 const JsonZone = struct {
     fire: u16,
     earth: u16,
     wind: u16,
     water: u16,
+    neutralized: JsonColors,
     neutral: u16,
 };
 
@@ -266,6 +388,16 @@ const JsonGame = struct {
     score: u32,
     zone_index: u8,
     zones: []const JsonZone,
+    /// Player ids whose spells fizzled since the previous frame (transient).
+    fizzles: []const u8,
+    /// Recipes fired since the previous frame (transient).  `index` refers
+    /// to the balance recipe table for `kind` (JS mirrors resolve labels).
+    recipes_fired: []const JsonRecipeFired,
+};
+
+const JsonRecipeFired = struct {
+    kind: proto.RecipeKind,
+    index: u8,
 };
 
 const JsonEntity = struct {

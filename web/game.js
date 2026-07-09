@@ -19,8 +19,10 @@ const LAYOUT = {
     x0: 40, x1: 984, y: 150, h: 18,
     labelFont: 14, labelDy: -8,
     bg: "rgba(30,10,10,0.78)",
-    fill: "rgba(255,150,50,0.9)",
-    danger: "rgba(255,60,60,0.95)",
+    // Dim purple: normal (neutral) consumption must not read as any slime
+    // color — element colors are reserved for the healable segments.
+    fill: "rgba(140,100,185,0.9)",
+    dangerBorder: "rgba(255,60,60,0.95)",
     textFont: 13,
   },
 
@@ -46,7 +48,9 @@ const LAYOUT = {
     previewDy: 102, previewFont: 13,
   },
 
-  floater: { font: 16, drift: 40, jitter: 40, stack: 22, lifetime: 1.5, },
+  // Default floater lifetime ≥ 3s so feedback is readable; cosmetic chomps
+  // are exempt (see tickLilGuys).  Recipe floaters render larger.
+  floater: { font: 16, drift: 40, jitter: 40, stack: 22, lifetime: 3.0, recipeFont: 24 },
 
   preLobby: {
     titleX: 40, titleY: 60, titleFont: 32,
@@ -64,11 +68,23 @@ const LAYOUT = {
     codeX: 40, codeY: 92, codeFont: 22,
     listY: 130, rowGap: 36, rowDy: 20, rowX: 60, rowFont: 20,
     readyDy: 20, readyFont: 18,
+    // Recipe study guide below the player list.
+    guideX: 40, guideY: 408, guideFont: 13, guideLineH: 19,
+    recipeHeaderGap: 10, recipeRowH: 25, recipeFont: 14,
+    recipeLabelW: 170, recipeSlotGap: 10, recipeArrowGap: 24,
   },
 
   connecting: { x: 40, y: 60, font: 24 },
   full: { x: 40, titleDy: -16, titleFont: 24, subDy: 16, subFont: 18 },
-  gameOver: { x: 40, font: 24, scoreDy: 40, scoreFont: 32 },
+  gameOver: {
+    x: 40, titleY: 56, titleFont: 26,
+    scoreY: 92, scoreFont: 20,
+    sectionFont: 15, rowFont: 13, rowH: 20,
+    roundsY: 150,
+    cols: { round: 40, casts: 92, agents: 150, neutralized: 330, escaped: 500, healed: 650, hunger: 830 },
+    pcols: { name: 40, casts: 200, dispense: 260, medicine: 460, recipes: 660, fizzles: 790 },
+    hintFont: 14,
+  },
 };
 
 // Derived convenience aliases (read-only mirrors of LAYOUT).
@@ -362,6 +378,118 @@ function drawLobby(lobby) {
   const pickerY = L.listY + 6 * L.rowGap + L.readyDy;
   const readyLabel = lobby.ready ? "Press ENTER to un-ready" : "Press ENTER when ready";
   text(readyLabel, L.rowX, pickerY, L.readyFont, C_TEXT);
+
+  drawRecipeGuide();
+}
+
+/** Key bindings per element / action — mirrors src/client/input.zig. */
+const ELEMENT_KEY = { fire: "Q", earth: "W", wind: "E", water: "R" };
+const ACTION_KEY = { dispense: "1", medicine: "2" };
+
+/** Render one combo slot as key+symbol (e.g. "Q♦", "1d") in its parity color. */
+function slotKeySymbol(slot) {
+  if (slot.element !== undefined) {
+    return {
+      str: `${ELEMENT_KEY[slot.element] ?? "?"}${ELEMENT_CHAR[slot.element] ?? "?"}`,
+      color: ELEMENT_COLOR[slot.element] ?? C_TEXT,
+    };
+  }
+  return {
+    str: `${ACTION_KEY[slot.action] ?? "?"}${ACTION_CHAR[slot.action] ?? "?"}`,
+    color: ACTION_COLOR[slot.action] ?? C_TEXT,
+  };
+}
+
+/** Draw colored text parts left-to-right; returns the x after the last part. */
+function drawParts(x, y, font, parts, gap) {
+  let dx = x;
+  ctx.font = `${font}px monospace`;
+  for (const p of parts) {
+    text(p.str, dx, y, font, p.color);
+    ctx.font = `${font}px monospace`;
+    dx += ctx.measureText(p.str).width + gap;
+  }
+  return dx;
+}
+
+/** Colored output parts for a recipe's AgentOutput ({units, medicine} maps). */
+function outputParts(output) {
+  const parts = [];
+  for (const name of ELEMENT_NAMES) {
+    const n = output.units?.[name];
+    if (n) parts.push({ str: `${ELEMENT_CHAR[name]}${n}`, color: ELEMENT_COLOR[name] });
+  }
+  for (const name of ELEMENT_NAMES) {
+    const n = output.medicine?.[name];
+    if (n) parts.push({ str: `med${ELEMENT_CHAR[name]}${n}`, color: ELEMENT_COLOR[name] });
+  }
+  return parts;
+}
+
+/**
+ * Lobby study guide: how casting works + every defined recipe with its key
+ * sequence AND symbols, all in parity colors (slime = agent = medicine =
+ * hunger block).  Recipe order mirrors balance.zig.
+ */
+function drawRecipeGuide() {
+  const L = LAYOUT.lobby;
+  let y = L.guideY;
+
+  text("HOW CASTING WORKS", L.guideX, y, L.guideFont + 2, C_HEADER);
+  y += L.guideLineH;
+  const descColor = "rgba(200,200,210,0.9)";
+  const descLines = [
+    [
+      { str: "Pick an agent color —", color: descColor },
+      { str: "Q♦", color: ELEMENT_COLOR.fire },
+      { str: "W▲", color: ELEMENT_COLOR.earth },
+      { str: "E≋", color: ELEMENT_COLOR.wind },
+      { str: "R~", color: ELEMENT_COLOR.water },
+      { str: "— then actions:", color: descColor },
+      { str: "1d dispense", color: ACTION_COLOR.dispense },
+      { str: "2m medicine", color: ACTION_COLOR.medicine },
+    ],
+    [
+      { str: "Dispensed agents transmute matching-color slime to neutral;", color: ACTION_COLOR.dispense },
+      { str: "medicine heals matching-color hunger.", color: ACTION_COLOR.medicine },
+    ],
+    [
+      { str: "Spells auto-cast when the cast bar empties — 3 per round. Exact combos below are RECIPES (stronger).", color: descColor },
+    ],
+  ];
+  for (const line of descLines) {
+    drawParts(L.guideX, y, L.guideFont, line, 8);
+    y += L.guideLineH;
+  }
+  y += L.recipeHeaderGap;
+
+  text("RECIPES", L.guideX, y, L.guideFont + 2, C_HEADER);
+  y += L.guideLineH;
+
+  const drawRecipeRow = (label, labelColor, patterns, output, suffix) => {
+    text(label, L.guideX, y, L.recipeFont, labelColor);
+    let x = L.guideX + L.recipeLabelW;
+    patterns.forEach((pattern, pi) => {
+      if (pi > 0) {
+        text("+", x, y, L.recipeFont, descColor);
+        ctx.font = `${L.recipeFont}px monospace`;
+        x += ctx.measureText("+").width + L.recipeSlotGap;
+      }
+      x = drawParts(x, y, L.recipeFont, pattern.map(slotKeySymbol), L.recipeSlotGap);
+    });
+    text("→", x, y, L.recipeFont, descColor);
+    x += L.recipeArrowGap;
+    x = drawParts(x, y, L.recipeFont, outputParts(output), L.recipeSlotGap);
+    if (suffix) text(suffix, x + 4, y, L.guideFont, RECIPE_COLOR_TEAM);
+    y += L.recipeRowH;
+  };
+
+  for (const r of PLAYER_RECIPES) {
+    drawRecipeRow(r.label, RECIPE_COLOR_PLAYER, [r.pattern], r.output, null);
+  }
+  for (const r of TEAM_RECIPES) {
+    drawRecipeRow(r.label, RECIPE_COLOR_TEAM, r.patterns, r.output, `(team ×${r.patterns.length})`);
+  }
 }
 
 /**
@@ -417,11 +545,55 @@ function drawSprite(id, kind, cx, cy, cw, ch, lastAction, dt, flip) {
  */
 function spawnCastFloaters(game) {
   const CP = LAYOUT.comboPanel;
+  const rowPos = (i) => ({
+    x: CP.x + CP.nameW + 5 * CP.slotW + 24,
+    y: CP.y0 + i * CP.rowH,
+  });
   (game.entities || []).forEach((e, i) => {
     if (!e.last_action) return;
-    const y = CP.y0 + i * CP.rowH;
-    const x = CP.x + CP.nameW + 5 * CP.slotW + 24;
-    spawnFloater("✦ cast", x, y, C_OWN_ROW, 1.0);
+    const { x, y } = rowPos(i);
+    spawnFloater("✦ cast", x, y, C_OWN_ROW);
+  });
+  // Zero-output spells discarded at window close: show the fizzle on the
+  // caster's row (grey — nothing happened, no cast consumed).
+  for (const pid of game.fizzles ?? []) {
+    const i = (game.entities || []).findIndex((e) => e.owner === pid);
+    if (i === -1) continue;
+    const { x, y } = rowPos(i);
+    spawnFloater("fizzle…", x, y, "rgba(150,150,160,0.9)");
+  }
+}
+
+/** Player-recipe floater color (matches the recipe label color elsewhere). */
+const RECIPE_COLOR_PLAYER = "rgba(255,255,140,1)";
+/** Team-recipe floater color — distinct so co-op combos pop. */
+const RECIPE_COLOR_TEAM = "rgba(140,240,255,1)";
+
+/**
+ * Big celebratory floaters when recipes fire (server broadcasts one event
+ * per fire at cast-window close).  Labels are resolved by table index from
+ * the JS mirror tables — order must match balance.zig.  Floaters rise from
+ * the active zone's center, stacked when several fire at once.
+ */
+function spawnRecipeFloaters(game) {
+  const fired = game.recipes_fired ?? [];
+  if (fired.length === 0) return;
+
+  const count = Math.max(game.zones?.length ?? 1, 1);
+  const zoneIndex = Math.min(game.zone_index ?? 0, count - 1);
+  const rectZ = zoneColumnRect(zoneIndex, count);
+  const cx = (rectZ.x0 + rectZ.x1) / 2;
+  const cy = (rectZ.y0 + rectZ.y1) / 2;
+  const STACK = LAYOUT.floater.stack + 8;
+
+  fired.forEach((rf, i) => {
+    const isTeam = rf.kind === "team";
+    const table = isTeam ? TEAM_RECIPES : PLAYER_RECIPES;
+    const label = table[rf.index]?.label ?? "recipe";
+    const textStr = isTeam ? `${label}! (team)` : `${label}!`;
+    spawnFloater(textStr, cx, cy - i * STACK,
+      isTeam ? RECIPE_COLOR_TEAM : RECIPE_COLOR_PLAYER,
+      LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
   });
 }
 
@@ -477,10 +649,11 @@ const floaters = [];
  * @param {number} x       - canvas x (centre of text)
  * @param {number} y       - canvas y (baseline at spawn)
  * @param {string} color   - CSS color string (alpha overridden by fade)
- * @param {number} lifetime - seconds until fully faded (default 1.5)
+ * @param {number} lifetime - seconds until fully faded (default 3.0)
+ * @param {number} size     - font px (default LAYOUT.floater.font)
  */
-function spawnFloater(text, x, y, color, lifetime = LAYOUT.floater.lifetime) {
-  floaters.push({ text, x, y, color, age: 0, lifetime });
+function spawnFloater(text, x, y, color, lifetime = LAYOUT.floater.lifetime, size = LAYOUT.floater.font) {
+  floaters.push({ text, x, y, color, age: 0, lifetime, size });
 }
 
 function tickFloaters(dt) {
@@ -501,7 +674,7 @@ function drawFloaters() {
 
     ctx.save();
     ctx.globalAlpha = alpha;
-    ctx.font = `bold ${LAYOUT.floater.font}px monospace`;
+    ctx.font = `bold ${f.size ?? LAYOUT.floater.font}px monospace`;
     ctx.fillStyle = f.color;
     ctx.textAlign = "center";
     ctx.fillText(f.text, f.x, f.y + yOffset);
@@ -564,7 +737,7 @@ const TEAM_RECIPES = [
       [el("fire"), ac("dispense"), ac("dispense")],
       [el("fire"), ac("dispense"), ac("dispense")],
     ],
-    output: { units: { fire: 30 }, medicine: { fire: 2 } },
+    output: { units: { fire: 30 }, medicine: { fire: 20 } },
   },
   {
     label: "mudslide",
@@ -572,7 +745,7 @@ const TEAM_RECIPES = [
       [el("water"), ac("dispense"), ac("dispense")],
       [el("earth"), ac("dispense"), ac("dispense")],
     ],
-    output: { units: { earth: 18, water: 18 }, medicine: {} },
+    output: { units: { earth: 40, water: 40 }, medicine: {} },
   },
 ];
 
@@ -622,7 +795,7 @@ function matchRecipes(combos) {
   const consumed = combos.map(() => false);
 
   for (const tr of TEAM_RECIPES) {
-    for (;;) {
+    for (; ;) {
       const picked = combos.map(() => false);
       const picks = [];
       let ok = true;
@@ -688,7 +861,7 @@ function updateRoundTracking(game) {
 
     // Chomp burst over the consumed zone.
     for (let i = 0; i < 4; i++) {
-      spawnFloater("chomp!", cx + jitter() * 2, cy + jitter() * 2, "rgba(255,255,255,0.9)", 1.0);
+      spawnFloater("chomp!", cx + jitter() * 2, cy + jitter() * 2, "rgba(255,255,255,0.9)", 1.0); // cosmetic: exempt from 3s rule
     }
     if (scoreGain > 0) {
       spawnFloater(`+${scoreGain} score`, cx + jitter(), cy - STACK, "rgba(100,220,100,1)");
@@ -721,7 +894,12 @@ const ELEMENT_NAMES = ["fire", "earth", "wind", "water"];
 const ELEMENT_CHAR = { fire: "♦", earth: "▲", wind: "≋", water: "~" };
 
 /** Map Element (agent color / slime type) → colour.  Matches the whiteboard:
- *  red / yellow / green / blue scribbles. */
+ *  red / yellow / green / blue scribbles.
+ *
+ *  SINGLE SOURCE OF COLOR TRUTH: slime blobs, agent key labels (QWER),
+ *  combo slot chars, team output preview, hunger-bar healable segments, and
+ *  the game-over stats tables all read from this map so a slime color always
+ *  matches its agent, its medicine, and its hunger block. */
 const ELEMENT_COLOR = {
   fire: "rgba(255,90,90,1)",
   earth: "rgba(250,210,80,1)",
@@ -729,6 +907,7 @@ const ELEMENT_COLOR = {
   water: "rgba(110,160,255,1)",
 };
 
+/** Neutral / transmuted slime (matches nothing — needs no agent). */
 const NEUTRAL_COLOR = "rgba(190,190,200,1)";
 
 // ---------------------------------------------------------------------------
@@ -754,10 +933,10 @@ function drawHungerBar(game) {
   text("TOTAL HUNGER", H.x0, H.y + H.labelDy, H.labelFont, C_HEADER);
 
   rect(H.x0, H.y, w, H.h, H.bg);
-  const fillColor = frac > 0.85 ? H.danger : H.fill;
-  if (frac > 0) rect(H.x0, H.y, w * frac, H.h, fillColor);
+  if (frac > 0) rect(H.x0, H.y, w * frac, H.h, H.fill);
 
-  // Healable segments: right end of the current fill, one per slime color.
+  // Healable segments: right end of the current fill, one per slime color
+  // (only these use element colors — dim-purple fill = unhealable hunger).
   // Scale segments proportionally if the fill clamped at the bar edge.
   if (healFracTotal > 0 && healableTotal > 0) {
     const scale = (w * healFracTotal) / healableTotal;
@@ -770,7 +949,10 @@ function drawHungerBar(game) {
       x += segW;
     }
   }
-  rectStroke(H.x0, H.y, w, H.h, 1, "rgba(255,255,255,0.25)");
+  // Danger is signalled by the border, never the fill.
+  const nearFull = frac > 0.85;
+  rectStroke(H.x0 - 2, H.y - 2, w + 4, H.h + 4, nearFull ? 3 : 1,
+    nearFull ? H.dangerBorder : "rgba(255,255,255,0.25)");
 
   text(`${hunger.current}/${hunger.max}  (healable ${healableTotal})`,
     H.x0 + w + 6 - 230, H.y + H.h + 14, H.textFont, "rgba(200,200,210,0.9)");
@@ -839,13 +1021,16 @@ function drawSlimeField(game) {
       ctx.restore();
     } else {
       // Blobs: fire, earth, wind, water, neutral stacked vertically.
+      // Transmuted (neutralized) slime folds into the grey neutral blob, so
+      // it visibly grows as casts land mid-round while modified blobs shrink.
       const z = zones[i];
+      const neutralTotal = (z.neutral ?? 0) + sumColors(z.neutralized);
       const entries = [
         { units: z.fire, color: ELEMENT_COLOR.fire },
         { units: z.earth, color: ELEMENT_COLOR.earth },
         { units: z.wind, color: ELEMENT_COLOR.wind },
         { units: z.water, color: ELEMENT_COLOR.water },
-        { units: z.neutral, color: NEUTRAL_COLOR },
+        { units: neutralTotal, color: NEUTRAL_COLOR },
       ].filter(b => b.units > 0);
 
       const cx = (rectZ.x0 + rectZ.x1) / 2;
@@ -932,7 +1117,7 @@ function tickLilGuys(game, dt) {
     g.chomp -= dt;
     if (g.chomp <= 0) {
       g.chomp = randIn(G.chompMin, G.chompMax);
-      spawnFloater("chomp", g.x + G.size / 2, g.y, "rgba(230,230,240,0.85)", 0.8);
+      spawnFloater("chomp", g.x + G.size / 2, g.y, "rgba(230,230,240,0.85)", 0.8); // cosmetic: exempt from 3s rule
     }
   }
 }
@@ -1038,6 +1223,7 @@ function drawGame(game, dt) {
   tickFloaters(dt);
   tickLilGuys(game, dt);
   spawnCastFloaters(game);
+  spawnRecipeFloaters(game);
 
   clear();
 
@@ -1058,12 +1244,142 @@ function drawGame(game, dt) {
   drawFloaters();
 }
 
+/** Sum a per-color {fire, earth, wind, water} object. */
+function sumColors(obj) {
+  return ELEMENT_NAMES.reduce((t, name) => t + (obj?.[name] ?? 0), 0);
+}
+
+/** Add per-color object `add` into accumulator object `acc`. */
+function addColors(acc, add) {
+  for (const name of ELEMENT_NAMES) acc[name] = (acc[name] ?? 0) + (add?.[name] ?? 0);
+}
+
+/**
+ * Draw non-zero per-color values as colored "♦12 ▲5" cells starting at x.
+ * Draws a grey dash when everything is zero.
+ */
+function drawColorCells(x, y, font, obj) {
+  let dx = x;
+  let any = false;
+  for (const name of ELEMENT_NAMES) {
+    const v = obj?.[name] ?? 0;
+    if (!v) continue;
+    any = true;
+    const str = `${ELEMENT_CHAR[name]}${v}`;
+    text(str, dx, y, font, ELEMENT_COLOR[name]);
+    ctx.font = `${font}px monospace`;
+    dx += ctx.measureText(str).width + 8;
+  }
+  if (!any) text("—", dx, y, font, "rgba(120,120,140,0.6)");
+}
+
+/**
+ * End-of-game tuning report: outcome, round-by-round table, per-player
+ * table, recipe fire counts, derived waste/overheal totals.
+ */
 function drawGameOver(msg) {
   clear();
   const L = LAYOUT.gameOver;
-  text("Encounter over!  Press any key to return to lobby.", L.x, SH / 2, L.font, C_TEXT);
   const score = msg && msg.score !== undefined && msg.score !== null ? msg.score : "?";
-  text(`Neutral slime consumed: ${score}`, L.x, SH / 2 + L.scoreDy, L.scoreFont, C_SLIME_HDR);
+  const stats = msg ? msg.stats : null;
+
+  const reasonText = stats
+    ? (stats.reason === "hunger_full" ? "The Lil Guys got full!" : "Slime field cleared!")
+    : "";
+  text(`Encounter over — ${reasonText}`, L.x, L.titleY, L.titleFont, C_HEADER);
+  const hungerText = stats ? `   ·   Hunger ${stats.hunger_final}/${stats.hunger_max}` : "";
+  text(`Neutral slime consumed: ${score}${hungerText}`, L.x, L.scoreY, L.scoreFont, C_SLIME_HDR);
+
+  if (!stats) {
+    text("Press any key to return to lobby.", L.x, SH - 40, L.hintFont, C_TEXT);
+    return;
+  }
+
+  // ---- Round-by-round table ------------------------------------------------
+  const C = L.cols;
+  let y = L.roundsY;
+  text("ROUND", C.round, y, L.sectionFont, C_HEADER);
+  text("CASTS", C.casts, y, L.sectionFont, C_HEADER);
+  text("AGENTS", C.agents, y, L.sectionFont, C_HEADER);
+  text("NEUTRALIZED", C.neutralized, y, L.sectionFont, C_HEADER);
+  text("ESCAPED", C.escaped, y, L.sectionFont, C_HEADER);
+  text("MED (HEALED)", C.healed, y, L.sectionFont, C_HEADER);
+  text("HUNGER", C.hunger, y, L.sectionFont, C_HEADER);
+  y += L.rowH;
+
+  const totals = { agents: {}, medicine: {}, healed: {}, neutralized: {}, escaped: {} };
+  let neutralTotal = 0;
+  for (const [i, r] of (stats.rounds ?? []).entries()) {
+    text(String(i + 1), C.round, y, L.rowFont, C_TEXT);
+    text(String(r.casts), C.casts, y, L.rowFont, C_TEXT);
+    drawColorCells(C.agents, y, L.rowFont, r.agents);
+    drawColorCells(C.neutralized, y, L.rowFont, r.neutralized);
+    drawColorCells(C.escaped, y, L.rowFont, r.escaped);
+    // Medicine: dispensed with healed total in parens.
+    drawColorCells(C.healed, y, L.rowFont, r.medicine);
+    text(`(+${sumColors(r.healed)})`, C.hunger - 60, y, L.rowFont, "rgba(255,80,180,0.9)");
+    text(`${r.hunger_after}`, C.hunger, y, L.rowFont,
+      r.hunger_extra > 0 ? "rgba(255,150,50,0.95)" : "rgba(160,220,160,0.9)");
+    y += L.rowH;
+
+    addColors(totals.agents, r.agents);
+    addColors(totals.medicine, r.medicine);
+    addColors(totals.healed, r.healed);
+    addColors(totals.neutralized, r.neutralized);
+    addColors(totals.escaped, r.escaped);
+    neutralTotal += r.neutral ?? 0;
+  }
+
+  // Derived totals: agent waste + medicine overheal.
+  const wasted = sumColors(totals.agents) - sumColors(totals.neutralized);
+  const overheal = sumColors(totals.medicine) - sumColors(totals.healed);
+  y += 4;
+  text(
+    `totals: neutralized ${sumColors(totals.neutralized)}  ·  natural ${neutralTotal}  ·  escaped ${sumColors(totals.escaped)}` +
+    `  ·  agents wasted ${wasted}  ·  medicine overheal ${overheal}`,
+    C.round, y, L.rowFont, "rgba(200,200,210,0.9)",
+  );
+  y += L.rowH + 14;
+
+  // ---- Per-player table ----------------------------------------------------
+  const P = L.pcols;
+  text("PLAYER", P.name, y, L.sectionFont, C_HEADER);
+  text("CASTS", P.casts, y, L.sectionFont, C_HEADER);
+  text("DISPENSE SLOTS", P.dispense, y, L.sectionFont, C_HEADER);
+  text("MEDICINE SLOTS", P.medicine, y, L.sectionFont, C_HEADER);
+  text("RECIPES", P.recipes, y, L.sectionFont, C_HEADER);
+  text("FIZZLES", P.fizzles, y, L.sectionFont, C_HEADER);
+  y += L.rowH;
+  for (const p of stats.players ?? []) {
+    text(p.name || "(anon)", P.name, y, L.rowFont, C_TEXT);
+    text(String(p.casts), P.casts, y, L.rowFont, C_TEXT);
+    drawColorCells(P.dispense, y, L.rowFont, p.dispense);
+    drawColorCells(P.medicine, y, L.rowFont, p.medicine);
+    text(`${p.recipe_casts}/${p.casts}`, P.recipes, y, L.rowFont, "rgba(255,255,140,0.9)");
+    text(String(p.fizzles ?? 0), P.fizzles, y, L.rowFont,
+      (p.fizzles ?? 0) > 0 ? "rgba(255,120,120,0.9)" : "rgba(120,120,140,0.7)");
+    y += L.rowH;
+  }
+  y += 14;
+
+  // ---- Recipe fire counts (labels resolved by table index; order must
+  // match balance.zig) --------------------------------------------------------
+  const recipeParts = [];
+  (stats.player_recipe_hits ?? []).forEach((n, i) => {
+    if (n > 0 && PLAYER_RECIPES[i]) recipeParts.push(`${PLAYER_RECIPES[i].label} ×${n}`);
+  });
+  (stats.team_recipe_hits ?? []).forEach((n, i) => {
+    if (n > 0 && TEAM_RECIPES[i]) recipeParts.push(`${TEAM_RECIPES[i].label} ×${n} (team)`);
+  });
+  text("RECIPES", P.name, y, L.sectionFont, C_HEADER);
+  y += L.rowH;
+  text(recipeParts.length > 0 ? recipeParts.join("  ·  ") : "none fired",
+    P.name, y, L.rowFont, recipeParts.length > 0 ? "rgba(255,255,140,0.9)" : "rgba(120,120,140,0.7)");
+  y += L.rowH;
+  text(`total spells cast: ${stats.casts_total}  ·  zones eaten: ${(stats.rounds ?? []).length}/${stats.zone_count}`,
+    P.name, y, L.rowFont, "rgba(200,200,210,0.9)");
+
+  text("Press any key to return to lobby.", L.x, SH - 40, L.hintFont, C_TEXT);
 }
 
 // ---------------------------------------------------------------------------

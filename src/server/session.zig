@@ -13,20 +13,17 @@
 //! a combo in `action_pool` (latest edit wins; Escape cancels).  When the
 //! window closes the pending combo is COMMITTED as a spell (broadcasting
 //! `cast_committed` + a `.cast` action_result) — up to CASTS_PER_ROUND
-//! spells per player per round.  When the round timer expires
-//! `resolve_round()`:
-//!   1. Commits any final pending combos, then converts all committed casts
-//!      into one AgentOutput (team recipes → player recipes → flat
-//!      conversion; see game_logic.match_recipes).
-//!   2. Applies the per-color medicine pools to the hunger bar.  Medicine is
-//!      symmetrical: color-X medicine heals only the healable hunger caused
-//!      by color-X modified slime; overheal discarded.
-//!   3. Neutralizes matching-color Modified Slime in the CURRENT zone
-//!      (excess / wrong-color agents wasted), then consumes the entire zone:
-//!      every unit adds normal hunger; un-neutralized modified units add
-//!      extra (healable) hunger.  Score += neutral units consumed
-//!      (neutralized + naturally-neutral).
-//!   4. Advances to the next zone.
+//! spells per player per round — and the window's batch CONVERTS
+//! immediately: recipes match within the batch (team recipes require
+//! distinct players in the SAME window), medicine heals the hunger bar
+//! right away, and agents transmute matching-color Modified Slime into
+//! Neutralized Slime in the current zone (visible live in game_state).
+//! When the round timer expires `resolve_round()`:
+//!   1. Closes the final cast window (conversion as above).
+//!   2. Consumes the entire zone: every unit adds normal hunger;
+//!      still-modified units add extra (healable) hunger.  Score += neutral
+//!      units consumed (neutralized + naturally-neutral).
+//!   3. Advances to the next zone.
 //!
 //! The encounter ends when all zones are consumed OR the hunger bar fills.
 //! Either way the final shared score is broadcast via game_over.
@@ -58,8 +55,6 @@ pub const GameWorld = ecs.World(
 );
 
 pub const MAX_PLAYERS = proto.MAX_PLAYERS;
-pub const MAX_CASTS_PER_ROUND: usize =
-    @as(usize, MAX_PLAYERS) * @as(usize, shared.balance.CASTS_PER_ROUND);
 
 pub const PlayerSlot = struct {
     occupied: bool = false,
@@ -105,11 +100,12 @@ pub const Session = struct {
     action_pool: [MAX_PLAYERS]?c.ActionCombo,
     /// Countdown of the current cast window; pending combos commit at 0.
     cast_timer: f32 = 0,
-    /// Spells committed so far this round (in commit order).
-    committed_casts: [MAX_CASTS_PER_ROUND]logic.Cast = undefined,
-    committed_count: u8 = 0,
     /// Per-player committed-spell count this round (capped CASTS_PER_ROUND).
     casts_used: [MAX_PLAYERS]u8 = [_]u8{0} ** MAX_PLAYERS,
+    /// Tuning stats accumulated over the match; broadcast with game_over.
+    /// `players` is indexed by player_id during play and compacted (dense,
+    /// names filled) in end_game.
+    stats: proto.MatchStats = .{},
     /// Number of rounds resolved so far in the current game.
     round_count: u32 = 0,
     profiler: dbg.Profiler(TickZones) = dbg.Profiler(TickZones).init(),
@@ -207,8 +203,8 @@ pub const Session = struct {
         self.world = try GameWorld.init(self.allocator);
         set_world_system_signatures(&self.world);
         for (&self.action_pool) |*a| a.* = @as(?c.ActionCombo, null);
-        self.committed_count = 0;
         self.casts_used = [_]u8{0} ** MAX_PLAYERS;
+        self.stats = .{};
         self.tick_count = 0;
         self.round_count = 0;
 
@@ -285,22 +281,39 @@ pub const Session = struct {
     }
 
     /// Commit every pending combo as a spell (up to CASTS_PER_ROUND per
-    /// player per round).  Broadcasts cast_committed (so the owning client
-    /// clears its pending combo) and a .cast action_result per commit.
+    /// player per round; zero-output combos fizzle for free) and CONVERT the
+    /// window's batch immediately:
+    /// recipes match within the batch (team recipes = same window only),
+    /// medicine heals right away, and agents transmute matching-color
+    /// Modified Slime into Neutralized Slime in the current zone.
+    /// Broadcasts cast_committed + a .cast action_result per commit, and a
+    /// .heal action_result when medicine lands.
     fn commit_pending_casts(self: *Session) !void {
+        var batch: [MAX_PLAYERS]logic.Cast = undefined;
+        var batch_len: usize = 0;
+
         for (&self.players, 0..) |*slot, pid| {
             const combo = self.action_pool[pid] orelse continue;
             self.action_pool[pid] = null;
 
             if (self.casts_used[pid] >= balance.CASTS_PER_ROUND) continue; // cap reached
-            if (self.committed_count >= MAX_CASTS_PER_ROUND) continue;
 
-            self.committed_casts[self.committed_count] = .{
-                .player_id = @intCast(pid),
-                .combo = combo,
-            };
-            self.committed_count += 1;
+            // Zero-output combos FIZZLE: discarded without costing a cast.
+            if (!logic.combo_has_output(combo)) {
+                self.stats.players[pid].fizzles +|= 1;
+                var fbuf: [4]u8 = undefined;
+                var ffbs = std.io.fixedBufferStream(&fbuf);
+                try proto.encode(ffbs.writer(), .cast_fizzled, proto.CastFizzled{
+                    .player_id = @intCast(pid),
+                });
+                try self.broadcast_raw(ffbs.getWritten());
+                continue;
+            }
+
+            batch[batch_len] = .{ .player_id = @intCast(pid), .combo = combo };
+            batch_len += 1;
             self.casts_used[pid] += 1;
+            self.record_cast_stats(pid, combo);
 
             var buf: [4]u8 = undefined;
             var fbs = std.io.fixedBufferStream(&buf);
@@ -318,11 +331,90 @@ pub const Session = struct {
                 });
             }
         }
+
+        if (batch_len == 0) return;
+
+        var report = logic.MatchReport{};
+        const output = logic.match_recipes(batch[0..batch_len], &report);
+
+        // Recipe stats: fire counts + per-player participation.  Each fire is
+        // also broadcast so clients can show recipe floaters live.
+        for (&self.stats.player_recipe_hits, report.player_hits, 0..) |*total, hit, ri| {
+            total.* +|= hit;
+            try self.broadcast_recipe_fired(.player, @intCast(ri), hit);
+        }
+        for (&self.stats.team_recipe_hits, report.team_hits, 0..) |*total, hit, ri| {
+            total.* +|= hit;
+            try self.broadcast_recipe_fired(.team, @intCast(ri), hit);
+        }
+        for (batch[0..batch_len], 0..) |cast, ci| {
+            if (report.consumed[ci] != .none) {
+                self.stats.players[cast.player_id].recipe_casts +|= 1;
+            }
+        }
+
+        // Medicine heals immediately (previous rounds' modified-slime hunger).
+        const healed = logic.apply_medicine(&self.hunger, &self.hunger_healable, output.medicine);
+        const healed_total = logic.sum_u16(healed);
+        if (healed_total > 0) {
+            try self.broadcast_action_result(.{
+                .tag = .heal,
+                .actor_entity = std.math.maxInt(u32),
+                .target_entity = std.math.maxInt(u32),
+                .value = stat_u16(healed_total),
+            });
+        }
+
+        // Agents transmute the current zone's slime in place (visible live).
+        if (self.zone_index < self.zone_count) {
+            _ = logic.transmute(&self.zones[self.zone_index], output.units);
+        }
+
+        // Per-round tuning stats accumulate per window.
+        if (self.zone_index < enc.MAX_ZONES) {
+            const rs = &self.stats.round_stats[self.zone_index];
+            for (&rs.agents_dispensed, output.units) |*d, u| d.* +|= stat_u16(u);
+            for (&rs.medicine_dispensed, output.medicine) |*d, m| d.* +|= stat_u16(m);
+            for (&rs.medicine_healed, healed) |*d, h| d.* +|= h;
+        }
+    }
+
+    /// Broadcast `count` recipe_fired messages for one recipe table entry.
+    fn broadcast_recipe_fired(self: *Session, kind: proto.RecipeKind, index: u8, count: u16) !void {
+        var fired: u16 = 0;
+        while (fired < count) : (fired += 1) {
+            var buf: [4]u8 = undefined;
+            var fbs = std.io.fixedBufferStream(&buf);
+            try proto.encode(fbs.writer(), .recipe_fired, proto.RecipeFired{
+                .kind = kind,
+                .index = index,
+            });
+            try self.broadcast_raw(fbs.getWritten());
+        }
+    }
+
+    /// Record a committed cast into the tuning stats: total + per-player
+    /// counts and RAW per-color slot tallies (pre-recipe attribution).
+    fn record_cast_stats(self: *Session, pid: usize, combo: c.ActionCombo) void {
+        self.stats.casts_total +|= 1;
+        if (self.zone_index < enc.MAX_ZONES) {
+            self.stats.round_stats[self.zone_index].casts +|= 1;
+        }
+        const ps = &self.stats.players[pid];
+        ps.casts +|= 1;
+        var ea_buf: [c.MAX_COMBO_LEN]logic.ElementedAction = undefined;
+        const n = logic.parse_combo(combo, &ea_buf);
+        for (ea_buf[0..n]) |ea| {
+            const el = ea.element orelse continue; // colorless slots are wasted
+            switch (ea.action) {
+                .dispense => ps.dispense_slots[@intFromEnum(el)] +|= 1,
+                .medicine => ps.medicine_slots[@intFromEnum(el)] +|= 1,
+            }
+        }
     }
 
     fn reset_round(self: *Session) void {
         for (&self.action_pool) |*a| a.* = null;
-        self.committed_count = 0;
         self.casts_used = [_]u8{0} ** MAX_PLAYERS;
         self.round_timer = self.round_duration;
         self.cast_timer = self.cast_duration();
@@ -424,41 +516,24 @@ pub const Session = struct {
         }
     }
 
-    /// Resolve one round of the Slime Feast (see module doc for the order).
+    /// Saturating u32 → u16 for stats fields.
+    fn stat_u16(v: u32) u16 {
+        return @intCast(@min(v, std.math.maxInt(u16)));
+    }
+
+    /// Resolve one round: close the final cast window (conversion happens in
+    /// commit_pending_casts), then consume the entire current zone.
     fn resolve_round(self: *Session) !void {
-        // Final cast window closes with the round: commit remaining pending
-        // combos (broadcasts cast_committed + .cast per commit).
         try self.commit_pending_casts();
-
-        const output = logic.match_recipes(self.committed_casts[0..self.committed_count]);
-
-        // Medicine first: heals hunger from PREVIOUS rounds' modified slime.
-        const healed = logic.apply_medicine(&self.hunger, &self.hunger_healable, output.medicine);
-        if (healed > 0) {
-            try self.broadcast_action_result(.{
-                .tag = .heal,
-                .actor_entity = std.math.maxInt(u32),
-                .target_entity = std.math.maxInt(u32),
-                .value = healed,
-            });
-        }
 
         if (self.zone_index >= self.zone_count) return;
 
-        // Neutralize + consume the entire current zone.
+        // Consume the zone: transmutation already happened per cast window.
         const zone = self.zones[self.zone_index];
-        const outcome = logic.resolve_zone(zone, output.units);
+        const outcome = logic.consume_zone(zone);
 
         var neutralized_total: u32 = 0;
         for (outcome.neutralized) |n| neutralized_total += n;
-        if (neutralized_total > 0) {
-            try self.broadcast_action_result(.{
-                .tag = .shield,
-                .actor_entity = std.math.maxInt(u32),
-                .target_entity = std.math.maxInt(u32),
-                .value = @intCast(@min(neutralized_total, std.math.maxInt(u16))),
-            });
-        }
 
         const hunger_added = outcome.hunger_normal + outcome.hunger_extra_total();
         logic.add_hunger(&self.hunger, hunger_added);
@@ -467,6 +542,15 @@ pub const Session = struct {
             healable.* = @intCast(@min(grown, @as(u32, std.math.maxInt(u16))));
         }
         self.score += outcome.score;
+
+        // Per-round consumption stats (round index == zone index).
+        const rs = &self.stats.round_stats[self.zone_index];
+        rs.neutralized = outcome.neutralized;
+        rs.modified_escaped = outcome.modified_missed;
+        rs.neutral_consumed = zone.neutral;
+        rs.hunger_normal = stat_u16(outcome.hunger_normal);
+        rs.hunger_extra = stat_u16(outcome.hunger_extra_total());
+        rs.hunger_after = self.hunger.current;
 
         if (hunger_added > 0) {
             try self.broadcast_action_result(.{
@@ -490,23 +574,50 @@ pub const Session = struct {
 
     fn check_end(self: *Session) !void {
         if (self.phase != .playing) return;
-        if (logic.hunger_full(self.hunger)) {
-            std.log.info("hunger bar full — encounter over, score={}", .{self.score});
-            try self.end_game();
-        } else if (self.zone_index >= self.zone_count) {
+        // Field-cleared wins ties: if the final zone fills the bar exactly,
+        // the players still ate everything.
+        if (self.zone_index >= self.zone_count) {
             std.log.info("all slime consumed — encounter over, score={}", .{self.score});
-            try self.end_game();
+            try self.end_game(.field_cleared);
+        } else if (logic.hunger_full(self.hunger)) {
+            std.log.info("hunger bar full — encounter over, score={}", .{self.score});
+            try self.end_game(.hunger_full);
         }
     }
 
-    fn end_game(self: *Session) !void {
-        std.log.info("game over — score: {}", .{self.score});
+    fn end_game(self: *Session, reason: proto.EndReason) !void {
+        std.log.info("game over — score: {} reason: {s}", .{ self.score, @tagName(reason) });
         self.phase = .lobby;
         // Reset ready flags so players must opt-in to the next game.
         for (&self.players) |*p| p.ready = false;
-        var buf: [8]u8 = undefined;
+
+        // Finalise the tuning report.
+        self.stats.reason = reason;
+        self.stats.rounds = self.zone_index; // one zone consumed per round
+        self.stats.zone_count = self.zone_count;
+        self.stats.hunger_final = self.hunger.current;
+        self.stats.hunger_max = self.hunger.max;
+        // Compact per-player stats (indexed by player_id during play) into a
+        // dense list with names for the wire.
+        var compacted = [_]proto.PlayerStats{.{}} ** MAX_PLAYERS;
+        var dense: u8 = 0;
+        for (&self.players, 0..) |*slot, pid| {
+            if (!slot.occupied) continue;
+            var ps = self.stats.players[pid];
+            ps.name = slot.name;
+            ps.name_len = slot.name_len;
+            compacted[dense] = ps;
+            dense += 1;
+        }
+        self.stats.players = compacted;
+        self.stats.player_count = dense;
+
+        var buf: [2048]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
-        try proto.encode(fbs.writer(), .game_over, proto.GameOver{ .score = self.score });
+        try proto.encode(fbs.writer(), .game_over, proto.GameOver{
+            .score = self.score,
+            .stats = self.stats,
+        });
         try self.broadcast_raw(fbs.getWritten());
         try self.broadcast_lobby_update();
     }
@@ -607,7 +718,11 @@ pub const Session = struct {
         snap.zone_index = self.zone_index;
         snap.zone_count = self.zone_count;
         for (self.zones[0..self.zone_count], 0..) |zone, i| {
-            snap.zones[i] = .{ .modified = zone.modified, .neutral = zone.neutral };
+            snap.zones[i] = .{
+                .modified = zone.modified,
+                .neutralized = zone.neutralized,
+                .neutral = zone.neutral,
+            };
         }
 
         const pm_arr = &self.world.component_arrays.player_marker;

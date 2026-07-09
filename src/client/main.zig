@@ -212,7 +212,12 @@ fn process_recv() void {
                 }
                 g_state.lobby.update = p;
                 g_state.lobby.player_id = g_state.player_id;
-                g_state.phase = .lobby;
+                // The server broadcasts a lobby_update right after game_over
+                // (ready flags reset).  Keep showing the outcome screen; the
+                // stored lobby state is used once the player presses a key.
+                if (g_state.phase != .game_over) {
+                    g_state.phase = .lobby;
+                }
             },
             .game_start => {
                 const p = proto.decode_game_start(r) catch continue;
@@ -233,12 +238,16 @@ fn process_recv() void {
             .game_over => {
                 const p = proto.decode_game_over(r) catch continue;
                 g_state.game.final_score = p.score;
+                g_state.game.final_stats = p.stats;
+                // Server resets ready flags at game end; mirror locally so the
+                // lobby prompt is correct when the player returns.
+                g_state.lobby.ready = false;
                 g_state.phase = .game_over;
             },
             .action_result => {
                 const p = proto.decode_action_result(r) catch continue;
                 const anim: c.ActionAnimation = switch (p.tag) {
-                    .damage, .shield, .heal, .cast => .attack,
+                    .damage, .heal, .cast => .attack,
                     .death => .die,
                 };
                 // Record actor animation (pool actions have no specific actor).
@@ -265,9 +274,32 @@ fn process_recv() void {
             .cast_committed => {
                 const p = proto.decode_cast_committed(r) catch continue;
                 // Our pending combo was committed server-side; clear the
-                // local buffer so the next spell starts fresh.
+                // local buffer so the next spell starts fresh, and cancel
+                // any stale in-flight combo the server may have stored after
+                // the commit (keys racing the cast_committed message).
                 if (p.player_id == g_state.player_id) {
                     g_state.game.pending_combo.clear();
+                    send_cancel_combo();
+                }
+            },
+            .cast_fizzled => {
+                const p = proto.decode_cast_fizzled(r) catch continue;
+                if (p.player_id == g_state.player_id) {
+                    g_state.game.pending_combo.clear();
+                    send_cancel_combo();
+                }
+                // Record for the renderer (transient, drained per frame).
+                if (g_state.game.fizzle_count < g_state.game.fizzles.len) {
+                    g_state.game.fizzles[g_state.game.fizzle_count] = p.player_id;
+                    g_state.game.fizzle_count += 1;
+                }
+            },
+            .recipe_fired => {
+                const p = proto.decode_recipe_fired(r) catch continue;
+                // Record for the renderer (transient, drained per frame).
+                if (g_state.game.recipe_count < g_state.game.recipes_fired.len) {
+                    g_state.game.recipes_fired[g_state.game.recipe_count] = p;
+                    g_state.game.recipe_count += 1;
                 }
             },
             else => {},

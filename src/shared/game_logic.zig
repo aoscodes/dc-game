@@ -1,14 +1,19 @@
 //! Pure resolution logic for the Slime Feast encounter.
 //!
-//! Round resolution pipeline (driven by session.resolve_round):
-//!   1. `match_recipes`   — convert the round's committed casts into one
+//! Cast-window pipeline (driven by session.commit_pending_casts, once per
+//! cast window):
+//!   1. `match_recipes`   — convert the window's committed casts into one
 //!                          AgentOutput (team recipes → player recipes →
-//!                          flat fallback; team recipes need distinct players).
-//!   2. `apply_medicine`  — heal the hunger bar, capped by the healable
-//!                          (modified-slime) portion.
-//!   3. `resolve_zone`    — neutralize matching-color slime with the agent
-//!                          units, then consume the whole zone: compute
-//!                          hunger added (normal + extra) and score.
+//!                          flat fallback; team recipes need distinct players
+//!                          casting in the SAME window).
+//!   2. `apply_medicine`  — heal the hunger bar immediately, capped by the
+//!                          per-color healable (modified-slime) portions.
+//!   3. `transmute`       — convert matching-color Modified Slime into
+//!                          Neutralized Slime in place (visible live).
+//!
+//! Round-end (session.resolve_round):
+//!   4. `consume_zone`    — eat the whole zone: hunger added (normal +
+//!                          extra for remaining modified) and score.
 //!
 //! All functions here are pure/deterministic and unit-testable without a
 //! session.
@@ -83,6 +88,27 @@ pub fn flat_convert(combo: c.ActionCombo) c.AgentOutput {
     return out;
 }
 
+/// True if committing this combo could produce ANY output: either its flat
+/// conversion yields agents/medicine, or it exactly matches a recipe pattern
+/// (player recipes, or any single pattern of a team recipe — the partner may
+/// commit in the same window).  Zero-output combos (e.g. a dangling element
+/// token or colorless actions) FIZZLE instead of committing, so they never
+/// waste one of the player's casts.
+pub fn combo_has_output(combo: c.ActionCombo) bool {
+    const flat = flat_convert(combo);
+    for (flat.units) |u| if (u > 0) return true;
+    for (flat.medicine) |m| if (m > 0) return true;
+    for (balance.player_recipes) |pr| {
+        if (combos_equal(combo, pr.pattern)) return true;
+    }
+    for (balance.team_recipes) |tr| {
+        for (tr.patterns) |pattern| {
+            if (combos_equal(combo, pattern)) return true;
+        }
+    }
+    return false;
+}
+
 /// One committed spell: the combo plus its caster (recipes that span players
 /// must be cast by distinct players).
 pub const Cast = struct {
@@ -92,9 +118,26 @@ pub const Cast = struct {
 
 /// Maximum casts per round == max players × casts each; sized for the
 /// consumed-flag arrays.
-const MAX_CASTS: usize = 64;
+pub const MAX_CASTS: usize = 64;
+
+/// How a cast was converted during recipe matching.
+pub const ConsumedBy = enum(u8) { none, player_recipe, team_recipe };
+
+/// Per-round recipe-matching report for tuning stats.
+pub const MatchReport = struct {
+    /// Fire count per balance.player_recipes entry (table order).
+    player_hits: [balance.player_recipes.len]u16 =
+        [_]u16{0} ** balance.player_recipes.len,
+    /// Fire count per balance.team_recipes entry (table order).
+    team_hits: [balance.team_recipes.len]u16 =
+        [_]u16{0} ** balance.team_recipes.len,
+    /// Parallel to the casts slice: what consumed each cast.
+    consumed: [MAX_CASTS]ConsumedBy = [_]ConsumedBy{.none} ** MAX_CASTS,
+};
 
 /// Convert one round's committed casts into the team's combined AgentOutput.
+/// When `report` is non-null it is filled with recipe fire counts and
+/// per-cast consumption for stats.
 ///
 /// Matching order (a cast is consumed by at most one recipe):
 ///   1. Team recipes, greedily in balance.team_recipes order.  Each pattern
@@ -103,13 +146,13 @@ const MAX_CASTS: usize = 64;
 ///      repeats while disjoint groups keep matching.
 ///   2. Player recipes in balance.player_recipes order (exact match).
 ///   3. Flat conversion fallback (flat_convert).
-pub fn match_recipes(casts: []const Cast) c.AgentOutput {
+pub fn match_recipes(casts: []const Cast, report: ?*MatchReport) c.AgentOutput {
     std.debug.assert(casts.len <= MAX_CASTS);
     var out = c.AgentOutput{};
     var consumed = [_]bool{false} ** MAX_CASTS;
 
     // 1. Team recipes — greedy, repeatable, table order, distinct players.
-    for (balance.team_recipes) |tr| {
+    for (balance.team_recipes, 0..) |tr, ti| {
         matching: while (true) {
             var picks: [MAX_CASTS]usize = undefined;
             var picked = [_]bool{false} ** MAX_CASTS;
@@ -128,7 +171,11 @@ pub fn match_recipes(casts: []const Cast) c.AgentOutput {
                 picks[pi] = ci;
                 picked[ci] = true;
             }
-            for (tr.patterns, 0..) |_, pi| consumed[picks[pi]] = true;
+            for (tr.patterns, 0..) |_, pi| {
+                consumed[picks[pi]] = true;
+                if (report) |r| r.consumed[picks[pi]] = .team_recipe;
+            }
+            if (report) |r| r.team_hits[ti] +|= 1;
             out.add(tr.output);
         }
     }
@@ -136,10 +183,14 @@ pub fn match_recipes(casts: []const Cast) c.AgentOutput {
     // 2. Player recipes.
     for (casts, 0..) |cast, ci| {
         if (consumed[ci]) continue;
-        for (balance.player_recipes) |pr| {
+        for (balance.player_recipes, 0..) |pr, pi| {
             if (combos_equal(cast.combo, pr.pattern)) {
                 out.add(pr.output);
                 consumed[ci] = true;
+                if (report) |r| {
+                    r.player_hits[pi] +|= 1;
+                    r.consumed[ci] = .player_recipe;
+                }
                 break;
             }
         }
@@ -162,20 +213,27 @@ pub fn match_recipes(casts: []const Cast) c.AgentOutput {
 /// symmetrical: the color-X pool heals only `healable[X]` — the hunger
 /// attributable to eating un-neutralized color-X Modified Slime — and is
 /// further capped by the current hunger level.  Overheal is discarded.
-/// Returns the total amount actually healed.
+/// Returns the amount actually healed per color (sum for the total).
 pub fn apply_medicine(
     hunger: *c.Health,
     healable: *[c.Element.size]u16,
     pools: [c.Element.size]u32,
-) u16 {
-    var total: u16 = 0;
+) [c.Element.size]u16 {
+    var healed = [_]u16{0} ** c.Element.size;
     for (pools, 0..) |pool, i| {
         const cap = @min(@as(u32, healable[i]), @as(u32, hunger.current));
         const heal: u16 = @intCast(@min(pool, cap));
         hunger.current -= heal;
         healable[i] -= heal;
-        total += heal;
+        healed[i] = heal;
     }
+    return healed;
+}
+
+/// Sum a per-color u16 array (convenience for totals).
+pub fn sum_u16(values: [c.Element.size]u16) u32 {
+    var total: u32 = 0;
+    for (values) |v| total += v;
     return total;
 }
 
@@ -189,10 +247,28 @@ pub fn hunger_full(hunger: c.Health) bool {
     return hunger.max > 0 and hunger.current >= hunger.max;
 }
 
+/// Transmute matching-color Modified Slime into Neutralized Slime using this
+/// cast window's agent units: per color `min(agents, modified)` moves from
+/// `zone.modified` to `zone.neutralized`.  Excess and wrong-color agents are
+/// wasted (no carry-over between windows).  Returns units transmuted per
+/// color this window.
+pub fn transmute(zone: *c.ZoneDef, agents: [c.Element.size]u32) [c.Element.size]u16 {
+    var transmuted = [_]u16{0} ** c.Element.size;
+    for (agents, 0..) |pool, i| {
+        const n: u16 = @intCast(@min(pool, @as(u32, zone.modified[i])));
+        zone.modified[i] -= n;
+        zone.neutralized[i] +|= n;
+        transmuted[i] = n;
+    }
+    return transmuted;
+}
+
 pub const ZoneOutcome = struct {
-    /// Modified units neutralized per color this round.
+    /// Neutralized (transmuted) units consumed per original color.
     neutralized: [c.Element.size]u16,
-    /// Modified units consumed WITHOUT neutralization (extra hunger).
+    /// Modified units consumed WITHOUT neutralization, per color.
+    modified_missed: [c.Element.size]u16,
+    /// Total of modified_missed (extra-hunger units).
     modified_consumed: u32,
     /// Hunger from consuming every unit at the normal rate (never healable).
     hunger_normal: u32,
@@ -209,27 +285,22 @@ pub const ZoneOutcome = struct {
     }
 };
 
-/// Resolve the end-of-round consumption of `zone` given the team's agent
-/// units.  `neutralized[color] = min(agents[color], zone.modified[color])`;
-/// excess and wrong-color agents are wasted.  The ENTIRE zone is consumed:
-/// every unit costs HUNGER_COST_NORMAL, and each un-neutralized modified
-/// unit additionally costs HUNGER_COST_MODIFIED_EXTRA (healable, tracked
-/// per color).
-pub fn resolve_zone(zone: c.ZoneDef, agents: [c.Element.size]u32) ZoneOutcome {
-    var neutralized = [_]u16{0} ** c.Element.size;
+/// Consume the ENTIRE zone at round end.  Transmutation already happened per
+/// cast window (see `transmute`); every unit costs HUNGER_COST_NORMAL, and
+/// each remaining modified unit additionally costs
+/// HUNGER_COST_MODIFIED_EXTRA (healable, tracked per color).
+pub fn consume_zone(zone: c.ZoneDef) ZoneOutcome {
     var hunger_extra = [_]u32{0} ** c.Element.size;
     var neutralized_total: u32 = 0;
     var modified_consumed: u32 = 0;
-    for (zone.modified, 0..) |mod, i| {
-        const n: u16 = @intCast(@min(agents[i], @as(u32, mod)));
-        neutralized[i] = n;
-        neutralized_total += n;
-        const missed = mod - n;
+    for (zone.modified, zone.neutralized, 0..) |missed, neut, i| {
+        neutralized_total += neut;
         modified_consumed += missed;
         hunger_extra[i] = @as(u32, missed) * balance.HUNGER_COST_MODIFIED_EXTRA;
     }
     return .{
-        .neutralized = neutralized,
+        .neutralized = zone.neutralized,
+        .modified_missed = zone.modified,
         .modified_consumed = modified_consumed,
         .hunger_normal = zone.total_units() * balance.HUNGER_COST_NORMAL,
         .hunger_extra = hunger_extra,
@@ -345,7 +416,7 @@ test "match_recipes: player recipe replaces flat conversion" {
     const casts = [_]Cast{
         .{ .player_id = 0, .combo = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }) },
     };
-    const out = match_recipes(&casts);
+    const out = match_recipes(&casts, null);
     try std.testing.expectEqual(@as(u32, 20), out.units[@intFromEnum(c.Element.fire)]);
 }
 
@@ -353,7 +424,7 @@ test "match_recipes: non-recipe combo falls back to flat conversion" {
     const casts = [_]Cast{
         .{ .player_id = 0, .combo = mk(&.{ .{ .element = .wind }, .{ .action = .dispense } }) },
     };
-    const out = match_recipes(&casts);
+    const out = match_recipes(&casts, null);
     try std.testing.expectEqual(balance.UNITS_PER_SLOT, out.units[@intFromEnum(c.Element.wind)]);
 }
 
@@ -364,7 +435,7 @@ test "match_recipes: team recipe consumes both casts exactly once" {
         .{ .player_id = 0, .combo = pat },
         .{ .player_id = 1, .combo = pat },
     };
-    const out = match_recipes(&casts);
+    const out = match_recipes(&casts, null);
     try std.testing.expectEqual(@as(u32, 30), out.units[@intFromEnum(c.Element.fire)]);
     try std.testing.expectEqual(@as(u32, 2), out.medicine[@intFromEnum(c.Element.fire)]);
 }
@@ -377,7 +448,7 @@ test "match_recipes: team recipe fires twice for two disjoint pairs" {
         .{ .player_id = 2, .combo = pat },
         .{ .player_id = 3, .combo = pat },
     };
-    const out = match_recipes(&casts);
+    const out = match_recipes(&casts, null);
     try std.testing.expectEqual(@as(u32, 60), out.units[@intFromEnum(c.Element.fire)]);
     try std.testing.expectEqual(@as(u32, 4), out.medicine[@intFromEnum(c.Element.fire)]);
 }
@@ -390,7 +461,7 @@ test "match_recipes: same player casting both halves does NOT fire team recipe" 
         .{ .player_id = 0, .combo = pat },
         .{ .player_id = 0, .combo = pat },
     };
-    const out = match_recipes(&casts);
+    const out = match_recipes(&casts, null);
     try std.testing.expectEqual(4 * balance.UNITS_PER_SLOT, out.units[@intFromEnum(c.Element.fire)]);
     for (out.medicine) |m| try std.testing.expectEqual(@as(u32, 0), m);
 }
@@ -404,7 +475,7 @@ test "match_recipes: distinct-player pair still fires alongside same-player extr
         .{ .player_id = 0, .combo = pat },
         .{ .player_id = 1, .combo = pat },
     };
-    const out = match_recipes(&casts);
+    const out = match_recipes(&casts, null);
     try std.testing.expectEqual(30 + 2 * balance.UNITS_PER_SLOT, out.units[@intFromEnum(c.Element.fire)]);
     try std.testing.expectEqual(@as(u32, 2), out.medicine[@intFromEnum(c.Element.fire)]);
 }
@@ -415,7 +486,7 @@ test "match_recipes: lone half of a team recipe falls back to flat" {
     const casts = [_]Cast{
         .{ .player_id = 0, .combo = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } }) },
     };
-    const out = match_recipes(&casts);
+    const out = match_recipes(&casts, null);
     try std.testing.expectEqual(2 * balance.UNITS_PER_SLOT, out.units[@intFromEnum(c.Element.fire)]);
     for (out.medicine) |m| try std.testing.expectEqual(@as(u32, 0), m);
 }
@@ -428,7 +499,7 @@ test "match_recipes: mixed — team pair + independent flat combo" {
         .{ .player_id = 1, .combo = flat },
         .{ .player_id = 2, .combo = pat },
     };
-    const out = match_recipes(&casts);
+    const out = match_recipes(&casts, null);
     try std.testing.expectEqual(@as(u32, 30), out.units[@intFromEnum(c.Element.fire)]);
     try std.testing.expectEqual(balance.UNITS_PER_SLOT, out.units[@intFromEnum(c.Element.water)]);
 }
@@ -440,7 +511,8 @@ test "apply_medicine: capped by matching-color healable portion" {
     var pools = [_]u32{0} ** c.Element.size;
     pools[@intFromEnum(c.Element.fire)] = 25;
     const healed = apply_medicine(&hunger, &healable, pools);
-    try std.testing.expectEqual(@as(u16, 10), healed);
+    try std.testing.expectEqual(@as(u16, 10), healed[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u32, 10), sum_u16(healed));
     try std.testing.expectEqual(@as(u16, 40), hunger.current);
     try std.testing.expectEqual(@as(u16, 0), healable[@intFromEnum(c.Element.fire)]);
 }
@@ -453,7 +525,7 @@ test "apply_medicine: asymmetric medicine heals nothing" {
     var pools = [_]u32{0} ** c.Element.size;
     pools[@intFromEnum(c.Element.water)] = 99;
     const healed = apply_medicine(&hunger, &healable, pools);
-    try std.testing.expectEqual(@as(u16, 0), healed);
+    try std.testing.expectEqual(@as(u32, 0), sum_u16(healed));
     try std.testing.expectEqual(@as(u16, 50), hunger.current);
     try std.testing.expectEqual(@as(u16, 20), healable[@intFromEnum(c.Element.fire)]);
 }
@@ -464,7 +536,9 @@ test "apply_medicine: multiple colors heal independently" {
     const pools = [_]u32{ 3, 99, 99, 8 };
     const healed = apply_medicine(&hunger, &healable, pools);
     // fire 3 + earth 0 + wind 4 + water 8 = 15.
-    try std.testing.expectEqual(@as(u16, 15), healed);
+    try std.testing.expectEqual(@as(u32, 15), sum_u16(healed));
+    try std.testing.expectEqual(@as(u16, 3), healed[0]);
+    try std.testing.expectEqual(@as(u16, 8), healed[3]);
     try std.testing.expectEqual(@as(u16, 35), hunger.current);
     try std.testing.expectEqual(@as(u16, 7), healable[0]);
     try std.testing.expectEqual(@as(u16, 0), healable[2]);
@@ -478,7 +552,7 @@ test "apply_medicine: capped by current hunger" {
     var pools = [_]u32{0} ** c.Element.size;
     pools[@intFromEnum(c.Element.fire)] = 25;
     const healed = apply_medicine(&hunger, &healable, pools);
-    try std.testing.expectEqual(@as(u16, 3), healed);
+    try std.testing.expectEqual(@as(u32, 3), sum_u16(healed));
     try std.testing.expectEqual(@as(u16, 0), hunger.current);
     try std.testing.expectEqual(@as(u16, 47), healable[@intFromEnum(c.Element.fire)]);
 }
@@ -488,7 +562,7 @@ test "apply_medicine: zero healable — neutral consumption not healable" {
     var healable = [_]u16{0} ** c.Element.size;
     const pools = [_]u32{99} ** c.Element.size;
     const healed = apply_medicine(&hunger, &healable, pools);
-    try std.testing.expectEqual(@as(u16, 0), healed);
+    try std.testing.expectEqual(@as(u32, 0), sum_u16(healed));
     try std.testing.expectEqual(@as(u16, 80), hunger.current);
 }
 
@@ -499,12 +573,19 @@ test "add_hunger: clamps at max" {
     try std.testing.expect(hunger_full(hunger));
 }
 
-test "resolve_zone: partial neutralization (25 of 50)" {
+test "transmute: partial neutralization (25 of 50) moves units in place" {
     var zone = c.ZoneDef{};
     zone.modified[@intFromEnum(c.Element.fire)] = 50;
     var agents = [_]u32{0} ** c.Element.size;
     agents[@intFromEnum(c.Element.fire)] = 25;
-    const outcome = resolve_zone(zone, agents);
+    const moved = transmute(&zone, agents);
+    try std.testing.expectEqual(@as(u16, 25), moved[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u16, 25), zone.modified[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u16, 25), zone.neutralized[@intFromEnum(c.Element.fire)]);
+    // Total units unchanged: transmutation converts, never consumes.
+    try std.testing.expectEqual(@as(u32, 50), zone.total_units());
+
+    const outcome = consume_zone(zone);
     try std.testing.expectEqual(@as(u16, 25), outcome.neutralized[@intFromEnum(c.Element.fire)]);
     try std.testing.expectEqual(@as(u32, 25), outcome.modified_consumed);
     try std.testing.expectEqual(50 * balance.HUNGER_COST_NORMAL, outcome.hunger_normal);
@@ -513,47 +594,130 @@ test "resolve_zone: partial neutralization (25 of 50)" {
     try std.testing.expectEqual(@as(u32, 25), outcome.score);
 }
 
-test "resolve_zone: excess agents are wasted" {
+test "transmute: excess agents in a window are wasted" {
     var zone = c.ZoneDef{};
     zone.modified[@intFromEnum(c.Element.water)] = 10;
     var agents = [_]u32{0} ** c.Element.size;
     agents[@intFromEnum(c.Element.water)] = 999;
-    const outcome = resolve_zone(zone, agents);
-    try std.testing.expectEqual(@as(u16, 10), outcome.neutralized[@intFromEnum(c.Element.water)]);
+    const moved = transmute(&zone, agents);
+    try std.testing.expectEqual(@as(u16, 10), moved[@intFromEnum(c.Element.water)]);
+    try std.testing.expectEqual(@as(u16, 0), zone.modified[@intFromEnum(c.Element.water)]);
+
+    const outcome = consume_zone(zone);
     try std.testing.expectEqual(@as(u32, 0), outcome.modified_consumed);
     try std.testing.expectEqual(@as(u32, 0), outcome.hunger_extra_total());
     try std.testing.expectEqual(@as(u32, 10), outcome.score);
 }
 
-test "resolve_zone: wrong-color agents have no effect" {
+test "transmute: wrong-color agents have no effect" {
     var zone = c.ZoneDef{};
     zone.modified[@intFromEnum(c.Element.fire)] = 20;
     var agents = [_]u32{0} ** c.Element.size;
     agents[@intFromEnum(c.Element.water)] = 20;
-    const outcome = resolve_zone(zone, agents);
-    try std.testing.expectEqual(@as(u16, 0), outcome.neutralized[@intFromEnum(c.Element.fire)]);
+    const moved = transmute(&zone, agents);
+    for (moved) |m| try std.testing.expectEqual(@as(u16, 0), m);
+
+    const outcome = consume_zone(zone);
     try std.testing.expectEqual(@as(u32, 20), outcome.modified_consumed);
     try std.testing.expectEqual(20 * balance.HUNGER_COST_MODIFIED_EXTRA, outcome.hunger_extra[@intFromEnum(c.Element.fire)]);
     try std.testing.expectEqual(@as(u32, 0), outcome.hunger_extra[@intFromEnum(c.Element.water)]);
     try std.testing.expectEqual(@as(u32, 0), outcome.score);
 }
 
-test "resolve_zone: naturally-neutral slime counts toward score, costs normal hunger" {
+test "transmute: sequential windows equal one batched application" {
+    // 25 agents in one window == 10 + 15 across two windows.
+    var zone_a = c.ZoneDef{};
+    zone_a.modified[0] = 50;
+    var zone_b = zone_a;
+
+    var batch = [_]u32{0} ** c.Element.size;
+    batch[0] = 25;
+    _ = transmute(&zone_a, batch);
+
+    var w1 = [_]u32{0} ** c.Element.size;
+    w1[0] = 10;
+    var w2 = [_]u32{0} ** c.Element.size;
+    w2[0] = 15;
+    _ = transmute(&zone_b, w1);
+    _ = transmute(&zone_b, w2);
+
+    try std.testing.expectEqual(zone_a.modified[0], zone_b.modified[0]);
+    try std.testing.expectEqual(zone_a.neutralized[0], zone_b.neutralized[0]);
+    const oa = consume_zone(zone_a);
+    const ob = consume_zone(zone_b);
+    try std.testing.expectEqual(oa.score, ob.score);
+    try std.testing.expectEqual(oa.hunger_extra_total(), ob.hunger_extra_total());
+}
+
+test "consume_zone: naturally-neutral slime counts toward score, costs normal hunger" {
     const zone = c.ZoneDef{ .neutral = 15 };
-    const agents = [_]u32{0} ** c.Element.size;
-    const outcome = resolve_zone(zone, agents);
+    const outcome = consume_zone(zone);
     try std.testing.expectEqual(@as(u32, 15), outcome.score);
     try std.testing.expectEqual(15 * balance.HUNGER_COST_NORMAL, outcome.hunger_normal);
     try std.testing.expectEqual(@as(u32, 0), outcome.hunger_extra_total());
 }
 
-test "resolve_zone: mixed zone full clear" {
+test "consume_zone: fully transmuted mixed zone" {
     var zone = c.ZoneDef{ .neutral = 5 };
     zone.modified = .{ 10, 20, 0, 0 };
     const agents = [_]u32{ 10, 20, 0, 0 };
-    const outcome = resolve_zone(zone, agents);
+    _ = transmute(&zone, agents);
+    const outcome = consume_zone(zone);
     try std.testing.expectEqual(@as(u32, 0), outcome.modified_consumed);
     try std.testing.expectEqual(@as(u32, 35), outcome.score);
     try std.testing.expectEqual(35 * balance.HUNGER_COST_NORMAL, outcome.hunger_normal);
     try std.testing.expectEqual(@as(u32, 0), outcome.hunger_extra_total());
+}
+
+test "match_recipes: report records fire counts and per-cast consumption" {
+    const half = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const flood = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const plain = mk(&.{ .{ .element = .water }, .{ .action = .dispense } });
+    const casts = [_]Cast{
+        .{ .player_id = 0, .combo = half }, // team pair w/ p1
+        .{ .player_id = 1, .combo = half },
+        .{ .player_id = 2, .combo = flood }, // crimson_flood (player recipe 0)
+        .{ .player_id = 3, .combo = plain }, // flat
+    };
+    var report = MatchReport{};
+    _ = match_recipes(&casts, &report);
+
+    try std.testing.expectEqual(@as(u16, 1), report.team_hits[0]); // twin_flames
+    try std.testing.expectEqual(@as(u16, 1), report.player_hits[0]); // crimson_flood
+    try std.testing.expectEqual(ConsumedBy.team_recipe, report.consumed[0]);
+    try std.testing.expectEqual(ConsumedBy.team_recipe, report.consumed[1]);
+    try std.testing.expectEqual(ConsumedBy.player_recipe, report.consumed[2]);
+    try std.testing.expectEqual(ConsumedBy.none, report.consumed[3]);
+}
+
+test "combo_has_output: dangling element token fizzles" {
+    try std.testing.expect(!combo_has_output(mk(&.{.{ .element = .fire }})));
+}
+
+test "combo_has_output: colorless actions fizzle" {
+    try std.testing.expect(!combo_has_output(mk(&.{
+        .{ .action = .dispense },
+        .{ .action = .medicine },
+    })));
+}
+
+test "combo_has_output: colored dispense has output" {
+    try std.testing.expect(combo_has_output(mk(&.{
+        .{ .element = .fire },
+        .{ .action = .dispense },
+    })));
+}
+
+test "combo_has_output: recipe patterns have output" {
+    // twin_flames half (team pattern) and panacea (player recipe).
+    try std.testing.expect(combo_has_output(mk(&.{
+        .{ .element = .fire },
+        .{ .action = .dispense },
+        .{ .action = .dispense },
+    })));
+    try std.testing.expect(combo_has_output(mk(&.{
+        .{ .element = .water },
+        .{ .action = .medicine },
+        .{ .action = .medicine },
+    })));
 }
