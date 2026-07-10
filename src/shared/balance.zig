@@ -1,10 +1,10 @@
-//! Tuning tables for the Slime Feast encounter.
+//! Balance *types* for the Slime Feast encounter.
 //!
-//! Everything gameplay-numeric lives here so designers can tune without
-//! touching resolution logic:
-//!   - flat per-slot conversion rates (non-recipe combos)
-//!   - hunger costs for neutral vs modified slime
-//!   - hard-coded recipe tables (player + team)
+//! The actual numbers live in `data/balance.json` and are loaded at server
+//! start by `config.zig` — designers tune the JSON, no rebuild required.
+//! The browser fetches the same file, so there is a single source of truth
+//! for rates and recipe tables (wire messages reference recipes by table
+//! index, in file order).
 //!
 //! ## Recipes
 //!
@@ -21,28 +21,11 @@
 
 const c = @import("components.zig");
 
-// ---------------------------------------------------------------------------
-// Flat conversion + hunger costs — TODO tune (arbitrary starting values)
-// ---------------------------------------------------------------------------
-
-/// Spells (combos) each player may commit per round.  The cast window is
-/// round_duration / CASTS_PER_ROUND; the pending combo commits when the
-/// window closes.
-pub const CASTS_PER_ROUND: u8 = 3;
-
-/// Agent units released per elemental dispense slot in a non-recipe combo.
-pub const UNITS_PER_SLOT: u32 = 5;
-/// Medicine contributed per elemental medicine slot in a non-recipe combo.
-/// Medicine carries the combo's current element; colorless slots are wasted.
-pub const MEDICINE_PER_SLOT: u32 = 3;
-/// Hunger cost per slime unit consumed (any unit — never healable).
-pub const HUNGER_COST_NORMAL: u32 = 1;
-/// EXTRA hunger per un-neutralized modified unit consumed (healable portion).
-pub const HUNGER_COST_MODIFIED_EXTRA: u32 = 2;
-
-// ---------------------------------------------------------------------------
-// Recipes
-// ---------------------------------------------------------------------------
+/// Wire cap on the player recipe table (MatchStats hit-array sizing).
+/// The config loader rejects data files exceeding it.
+pub const MAX_PLAYER_RECIPES: u8 = 64;
+/// Wire cap on the team recipe table.
+pub const MAX_TEAM_RECIPES: u8 = 64;
 
 pub const PlayerRecipe = struct {
     label: []const u8,
@@ -57,62 +40,24 @@ pub const TeamRecipe = struct {
     output: c.AgentOutput,
 };
 
-const mk = c.make_combo;
-
-// Starter recipe set — TODO tune with playtesting.
-pub const player_recipes = [_]PlayerRecipe{
-    // Mono-color burst: beats flat conversion (3 slots × 5 = 15 → 20).
-    .{
-        .label = "crimson_flood",
-        .pattern = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        .output = .{ .units = .{ 20, 0, 0, 0 } },
-    },
-    .{
-        .label = "verdant_flood",
-        .pattern = mk(&.{ .{ .element = .earth }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        .output = .{ .units = .{ 0, 20, 0, 0 } },
-    },
-    .{
-        .label = "gale_flood",
-        .pattern = mk(&.{ .{ .element = .wind }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        .output = .{ .units = .{ 0, 0, 20, 0 } },
-    },
-    .{
-        .label = "tide_flood",
-        .pattern = mk(&.{ .{ .element = .water }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        .output = .{ .units = .{ 0, 0, 0, 20 } },
-    },
-    // Multi-color mist: covers every color at once.
-    .{
-        .label = "prism_mist",
-        .pattern = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .element = .water }, .{ .action = .dispense } }),
-        .output = .{ .units = .{ 6, 6, 6, 6 } },
-    },
-    // Concentrated water medicine: beats flat conversion (2 slots × 3 = 6 → 10).
-    .{
-        .label = "panacea",
-        .pattern = mk(&.{ .{ .element = .water }, .{ .action = .medicine }, .{ .action = .medicine } }),
-        .output = .{ .medicine = .{ 0, 0, 0, 10 } },
-    },
-};
-
-pub const team_recipes = [_]TeamRecipe{
-    // Two players each cast [fire, dispense, dispense] in the same round.
-    .{
-        .label = "twin_flames",
-        .patterns = &.{
-            mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } }),
-            mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        },
-        .output = .{ .units = .{ 30, 0, 0, 0 }, .medicine = .{ 20, 0, 0, 0 } },
-    },
-    // One dispenses water, one dispenses earth — combined downpour.
-    .{
-        .label = "mudslide",
-        .patterns = &.{
-            mk(&.{ .{ .element = .water }, .{ .action = .dispense }, .{ .action = .dispense } }),
-            mk(&.{ .{ .element = .earth }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        },
-        .output = .{ .units = .{ 0, 40, 0, 40 } },
-    },
+/// All designer-tunable balance numbers.  Loaded from `data/balance.json`
+/// (see config.zig); tests use the frozen fixture in fixtures.zig.
+pub const Balance = struct {
+    /// Spells (combos) each player may commit per round.  The cast window is
+    /// round_duration / casts_per_round; the pending combo commits when the
+    /// window closes.
+    casts_per_round: u8,
+    /// Agent units released per elemental dispense slot in a non-recipe combo.
+    units_per_slot: u32,
+    /// Medicine contributed per elemental medicine slot in a non-recipe combo.
+    /// Medicine carries the combo's current element; colorless slots are wasted.
+    medicine_per_slot: u32,
+    /// Hunger cost per slime unit consumed (any unit — never healable).
+    hunger_cost_normal: u32,
+    /// EXTRA hunger per un-neutralized modified unit consumed (healable portion).
+    hunger_cost_modified_extra: u32,
+    /// Round length in seconds unless overridden with --round-duration.
+    round_duration_default_s: f32,
+    player_recipes: []const PlayerRecipe,
+    team_recipes: []const TeamRecipe,
 };

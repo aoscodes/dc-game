@@ -10,7 +10,7 @@ const std = @import("std");
 const ws = @import("websocket");
 const shared = @import("shared");
 const proto = shared.protocol;
-const logic = shared.game_logic;
+const cfg_mod = shared.config;
 const dbg = @import("debug_zig");
 
 const session_mod = @import("session.zig");
@@ -20,9 +20,14 @@ const ws_server = @import("net/ws_server.zig");
 const TICK_HZ: u64 = 20;
 const TICK_NS: u64 = std.time.ns_per_s / TICK_HZ;
 const DEFAULT_PORT: u16 = 9001;
+/// Default directory holding balance.json / encounters.json (relative to
+/// cwd); override with --data-dir.
+const DEFAULT_DATA_DIR = "data";
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 var ta: dbg.TrackingAllocator = undefined;
+/// Loaded once at startup; referenced by the session for its lifetime.
+var g_loaded: cfg_mod.Loaded = undefined;
 var session: ?Session = null;
 var session_lock: std.Thread.Mutex = .{};
 
@@ -134,8 +139,10 @@ pub fn main() !void {
     defer ta.report_stderr("server");
 
     var port: u16 = DEFAULT_PORT;
-    var round_duration: f32 = logic.ROUND_DURATION_DEFAULT_S;
+    var round_duration_override: ?f32 = null;
     var join_code_override: ?[6]u8 = null;
+    var data_dir: []const u8 = DEFAULT_DATA_DIR;
+    var validate_only = false;
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // skip argv[0]
@@ -145,9 +152,9 @@ pub fn main() !void {
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--round-duration")) {
             if (args.next()) |val| {
-                round_duration = std.fmt.parseFloat(f32, val) catch blk: {
-                    std.log.warn("invalid --round-duration value '{s}', using default {d:.1}s", .{ val, logic.ROUND_DURATION_DEFAULT_S });
-                    break :blk logic.ROUND_DURATION_DEFAULT_S;
+                round_duration_override = std.fmt.parseFloat(f32, val) catch blk: {
+                    std.log.warn("invalid --round-duration value '{s}', using data-file default", .{val});
+                    break :blk null;
                 };
             }
         } else if (std.mem.eql(u8, arg, "--join-code")) {
@@ -160,8 +167,32 @@ pub fn main() !void {
                     std.log.warn("--join-code must be exactly 6 characters, ignoring '{s}'", .{val});
                 }
             }
+        } else if (std.mem.eql(u8, arg, "--data-dir")) {
+            if (args.next()) |val| data_dir = val;
+        } else if (std.mem.eql(u8, arg, "--validate")) {
+            // Load + validate the data files, then exit — used by the bridge's
+            // /api/tune/save endpoint to vet designer configs with the exact
+            // same loader the game uses.
+            validate_only = true;
         }
     }
+
+    // Load all balance/encounter data from the data files.  Every new lobby
+    // gets a fresh server process (see bridge/index.js), so editing the JSON
+    // takes effect on the next lobby without a rebuild.
+    g_loaded = cfg_mod.load(allocator, data_dir) catch {
+        std.log.err("failed to load game data from '{s}' — fix the data files and restart", .{data_dir});
+        std.process.exit(1);
+    };
+    defer g_loaded.deinit();
+
+    if (validate_only) {
+        std.log.info("game data in '{s}' is valid", .{data_dir});
+        return;
+    }
+
+    const round_duration = round_duration_override orelse
+        g_loaded.config.balance.round_duration_default_s;
 
     var join_code: [6]u8 = undefined;
     if (join_code_override) |override| {
@@ -174,7 +205,7 @@ pub fn main() !void {
         }
     }
 
-    session = try Session.init(allocator, join_code);
+    session = try Session.init(allocator, join_code, &g_loaded.config);
     defer if (session) |*s| s.deinit();
     session.?.round_duration = round_duration;
     session.?.round_timer = round_duration;

@@ -57,10 +57,6 @@ const LAYOUT = {
     optX: 60, optY0: 160, optGap: 40, optFont: 22,
     errorDy: 100, errorFont: 18,
     codePromptY: 160, codeY: 210, codeFont: 36, codeHintY: 270, codeHintFont: 16,
-    statTitleY: 100, statTitleFont: 24, statHintY: 130, statHintFont: 14,
-    statRowH: 38, statStartY: 168, statLabelX: 70, statLabelFont: 20,
-    statHiX: 50, statHiW: 480,
-    statBarX: 220, statBarW: 300, statBarH: 14, statValX: 534,
   },
 
   lobby: {
@@ -93,7 +89,6 @@ const SH = LAYOUT.screen.h;
 const FIELD = LAYOUT.slimeField;
 
 const C_BG = LAYOUT.bg ?? "#14141e";
-const C_CURSOR = "rgba(255,255,100,0.7)";
 const C_TEXT = "rgba(230,230,230,1)";
 const C_HEADER = "rgba(180,200,255,1)";
 const C_SLIME_HDR = "rgba(160,255,140,1)";
@@ -110,18 +105,71 @@ const CLASSES = [LIL_GUY_SPRITE];
 const sprites = new Map();
 
 async function loadAssets() {
-  await Promise.all(CLASSES.map(async cls => {
-    const [meta, img] = await Promise.all([
-      fetch(`assets/${cls}.json`).then(r => r.json()),
-      new Promise((res, rej) => {
-        const i = new Image();
-        i.onload = () => res(i);
-        i.onerror = rej;
-        i.src = `assets/${cls}.png`;
-      }),
-    ]);
-    sprites.set(cls, { img, meta });
+  await Promise.all([
+    loadBalanceData(),
+    ...CLASSES.map(async cls => {
+      // Absolute paths: the page may be served at /config/{hash}.
+      const [meta, img] = await Promise.all([
+        fetch(`/assets/${cls}.json`).then(r => r.json()),
+        new Promise((res, rej) => {
+          const i = new Image();
+          i.onload = () => res(i);
+          i.onerror = rej;
+          i.src = `/assets/${cls}.png`;
+        }),
+      ]);
+      sprites.set(cls, { img, meta });
+    }),
+  ]);
+}
+
+/** Combo slot from its data-file name: actions vs element modifiers. */
+function slotFromName(name) {
+  return (name === "dispense" || name === "medicine")
+    ? { action: name }
+    : { element: name };
+}
+
+/**
+ * Saved /tune config hash from the URL when playing at /config/{hash};
+ * null on the plain game page (shipped defaults).
+ */
+const PAGE_CONFIG_HASH =
+  (location.pathname.match(/^\/config\/([0-9a-f]{16})/) || [])[1] ?? null;
+
+/** Config hash whose balance tables are currently loaded. */
+let loadedConfigHash = null;
+
+/** Balance data URL for a config hash (null = shipped defaults). */
+function balanceUrl(hash) {
+  return hash ? `/config/${hash}/data/balance.json` : "/data/balance.json";
+}
+
+/**
+ * Fetch balance data — the same file the Zig server loads — and populate
+ * the rates and recipe tables.  Single source of truth:
+ * wire recipe indices refer to these tables in file order.  Re-invoked with
+ * a different hash when joining a lobby that runs a custom config.
+ */
+async function loadBalanceData(hash = PAGE_CONFIG_HASH) {
+  const res = await fetch(balanceUrl(hash));
+  if (!res.ok) throw new Error(`fetch ${balanceUrl(hash)}: HTTP ${res.status}`);
+  const bal = await res.json();
+  const output = (o) => ({ units: o.units ?? {}, medicine: o.medicine ?? {} });
+  UNITS_PER_SLOT = bal.units_per_slot;
+  MEDICINE_PER_SLOT = bal.medicine_per_slot;
+  CASTS_PER_ROUND = bal.casts_per_round;
+  PLAYER_RECIPES = bal.player_recipes.map((r) => ({
+    label: r.label,
+    pattern: r.pattern.map(slotFromName),
+    output: output(r.output),
   }));
+  TEAM_RECIPES = bal.team_recipes.map((r) => ({
+    label: r.label,
+    patterns: r.patterns.map((p) => p.map(slotFromName)),
+    output: output(r.output),
+  }));
+  loadedConfigHash = hash;
 }
 
 /**
@@ -233,67 +281,16 @@ function drawConnecting() {
 /**
  * "choose"        — show Create / Join options
  * "entering_code" — user is typing a 6-char lobby code
- * "editing_stats" — player is adjusting their statblock before creating/joining
  */
 let preLobbyMode = "choose";
 let preLobbyCode = "";
 let preLobbyError = "";
 
-/** Ordered list of stat keys shown in the editor (display order). */
-const STAT_KEYS = ["hp", "attack", "shield", "heal", "fire", "earth", "wind", "water", "level"];
-
-/** Default statblock values (applied on each pre_lobby entry). */
-const DEFAULT_STATS = { hp: 120, attack: 1, shield: 1, heal: 1, fire: 1, earth: 1, wind: 1, water: 1, level: 1 };
-
 /** Reset all pre-lobby state (called on server pre_lobby / joining / error messages). */
 function resetPreLobby() {
-  _krStop();
   preLobbyMode = "choose";
   preLobbyCode = "";
   preLobbyError = "";
-  preLobbyStats = { ...DEFAULT_STATS };
-  preLobbyPendingAction = null;
-  preLobbyStatCursor = 0;
-}
-
-/** Mutable statblock for the current session (reset on pre_lobby entry). */
-let preLobbyStats = { hp: 120, attack: 1, shield: 1, heal: 1, fire: 1, earth: 1, wind: 1, water: 1, level: 1 };
-
-/** Index into STAT_KEYS indicating the currently selected row. */
-let preLobbyStatCursor = 0;
-
-/**
- * Pending create-or-join action; stored while player edits stats.
- * @type {{ action: string, code?: string } | null}
- */
-let preLobbyPendingAction = null;
-
-// Key-repeat state for stat value adjustment (ArrowLeft / ArrowRight).
-let _krKey = null;   // "ArrowLeft" | "ArrowRight" | null
-let _krTimer = null;
-let _krStart = 0;
-let _krDelta = 0;      // +1 or -1
-
-function _krStop() {
-  _krKey = null;
-  if (_krTimer !== null) { clearTimeout(_krTimer); _krTimer = null; }
-}
-
-function _krSchedule() {
-  const elapsed = Date.now() - _krStart;
-  const delay = Math.max(30, 400 - elapsed * 0.6);
-  _krTimer = setTimeout(_krTick, delay);
-}
-
-function _krTick() {
-  if (_krKey === null) return;
-  _adjustStat(_krDelta);
-  _krSchedule();
-}
-
-function _adjustStat(delta) {
-  const key = STAT_KEYS[preLobbyStatCursor];
-  preLobbyStats[key] = Math.max(1, Math.min(100, (preLobbyStats[key] || 1) + delta));
 }
 
 function drawPreLobby() {
@@ -315,38 +312,6 @@ function drawPreLobby() {
     text("[ENTER] to confirm    [ESC] back", L.optX, L.codeHintY, L.codeHintFont, "rgba(170,170,170,1)");
     if (preLobbyError) {
       text(preLobbyError, L.optX, L.codeHintY + 40, L.errorFont, "rgba(255,100,100,1)");
-    }
-  } else if (preLobbyMode === "editing_stats") {
-    text("Customise stats", L.optX, L.statTitleY, L.statTitleFont, C_HEADER);
-    text("[UP/DOWN] change value    [ENTER] confirm    [ESC] back", L.optX, L.statHintY, L.statHintFont, "rgba(170,170,170,1)");
-
-    for (let i = 0; i < STAT_KEYS.length; i++) {
-      const key = STAT_KEYS[i];
-      const val = preLobbyStats[key] || 1;
-      const y = L.statStartY + i * L.statRowH;
-      const sel = i === preLobbyStatCursor;
-
-      if (sel) {
-        // Highlight row background.
-        ctx.save();
-        ctx.fillStyle = "rgba(255,255,100,0.12)";
-        ctx.fillRect(L.statHiX, y - 14, L.statHiW, L.statRowH - 4);
-        ctx.restore();
-      }
-
-      const label = key.charAt(0).toUpperCase() + key.slice(1);
-      text(label, L.statLabelX, y, L.statLabelFont, sel ? C_CURSOR : C_TEXT);
-
-      // Value bar (0-100 mapped to statBarW px wide).
-      const barY = y - L.statBarH / 2 + 2;
-      ctx.save();
-      ctx.fillStyle = "rgba(60,60,80,0.7)";
-      ctx.fillRect(L.statBarX, barY, L.statBarW, L.statBarH);
-      ctx.fillStyle = sel ? "rgba(255,255,80,0.85)" : "rgba(80,180,255,0.75)";
-      ctx.fillRect(L.statBarX, barY, L.statBarW * (val / 100), L.statBarH);
-      ctx.restore();
-
-      text(String(val).padStart(3, " "), L.statValX, y, L.statLabelFont, sel ? C_CURSOR : C_TEXT);
     }
   }
 }
@@ -429,7 +394,7 @@ function outputParts(output) {
 /**
  * Lobby study guide: how casting works + every defined recipe with its key
  * sequence AND symbols, all in parity colors (slime = agent = medicine =
- * hunger block).  Recipe order mirrors balance.zig.
+ * hunger block).  Recipes appear in data/balance.json order.
  */
 function drawRecipeGuide() {
   const L = LAYOUT.lobby;
@@ -454,7 +419,7 @@ function drawRecipeGuide() {
       { str: "medicine heals matching-color hunger.", color: ACTION_COLOR.medicine },
     ],
     [
-      { str: "Spells auto-cast when the cast bar empties — 3 per round. Exact combos below are RECIPES (stronger).", color: descColor },
+      { str: `Spells auto-cast when the cast bar empties — ${CASTS_PER_ROUND} per round. Exact combos below are RECIPES (stronger).`, color: descColor },
     ],
   ];
   for (const line of descLines) {
@@ -571,9 +536,10 @@ const RECIPE_COLOR_TEAM = "rgba(140,240,255,1)";
 
 /**
  * Big celebratory floaters when recipes fire (server broadcasts one event
- * per fire at cast-window close).  Labels are resolved by table index from
- * the JS mirror tables — order must match balance.zig.  Floaters rise from
- * the active zone's center, stacked when several fire at once.
+ * per fire at cast-window close).  Labels are resolved by table index into
+ * the tables loaded from data/balance.json (same file the server reads, so
+ * indices agree by construction).  Floaters rise from the active zone's
+ * center, stacked when several fire at once.
  */
 function spawnRecipeFloaters(game) {
   const fired = game.recipes_fired ?? [];
@@ -710,44 +676,17 @@ function parseComboSlots(slots) {
   return out;
 }
 
-// Must match balance.zig flat conversion rates.
-const UNITS_PER_SLOT = 5;
-const MEDICINE_PER_SLOT = 3;
-
-const el = (e) => ({ element: e });
-const ac = (a) => ({ action: a });
-
-/** Mirrors balance.player_recipes (exact patterns → outputs).
- *  `medicine` is per color: color-X medicine heals only color-X healable
- *  hunger (symmetrical healing). */
-const PLAYER_RECIPES = [
-  { label: "crimson_flood", pattern: [el("fire"), ac("dispense"), ac("dispense"), ac("dispense")], output: { units: { fire: 20 }, medicine: {} } },
-  { label: "verdant_flood", pattern: [el("earth"), ac("dispense"), ac("dispense"), ac("dispense")], output: { units: { earth: 20 }, medicine: {} } },
-  { label: "gale_flood", pattern: [el("wind"), ac("dispense"), ac("dispense"), ac("dispense")], output: { units: { wind: 20 }, medicine: {} } },
-  { label: "tide_flood", pattern: [el("water"), ac("dispense"), ac("dispense"), ac("dispense")], output: { units: { water: 20 }, medicine: {} } },
-  { label: "prism_mist", pattern: [el("fire"), ac("dispense"), el("water"), ac("dispense")], output: { units: { fire: 6, earth: 6, wind: 6, water: 6 }, medicine: {} } },
-  { label: "panacea", pattern: [el("water"), ac("medicine"), ac("medicine")], output: { units: {}, medicine: { water: 10 } } },
-];
-
-/** Mirrors balance.team_recipes. */
-const TEAM_RECIPES = [
-  {
-    label: "twin_flames",
-    patterns: [
-      [el("fire"), ac("dispense"), ac("dispense")],
-      [el("fire"), ac("dispense"), ac("dispense")],
-    ],
-    output: { units: { fire: 30 }, medicine: { fire: 20 } },
-  },
-  {
-    label: "mudslide",
-    patterns: [
-      [el("water"), ac("dispense"), ac("dispense")],
-      [el("earth"), ac("dispense"), ac("dispense")],
-    ],
-    output: { units: { earth: 40, water: 40 }, medicine: {} },
-  },
-];
+// Flat conversion rates + recipe tables are loaded from data/balance.json
+// (loadBalanceData) — the same file the Zig server reads, so there is no
+// hand-mirrored copy to drift.  `medicine` outputs are per color: color-X
+// medicine heals only color-X healable hunger (symmetrical healing).
+let UNITS_PER_SLOT = 0;
+let MEDICINE_PER_SLOT = 0;
+let CASTS_PER_ROUND = 0;
+/** @type {Array<{label: string, pattern: Array<object>, output: object}>} */
+let PLAYER_RECIPES = [];
+/** @type {Array<{label: string, patterns: Array<Array<object>>, output: object}>} */
+let TEAM_RECIPES = [];
 
 function slotsEqual(a, b) {
   if (a.length !== b.length) return false;
@@ -1442,16 +1381,22 @@ function connect() {
       // and any stale error text disappears.
       resetPreLobby();
       latestMsg = { phase: "connecting" };
+      // Adopt the lobby's config: a room created from /config/{hash} uses
+      // that hash's balance tables; joiners from any page must match.
+      const roomConfig = typeof msg.config === "string" ? msg.config : null;
+      if (roomConfig !== loadedConfigHash) {
+        loadBalanceData(roomConfig).catch((err) =>
+          console.error("[game] failed to load lobby config", err));
+      }
     } else if (msg.tag === "error") {
-      // Only show an error to the user when they explicitly submitted a code.
-      // If the error came from an auto-reconnect (preLobbyMode === "choose" and
-      // preLobbyCode is empty), just clear stale localStorage silently.
-      const userInitiated = preLobbyMode === "entering_code" ||
-        preLobbyMode === "editing_stats" ||
-        preLobbyCode.length > 0;
-      const errMsg = msg.reason === "not_found" ? "Lobby not found." : `Error: ${msg.reason}`;
+      // Every pre-lobby action is user-initiated (C/J keys), so always show
+      // the reason.
+      const errMsg =
+        msg.reason === "not_found" ? "Lobby not found." :
+        msg.reason === "config_not_found" ? "Saved config not found — re-save it at /tune." :
+        `Error: ${msg.reason}`;
       resetPreLobby();
-      preLobbyError = userInitiated ? errMsg : "";
+      preLobbyError = errMsg;
       latestMsg = { phase: "pre_lobby" };
     } else if (msg.tag === "full") {
       drawFull();
@@ -1483,12 +1428,12 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-document.addEventListener("keyup", (e) => {
-  // Stop key-repeat when ArrowLeft/Right released in stat editor.
-  if (preLobbyMode === "editing_stats" && e.key === _krKey) {
-    _krStop();
+/** Send a pre-lobby room action to the bridge. */
+function sendPreLobbyAction(action) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(action));
   }
-});
+}
 
 /**
  * Handle a keydown event while the pre_lobby screen is shown.
@@ -1501,9 +1446,8 @@ function handlePreLobbyKey(e) {
   if (preLobbyMode === "choose") {
     if (e.key === "c" || e.key === "C") {
       preLobbyError = "";
-      preLobbyPendingAction = { action: "create" };
-      preLobbyMode = "editing_stats";
-      preLobbyStatCursor = 0;
+      // Creating from /config/{hash} runs the lobby with that saved config.
+      sendPreLobbyAction({ action: "create", config: PAGE_CONFIG_HASH ?? undefined });
     } else if (e.key === "j" || e.key === "J") {
       preLobbyMode = "entering_code";
       preLobbyCode = "";
@@ -1527,9 +1471,7 @@ function handlePreLobbyKey(e) {
     if (e.key === "Enter") {
       if (preLobbyCode.length === 6) {
         preLobbyError = "";
-        preLobbyPendingAction = { action: "join", code: preLobbyCode };
-        preLobbyMode = "editing_stats";
-        preLobbyStatCursor = 0;
+        sendPreLobbyAction({ action: "join", code: preLobbyCode });
       } else {
         preLobbyError = "Code must be 6 characters.";
       }
@@ -1539,49 +1481,6 @@ function handlePreLobbyKey(e) {
     if (preLobbyCode.length < 6 && /^[a-zA-Z0-9]$/.test(e.key)) {
       preLobbyCode += e.key.toUpperCase();
       preLobbyError = "";
-    }
-    return;
-  }
-
-  if (preLobbyMode === "editing_stats") {
-    if (e.key === "Escape") {
-      _krStop();
-      // Go back: to entering_code if joining, to choose if creating.
-      if (preLobbyPendingAction && preLobbyPendingAction.action === "join") {
-        preLobbyMode = "entering_code";
-      } else {
-        preLobbyMode = "choose";
-      }
-      return;
-    }
-    if (e.key === "Enter") {
-      _krStop();
-      if (preLobbyPendingAction && ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ ...preLobbyPendingAction, stats: { ...preLobbyStats } }));
-      }
-      return;
-    }
-    if (e.key === "ArrowUp") {
-      preLobbyStatCursor = (preLobbyStatCursor - 1 + STAT_KEYS.length) % STAT_KEYS.length;
-      _krStop();
-      return;
-    }
-    if (e.key === "ArrowDown") {
-      preLobbyStatCursor = (preLobbyStatCursor + 1) % STAT_KEYS.length;
-      _krStop();
-      return;
-    }
-    // Key-repeat for value adjustment.
-    if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
-      if (_krKey !== e.key) {
-        _krStop();
-        _krKey = e.key;
-        _krDelta = e.key === "ArrowRight" ? 1 : -1;
-        _krStart = Date.now();
-        _adjustStat(_krDelta);
-        _krSchedule();
-      }
-      return;
     }
   }
 }

@@ -19,10 +19,15 @@ const proto = shared.protocol;
 const c = shared.components;
 const enc = shared.encounter;
 const bots = shared.bots;
-const balance = shared.balance;
+const fixtures = shared.fixtures;
 
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
+
+/// Frozen fixture config — designer edits to data/*.json can't break these.
+const TEST_CFG = &fixtures.test_config;
+const BAL = &fixtures.test_config.balance;
+const DEFAULT_ENC = fixtures.test_config.encounters.default();
 
 // ---------------------------------------------------------------------------
 // BotHarness
@@ -92,7 +97,7 @@ pub const BotHarness = struct {
         const bot_states = try allocator.alloc(BotState, team.bots.len);
         errdefer allocator.free(bot_states);
 
-        var sess = try Session.init(allocator, join_code);
+        var sess = try Session.init(allocator, join_code, TEST_CFG);
 
         for (team.bots, 0..) |entry, i| {
             bot_states[i].init(allocator, 0xFF, entry.profile);
@@ -207,7 +212,7 @@ test "twin_flames pair fully neutralizes the fire field" {
     for (h.session.hunger_healable) |healable|
         try std.testing.expectEqual(@as(u16, 0), healable);
     try std.testing.expectEqual(
-        @as(u16, @intCast(60 * balance.HUNGER_COST_NORMAL)),
+        @as(u16, @intCast(60 * BAL.hunger_cost_normal)),
         h.session.hunger.current,
     );
 }
@@ -216,7 +221,7 @@ test "neutralizing bots survive a hunger budget that idle play fails" {
     const allocator = std.testing.allocator;
 
     // Idle team: submits nothing (empty session, no combos injected).
-    var idle_sess = try Session.init(allocator, "BOTK01".*);
+    var idle_sess = try Session.init(allocator, "BOTK01".*, TEST_CFG);
     defer idle_sess.deinit();
     var idle_bot = BotState{ .player_id = 0xFF, .profile = &bots.profile_fire_dispenser, .buf = .empty, .bt = undefined };
     idle_bot.init(allocator, 0xFF, &bots.profile_fire_dispenser);
@@ -241,12 +246,12 @@ test "neutralizing bots survive a hunger budget that idle play fails" {
 
 test "mixed team completes the default encounter with a positive score" {
     const allocator = std.testing.allocator;
-    var h = try BotHarness.init(allocator, &bots.team_mixed, enc.DEFAULT_ENCOUNTER, "BOTKEY".*, .{});
+    var h = try BotHarness.init(allocator, &bots.team_mixed, DEFAULT_ENC, "BOTKEY".*, .{});
     defer h.deinit();
 
-    const rounds = try h.run_to_completion(@intCast(enc.DEFAULT_ENCOUNTER.zones.len + 2));
+    const rounds = try h.run_to_completion(@intCast(DEFAULT_ENC.zones.len + 2));
 
-    try std.testing.expect(rounds <= enc.DEFAULT_ENCOUNTER.zones.len);
+    try std.testing.expect(rounds <= DEFAULT_ENC.zones.len);
     try std.testing.expectEqual(session_mod.SessionPhase.lobby, h.session.phase);
     // Naturally-neutral slime alone guarantees score > 0 on any consumed zone.
     try std.testing.expect(h.session.score > 0);

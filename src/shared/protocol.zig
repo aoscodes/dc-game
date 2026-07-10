@@ -8,7 +8,7 @@ pub const MsgTag = enum(u8) {
     ready_up = 0x03,
     // 0x04 was the legacy single-action choose_action; retired.
     reconnect = 0x05,
-    set_statblock = 0x06,
+    // 0x06 was the legacy set_statblock; retired (statblocks removed).
     choose_combo = 0x07,
     cancel_combo = 0x08,
 
@@ -32,10 +32,6 @@ pub const MsgTag = enum(u8) {
 pub const JoinLobby = struct {
     name: [16]u8,
     name_len: u8,
-};
-
-pub const SetStatblock = struct {
-    statblock: components.Statblock,
 };
 
 pub const ChooseCombo = struct {
@@ -126,6 +122,9 @@ pub const GameStart = struct {
     encounter_label_len: u8,
     player_id: u8,
     round_duration: f32,
+    /// Spells each player may commit per round (from the server's balance
+    /// data; clients must not hardcode it).
+    casts_per_round: u8,
 };
 
 pub const EntitySnapshot = struct {
@@ -279,12 +278,16 @@ pub const MatchStats = struct {
     round_stats: [encounter.MAX_ZONES]RoundStats = [_]RoundStats{.{}} ** encounter.MAX_ZONES,
     player_count: u8 = 0,
     players: [MAX_PLAYERS]PlayerStats = [_]PlayerStats{.{}} ** MAX_PLAYERS,
-    /// Fire counts per balance recipe table entry (table order — the JS
-    /// mirror in web/game.js resolves labels by index).
-    player_recipe_hits: [balance.player_recipes.len]u16 =
-        [_]u16{0} ** balance.player_recipes.len,
-    team_recipe_hits: [balance.team_recipes.len]u16 =
-        [_]u16{0} ** balance.team_recipes.len,
+    /// Number of valid entries in the recipe hit arrays — the size of the
+    /// loaded balance recipe tables (runtime data, bounded by the caps).
+    player_recipe_count: u8 = 0,
+    team_recipe_count: u8 = 0,
+    /// Fire counts per balance recipe table entry (table order — the browser
+    /// resolves labels by index from the same data/balance.json).
+    player_recipe_hits: [balance.MAX_PLAYER_RECIPES]u16 =
+        [_]u16{0} ** balance.MAX_PLAYER_RECIPES,
+    team_recipe_hits: [balance.MAX_TEAM_RECIPES]u16 =
+        [_]u16{0} ** balance.MAX_TEAM_RECIPES,
     casts_total: u16 = 0,
 };
 
@@ -304,7 +307,6 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
         .join_lobby => try encode_join_lobby(writer, payload),
         .ready_up => {},
         .reconnect => try writer.writeByte(payload.player_id),
-        .set_statblock => try encode_statblock(writer, payload.statblock),
         .choose_combo => {
             try writer.writeByte(payload.combo.len);
             for (payload.combo.slots[0..payload.combo.len]) |slot|
@@ -357,6 +359,7 @@ fn encode_game_start(w: anytype, p: GameStart) !void {
     try w.writeAll(p.encounter_label[0..p.encounter_label_len]);
     try w.writeByte(p.player_id);
     try w.writeInt(u32, @bitCast(p.round_duration), .little);
+    try w.writeByte(p.casts_per_round);
 }
 
 fn encode_bar_summary(w: anytype, s: BarSummary) !void {
@@ -471,12 +474,11 @@ fn encode_match_stats(w: anytype, ms: MatchStats) !void {
     i = 0;
     while (i < ms.player_count) : (i += 1)
         try encode_player_stats(w, ms.players[i]);
-    // Recipe hit arrays are length-prefixed so decoders can validate the
-    // balance tables have not drifted between builds.
-    try w.writeByte(@intCast(ms.player_recipe_hits.len));
-    for (ms.player_recipe_hits) |h| try w.writeInt(u16, h, .little);
-    try w.writeByte(@intCast(ms.team_recipe_hits.len));
-    for (ms.team_recipe_hits) |h| try w.writeInt(u16, h, .little);
+    // Recipe hit arrays are length-prefixed with the loaded table sizes.
+    try w.writeByte(ms.player_recipe_count);
+    for (ms.player_recipe_hits[0..ms.player_recipe_count]) |h| try w.writeInt(u16, h, .little);
+    try w.writeByte(ms.team_recipe_count);
+    for (ms.team_recipe_hits[0..ms.team_recipe_count]) |h| try w.writeInt(u16, h, .little);
     try w.writeInt(u16, ms.casts_total, .little);
 }
 
@@ -498,10 +500,12 @@ fn decode_match_stats(r: anytype) !MatchStats {
     i = 0;
     while (i < ms.player_count) : (i += 1)
         ms.players[i] = try decode_player_stats(r);
-    if ((try r.readByte()) != ms.player_recipe_hits.len) return DecodeError.RecipeTableMismatch;
-    for (&ms.player_recipe_hits) |*h| h.* = try r.readInt(u16, .little);
-    if ((try r.readByte()) != ms.team_recipe_hits.len) return DecodeError.RecipeTableMismatch;
-    for (&ms.team_recipe_hits) |*h| h.* = try r.readInt(u16, .little);
+    ms.player_recipe_count = try r.readByte();
+    if (ms.player_recipe_count > balance.MAX_PLAYER_RECIPES) return DecodeError.TooManyRecipes;
+    for (ms.player_recipe_hits[0..ms.player_recipe_count]) |*h| h.* = try r.readInt(u16, .little);
+    ms.team_recipe_count = try r.readByte();
+    if (ms.team_recipe_count > balance.MAX_TEAM_RECIPES) return DecodeError.TooManyRecipes;
+    for (ms.team_recipe_hits[0..ms.team_recipe_count]) |*h| h.* = try r.readInt(u16, .little);
     ms.casts_total = try r.readInt(u16, .little);
     return ms;
 }
@@ -524,7 +528,7 @@ pub const DecodeError = error{
     TooManyZones,
     InvalidComboLen,
     InvalidEndReason,
-    RecipeTableMismatch,
+    TooManyRecipes,
     InvalidRecipeKind,
 };
 
@@ -554,36 +558,6 @@ pub fn decode_choose_combo(reader: anytype) !ChooseCombo {
         combo.slots[i] = try decode_combo_slot(byte);
     }
     return .{ .combo = combo };
-}
-
-fn encode_statblock(w: anytype, s: components.Statblock) !void {
-    try w.writeInt(u16, s.attack, .little);
-    try w.writeInt(u16, s.shield, .little);
-    try w.writeInt(u16, s.heal, .little);
-    try w.writeInt(u16, s.fire, .little);
-    try w.writeInt(u16, s.earth, .little);
-    try w.writeInt(u16, s.wind, .little);
-    try w.writeInt(u16, s.water, .little);
-    try w.writeInt(u16, s.hp, .little);
-    try w.writeInt(u16, s.level, .little);
-}
-
-fn decode_statblock(r: anytype) !components.Statblock {
-    return .{
-        .attack = try r.readInt(u16, .little),
-        .shield = try r.readInt(u16, .little),
-        .heal = try r.readInt(u16, .little),
-        .fire = try r.readInt(u16, .little),
-        .earth = try r.readInt(u16, .little),
-        .wind = try r.readInt(u16, .little),
-        .water = try r.readInt(u16, .little),
-        .hp = try r.readInt(u16, .little),
-        .level = try r.readInt(u16, .little),
-    };
-}
-
-pub fn decode_set_statblock(reader: anytype) !SetStatblock {
-    return .{ .statblock = try decode_statblock(reader) };
 }
 
 pub fn decode_reconnect(reader: anytype) !Reconnect {
@@ -622,6 +596,7 @@ pub fn decode_game_start(reader: anytype) !GameStart {
     _ = try reader.readAll(p.encounter_label[0..llen]);
     p.player_id = try reader.readByte();
     p.round_duration = @bitCast(try reader.readInt(u32, .little));
+    p.casts_per_round = try reader.readByte();
     return p;
 }
 
@@ -732,6 +707,8 @@ test "round-trip: game_over carries score and match stats" {
     @memcpy(go.stats.players[0].name[0..5], "Alice");
     go.stats.players[0].name_len = 5;
     go.stats.players[1] = .{ .casts = 2, .medicine_slots = .{ 0, 0, 0, 4 } };
+    go.stats.player_recipe_count = 6;
+    go.stats.team_recipe_count = 2;
     go.stats.player_recipe_hits[0] = 1;
     go.stats.team_recipe_hits[0] = 2;
     go.stats.casts_total = 5;
@@ -760,6 +737,8 @@ test "round-trip: game_over carries score and match stats" {
     try std.testing.expectEqual(@as(u16, 2), d.stats.players[0].recipe_casts);
     try std.testing.expectEqual(@as(u16, 1), d.stats.players[0].fizzles);
     try std.testing.expectEqual(@as(u16, 4), d.stats.players[1].medicine_slots[3]);
+    try std.testing.expectEqual(@as(u8, 6), d.stats.player_recipe_count);
+    try std.testing.expectEqual(@as(u8, 2), d.stats.team_recipe_count);
     try std.testing.expectEqual(@as(u16, 1), d.stats.player_recipe_hits[0]);
     try std.testing.expectEqual(@as(u16, 2), d.stats.team_recipe_hits[0]);
     try std.testing.expectEqual(@as(u16, 5), d.stats.casts_total);
@@ -881,6 +860,7 @@ test "round-trip: game_start — round_duration survives" {
         .encounter_label_len = @intCast(label.len),
         .player_id = 3,
         .round_duration = 4.0,
+        .casts_per_round = 3,
     };
     @memcpy(gs.encounter_label[0..label.len], label);
 
@@ -891,6 +871,7 @@ test "round-trip: game_start — round_duration survives" {
 
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), decoded.round_duration, 0.001);
     try std.testing.expectEqual(@as(u8, 3), decoded.player_id);
+    try std.testing.expectEqual(@as(u8, 3), decoded.casts_per_round);
     try std.testing.expectEqualSlices(u8, label, decoded.encounter_label[0..decoded.encounter_label_len]);
 }
 

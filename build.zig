@@ -23,6 +23,9 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
+    // Shipped data files, embedded so config tests can validate them.
+    shared_mod.addAnonymousImport("balance_data", .{ .root_source_file = b.path("data/balance.json") });
+    shared_mod.addAnonymousImport("encounters_data", .{ .root_source_file = b.path("data/encounters.json") });
 
     // -----------------------------------------------------------------------
     // ECS core module
@@ -182,13 +185,14 @@ pub fn build(b: *std.Build) !void {
     const ecs_tests = b.addTest(.{ .root_module = ecs_mod });
     test_step.dependOn(&b.addRunArtifact(ecs_tests).step);
 
-    const shared_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/shared/shared.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+    const shared_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/shared/shared.zig"),
+        .target = target,
+        .optimize = optimize,
     });
+    shared_test_mod.addAnonymousImport("balance_data", .{ .root_source_file = b.path("data/balance.json") });
+    shared_test_mod.addAnonymousImport("encounters_data", .{ .root_source_file = b.path("data/encounters.json") });
+    const shared_tests = b.addTest(.{ .root_module = shared_test_mod });
     test_step.dependOn(&b.addRunArtifact(shared_tests).step);
 
     // Session integration tests — debug_zig no longer requires raylib.
@@ -240,44 +244,4 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(bot_harness_tests).step);
 
-    // -----------------------------------------------------------------------
-    // Browser e2e  (Playwright + headless Chromium)
-    //
-    // Requires: Node.js, npm, and Playwright browsers installed.
-    // Run with:  zig build browser-e2e
-    //
-    // Spawns the server and bridge binaries from zig-out/bin/, so a prior
-    // `zig build` (or `zig build server client`) is required first.
-    // -----------------------------------------------------------------------
-
-    const browser_e2e_step = b.step("browser-e2e", "Run browser e2e tests (Playwright)");
-    const npm_install = b.addSystemCommand(&.{ "npm", "ci", "--prefix", "e2e/browser" });
-    const playwright_test = b.addSystemCommand(&.{
-        "npx",                              "--prefix", "e2e/browser",
-        "playwright",                       "test",     "--config",
-        "e2e/browser/playwright.config.js",
-    });
-    playwright_test.step.dependOn(&npm_install.step);
-    browser_e2e_step.dependOn(&playwright_test.step);
-
-    // -----------------------------------------------------------------------
-    // Bot watch  (zig build bot-watch)
-    //
-    // Runs all browser e2e tests headed with slow-mo so you can watch bots
-    // play in a real browser window.  Requires a prior `zig build server`.
-    // The server is started by each test at its own port with the default
-    // round duration (3 s); pass --round-duration to the server manually if
-    // you want a different pace.
-    // -----------------------------------------------------------------------
-
-    const bot_watch_step = b.step("bot-watch", "Run all browser e2e tests headed (watch bots play)");
-    const bot_watch_cmd = b.addSystemCommand(&.{
-        "npx",                              "--prefix", "e2e/browser",
-        "playwright",                       "test",     "--config",
-        "e2e/browser/playwright.config.js", "--headed",
-    });
-    bot_watch_cmd.setEnvironmentVariable("SLOW_MO", "300");
-    bot_watch_cmd.step.dependOn(&server_install.step);
-    bot_watch_cmd.step.dependOn(&npm_install.step);
-    bot_watch_step.dependOn(&bot_watch_cmd.step);
 }

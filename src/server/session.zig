@@ -8,11 +8,11 @@
 //! ## Slime Feast round loop
 //!
 //! All players share a single countdown timer (`round_timer`).  The round is
-//! split into `balance.CASTS_PER_ROUND` cast windows (`cast_timer`, each
-//! round_duration / CASTS_PER_ROUND long).  During a window players compose
+//! split into `casts_per_round` cast windows (`cast_timer`, each
+//! round_duration / casts_per_round long).  During a window players compose
 //! a combo in `action_pool` (latest edit wins; Escape cancels).  When the
 //! window closes the pending combo is COMMITTED as a spell (broadcasting
-//! `cast_committed` + a `.cast` action_result) — up to CASTS_PER_ROUND
+//! `cast_committed` + a `.cast` action_result) — up to casts_per_round
 //! spells per player per round — and the window's batch CONVERTS
 //! immediately: recipes match within the batch (team recipes require
 //! distinct players in the SAME window), medicine heals the hunger bar
@@ -34,8 +34,8 @@ const shared = @import("shared");
 const c = shared.components;
 const proto = shared.protocol;
 const logic = shared.game_logic;
-const balance = shared.balance;
 const enc = shared.encounter;
+const cfg_mod = shared.config;
 const dbg = @import("debug_zig");
 
 pub const TickZones = enum { drain, round, broadcast, check_end };
@@ -45,7 +45,6 @@ pub const PlayerTeam = struct {};
 pub const GameWorld = ecs.World(
     .{
         .kind = c.Kind,
-        .statblock = c.Statblock,
         .owner = c.Owner,
         .player_marker = c.PlayerMarker,
     },
@@ -62,7 +61,6 @@ pub const PlayerSlot = struct {
     player_id: u8,
     name: [16]u8 = [_]u8{0} ** 16,
     name_len: u8 = 0,
-    statblock: c.Statblock = .{ .attack = 1, .shield = 1, .heal = 1, .fire = 1, .earth = 1, .wind = 1, .water = 1, .hp = 120, .level = 1 },
     ready: bool = false,
     entity: ecs.Entity = std.math.maxInt(ecs.Entity),
     transport: ?shared.Transport = null,
@@ -76,14 +74,17 @@ pub const SessionPhase = enum { lobby, playing };
 pub const Session = struct {
     allocator: std.mem.Allocator,
     join_code: [6]u8,
+    /// Loaded balance + encounter data; owned by the caller and must outlive
+    /// the session.
+    cfg: *const cfg_mod.Config,
     players: [MAX_PLAYERS]PlayerSlot,
     player_count: u8 = 0,
     phase: SessionPhase = .lobby,
     world: GameWorld,
     tick_count: u32 = 0,
     current_encounter: ?*const enc.Encounter = null,
-    round_timer: f32 = logic.ROUND_DURATION_DEFAULT_S,
-    round_duration: f32 = logic.ROUND_DURATION_DEFAULT_S,
+    round_timer: f32,
+    round_duration: f32,
     /// Total Hunger bar.  Fills as slime is consumed; full = encounter over.
     hunger: c.Health = .{ .current = 0, .max = 0 },
     /// Portion of `hunger.current` attributable to un-neutralized modified
@@ -100,7 +101,7 @@ pub const Session = struct {
     action_pool: [MAX_PLAYERS]?c.ActionCombo,
     /// Countdown of the current cast window; pending combos commit at 0.
     cast_timer: f32 = 0,
-    /// Per-player committed-spell count this round (capped CASTS_PER_ROUND).
+    /// Per-player committed-spell count this round (capped casts_per_round).
     casts_used: [MAX_PLAYERS]u8 = [_]u8{0} ** MAX_PLAYERS,
     /// Tuning stats accumulated over the match; broadcast with game_over.
     /// `players` is indexed by player_id during play and compacted (dense,
@@ -110,7 +111,11 @@ pub const Session = struct {
     round_count: u32 = 0,
     profiler: dbg.Profiler(TickZones) = dbg.Profiler(TickZones).init(),
 
-    pub fn init(allocator: std.mem.Allocator, join_code: [6]u8) !Session {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        join_code: [6]u8,
+        cfg: *const cfg_mod.Config,
+    ) !Session {
         var players: [MAX_PLAYERS]PlayerSlot = undefined;
         for (&players, 0..) |*p, i| {
             p.* = PlayerSlot{
@@ -123,8 +128,11 @@ pub const Session = struct {
         return Session{
             .allocator = allocator,
             .join_code = join_code,
+            .cfg = cfg,
             .players = players,
             .world = world,
+            .round_timer = cfg.balance.round_duration_default_s,
+            .round_duration = cfg.balance.round_duration_default_s,
             .action_pool = [_]?c.ActionCombo{null} ** MAX_PLAYERS,
         };
     }
@@ -193,7 +201,8 @@ pub const Session = struct {
     }
 
     pub fn start_game(self: *Session, encounter_label: []const u8) !void {
-        const encounter = enc.find_encounter(encounter_label) orelse enc.DEFAULT_ENCOUNTER;
+        const encounter = self.cfg.encounters.find(encounter_label) orelse
+            self.cfg.encounters.default();
         try self.start_game_encounter(encounter);
     }
 
@@ -204,7 +213,10 @@ pub const Session = struct {
         set_world_system_signatures(&self.world);
         for (&self.action_pool) |*a| a.* = @as(?c.ActionCombo, null);
         self.casts_used = [_]u8{0} ** MAX_PLAYERS;
-        self.stats = .{};
+        self.stats = .{
+            .player_recipe_count = @intCast(self.cfg.balance.player_recipes.len),
+            .team_recipe_count = @intCast(self.cfg.balance.team_recipes.len),
+        };
         self.tick_count = 0;
         self.round_count = 0;
 
@@ -233,7 +245,6 @@ pub const Session = struct {
             const e = self.world.create_entity();
             p.entity = e;
             self.world.add_component(e, c.Kind{ .tag = .player });
-            self.world.add_component(e, p.statblock);
             self.world.add_component(e, c.Owner{ .player_id = p.player_id });
             self.world.add_component(e, c.PlayerMarker{});
         }
@@ -275,12 +286,12 @@ pub const Session = struct {
         }
     }
 
-    /// Length of one cast window: the round divided into CASTS_PER_ROUND slots.
+    /// Length of one cast window: the round divided into casts_per_round slots.
     fn cast_duration(self: *const Session) f32 {
-        return self.round_duration / @as(f32, @floatFromInt(balance.CASTS_PER_ROUND));
+        return self.round_duration / @as(f32, @floatFromInt(self.cfg.balance.casts_per_round));
     }
 
-    /// Commit every pending combo as a spell (up to CASTS_PER_ROUND per
+    /// Commit every pending combo as a spell (up to casts_per_round per
     /// player per round; zero-output combos fizzle for free) and CONVERT the
     /// window's batch immediately:
     /// recipes match within the batch (team recipes = same window only),
@@ -296,10 +307,10 @@ pub const Session = struct {
             const combo = self.action_pool[pid] orelse continue;
             self.action_pool[pid] = null;
 
-            if (self.casts_used[pid] >= balance.CASTS_PER_ROUND) continue; // cap reached
+            if (self.casts_used[pid] >= self.cfg.balance.casts_per_round) continue; // cap reached
 
             // Zero-output combos FIZZLE: discarded without costing a cast.
-            if (!logic.combo_has_output(combo)) {
+            if (!logic.combo_has_output(&self.cfg.balance, combo)) {
                 self.stats.players[pid].fizzles +|= 1;
                 var fbuf: [4]u8 = undefined;
                 var ffbs = std.io.fixedBufferStream(&fbuf);
@@ -335,16 +346,19 @@ pub const Session = struct {
         if (batch_len == 0) return;
 
         var report = logic.MatchReport{};
-        const output = logic.match_recipes(batch[0..batch_len], &report);
+        const output = logic.match_recipes(&self.cfg.balance, batch[0..batch_len], &report);
 
         // Recipe stats: fire counts + per-player participation.  Each fire is
-        // also broadcast so clients can show recipe floaters live.
-        for (&self.stats.player_recipe_hits, report.player_hits, 0..) |*total, hit, ri| {
-            total.* +|= hit;
+        // also broadcast so clients can show recipe floaters live.  Only the
+        // loaded tables' entries are meaningful (arrays are cap-sized).
+        for (self.cfg.balance.player_recipes, 0..) |_, ri| {
+            const hit = report.player_hits[ri];
+            self.stats.player_recipe_hits[ri] +|= hit;
             try self.broadcast_recipe_fired(.player, @intCast(ri), hit);
         }
-        for (&self.stats.team_recipe_hits, report.team_hits, 0..) |*total, hit, ri| {
-            total.* +|= hit;
+        for (self.cfg.balance.team_recipes, 0..) |_, ri| {
+            const hit = report.team_hits[ri];
+            self.stats.team_recipe_hits[ri] +|= hit;
             try self.broadcast_recipe_fired(.team, @intCast(ri), hit);
         }
         for (batch[0..batch_len], 0..) |cast, ci| {
@@ -479,8 +493,9 @@ pub const Session = struct {
                 try self.broadcast_lobby_update();
                 if (self.all_ready()) {
                     std.log.info("all players ready — starting game", .{});
-                    try self.start_game(enc.DEFAULT_ENCOUNTER.label);
-                    try self.broadcast_game_start(enc.DEFAULT_ENCOUNTER.label);
+                    const default_label = self.cfg.encounters.default().label;
+                    try self.start_game(default_label);
+                    try self.broadcast_game_start(default_label);
                 }
             },
             .choose_combo => {
@@ -494,21 +509,6 @@ pub const Session = struct {
                 if (self.phase == .playing and player_id < MAX_PLAYERS) {
                     self.action_pool[player_id] = null;
                     std.log.debug("player {} cancelled combo", .{player_id});
-                }
-            },
-            .set_statblock => {
-                const p = try proto.decode_set_statblock(fbs.reader());
-                if (player_id < MAX_PLAYERS) {
-                    self.players[player_id].statblock = p.statblock;
-                    if (self.phase == .playing) {
-                        // Apply to live entity if already spawned.
-                        const slot = &self.players[player_id];
-                        if (slot.entity != std.math.maxInt(ecs.Entity) and
-                            self.world.component_arrays.statblock.has(slot.entity))
-                        {
-                            self.world.get_component(slot.entity, c.Statblock).* = p.statblock;
-                        }
-                    }
                 }
             },
             .reconnect => {},
@@ -530,7 +530,7 @@ pub const Session = struct {
 
         // Consume the zone: transmutation already happened per cast window.
         const zone = self.zones[self.zone_index];
-        const outcome = logic.consume_zone(zone);
+        const outcome = logic.consume_zone(&self.cfg.balance, zone);
 
         var neutralized_total: u32 = 0;
         for (outcome.neutralized) |n| neutralized_total += n;
@@ -629,7 +629,6 @@ pub const Session = struct {
         const e = self.world.create_entity();
         slot.entity = e;
         self.world.add_component(e, c.Kind{ .tag = .player });
-        self.world.add_component(e, slot.statblock);
         self.world.add_component(e, c.Owner{ .player_id = slot.player_id });
         self.world.add_component(e, c.PlayerMarker{});
         std.log.info("player {} joined mid-game", .{player_id});
@@ -649,6 +648,7 @@ pub const Session = struct {
             .encounter_label_len = @intCast(@min(encounter.label.len, 32)),
             .player_id = slot.player_id,
             .round_duration = self.round_duration,
+            .casts_per_round = self.cfg.balance.casts_per_round,
         };
         @memcpy(gs_msg.encounter_label[0..gs_msg.encounter_label_len], encounter.label[0..gs_msg.encounter_label_len]);
         try proto.encode(fbs.writer(), .game_start, gs_msg);
@@ -697,6 +697,7 @@ pub const Session = struct {
                 .encounter_label_len = @intCast(@min(encounter_label.len, 32)),
                 .player_id = slot.player_id,
                 .round_duration = self.round_duration,
+                .casts_per_round = self.cfg.balance.casts_per_round,
             };
             @memcpy(gs_msg.encounter_label[0..gs_msg.encounter_label_len], encounter_label[0..gs_msg.encounter_label_len]);
             try proto.encode(fbs.writer(), .game_start, gs_msg);

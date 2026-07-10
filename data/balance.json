@@ -1,0 +1,142 @@
+{
+  "casts_per_round": 3,
+  "units_per_slot": 5,
+  "medicine_per_slot": 3,
+  "hunger_cost_normal": 1,
+  "hunger_cost_modified_extra": 2,
+  "round_duration_default_s": 15.0,
+  "player_recipes": [
+    {
+      "label": "crimson_flood",
+      "pattern": [
+        "fire",
+        "dispense",
+        "dispense",
+        "dispense"
+      ],
+      "output": {
+        "units": {
+          "fire": 20
+        }
+      }
+    },
+    {
+      "label": "verdant_flood",
+      "pattern": [
+        "earth",
+        "dispense",
+        "dispense",
+        "dispense"
+      ],
+      "output": {
+        "units": {
+          "earth": 20
+        }
+      }
+    },
+    {
+      "label": "gale_flood",
+      "pattern": [
+        "wind",
+        "dispense",
+        "dispense",
+        "dispense"
+      ],
+      "output": {
+        "units": {
+          "wind": 20
+        }
+      }
+    },
+    {
+      "label": "tide_flood",
+      "pattern": [
+        "water",
+        "dispense",
+        "dispense",
+        "dispense"
+      ],
+      "output": {
+        "units": {
+          "water": 20
+        }
+      }
+    },
+    {
+      "label": "prism_mist",
+      "pattern": [
+        "fire",
+        "dispense",
+        "water",
+        "dispense"
+      ],
+      "output": {
+        "units": {
+          "fire": 6,
+          "earth": 6,
+          "wind": 6,
+          "water": 6
+        }
+      }
+    },
+    {
+      "label": "panacea",
+      "pattern": [
+        "water",
+        "medicine",
+        "medicine"
+      ],
+      "output": {
+        "medicine": {
+          "water": 10
+        }
+      }
+    }
+  ],
+  "team_recipes": [
+    {
+      "label": "twin_flames",
+      "patterns": [
+        [
+          "fire",
+          "dispense",
+          "dispense"
+        ],
+        [
+          "fire",
+          "dispense",
+          "dispense"
+        ]
+      ],
+      "output": {
+        "units": {
+          "fire": 30
+        },
+        "medicine": {
+          "fire": 20
+        }
+      }
+    },
+    {
+      "label": "mudslide",
+      "patterns": [
+        [
+          "water",
+          "dispense",
+          "dispense"
+        ],
+        [
+          "earth",
+          "dispense",
+          "dispense"
+        ]
+      ],
+      "output": {
+        "units": {
+          "earth": 40,
+          "water": 40
+        }
+      }
+    }
+  ]
+}

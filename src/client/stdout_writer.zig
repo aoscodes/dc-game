@@ -1,7 +1,6 @@
 const std = @import("std");
 const proto = @import("shared").protocol;
 const c = @import("shared").components;
-const balance = @import("shared").balance;
 const inp = @import("input.zig");
 
 /// JSON serialisation for ComboSlot.
@@ -70,6 +69,8 @@ pub const GameState = struct {
     pending_combo: inp.ComboBuffer = .{},
     round_timer: f32 = 0.0,
     round_duration: f32 = 0.0,
+    /// Spells per round, as announced by the server in game_start.
+    casts_per_round: u8 = 0,
     encounter_label: [32]u8 = [_]u8{0} ** 32,
     encounter_label_len: u8 = 0,
     /// Final score from game_over (null until the encounter ends).
@@ -197,8 +198,8 @@ fn write_render_inner(
                 .hunger_max = ms.hunger_max,
                 .rounds = rounds_buf[0..ms.rounds],
                 .players = pstats_buf[0..ms.player_count],
-                .player_recipe_hits = &ms.player_recipe_hits,
-                .team_recipe_hits = &ms.team_recipe_hits,
+                .player_recipe_hits = ms.player_recipe_hits[0..ms.player_recipe_count],
+                .team_recipe_hits = ms.team_recipe_hits[0..ms.team_recipe_count],
                 .casts_total = ms.casts_total,
             };
         }
@@ -221,7 +222,7 @@ fn write_render_inner(
             .round_timer = game.round_timer,
             .round_duration = game.round_duration,
             .cast_timer = game.snapshot.cast_timer,
-            .casts_per_round = balance.CASTS_PER_ROUND,
+            .casts_per_round = game.casts_per_round,
             .tick = game.snapshot.tick,
             .round = game.round,
             .entities = entities_buf[0..game.snapshot.entity_count],
@@ -315,7 +316,7 @@ const JsonPlayerStats = struct {
 };
 
 /// End-of-game tuning report.  Recipe hit arrays are in balance table order;
-/// web/game.js resolves labels by index via its mirror tables.
+/// web/game.js resolves labels by index from the fetched data/balance.json.
 const JsonMatchStats = struct {
     reason: proto.EndReason,
     zone_count: u8,
@@ -391,7 +392,8 @@ const JsonGame = struct {
     /// Player ids whose spells fizzled since the previous frame (transient).
     fizzles: []const u8,
     /// Recipes fired since the previous frame (transient).  `index` refers
-    /// to the balance recipe table for `kind` (JS mirrors resolve labels).
+    /// to the balance recipe table for `kind` (JS resolves labels from the
+    /// fetched data/balance.json, same order).
     recipes_fired: []const JsonRecipeFired,
 };
 

@@ -60,6 +60,22 @@ function resolveBin(name) {
 const CLIENT_BIN  = resolveBin("client");
 const SERVER_BIN  = resolveBin("server");
 const WEB_DIR     = path.resolve(__dirname, "../web");
+// Designer-tunable game data (balance.json / encounters.json).  Served to
+// the browser at /data/* and passed to every spawned server via --data-dir,
+// so both sides read the same files.
+const DATA_DIR    = path.resolve(__dirname, "../data");
+// Saved /tune configs: custom-configs/{hash}/{balance,encounters}.json.
+// Content-addressed (sha256 prefix), validated by `server --validate` at
+// save time, never garbage-collected (tiny JSON files).
+const CUSTOM_DIR  = path.resolve(__dirname, "../custom-configs");
+
+/** Config hashes are 16 lowercase hex chars (sha256 prefix). */
+const HASH_RE = /^[0-9a-f]{16}$/;
+
+/** Data dir for a config hash, or the shipped defaults when hash is null. */
+function dataDirFor(hash) {
+  return hash ? path.join(CUSTOM_DIR, hash) : DATA_DIR;
+}
 
 const RECONNECT_INITIAL_MS  = 1_000;
 const RECONNECT_MAX_MS      = 16_000;
@@ -81,25 +97,188 @@ const MIME = {
   ".js":   "application/javascript",
   ".css":  "text/css",
   ".ico":  "image/x-icon",
+  ".json": "application/json",
+  ".png":  "image/png",
 };
 
-const httpServer = http.createServer((req, res) => {
-  // Strip the query string (e.g. game.js?v=<sha> cache buster).
-  const rawPath  = req.url.split("?")[0];
-  const urlPath  = rawPath === "/" ? "/index.html" : rawPath;
-  const filePath = path.join(WEB_DIR, path.normalize(urlPath));
-
-  if (!filePath.startsWith(WEB_DIR)) {
+function serveFile(res, baseDir, relPath, extraHeaders = {}) {
+  const filePath = path.join(baseDir, path.normalize(relPath));
+  if (!filePath.startsWith(baseDir)) {
     res.writeHead(403); res.end("Forbidden"); return;
   }
-
   fs.readFile(filePath, (err, data) => {
     if (err) { res.writeHead(404); res.end("Not found"); return; }
     const ext = path.extname(filePath);
-    res.writeHead(200, { "Content-Type": MIME[ext] || "application/octet-stream" });
+    res.writeHead(200, {
+      "Content-Type": MIME[ext] || "application/octet-stream",
+      ...extraHeaders,
+    });
     res.end(data);
   });
+}
+
+const httpServer = http.createServer((req, res) => {
+  // Strip the query string (e.g. game.js?v=<sha> cache buster).
+  const rawPath = req.url.split("?")[0];
+
+  if (req.method === "POST" && rawPath === "/api/tune/save") {
+    handleTuneSave(req, res);
+    return;
+  }
+
+  // /tune — the config editor (query string carries ?from=<hash>).
+  if (rawPath === "/tune") {
+    serveFile(res, WEB_DIR, "/tune.html", { "Cache-Control": "no-cache" });
+    return;
+  }
+
+  // /config/{hash}[/...] — play (or fetch data for) a saved custom config.
+  const cfgMatch = rawPath.match(/^\/config\/([0-9a-f]{16})(\/.*)?$/);
+  if (cfgMatch) {
+    const [, hash, rest] = cfgMatch;
+    if (!rest || rest === "/") {
+      // The game shell; game.js reads the hash from location.pathname.
+      serveFile(res, WEB_DIR, "/index.html", { "Cache-Control": "no-cache" });
+    } else if (rest.startsWith("/data/")) {
+      serveFile(res, path.join(CUSTOM_DIR, hash), rest.slice("/data".length));
+    } else {
+      res.writeHead(404); res.end("Not found");
+    }
+    return;
+  }
+
+  const urlPath = rawPath === "/" ? "/index.html" : rawPath;
+
+  // /data/* serves the game data files (same ones the servers load).
+  if (urlPath.startsWith("/data/")) {
+    serveFile(res, DATA_DIR, urlPath.slice("/data".length));
+    return;
+  }
+  serveFile(res, WEB_DIR, urlPath);
 });
+
+// ---------------------------------------------------------------------------
+// /api/tune/save — persist a designer config and hand back a play URL
+// ---------------------------------------------------------------------------
+
+const MAX_TUNE_BODY = 256 * 1024;
+
+/** JSON.stringify with recursively sorted object keys (stable hashing). */
+function stableStringify(value) {
+  if (Array.isArray(value)) {
+    return "[" + value.map(stableStringify).join(",") + "]";
+  }
+  if (value !== null && typeof value === "object") {
+    return "{" + Object.keys(value).sort()
+      .map((k) => JSON.stringify(k) + ":" + stableStringify(value[k]))
+      .join(",") + "}";
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * Run `server --validate` against a data dir; resolves with
+ * { ok, errors: string[] }.  The Zig config loader is the single source of
+ * truth for limits — the bridge never re-implements validation rules.
+ */
+function validateDataDir(dir) {
+  return new Promise((resolve) => {
+    // Positional port arg first ("0", unused in validate mode) — the server
+    // treats its first argument as the port.
+    const proc = spawn(SERVER_BIN, ["0", "--data-dir", dir, "--validate"], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    proc.stderr.on("data", (d) => { stderr += d.toString(); });
+    proc.on("error", (err) => {
+      resolve({ ok: false, errors: [`validator spawn failed: ${err.message}`] });
+    });
+    proc.on("exit", (code) => {
+      if (code === 0) { resolve({ ok: true, errors: [] }); return; }
+      // Keep only the config loader's precise diagnostics; the trailing
+      // generic "failed to load game data" line adds nothing.
+      const errors = stderr.split("\n")
+        .filter((l) => l.includes("error(config):"))
+        .map((l) => l.replace(/^error\(config\):\s*/, "").trim())
+        .filter((l) => l.length > 0);
+      resolve({ ok: false, errors: errors.length ? errors : ["config validation failed"] });
+    });
+  });
+}
+
+/**
+ * POST body: { balance: <balance.json object>,
+ *              encounter: { hunger_max, zones: [...] } }
+ * The encounter is saved as the single default encounter labelled "custom".
+ * Responds 200 { url, hash } or 400 { errors: [...] }.
+ */
+function handleTuneSave(req, res) {
+  const reply = (status, obj) => {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(obj));
+  };
+
+  let body = "";
+  let overflow = false;
+  req.on("data", (chunk) => {
+    body += chunk;
+    if (body.length > MAX_TUNE_BODY) { overflow = true; req.destroy(); }
+  });
+  req.on("close", () => { if (overflow) reply(413, { errors: ["config too large"] }); });
+  req.on("end", async () => {
+    if (overflow) return;
+    let msg;
+    try { msg = JSON.parse(body); } catch {
+      reply(400, { errors: ["body is not valid JSON"] });
+      return;
+    }
+    if (typeof msg !== "object" || msg === null ||
+        typeof msg.balance !== "object" || msg.balance === null ||
+        typeof msg.encounter !== "object" || msg.encounter === null) {
+      reply(400, { errors: ["expected { balance, encounter }"] });
+      return;
+    }
+
+    const balanceDoc = msg.balance;
+    const encountersDoc = {
+      default: "custom",
+      encounters: [{
+        label: "custom",
+        hunger_max: msg.encounter.hunger_max,
+        zones: msg.encounter.zones,
+      }],
+    };
+
+    const hash = require("crypto").createHash("sha256")
+      .update(stableStringify({ balance: balanceDoc, encounters: encountersDoc }))
+      .digest("hex").slice(0, 16);
+    const dir = path.join(CUSTOM_DIR, hash);
+    const url = `/config/${hash}`;
+
+    // Content-addressed: an existing dir already passed validation.
+    if (fs.existsSync(dir)) { reply(200, { url, hash }); return; }
+
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "balance.json"), JSON.stringify(balanceDoc, null, 2) + "\n");
+      fs.writeFileSync(path.join(dir, "encounters.json"), JSON.stringify(encountersDoc, null, 2) + "\n");
+    } catch (err) {
+      console.error("[tune] save write failed:", err.message);
+      fs.rmSync(dir, { recursive: true, force: true });
+      reply(500, { errors: ["failed to write config"] });
+      return;
+    }
+
+    const result = await validateDataDir(dir);
+    if (!result.ok) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      reply(400, { errors: result.errors });
+      return;
+    }
+    console.log(`[tune] saved config ${hash}`);
+    reply(200, { url, hash });
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Port allocation
@@ -140,6 +319,7 @@ function findFreePort() {
  *   proc:        import("child_process").ChildProcess,
  *   tabCount:    number,
  *   idleTimer:   ReturnType<typeof setTimeout> | null,
+ *   configHash:  string | null,
  * }} LobbyRoom
  */
 
@@ -167,13 +347,15 @@ function uniqueCode() {
  *
  * @param {string} code
  * @param {number} port
+ * @param {string | null} configHash - saved /tune config, or null for defaults
  * @returns {LobbyRoom}
  */
-function spawnLobbyServer(code, port) {
-  console.log(`[lobby] spawning server for code=${code} port=${port}`);
+function spawnLobbyServer(code, port, configHash) {
+  const dataDir = dataDirFor(configHash);
+  console.log(`[lobby] spawning server for code=${code} port=${port} config=${configHash ?? "default"}`);
   usedPorts.add(port);
 
-  const proc = spawn(SERVER_BIN, [String(port), "--join-code", code], {
+  const proc = spawn(SERVER_BIN, [String(port), "--join-code", code, "--data-dir", dataDir], {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -203,7 +385,7 @@ function spawnLobbyServer(code, port) {
   });
 
   /** @type {LobbyRoom} */
-  const room = { code, port, proc, tabCount: 0, idleTimer: null };
+  const room = { code, port, proc, tabCount: 0, idleTimer: null, configHash };
   lobbyRegistry.set(code, room);
   return room;
 }
@@ -254,8 +436,6 @@ class TabSession {
     /** @type {LobbyRoom | null} */
     this.room           = null;
     this.started        = false;
-    /** @type {object | null} Statblock from browser, sent to Zig before READY. */
-    this.pendingStats   = null;
   }
 
   // ---- Zig stdin ----------------------------------------------------------
@@ -290,9 +470,6 @@ class TabSession {
       console.log("[bridge] tab server connected");
       this.serverConnected = true;
       this.reconnectDelay  = RECONNECT_INITIAL_MS;
-      if (this.pendingStats) {
-        this.writeToZig(`STATBLOCK:${JSON.stringify(this.pendingStats)}\n`);
-      }
       this.writeToZig("READY\n");
     });
 
@@ -416,7 +593,16 @@ class TabSession {
     if (this.started) return; // already in a room
 
     if (msg.action === "create") {
-      if (msg.stats && typeof msg.stats === "object") this.pendingStats = msg.stats;
+      // Optional saved /tune config for this lobby.
+      let configHash = null;
+      if (typeof msg.config === "string" && msg.config.length > 0) {
+        if (!HASH_RE.test(msg.config) || !fs.existsSync(dataDirFor(msg.config))) {
+          console.warn(`[lobby] create with unknown config '${msg.config}'`);
+          this.sendPreLobbyError("config_not_found");
+          return;
+        }
+        configHash = msg.config;
+      }
       const code = uniqueCode();
       let port;
       try { port = await findFreePort(); } catch (err) {
@@ -424,19 +610,19 @@ class TabSession {
         this.sendPreLobbyError("server_error");
         return;
       }
-      const room = spawnLobbyServer(code, port);
+      const room = spawnLobbyServer(code, port, configHash);
       console.log(`[lobby] created room code=${code} port=${port}`);
       // Acknowledge before the Zig client has connected so the browser
-      // transitions away from pre_lobby immediately.
+      // transitions away from pre_lobby immediately.  `config` lets the tab
+      // load the matching balance tables.
       if (this.tabWs.readyState === WebSocket.OPEN) {
-        this.tabWs.send(JSON.stringify({ tag: "joining" }));
+        this.tabWs.send(JSON.stringify({ tag: "joining", config: room.configHash }));
       }
       this.startInRoom(room);
       return;
     }
 
     if (msg.action === "join" || msg.action === "reconnect") {
-      if (msg.stats && typeof msg.stats === "object") this.pendingStats = msg.stats;
       const rawCode = (msg.code || "").toUpperCase().trim();
       if (rawCode.length !== 6) {
         this.sendPreLobbyError("invalid_code");
@@ -450,9 +636,11 @@ class TabSession {
       }
       console.log(`[lobby] join/reconnect: code=${rawCode} found, routing tab`);
       // Acknowledge immediately so the browser clears the pre_lobby screen
-      // before the Zig client finishes connecting to the server.
+      // before the Zig client finishes connecting to the server.  `config`
+      // makes joiners adopt the lobby's balance tables (may differ from the
+      // page they joined from).
       if (this.tabWs.readyState === WebSocket.OPEN) {
-        this.tabWs.send(JSON.stringify({ tag: "joining" }));
+        this.tabWs.send(JSON.stringify({ tag: "joining", config: room.configHash }));
       }
       this.startInRoom(room);
       return;
@@ -500,8 +688,7 @@ class TabSession {
     }
     this.serverConnected = false;
     if (this.room) { roomTabLeft(this.room); this.room = null; }
-    this.started      = false;
-    this.pendingStats = null;
+    this.started = false;
     console.warn(`[bridge] tab bounced to pre_lobby (${reason})`);
     this.sendPreLobbyError(reason);
   }

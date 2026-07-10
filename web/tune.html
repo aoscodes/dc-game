@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Slime Feast — Tuning</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #14141e;
+      color: #ddd;
+      font-family: monospace;
+      font-size: 14px;
+      padding: 24px;
+      max-width: 980px;
+      margin: 0 auto;
+    }
+    h1 { color: #ffd75e; font-size: 22px; margin-bottom: 4px; }
+    .subtitle { color: #888; margin-bottom: 24px; }
+    a { color: #8cf; }
+    fieldset {
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 14px 16px 16px;
+      margin-bottom: 20px;
+      background: rgba(255,255,255,0.02);
+    }
+    legend { color: #ffd75e; padding: 0 8px; font-size: 15px; }
+    label { display: inline-block; margin: 4px 12px 4px 0; }
+    label span { display: inline-block; min-width: 190px; color: #aaa; }
+    input[type="number"], input[type="text"], select {
+      background: #1e1e2c;
+      color: #eee;
+      border: 1px solid #444;
+      border-radius: 4px;
+      padding: 4px 6px;
+      font-family: monospace;
+      font-size: 13px;
+    }
+    input[type="number"] { width: 72px; }
+    input:invalid { border-color: #e66; }
+    button {
+      background: #2a2a3c;
+      color: #ffd75e;
+      border: 1px solid #555;
+      border-radius: 4px;
+      padding: 4px 10px;
+      font-family: monospace;
+      font-size: 13px;
+      cursor: pointer;
+      margin: 2px;
+    }
+    button:hover { background: #3a3a52; }
+    button:disabled { opacity: 0.4; cursor: default; }
+    button.danger { color: #f88; }
+    button.primary {
+      background: #ffd75e;
+      color: #14141e;
+      font-size: 16px;
+      padding: 8px 22px;
+      font-weight: bold;
+    }
+    .card {
+      border: 1px solid #2c2c40;
+      border-radius: 6px;
+      padding: 10px 12px;
+      margin: 10px 0;
+      background: rgba(0,0,0,0.25);
+    }
+    .card .row { margin: 6px 0; }
+    .muted { color: #888; }
+    .colors span.fire  { color: #ff7a5e; }
+    .colors span.earth { color: #8bd36b; }
+    .colors span.wind  { color: #9fd8ff; }
+    .colors span.water { color: #6ba7ff; }
+    .colors input { width: 62px; margin-right: 8px; }
+    .slotseq select { margin-right: 4px; }
+    #save-result {
+      margin-top: 10px;
+      padding: 12px;
+      border-radius: 6px;
+      display: none;
+    }
+    #save-result.ok    { display: block; background: rgba(80,200,120,0.12); border: 1px solid #4a8; }
+    #save-result.error { display: block; background: rgba(220,80,80,0.12);  border: 1px solid #a44; }
+    #save-result ul { margin-left: 20px; }
+    #play-link { font-size: 16px; }
+    .footer-note { color: #777; margin: 8px 0 40px; }
+  </style>
+</head>
+<body>
+  <h1>Slime Feast — Tuning</h1>
+  <div class="subtitle">
+    Tune every knob, then Save to get a shareable play URL.
+    <a href="/">back to game</a>
+  </div>
+
+  <fieldset id="rates">
+    <legend>Rates &amp; costs</legend>
+  </fieldset>
+
+  <fieldset>
+    <legend>Player recipes <span class="muted" id="pr-count"></span></legend>
+    <div id="player-recipes"></div>
+    <button id="add-player-recipe">+ add player recipe</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Team recipes <span class="muted" id="tr-count"></span></legend>
+    <div id="team-recipes"></div>
+    <button id="add-team-recipe">+ add team recipe</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Encounter <span class="muted" id="zone-count"></span></legend>
+    <div id="encounter-scalars"></div>
+    <div id="zones"></div>
+    <button id="add-zone">+ add round</button>
+  </fieldset>
+
+  <button id="save" class="primary">Save configuration</button>
+  <div id="save-result"></div>
+  <div class="footer-note">
+    Saving validates with the exact same loader the game server uses; any
+    problem is reported verbatim. The returned /config/… URL runs lobbies
+    with this configuration — players joining by room code adopt it
+    automatically.
+  </div>
+
+  <script src="/tune.js"></script>
+</body>
+</html>

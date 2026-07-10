@@ -1,0 +1,29 @@
+{
+  "default": "slime_feast_01",
+  "encounters": [
+    {
+      "label": "slime_feast_01",
+      "hunger_max": 200,
+      "zones": [
+        { "modified": { "fire": 10, "earth": 5 }, "neutral": 15 },
+        { "modified": { "fire": 10, "earth": 10, "wind": 5 }, "neutral": 10 },
+        { "modified": { "fire": 15, "earth": 10, "wind": 10, "water": 5 }, "neutral": 5 }
+      ]
+    },
+    {
+      "label": "slime_feast_02",
+      "hunger_max": 700,
+      "zones": [
+        { "modified": { "fire": 10, "earth": 5 }, "neutral": 15 },
+        { "modified": { "fire": 10, "earth": 10, "wind": 5 }, "neutral": 10 },
+        { "modified": { "fire": 15, "earth": 10, "wind": 10, "water": 5 }, "neutral": 5 },
+        { "modified": { "fire": 30, "earth": 20, "wind": 45, "water": 50 }, "neutral": 15 },
+        { "modified": { "fire": 20, "earth": 40, "wind": 15, "water": 20 }, "neutral": 10 },
+        { "modified": { "fire": 15, "earth": 10, "wind": 100, "water": 5 }, "neutral": 5 },
+        { "modified": { "fire": 20, "earth": 50, "wind": 20, "water": 10 }, "neutral": 15 },
+        { "modified": { "fire": 10, "earth": 10, "wind": 15, "water": 10 }, "neutral": 10 },
+        { "modified": { "fire": 15, "earth": 10, "wind": 10, "water": 5 }, "neutral": 5 }
+      ]
+    }
+  ]
+}

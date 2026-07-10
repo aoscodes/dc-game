@@ -7,7 +7,7 @@ Authoritative Zig server. Browser canvas renderer. Zig headless client ↔ Node 
 ## Requirements
 
 - Zig 0.15.2
-- Node.js 18+ (for the bridge and browser e2e tests)
+- Node.js 18+ (for the bridge)
 
 ## Quick start (local)
 
@@ -51,7 +51,6 @@ The Zig client is headless — no window, no GPU. It reads server messages and k
 | `zig build run-server`  | Build + run server (listens on port 9001)                  |
 | `zig build test`        | Unit + integration tests                                   |
 | `zig build e2e`         | Zig e2e test: spawn server + 2 bot clients, full game loop |
-| `zig build browser-e2e` | Playwright browser e2e (14 tests, requires Node.js)        |
 
 ## Deploy to a VPS
 
@@ -89,13 +88,12 @@ After the script:
 
 `.github/workflows/deploy.yml` runs on every push to `main`:
 
-1. `zig build test` + `zig build e2e` — deploy aborts if either fails
+1. `zig build test` — deploy aborts if it fails
 2. Builds `zig-out/bin/server` (`-Doptimize=ReleaseSafe`)
-3. Builds `zig-out/bin/client` (`-Doptimize=ReleaseSafe`) and bundles it with `bridge/`
-4. Browser e2e (Playwright, 14 tests) — deploy aborts if any fail
-5. SCPs server binary → VPS (no restart; new lobbies spawn the new binary)
-6. SCPs client binary + bridge → VPS, runs `npm ci`, restarts `dragoncon-bridge.service`
-7. SCPs `web/` static files → `/var/www/dragoncon/`
+3. Builds `zig-out/bin/client` (`-Doptimize=ReleaseSafe`) and bundles it with `bridge/` + `data/`
+4. SCPs server binary → VPS (no restart; new lobbies spawn the new binary)
+5. SCPs client binary + bridge + game data → VPS, restarts `dragoncon-bridge.service`
+6. SCPs `web/` static files + `data/` → `/var/www/dragoncon/`
 
 Path filters skip jobs when unrelated files change (e.g. only `web/` changed → only `deploy-web` runs).
 
@@ -111,12 +109,42 @@ Certbot adds `listen 443 ssl` and sets up auto-renew. `game.js` derives the WebS
 
 Until you have a domain, the game is playable over plain `http://`.
 
-### Encounter tuning
+### Balance / encounter tuning (data files — no rebuild)
 
-Encounter definitions (zones, slime amounts, hunger budget) are comptime Zig
-in `src/shared/encounter.zig`; recipes and costs live in
-`src/shared/balance.zig`. Retuning currently requires a rebuild+deploy.
-(A planned JSON hot-reload was never implemented.)
+All designer-tunable data lives in two JSON files:
+
+- `data/balance.json` — conversion rates, hunger costs, casts per round,
+  default round duration, and the player/team recipe
+  tables (patterns are slot-name lists: `"fire"`, `"dispense"`, ...).
+- `data/encounters.json` — encounters (zones, slime amounts per color,
+  hunger budget) plus which encounter is the default.
+
+The server loads both at process start (`--data-dir`, default `data/`) and
+the browser fetches `data/balance.json` directly, so there is a single
+source of truth — no mirrored tables.  The bridge spawns one server per
+lobby, so **editing the JSON takes effect on the next lobby created; no
+rebuild or bridge restart needed**.  Invalid files fail loudly at server
+start with the exact field and reason; unknown fields are rejected so typos
+can't silently default.  Caps enforced by the loader: 64 recipes per table,
+16 zones per encounter, combo patterns ≤ 5 slots.
+`server --data-dir <dir> --validate` checks a data dir and exits.
+
+### /tune — in-browser config editor
+
+Open **`/tune`** for a form with every knob: rates/costs, casts per round,
+round duration, player/team recipes (add/remove recipes,
+pattern slots, per-color outputs) and the encounter (add/remove rounds,
+per-color slime, hunger budget).  Saving POSTs to `/api/tune/save`:
+
+- The bridge content-addresses the config (`sha256` prefix) into
+  `custom-configs/{hash}/` and validates it with `server --validate` —
+  rejections show the loader's exact messages.
+- On success you get a **shareable `/config/{hash}` URL**.  Creating a lobby
+  from that page runs the game with that config; players joining by room
+  code adopt its balance tables automatically.
+- Edit an existing config with `/tune?from={hash}`.
+
+Saved configs are never garbage-collected (tiny JSON dirs).
 
 ## Gameplay
 
@@ -146,7 +174,7 @@ At round end the current zone is consumed in its entirety:
   hunger, and only that extra portion is healable by Medicine.
 - Score += neutralized + naturally-neutral units.
 
-Exact combos can match hard-coded **recipes** (`balance.zig`) that replace the
+Exact combos can match **recipes** (`data/balance.json`) that replace the
 flat per-slot conversion — including **team recipes** matched across multiple
 players' combos in the same round (e.g. `twin_flames`).
 
@@ -156,15 +184,16 @@ final shared score is broadcast either way.
 ## Architecture
 
 ```
-shared/      pure Zig: ECS components, recipe/zone resolution math, wire protocol, encounter defs
+shared/      pure Zig: ECS components, recipe/zone resolution math, wire protocol, data-file loader
 client/      headless Zig stdio binary — game logic + UI state, no window/GPU
 server/      authoritative game loop, lobby state machine, round resolution, broadcasts
-bridge/      Node.js: spawns client, owns both WebSocket connections, serves web/
+bridge/      Node.js: spawns client, owns both WebSocket connections, serves web/ + data/
 web/         static HTML + JS canvas renderer (no build step)
-e2e/         Zig bot e2e (src/e2e/) + Playwright browser e2e (e2e/browser/)
+data/        designer-tunable JSON: balance + recipes + encounters
+e2e/         Zig bot e2e (src/e2e/)
 ```
 
-All game logic runs on the server. Clients send inputs only (`JoinLobby`, `ReadyUp`, `ChooseCombo`, `CancelCombo`, `SetStatblock`, `Reconnect`). The server broadcasts `LobbyUpdate`, `GameState` snapshots, `RoundReset`, `ActionResult`, `GameOver` (final score).
+All game logic runs on the server. Clients send inputs only (`JoinLobby`, `ReadyUp`, `ChooseCombo`, `CancelCombo`, `Reconnect`). The server broadcasts `LobbyUpdate`, `GameState` snapshots, `RoundReset`, `ActionResult`, `GameOver` (final score).
 
 Wire protocol is binary, little-endian, no allocations on the hot path. See `src/shared/protocol.zig`.
 
@@ -187,10 +216,12 @@ src/
     shared.zig           module root
     components.zig       component types + combo/zone/agent model
     game_logic.zig       combo parsing, recipe matching, zone/hunger resolution
-    balance.zig          tunables + recipe tables (player + team)
+    balance.zig          balance/recipe types (values in data/balance.json)
+    config.zig           data-file loader: JSON parse + validation
+    fixtures.zig         frozen fixture config for tests
     protocol.zig         binary wire protocol + round-trip tests
     transport.zig        abstract Transport interface
-    encounter.zig        encounter (slime field) definitions
+    encounter.zig        encounter types (values in data/encounters.json)
     bots.zig             bot profiles/teams for the test harness
   client/
     main.zig             entry point, ClientState, stdin reader, game loop
@@ -206,20 +237,17 @@ src/
   debug/
     debug.zig            debug/snapshot utilities (no Raylib dependency)
 bridge/
-  index.js               Node bridge: spawns client, WebSocket relay, static file server
+  index.js               Node bridge: spawns client, WebSocket relay, static files, /api/tune/save
 web/
-  index.html             canvas shell
+  index.html             canvas shell (also served at /config/{hash})
   game.js                canvas renderer: connecting / lobby / game / game_over phases
-e2e/browser/
-  helpers.js             spawn helpers, Bot, frame collectors, pixel/frame assertions
-  playwright.config.js   Playwright config (headless Chromium)
-  tests/
-    canvas.test.js       canvas element, dimensions, frame rate, connecting screen
-    connecting.test.js   connecting phase before/after server comes up
-    lobby.test.js        lobby frame content, C_HEADER title colour, key round-trips
-    game.test.js         game phase entities, grid pixel checks, game_over
+  tune.html, tune.js     /tune config editor
+data/
+  balance.json           rates, costs, recipes
+  encounters.json        encounters (zones per round, hunger budget)
+custom-configs/          saved /tune configs (gitignored, content-addressed)
 scripts/
   vps-setup.sh           one-time VPS provisioning (Nginx, Node.js, systemd, deploy user)
 .github/workflows/
-  deploy.yml             CI: test → build → browser-e2e → deploy on push to main
+  deploy.yml             CI: test → build → deploy on push to main
 ```

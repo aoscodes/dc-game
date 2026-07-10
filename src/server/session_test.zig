@@ -18,13 +18,18 @@ const shared = @import("shared");
 const proto = shared.protocol;
 const c = shared.components;
 const logic = shared.game_logic;
-const balance = shared.balance;
 const enc = shared.encounter;
+const fixtures = shared.fixtures;
 
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 
 const mk = c.make_combo;
+
+/// Frozen fixture config — designer edits to data/*.json can't break these.
+const TEST_CFG = &fixtures.test_config;
+const BAL = &fixtures.test_config.balance;
+const DEFAULT_ENC = fixtures.test_config.encounters.default();
 
 // ---------------------------------------------------------------------------
 // Minimal test encounters
@@ -143,7 +148,6 @@ fn consume_payload(tag: proto.MsgTag, r: anytype) bool {
         .reconnect => if (proto.decode_reconnect(r)) |_| true else |_| false,
         .ready_up => true, // zero-payload
         .choose_combo => if (proto.decode_choose_combo(r)) |_| true else |_| false,
-        .set_statblock => if (proto.decode_set_statblock(r)) |_| true else |_| false,
         .cancel_combo => true, // zero-payload
         .lobby_update => if (proto.decode_lobby_update(r)) |_| true else |_| false,
         .game_start => if (proto.decode_game_start(r)) |_| true else |_| false,
@@ -231,7 +235,7 @@ fn init_two_player_session(
     self.p[0].init(allocator);
     self.p[1].init(allocator);
 
-    self.sess = try Session.init(allocator, "TSTKEY".*);
+    self.sess = try Session.init(allocator, "TSTKEY".*, TEST_CFG);
 
     const pid0 = self.sess.join(self.p[0].transport(), "") orelse return error.JoinFailed;
     const pid1 = self.sess.join(self.p[1].transport(), "") orelse return error.JoinFailed;
@@ -329,13 +333,14 @@ test "ready flow starts the default encounter" {
     const gs = try proto.decode_game_start(fbs.reader());
     try std.testing.expectEqualSlices(
         u8,
-        enc.DEFAULT_ENCOUNTER.label,
+        DEFAULT_ENC.label,
         gs.encounter_label[0..gs.encounter_label_len],
     );
+    try std.testing.expectEqual(BAL.casts_per_round, gs.casts_per_round);
 
-    try std.testing.expectEqual(@as(u16, enc.DEFAULT_ENCOUNTER.hunger_max), s.sess.hunger.max);
+    try std.testing.expectEqual(@as(u16, DEFAULT_ENC.hunger_max), s.sess.hunger.max);
     try std.testing.expectEqual(@as(u16, 0), s.sess.hunger.current);
-    try std.testing.expectEqual(@as(u8, enc.DEFAULT_ENCOUNTER.zones.len), s.sess.zone_count);
+    try std.testing.expectEqual(@as(u8, DEFAULT_ENC.zones.len), s.sess.zone_count);
 }
 
 // ---------------------------------------------------------------------------
@@ -406,7 +411,7 @@ test "full neutralization: no extra hunger, full score" {
 
     try std.testing.expectEqual(@as(u32, 20), s.sess.score);
     try std.testing.expectEqual(
-        @as(u16, @intCast(20 * balance.HUNGER_COST_NORMAL)),
+        @as(u16, @intCast(20 * BAL.hunger_cost_normal)),
         s.sess.hunger.current,
     );
     try std.testing.expectEqual(@as(u32, 0), total_healable(&s.sess));
@@ -435,8 +440,8 @@ test "partial neutralization: 25 of 50 — split hunger and score" {
 
     // 25 neutralized + 25 modified consumed.
     try std.testing.expectEqual(@as(u32, 25), s.sess.score);
-    const expected_normal = 50 * balance.HUNGER_COST_NORMAL;
-    const expected_extra = 25 * balance.HUNGER_COST_MODIFIED_EXTRA;
+    const expected_normal = 50 * BAL.hunger_cost_normal;
+    const expected_extra = 25 * BAL.hunger_cost_modified_extra;
     try std.testing.expectEqual(
         @as(u16, @intCast(expected_normal + expected_extra)),
         s.sess.hunger.current,
@@ -462,10 +467,10 @@ test "wrong-color agents have no effect on the zone" {
     try resolve(&s.sess);
 
     try std.testing.expectEqual(@as(u32, 0), s.sess.score);
-    const expected = 20 * balance.HUNGER_COST_NORMAL + 20 * balance.HUNGER_COST_MODIFIED_EXTRA;
+    const expected = 20 * BAL.hunger_cost_normal + 20 * BAL.hunger_cost_modified_extra;
     try std.testing.expectEqual(@as(u16, @intCast(expected)), s.sess.hunger.current);
     try std.testing.expectEqual(
-        @as(u16, @intCast(20 * balance.HUNGER_COST_MODIFIED_EXTRA)),
+        @as(u16, @intCast(20 * BAL.hunger_cost_modified_extra)),
         s.sess.hunger_healable[FIRE],
     );
 }
@@ -496,7 +501,7 @@ test "excess agents are wasted (no carryover to next zone)" {
     try resolve(&s.sess);
     try std.testing.expectEqual(@as(u32, 15 + 2), s.sess.score); // only neutral counts
     try std.testing.expectEqual(
-        @as(u16, @intCast(8 * balance.HUNGER_COST_MODIFIED_EXTRA)),
+        @as(u16, @intCast(8 * BAL.hunger_cost_modified_extra)),
         s.sess.hunger_healable[EARTH],
     );
 }
@@ -518,7 +523,7 @@ test "team recipe (twin_flames) neutralizes more than two flat casts" {
 
     try std.testing.expectEqual(@as(u32, 30), s.sess.score);
     try std.testing.expectEqual(
-        @as(u16, @intCast(20 * balance.HUNGER_COST_MODIFIED_EXTRA)),
+        @as(u16, @intCast(20 * BAL.hunger_cost_modified_extra)),
         s.sess.hunger_healable[FIRE],
     );
 }
@@ -605,7 +610,7 @@ test "casts beyond CASTS_PER_ROUND are dropped" {
 
     // White-box: player already used all casts this round; a pending combo
     // must not commit at resolution.
-    s.sess.casts_used[s.p[0].pid] = balance.CASTS_PER_ROUND;
+    s.sess.casts_used[s.p[0].pid] = BAL.casts_per_round;
     try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .fire }, .{ .action = .dispense } }));
     try resolve(&s.sess);
 
@@ -750,7 +755,7 @@ test "medicine heals immediately when the cast window closes" {
     try s.sess.tick(3.05);
     const hunger_r1 = s.sess.hunger.current;
     try std.testing.expectEqual(
-        @as(u16, @intCast(10 * balance.HUNGER_COST_MODIFIED_EXTRA)),
+        @as(u16, @intCast(10 * BAL.hunger_cost_modified_extra)),
         s.sess.hunger_healable[FIRE],
     );
 
@@ -762,10 +767,10 @@ test "medicine heals immediately when the cast window closes" {
     }));
     try s.sess.tick(1.05); // window closes; round still running
     try std.testing.expectEqual(session_mod.SessionPhase.playing, s.sess.phase);
-    const expected_heal: u16 = @intCast(2 * balance.MEDICINE_PER_SLOT);
+    const expected_heal: u16 = @intCast(2 * BAL.medicine_per_slot);
     try std.testing.expectEqual(hunger_r1 - expected_heal, s.sess.hunger.current);
     try std.testing.expectEqual(
-        @as(u16, @intCast(10 * balance.HUNGER_COST_MODIFIED_EXTRA)) - expected_heal,
+        @as(u16, @intCast(10 * BAL.hunger_cost_modified_extra)) - expected_heal,
         s.sess.hunger_healable[FIRE],
     );
 }
@@ -832,7 +837,7 @@ test "symmetrical medicine heals matching-color healable hunger" {
     try resolve(&s.sess);
     const fire_healable_r1 = s.sess.hunger_healable[FIRE];
     try std.testing.expectEqual(
-        @as(u16, @intCast(10 * balance.HUNGER_COST_MODIFIED_EXTRA)),
+        @as(u16, @intCast(10 * BAL.hunger_cost_modified_extra)),
         fire_healable_r1,
     );
     const hunger_after_r1 = s.sess.hunger.current;
@@ -847,9 +852,9 @@ test "symmetrical medicine heals matching-color healable hunger" {
     }));
     try resolve(&s.sess);
 
-    const expected_heal: u16 = @intCast(@min(2 * balance.MEDICINE_PER_SLOT, fire_healable_r1));
+    const expected_heal: u16 = @intCast(@min(2 * BAL.medicine_per_slot, fire_healable_r1));
     // Round 2 also consumed zone 1 (8 earth modified + 2 neutral).
-    const zone1_hunger = 10 * balance.HUNGER_COST_NORMAL + 8 * balance.HUNGER_COST_MODIFIED_EXTRA;
+    const zone1_hunger = 10 * BAL.hunger_cost_normal + 8 * BAL.hunger_cost_modified_extra;
     try std.testing.expectEqual(
         hunger_after_r1 - expected_heal + @as(u16, @intCast(zone1_hunger)),
         s.sess.hunger.current,
@@ -894,7 +899,7 @@ test "asymmetric medicine heals nothing" {
     try resolve(&s.sess);
 
     // No healing: hunger only grew by zone 1 consumption; fire bucket intact.
-    const zone1_hunger = 10 * balance.HUNGER_COST_NORMAL + 8 * balance.HUNGER_COST_MODIFIED_EXTRA;
+    const zone1_hunger = 10 * BAL.hunger_cost_normal + 8 * BAL.hunger_cost_modified_extra;
     try std.testing.expectEqual(
         hunger_after_r1 + @as(u16, @intCast(zone1_hunger)),
         s.sess.hunger.current,
@@ -930,7 +935,7 @@ test "neutral-slime hunger is not healable" {
 
     // Hunger only grew (zone 1: 10 neutral); no healing happened.
     try std.testing.expectEqual(
-        hunger_after_r1 + @as(u16, @intCast(10 * balance.HUNGER_COST_NORMAL)),
+        hunger_after_r1 + @as(u16, @intCast(10 * BAL.hunger_cost_normal)),
         s.sess.hunger.current,
     );
 }
@@ -1094,7 +1099,7 @@ test "match stats: rounds, players, recipes, and reason are reported" {
     try std.testing.expectEqual(@as(u16, 5), r1.agents_dispensed[@intFromEnum(c.Element.water)]);
     try std.testing.expectEqual(@as(u16, 8), r1.modified_escaped[EARTH]);
     try std.testing.expectEqual(
-        @as(u16, @intCast(8 * balance.HUNGER_COST_MODIFIED_EXTRA)),
+        @as(u16, @intCast(8 * BAL.hunger_cost_modified_extra)),
         r1.hunger_extra,
     );
 

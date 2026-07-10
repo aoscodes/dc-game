@@ -24,9 +24,9 @@
 //! following action are ignored during resolution.  See
 //! `game_logic.parse_combo` for the canonical interpretation.
 //!
-//! Exact combos may match hard-coded recipes (balance.player_recipes /
-//! balance.team_recipes) which *replace* the combo's flat per-slot
-//! conversion with a tuned AgentOutput.
+//! Exact combos may match recipes (player/team tables loaded from
+//! data/balance.json — see config.zig) which *replace* the combo's flat
+//! per-slot conversion with a tuned AgentOutput.
 
 const std = @import("std");
 
@@ -44,18 +44,6 @@ pub const EntityKind = enum(u8) {
 
 pub const Kind = struct {
     tag: EntityKind,
-};
-
-pub const Statblock = struct {
-    attack: u16,
-    shield: u16,
-    heal: u16,
-    fire: u16,
-    earth: u16,
-    wind: u16,
-    water: u16,
-    hp: u16,
-    level: u16,
 };
 
 /// Zero-size marker component. Present on every player entity; drives the

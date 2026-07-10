@@ -35,7 +35,7 @@ if ! id dragoncon &>/dev/null; then
     useradd -r -s /bin/false dragoncon
 fi
 
-mkdir -p /opt/dragoncon/bridge /var/www/dragoncon
+mkdir -p /opt/dragoncon/bridge /opt/dragoncon/data /opt/dragoncon/custom-configs /var/www/dragoncon
 chown -R dragoncon:dragoncon /opt/dragoncon
 
 # ---------------------------------------------------------------------------
@@ -55,9 +55,10 @@ cat > /etc/sudoers.d/deploy <<'EOF'
 # Server binary (spawned per-lobby by the bridge; no standalone service)
 deploy ALL=(root) NOPASSWD: /usr/bin/install -o dragoncon -g dragoncon -m 755 /tmp/dragoncon-deploy/zig-out/bin/server /opt/dragoncon/server
 
-# Client binary + Node bridge
+# Client binary + Node bridge + game data files
 deploy ALL=(root) NOPASSWD: /usr/bin/install -o dragoncon -g dragoncon -m 755 /tmp/dragoncon-deploy/zig-out/bin/client /opt/dragoncon/client
 deploy ALL=(root) NOPASSWD: /usr/bin/rsync -a --delete /tmp/dragoncon-deploy/bridge/ /opt/dragoncon/bridge/
+deploy ALL=(root) NOPASSWD: /usr/bin/rsync -a --delete /tmp/dragoncon-deploy/data/ /opt/dragoncon/data/
 deploy ALL=(root) NOPASSWD: /bin/systemctl restart dragoncon-bridge
 EOF
 chmod 440 /etc/sudoers.d/deploy
@@ -116,6 +117,32 @@ server {
         # Keep long-lived WS connections alive through the proxy
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
+    }
+
+    # Tuning API (save configs) -> Node bridge
+    location /api/ {
+        proxy_pass       http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+    }
+
+    # Saved custom-config data files live with the bridge (content-addressed
+    # under /opt/dragoncon/custom-configs), not in the static web root.
+    location ~ ^/config/[0-9a-f]{16}/data/ {
+        proxy_pass       http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+    }
+
+    # /config/{hash} serves the regular game shell; game.js reads the hash
+    # from location.pathname (all asset/script URLs are absolute).
+    location ~ ^/config/[0-9a-f]{16}$ {
+        add_header Cache-Control "no-cache";
+        try_files /index.html =404;
+    }
+
+    # The tuning editor (static, ships with web/).
+    location = /tune {
+        add_header Cache-Control "no-cache";
+        try_files /tune.html =404;
     }
 
     # index.html must revalidate so the game.js?v=<sha> cache buster is seen

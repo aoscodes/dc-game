@@ -21,7 +21,6 @@ jobs:
       client: ${{ steps.filter.outputs.client }}
       web: ${{ steps.filter.outputs.web }}
       setup: ${{ steps.filter.outputs.setup }}
-      browser: ${{ steps.filter.outputs.browser }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -35,6 +34,7 @@ jobs:
               - 'src/root.zig'
               - 'build.zig'
               - 'build.zig.zon'
+              - 'data/**'
             client:
               - 'src/client/**'
               - 'src/shared/**'
@@ -42,16 +42,12 @@ jobs:
               - 'build.zig'
               - 'build.zig.zon'
               - 'bridge/**'
+              - 'data/**'
             web:
               - 'web/**'
+              - 'data/**'
             setup:
               - 'scripts/vps-setup.sh'
-            browser:
-              - 'src/client/**'
-              - 'src/server/**'
-              - 'src/shared/**'
-              - 'bridge/**'
-              - 'web/**'
 
   build-server:
     needs: changes
@@ -116,6 +112,7 @@ jobs:
           cp bridge/package.json         deploy/bridge/package.json
           cp bridge/package-lock.json    deploy/bridge/package-lock.json
           cp -r bridge/node_modules      deploy/bridge/node_modules
+          cp -r data                     deploy/data
 
       - name: upload client artifact
         uses: actions/upload-artifact@v4
@@ -197,6 +194,9 @@ jobs:
               /tmp/dragoncon-deploy/zig-out/bin/client \
               /opt/dragoncon/client
             sudo rsync -a --delete /tmp/dragoncon-deploy/bridge/ /opt/dragoncon/bridge/
+            # Game data: bridge serves /data/* from here and passes it to
+            # spawned servers via --data-dir.
+            sudo rsync -a --delete /tmp/dragoncon-deploy/data/ /opt/dragoncon/data/
             sudo systemctl restart dragoncon-bridge
             rm -rf /tmp/dragoncon-deploy
 
@@ -219,6 +219,18 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           source: "web/*"
           target: "/var/www/dragoncon/"
+          strip_components: 1
+
+      # The browser fetches data/balance.json relative to the web root, so
+      # the game data files ship alongside the static assets too.
+      - name: scp game data to VPS
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          source: "data/*"
+          target: "/var/www/dragoncon/data/"
           strip_components: 1
 
   deploy-setup:

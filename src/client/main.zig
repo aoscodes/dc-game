@@ -10,9 +10,8 @@ const ClientPhaseTag = sw.ClientPhaseTag;
 const LobbyState = sw.LobbyState;
 const GameState = sw.GameState;
 
-const WIRE_PREFIX      = "WIRE:";
-const KEY_PREFIX       = "KEY:";
-const STATBLOCK_PREFIX = "STATBLOCK:";
+const WIRE_PREFIX = "WIRE:";
+const KEY_PREFIX  = "KEY:";
 
 const RENDER_HZ: u64 = 60;
 const TICK_NS: u64 = std.time.ns_per_s / RENDER_HZ;
@@ -89,8 +88,6 @@ const ClientState = struct {
     send_buf: [512]u8 = undefined,
     recv_queue: MsgQueue = .{},
     recv_scratch: [4096]u8 = undefined,
-    /// Statblock received from bridge before READY; sent to server after join.
-    pending_statblock: ?c.Statblock = null,
 };
 
 var g_state: ClientState = .{};
@@ -117,23 +114,9 @@ fn stdin_reader(_: void) void {
         };
         const trimmed = std.mem.trimRight(u8, line, "\r");
 
-        if (std.mem.startsWith(u8, trimmed, STATBLOCK_PREFIX)) {
-            const json = trimmed[STATBLOCK_PREFIX.len..];
-            var arena_buf: [512]u8 = undefined;
-            var fba = std.heap.FixedBufferAllocator.init(&arena_buf);
-            const parsed = std.json.parseFromSlice(c.Statblock, fba.allocator(), json, .{
-                .ignore_unknown_fields = true,
-            }) catch |err| {
-                std.log.warn("STATBLOCK parse error: {}", .{err});
-                continue;
-            };
-            g_state.pending_statblock = parsed.value;
-        } else if (std.mem.eql(u8, trimmed, "READY")) {
+        if (std.mem.eql(u8, trimmed, "READY")) {
             g_ready.store(true, .release);
             send_join();
-            if (g_state.pending_statblock) |sb| {
-                send_statblock(sb);
-            }
         } else if (std.mem.startsWith(u8, trimmed, WIRE_PREFIX)) {
             const hex = trimmed[WIRE_PREFIX.len..];
             const decoded = std.fmt.hexToBytes(&hex_buf, hex) catch |err| {
@@ -165,12 +148,6 @@ fn send_join() void {
         @memcpy(p.name[0..name.len], name);
         proto.encode(w, .join_lobby, p) catch return;
     }
-    emit_send(fbs.getWritten());
-}
-
-fn send_statblock(sb: c.Statblock) void {
-    var fbs = std.io.fixedBufferStream(&g_state.send_buf);
-    proto.encode(fbs.writer(), .set_statblock, proto.SetStatblock{ .statblock = sb }) catch return;
     emit_send(fbs.getWritten());
 }
 
@@ -226,6 +203,7 @@ fn process_recv() void {
                 g_state.game.player_id = p.player_id;
                 g_state.game.round_timer = p.round_duration;
                 g_state.game.round_duration = p.round_duration;
+                g_state.game.casts_per_round = p.casts_per_round;
                 g_state.game.encounter_label_len = p.encounter_label_len;
                 @memcpy(g_state.game.encounter_label[0..p.encounter_label_len], p.encounter_label[0..p.encounter_label_len]);
                 g_state.phase = .game;
