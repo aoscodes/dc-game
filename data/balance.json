@@ -1,18 +1,18 @@
 {
-  "casts_per_round": 1,
+  "casts_per_round": 3,
   "units_per_slot": 5,
   "medicine_per_slot": 3,
   "hunger_cost_normal": 1,
   "hunger_cost_modified_extra": 2,
-  "round_duration_default_s": 10.0,
+  "round_duration_default_s": 15.0,
   "player_recipes": [
     {
       "label": "big_red",
       "pattern": [
+        "red",
         "dispense",
-        "red",
-        "red",
-        "red"
+        "dispense",
+        "dispense"
       ],
       "output": {
         "units": {
@@ -23,10 +23,10 @@
     {
       "label": "big_green",
       "pattern": [
+        "green",
         "dispense",
-        "green",
-        "green",
-        "green"
+        "dispense",
+        "dispense"
       ],
       "output": {
         "units": {
@@ -37,10 +37,10 @@
     {
       "label": "big_yellow",
       "pattern": [
+        "yellow",
         "dispense",
-        "yellow",
-        "yellow",
-        "yellow"
+        "dispense",
+        "dispense"
       ],
       "output": {
         "units": {
@@ -51,10 +51,10 @@
     {
       "label": "big_blue",
       "pattern": [
+        "blue",
         "dispense",
-        "blue",
-        "blue",
-        "blue"
+        "dispense",
+        "dispense"
       ],
       "output": {
         "units": {
@@ -65,10 +65,10 @@
     {
       "label": "prism",
       "pattern": [
-        "dispense",
         "red",
         "dispense",
-        "blue"
+        "blue",
+        "dispense"
       ],
       "output": {
         "units": {
@@ -82,14 +82,13 @@
     {
       "label": "panacea",
       "pattern": [
-        "medicine",
         "blue",
         "medicine",
-        "blue"
+        "medicine"
       ],
       "output": {
         "medicine": {
-          "blue": 15
+          "blue": 10
         }
       }
     }
