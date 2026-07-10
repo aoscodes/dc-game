@@ -25,10 +25,10 @@ const MAX_ZONES = 16;
 /** Scalar balance fields: [key, label, min, max, step]. */
 const RATE_FIELDS = [
   ["casts_per_round", "casts per round", 1, 10, 1],
-  ["units_per_slot", "agent units per dispense slot", 0, 1000, 1],
-  ["medicine_per_slot", "medicine per medicine slot", 0, 1000, 1],
+  ["units_per_slot", "neutralization agent units per dispense", 0, 1000, 1],
+  ["medicine_per_slot", "medicine per dispense", 0, 1000, 1],
   ["hunger_cost_normal", "hunger per unit eaten", 0, 1000, 1],
-  ["hunger_cost_modified_extra", "extra hunger per un-neutralized unit", 0, 1000, 1],
+  ["hunger_cost_modified_extra", "extra hunger from modified slime", 0, 1000, 1],
   ["round_duration_default_s", "round duration (seconds)", 0.5, 300, 0.5],
 ];
 
@@ -333,7 +333,7 @@ document.getElementById("save").addEventListener("click", async () => {
     el("span", {}, " "),
     el("button", { onclick: () => navigator.clipboard.writeText(playUrl) }, "copy"),
     el("div", { class: "muted" },
-      `Edit it later at /tune?from=${data.hash}. Anyone joining the lobby by room code gets this config automatically.`),
+      `Edit it later at /tune?from=${data.hash}.`),
   ]);
 });
 
