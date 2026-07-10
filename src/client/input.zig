@@ -8,8 +8,6 @@ pub fn parse_key_name(name: []const u8) ?RawKey {
     if (std.mem.eql(u8, name, "Escape")) return .escape;
     if (std.mem.eql(u8, name, "1")) return .one;
     if (std.mem.eql(u8, name, "2")) return .two;
-    if (std.mem.eql(u8, name, "3")) return .three;
-    if (std.mem.eql(u8, name, "4")) return .four;
     if (std.mem.eql(u8, name, "q")) return .q;
     if (std.mem.eql(u8, name, "w")) return .w;
     if (std.mem.eql(u8, name, "e")) return .e;
@@ -18,7 +16,7 @@ pub fn parse_key_name(name: []const u8) ?RawKey {
     return null;
 }
 
-pub const RawKey = enum { enter, escape, one, two, three, four, q, w, e, r };
+pub const RawKey = enum { enter, escape, one, two, q, w, e, r };
 
 pub const KeyQueue = struct {
     buf: [64]RawKey = undefined,
@@ -84,8 +82,8 @@ pub fn drain_into_combo(queue: *KeyQueue, combo: *ComboBuffer) DrainResult {
             // Action keys: 1=dispense  2=medicine
             .one, .two => {
                 const action: c.ActionChoice = switch (key) {
-                    .q => .dispense,
-                    .w => .medicine,
+                    .one => .dispense,
+                    .two => .medicine,
                     else => unreachable,
                 };
                 if (combo.push(.{ .action = action })) result = .appended;
@@ -93,10 +91,10 @@ pub fn drain_into_combo(queue: *KeyQueue, combo: *ComboBuffer) DrainResult {
             // Agent color keys: Q=red  W=green  E=yellow  R=blue
             .q, .w, .e, .r => {
                 const element: c.Element = switch (key) {
-                    .one => .red,
-                    .two => .green,
-                    .three => .yellow,
-                    .four => .blue,
+                    .q => .red,
+                    .w => .green,
+                    .e => .yellow,
+                    .r => .blue,
                     else => unreachable,
                 };
                 if (combo.push(.{ .element = element })) result = .appended;
