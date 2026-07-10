@@ -127,14 +127,15 @@ server {
 
     # Saved custom-config data files live with the bridge (content-addressed
     # under /opt/dragoncon/custom-configs), not in the static web root.
-    location ~ ^/config/[0-9a-f]{16}/data/ {
+    # Regexes with {n} repetition must be quoted or nginx parses { as a block.
+    location ~ "^/config/[0-9a-f]{16}/data/" {
         proxy_pass       http://127.0.0.1:3000;
         proxy_set_header Host $host;
     }
 
     # /config/{hash} serves the regular game shell; game.js reads the hash
     # from location.pathname (all asset/script URLs are absolute).
-    location ~ ^/config/[0-9a-f]{16}$ {
+    location ~ "^/config/[0-9a-f]{16}$" {
         add_header Cache-Control "no-cache";
         try_files /index.html =404;
     }
