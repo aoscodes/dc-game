@@ -124,14 +124,14 @@ pub fn parse(
 // The Colors* structs map named fields onto Element-ordinal arrays; guard
 // the assumed ordering at compile time.
 comptime {
-    std.debug.assert(@intFromEnum(c.Element.fire) == 0);
-    std.debug.assert(@intFromEnum(c.Element.earth) == 1);
-    std.debug.assert(@intFromEnum(c.Element.wind) == 2);
-    std.debug.assert(@intFromEnum(c.Element.water) == 3);
+    std.debug.assert(@intFromEnum(c.Element.red) == 0);
+    std.debug.assert(@intFromEnum(c.Element.green) == 1);
+    std.debug.assert(@intFromEnum(c.Element.yellow) == 2);
+    std.debug.assert(@intFromEnum(c.Element.blue) == 3);
 }
 
-const ColorsU32Json = struct { fire: u32 = 0, earth: u32 = 0, wind: u32 = 0, water: u32 = 0 };
-const ColorsU16Json = struct { fire: u16 = 0, earth: u16 = 0, wind: u16 = 0, water: u16 = 0 };
+const ColorsU32Json = struct { red: u32 = 0, green: u32 = 0, yellow: u32 = 0, blue: u32 = 0 };
+const ColorsU16Json = struct { red: u16 = 0, green: u16 = 0, yellow: u16 = 0, blue: u16 = 0 };
 
 const OutputJson = struct {
     units: ColorsU32Json = .{},
@@ -284,7 +284,7 @@ fn parse_encounters(a: std.mem.Allocator, bytes: []const u8) !enc.EncounterSet {
         const zones = try a.alloc(c.ZoneDef, e.zones.len);
         for (e.zones, zones) |z, *zd| {
             zd.* = .{
-                .modified = .{ z.modified.fire, z.modified.earth, z.modified.wind, z.modified.water },
+                .modified = .{ z.modified.red, z.modified.green, z.modified.yellow, z.modified.blue },
                 .neutral = z.neutral,
             };
         }
@@ -310,8 +310,8 @@ fn validate_recipe_label(label: []const u8) !void {
 
 fn output_from_json(o: OutputJson) c.AgentOutput {
     return .{
-        .units = .{ o.units.fire, o.units.earth, o.units.wind, o.units.water },
-        .medicine = .{ o.medicine.fire, o.medicine.earth, o.medicine.wind, o.medicine.water },
+        .units = .{ o.units.red, o.units.green, o.units.yellow, o.units.blue },
+        .medicine = .{ o.medicine.red, o.medicine.green, o.medicine.yellow, o.medicine.blue },
     };
 }
 
@@ -332,7 +332,7 @@ fn combo_from_names(recipe_label: []const u8, names: []const []const u8) !c.Acti
     };
     for (names, 0..) |name, i| {
         combo.slots[i] = slot_from_name(name) orelse {
-            fail("{s}: recipe '{s}' has unknown slot '{s}' (want dispense|medicine|fire|earth|wind|water)", .{ BALANCE_FILE, recipe_label, name });
+            fail("{s}: recipe '{s}' has unknown slot '{s}' (want dispense|medicine|red|green|yellow|blue)", .{ BALANCE_FILE, recipe_label, name });
             return ConfigError.InvalidComboSlot;
         };
     }
@@ -407,7 +407,7 @@ test "unknown combo slot name is rejected" {
         \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
         \\ "round_duration_default_s":15,
         \\ "player_recipes":[{"label":"x","pattern":["lava","dispense"],
-        \\   "output":{"units":{"fire":1}}}],
+        \\   "output":{"units":{"red":1}}}],
         \\ "team_recipes":[]}
     ;
     try std.testing.expectError(
@@ -422,8 +422,8 @@ test "over-long combo pattern is rejected" {
         \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
         \\ "round_duration_default_s":15,
         \\ "player_recipes":[{"label":"x",
-        \\   "pattern":["fire","dispense","dispense","dispense","dispense","dispense"],
-        \\   "output":{"units":{"fire":1}}}],
+        \\   "pattern":["red","dispense","dispense","dispense","dispense","dispense"],
+        \\   "output":{"units":{"red":1}}}],
         \\ "team_recipes":[]}
     ;
     try std.testing.expectError(

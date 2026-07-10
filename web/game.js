@@ -348,7 +348,7 @@ function drawLobby(lobby) {
 }
 
 /** Key bindings per element / action — mirrors src/client/input.zig. */
-const ELEMENT_KEY = { fire: "Q", earth: "W", wind: "E", water: "R" };
+const ELEMENT_KEY = { red: "Q", green: "W", yellow: "E", blue: "R" };
 const ACTION_KEY = { dispense: "1", medicine: "2" };
 
 /** Render one combo slot as key+symbol (e.g. "Q♦", "1d") in its parity color. */
@@ -406,10 +406,10 @@ function drawRecipeGuide() {
   const descLines = [
     [
       { str: "Pick an agent color —", color: descColor },
-      { str: "Q♦", color: ELEMENT_COLOR.fire },
-      { str: "W▲", color: ELEMENT_COLOR.earth },
-      { str: "E≋", color: ELEMENT_COLOR.wind },
-      { str: "R~", color: ELEMENT_COLOR.water },
+      { str: "Q♦", color: ELEMENT_COLOR.red },
+      { str: "W▲", color: ELEMENT_COLOR.green },
+      { str: "E≋", color: ELEMENT_COLOR.yellow },
+      { str: "R~", color: ELEMENT_COLOR.blue },
       { str: "— then actions:", color: descColor },
       { str: "1d dispense", color: ACTION_COLOR.dispense },
       { str: "2m medicine", color: ACTION_COLOR.medicine },
@@ -827,10 +827,10 @@ const ACTION_COLOR = {
 };
 
 /** Element ordinal → name string; matches protocol Element ordinal order. */
-const ELEMENT_NAMES = ["fire", "earth", "wind", "water"];
+const ELEMENT_NAMES = ["red", "green", "yellow", "blue"];
 
 /** Map Element (agent color) enum string → display character. */
-const ELEMENT_CHAR = { fire: "♦", earth: "▲", wind: "≋", water: "~" };
+const ELEMENT_CHAR = { red: "♦", green: "▲", yellow: "≋", blue: "~" };
 
 /** Map Element (agent color / slime type) → colour.  Matches the whiteboard:
  *  red / yellow / green / blue scribbles.
@@ -840,10 +840,10 @@ const ELEMENT_CHAR = { fire: "♦", earth: "▲", wind: "≋", water: "~" };
  *  the game-over stats tables all read from this map so a slime color always
  *  matches its agent, its medicine, and its hunger block. */
 const ELEMENT_COLOR = {
-  fire: "rgba(255,90,90,1)",
-  earth: "rgba(250,210,80,1)",
-  wind: "rgba(130,230,130,1)",
-  water: "rgba(110,160,255,1)",
+  red: "rgba(255,90,90,1)",
+  green: "rgba(130,230,130,1)",
+  yellow: "rgba(250,210,80,1)",
+  blue: "rgba(110,160,255,1)",
 };
 
 /** Neutral / transmuted slime (matches nothing — needs no agent). */
@@ -959,16 +959,16 @@ function drawSlimeField(game) {
       ctx.fillText("EATEN", (rectZ.x0 + rectZ.x1) / 2, (rectZ.y0 + rectZ.y1) / 2);
       ctx.restore();
     } else {
-      // Blobs: fire, earth, wind, water, neutral stacked vertically.
+      // Blobs: red, green, yellow, blue, neutral stacked vertically.
       // Transmuted (neutralized) slime folds into the grey neutral blob, so
       // it visibly grows as casts land mid-round while modified blobs shrink.
       const z = zones[i];
       const neutralTotal = (z.neutral ?? 0) + sumColors(z.neutralized);
       const entries = [
-        { units: z.fire, color: ELEMENT_COLOR.fire },
-        { units: z.earth, color: ELEMENT_COLOR.earth },
-        { units: z.wind, color: ELEMENT_COLOR.wind },
-        { units: z.water, color: ELEMENT_COLOR.water },
+        { units: z.red, color: ELEMENT_COLOR.red },
+        { units: z.green, color: ELEMENT_COLOR.green },
+        { units: z.yellow, color: ELEMENT_COLOR.yellow },
+        { units: z.blue, color: ELEMENT_COLOR.blue },
         { units: neutralTotal, color: NEUTRAL_COLOR },
       ].filter(b => b.units > 0);
 
@@ -1089,10 +1089,10 @@ function drawActionMenu(game) {
   text("[2] Medicine", px + M.actionCols[1], aRowY, M.actionFont, ACTION_COLOR.medicine);
 
   const eRowY = my + M.padTopY + M.elementRowDy;
-  text("[Q]♦", px + M.elementCols[0], eRowY, M.elementFont, ELEMENT_COLOR.fire);
-  text("[W]▲", px + M.elementCols[1], eRowY, M.elementFont, ELEMENT_COLOR.earth);
-  text("[E]≋", px + M.elementCols[2], eRowY, M.elementFont, ELEMENT_COLOR.wind);
-  text("[R]~", px + M.elementCols[3], eRowY, M.elementFont, ELEMENT_COLOR.water);
+  text("[Q]♦", px + M.elementCols[0], eRowY, M.elementFont, ELEMENT_COLOR.red);
+  text("[W]▲", px + M.elementCols[1], eRowY, M.elementFont, ELEMENT_COLOR.green);
+  text("[E]≋", px + M.elementCols[2], eRowY, M.elementFont, ELEMENT_COLOR.yellow);
+  text("[R]~", px + M.elementCols[3], eRowY, M.elementFont, ELEMENT_COLOR.blue);
 
   text("[Esc] Cancel", px, my + M.padTopY + M.cancelRowDy, M.cancelFont, "rgba(180,180,180,0.8)");
 
@@ -1183,7 +1183,7 @@ function drawGame(game, dt) {
   drawFloaters();
 }
 
-/** Sum a per-color {fire, earth, wind, water} object. */
+/** Sum a per-color {red, green, yellow, blue} object. */
 function sumColors(obj) {
   return ELEMENT_NAMES.reduce((t, name) => t + (obj?.[name] ?? 0), 0);
 }

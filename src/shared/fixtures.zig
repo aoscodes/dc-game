@@ -18,54 +18,54 @@ pub const player_recipes = [_]balance.PlayerRecipe{
     // Mono-color burst: beats flat conversion (3 slots × 5 = 15 → 20).
     .{
         .label = "crimson_flood",
-        .pattern = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        .pattern = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
         .output = .{ .units = .{ 20, 0, 0, 0 } },
     },
     .{
         .label = "verdant_flood",
-        .pattern = mk(&.{ .{ .element = .earth }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        .pattern = mk(&.{ .{ .element = .green }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
         .output = .{ .units = .{ 0, 20, 0, 0 } },
     },
     .{
         .label = "gale_flood",
-        .pattern = mk(&.{ .{ .element = .wind }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        .pattern = mk(&.{ .{ .element = .yellow }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
         .output = .{ .units = .{ 0, 0, 20, 0 } },
     },
     .{
         .label = "tide_flood",
-        .pattern = mk(&.{ .{ .element = .water }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        .pattern = mk(&.{ .{ .element = .blue }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
         .output = .{ .units = .{ 0, 0, 0, 20 } },
     },
     // Multi-color mist: covers every color at once.
     .{
         .label = "prism_mist",
-        .pattern = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .element = .water }, .{ .action = .dispense } }),
+        .pattern = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .element = .blue }, .{ .action = .dispense } }),
         .output = .{ .units = .{ 6, 6, 6, 6 } },
     },
-    // Concentrated water medicine: beats flat conversion (2 slots × 3 = 6 → 10).
+    // Concentrated blue medicine: beats flat conversion (2 slots × 3 = 6 → 10).
     .{
         .label = "panacea",
-        .pattern = mk(&.{ .{ .element = .water }, .{ .action = .medicine }, .{ .action = .medicine } }),
+        .pattern = mk(&.{ .{ .element = .blue }, .{ .action = .medicine }, .{ .action = .medicine } }),
         .output = .{ .medicine = .{ 0, 0, 0, 10 } },
     },
 };
 
 pub const team_recipes = [_]balance.TeamRecipe{
-    // Two players each cast [fire, dispense, dispense] in the same round.
+    // Two players each cast [red, dispense, dispense] in the same round.
     .{
         .label = "twin_flames",
         .patterns = &.{
-            mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } }),
-            mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } }),
+            mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } }),
+            mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } }),
         },
         .output = .{ .units = .{ 30, 0, 0, 0 }, .medicine = .{ 20, 0, 0, 0 } },
     },
-    // One dispenses water, one dispenses earth — combined downpour.
+    // One dispenses blue, one dispenses green — combined downpour.
     .{
         .label = "mudslide",
         .patterns = &.{
-            mk(&.{ .{ .element = .water }, .{ .action = .dispense }, .{ .action = .dispense } }),
-            mk(&.{ .{ .element = .earth }, .{ .action = .dispense }, .{ .action = .dispense } }),
+            mk(&.{ .{ .element = .blue }, .{ .action = .dispense }, .{ .action = .dispense } }),
+            mk(&.{ .{ .element = .green }, .{ .action = .dispense }, .{ .action = .dispense } }),
         },
         .output = .{ .units = .{ 0, 40, 0, 40 } },
     },

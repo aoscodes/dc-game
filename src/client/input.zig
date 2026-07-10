@@ -88,13 +88,13 @@ pub fn drain_into_combo(queue: *KeyQueue, combo: *ComboBuffer) DrainResult {
                 };
                 if (combo.push(.{ .action = action })) result = .appended;
             },
-            // Agent color keys: Q=fire  W=earth  E=wind  R=water
+            // Agent color keys: Q=red  W=green  E=yellow  R=blue
             .q, .w, .e, .r => {
                 const element: c.Element = switch (key) {
-                    .q => .fire,
-                    .w => .earth,
-                    .e => .wind,
-                    .r => .water,
+                    .q => .red,
+                    .w => .green,
+                    .e => .yellow,
+                    .r => .blue,
                     else => unreachable,
                 };
                 if (combo.push(.{ .element = element })) result = .appended;

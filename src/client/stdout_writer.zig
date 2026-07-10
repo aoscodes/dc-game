@@ -4,7 +4,7 @@ const c = @import("shared").components;
 const inp = @import("input.zig");
 
 /// JSON serialisation for ComboSlot.
-/// Emits {"action":"damage"} or {"element":"fire"} so game.js can branch.
+/// Emits {"action":"damage"} or {"element":"red"} so game.js can branch.
 const JsonComboSlot = struct {
     slot: c.ComboSlot,
 
@@ -152,10 +152,10 @@ fn write_render_inner(
     var zones_buf: [proto.MAX_ZONES_WIRE]JsonZone = undefined;
     for (game.snapshot.zones[0..game.snapshot.zone_count], 0..) |z, i| {
         zones_buf[i] = .{
-            .fire = z.modified[0],
-            .earth = z.modified[1],
-            .wind = z.modified[2],
-            .water = z.modified[3],
+            .red = z.modified[0],
+            .green = z.modified[1],
+            .yellow = z.modified[2],
+            .blue = z.modified[3],
             .neutralized = colors(z.neutralized),
             .neutral = z.neutral,
         };
@@ -230,10 +230,10 @@ fn write_render_inner(
                 .current = game.snapshot.hunger.current,
                 .max = game.snapshot.hunger.max,
                 .healable = .{
-                    .fire = game.snapshot.hunger_healable[0],
-                    .earth = game.snapshot.hunger_healable[1],
-                    .wind = game.snapshot.hunger_healable[2],
-                    .water = game.snapshot.hunger_healable[3],
+                    .red = game.snapshot.hunger_healable[0],
+                    .green = game.snapshot.hunger_healable[1],
+                    .yellow = game.snapshot.hunger_healable[2],
+                    .blue = game.snapshot.hunger_healable[3],
                 },
             },
             .score = game.snapshot.score,
@@ -252,10 +252,10 @@ fn write_render_inner(
 /// Convert a per-color u16 array into named JSON fields.
 fn colors(values: [c.Element.size]u16) JsonColors {
     return .{
-        .fire = values[0],
-        .earth = values[1],
-        .wind = values[2],
-        .water = values[3],
+        .red = values[0],
+        .green = values[1],
+        .yellow = values[2],
+        .blue = values[3],
     };
 }
 
@@ -287,10 +287,10 @@ const JsonRenderFrame = struct {
 
 /// Per-color values with named fields (Element ordinal order).
 const JsonColors = struct {
-    fire: u16,
-    earth: u16,
-    wind: u16,
-    water: u16,
+    red: u16,
+    green: u16,
+    yellow: u16,
+    blue: u16,
 };
 
 const JsonRoundStats = struct {
@@ -348,10 +348,10 @@ const JsonPlayer = struct {
 /// Portion of hunger healable by medicine, per slime color.  Only
 /// matching-color (symmetrical) medicine heals each bucket.
 const JsonHealable = struct {
-    fire: u16,
-    earth: u16,
-    wind: u16,
-    water: u16,
+    red: u16,
+    green: u16,
+    yellow: u16,
+    blue: u16,
 };
 
 /// Hunger bar: current fills toward max; `healable` = per-color portions
@@ -365,10 +365,10 @@ const JsonHunger = struct {
 /// One zone's remaining slime: modified units named per agent color, plus
 /// transmuted (`neutralized`, per original color) and naturally-neutral.
 const JsonZone = struct {
-    fire: u16,
-    earth: u16,
-    wind: u16,
-    water: u16,
+    red: u16,
+    green: u16,
+    yellow: u16,
+    blue: u16,
     neutralized: JsonColors,
     neutral: u16,
 };

@@ -1,140 +1,141 @@
 {
-  "casts_per_round": 3,
+  "casts_per_round": 1,
   "units_per_slot": 5,
   "medicine_per_slot": 3,
   "hunger_cost_normal": 1,
   "hunger_cost_modified_extra": 2,
-  "round_duration_default_s": 15.0,
+  "round_duration_default_s": 10.0,
   "player_recipes": [
     {
-      "label": "crimson_flood",
+      "label": "big_red",
       "pattern": [
-        "fire",
         "dispense",
-        "dispense",
-        "dispense"
+        "red",
+        "red",
+        "red"
       ],
       "output": {
         "units": {
-          "fire": 20
+          "red": 20
         }
       }
     },
     {
-      "label": "verdant_flood",
+      "label": "big_green",
       "pattern": [
-        "earth",
         "dispense",
-        "dispense",
-        "dispense"
+        "green",
+        "green",
+        "green"
       ],
       "output": {
         "units": {
-          "earth": 20
+          "green": 20
         }
       }
     },
     {
-      "label": "gale_flood",
+      "label": "big_yellow",
       "pattern": [
-        "wind",
         "dispense",
-        "dispense",
-        "dispense"
+        "yellow",
+        "yellow",
+        "yellow"
       ],
       "output": {
         "units": {
-          "wind": 20
+          "yellow": 20
         }
       }
     },
     {
-      "label": "tide_flood",
+      "label": "big_blue",
       "pattern": [
-        "water",
         "dispense",
-        "dispense",
-        "dispense"
+        "blue",
+        "blue",
+        "blue"
       ],
       "output": {
         "units": {
-          "water": 20
+          "blue": 20
         }
       }
     },
     {
-      "label": "prism_mist",
+      "label": "prism",
       "pattern": [
-        "fire",
         "dispense",
-        "water",
-        "dispense"
+        "red",
+        "dispense",
+        "blue"
       ],
       "output": {
         "units": {
-          "fire": 6,
-          "earth": 6,
-          "wind": 6,
-          "water": 6
+          "red": 6,
+          "green": 6,
+          "yellow": 6,
+          "blue": 6
         }
       }
     },
     {
       "label": "panacea",
       "pattern": [
-        "water",
         "medicine",
-        "medicine"
+        "blue",
+        "medicine",
+        "blue"
       ],
       "output": {
         "medicine": {
-          "water": 10
+          "blue": 15
         }
       }
     }
   ],
   "team_recipes": [
     {
-      "label": "twin_flames",
+      "label": "twin_red",
       "patterns": [
         [
-          "fire",
+          "red",
           "dispense",
           "dispense"
         ],
         [
-          "fire",
+          "red",
           "dispense",
           "dispense"
         ]
       ],
       "output": {
         "units": {
-          "fire": 30
+          "red": 30
         },
         "medicine": {
-          "fire": 20
+          "red": 20
         }
       }
     },
     {
-      "label": "mudslide",
+      "label": "twin_brown",
       "patterns": [
         [
-          "water",
+          "blue",
           "dispense",
           "dispense"
         ],
         [
-          "earth",
+          "green",
           "dispense",
           "dispense"
         ]
       ],
       "output": {
         "units": {
-          "earth": 40,
-          "water": 40
+          "green": 40,
+          "blue": 40
         }
       }
     }

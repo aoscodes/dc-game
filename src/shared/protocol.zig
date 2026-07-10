@@ -232,7 +232,7 @@ pub const EndReason = enum(u8) {
 };
 
 /// One resolved round's tuning numbers (all per-color arrays use Element
-/// ordinal order: fire, earth, wind, water).
+/// ordinal order: red, green, yellow, blue).
 pub const RoundStats = struct {
     /// Spells committed this round.
     casts: u8 = 0,
@@ -784,7 +784,7 @@ test "round-trip: game_state — hunger, score, zones, and combo survive" {
         .casts_used = 2,
         .combo_len = 2,
         .combo_slots = [_]components.ComboSlot{
-            .{ .element = .fire },
+            .{ .element = .red },
             .{ .action = .dispense },
             .{ .action = .dispense },
             .{ .action = .dispense },
@@ -815,7 +815,7 @@ test "round-trip: game_state — hunger, score, zones, and combo survive" {
     try std.testing.expectEqual(@as(u16, 15), decoded.zones[1].neutral);
     try std.testing.expectEqual(@as(u16, 8), decoded.zones[2].modified[3]);
     try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].combo_len);
-    try std.testing.expectEqual(components.Element.fire, decoded.entities[0].combo_slots[0].element);
+    try std.testing.expectEqual(components.Element.red, decoded.entities[0].combo_slots[0].element);
     try std.testing.expectEqual(components.ActionChoice.dispense, decoded.entities[0].combo_slots[1].action);
 }
 
@@ -911,14 +911,14 @@ test "round-trip: choose_combo max-length all dispense" {
         try std.testing.expectEqual(components.ActionChoice.dispense, s.action);
 }
 
-test "round-trip: choose_combo with element slots [fire, dispense, water, dispense]" {
+test "round-trip: choose_combo with element slots [red, dispense, blue, dispense]" {
     var buf: [16]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
 
     const combo = components.make_combo(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .dispense },
-        .{ .element = .water },
+        .{ .element = .blue },
         .{ .action = .dispense },
     });
     try encode(fbs.writer(), .choose_combo, ChooseCombo{ .combo = combo });
@@ -926,9 +926,9 @@ test "round-trip: choose_combo with element slots [fire, dispense, water, dispen
     _ = try read_tag(fbs.reader());
     const decoded = try decode_choose_combo(fbs.reader());
     try std.testing.expectEqual(@as(u8, 4), decoded.combo.len);
-    try std.testing.expectEqual(components.Element.fire, decoded.combo.slots[0].element);
+    try std.testing.expectEqual(components.Element.red, decoded.combo.slots[0].element);
     try std.testing.expectEqual(components.ActionChoice.dispense, decoded.combo.slots[1].action);
-    try std.testing.expectEqual(components.Element.water, decoded.combo.slots[2].element);
+    try std.testing.expectEqual(components.Element.blue, decoded.combo.slots[2].element);
     try std.testing.expectEqual(components.ActionChoice.dispense, decoded.combo.slots[3].action);
 }
 

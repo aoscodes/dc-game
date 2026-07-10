@@ -14,8 +14,8 @@
  *   zones 1..16, encounter hunger_max 1..65535.
  */
 
-const ELEMENTS = ["fire", "earth", "wind", "water"];
-const SLOT_OPTIONS = ["dispense", "medicine", "fire", "earth", "wind", "water"];
+const ELEMENTS = ["red", "green", "yellow", "blue"];
+const SLOT_OPTIONS = ["dispense", "medicine", "red", "green", "yellow", "blue"];
 
 const MAX_RECIPES = 64;
 const MAX_PATTERN_SLOTS = 5;
@@ -123,7 +123,7 @@ function numInput(obj, key, min, max, step = 1, cls = "") {
   return input;
 }
 
-/** Row of 4 per-color inputs bound to a {fire,earth,wind,water} object. */
+/** Row of 4 per-color inputs bound to a {red, green,yellow,blue} object. */
 function colorRow(prefix, colors, max = 1000) {
   const row = el("span", { class: "colors" });
   if (prefix) row.append(el("span", { class: "muted" }, `${prefix} `));
@@ -221,7 +221,7 @@ function renderTeamRecipes() {
         patternEditor(p, renderTeamRecipes), delPattern));
     });
     const addPattern = el("button", {
-      onclick: () => { r.patterns.push(["fire", "dispense"]); renderTeamRecipes(); },
+      onclick: () => { r.patterns.push(["red", "dispense"]); renderTeamRecipes(); },
     }, "+ pattern");
     if (r.patterns.length >= MAX_TEAM_PATTERNS) addPattern.disabled = true;
     card.append(
@@ -279,7 +279,7 @@ function renderAll() {
 document.getElementById("add-player-recipe").addEventListener("click", () => {
   state.balance.player_recipes.push({
     label: "new_recipe",
-    pattern: ["fire", "dispense", "dispense"],
+    pattern: ["red", "dispense", "dispense"],
     output: { units: colorsFrom(null), medicine: colorsFrom(null) },
   });
   renderPlayerRecipes();
@@ -288,7 +288,7 @@ document.getElementById("add-player-recipe").addEventListener("click", () => {
 document.getElementById("add-team-recipe").addEventListener("click", () => {
   state.balance.team_recipes.push({
     label: "new_team_recipe",
-    patterns: [["fire", "dispense"], ["fire", "dispense"]],
+    patterns: [["red", "dispense"], ["red", "dispense"]],
     output: { units: colorsFrom(null), medicine: colorsFrom(null) },
   });
   renderTeamRecipes();

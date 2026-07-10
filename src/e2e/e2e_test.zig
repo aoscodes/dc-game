@@ -224,12 +224,12 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                 var fbs = std.io.fixedBufferStream(payload);
                 const gs = proto.decode_game_state(fbs.reader()) catch continue;
                 // Once per zone: both bots cast the twin_flames half so the
-                // team recipe fires and fire slime gets neutralized.
+                // team recipe fires and red slime gets neutralized.
                 if (in_game and gs.zone_index != last_zone and gs.zone_index < gs.zone_count) {
                     last_zone = gs.zone_index;
                     std.debug.print("[e2e] {s} dispensing for zone {}\n", .{ ctx.name, gs.zone_index });
                     try send_combo(&client, c.make_combo(&.{
-                        .{ .element = .fire },
+                        .{ .element = .red },
                         .{ .action = .dispense },
                         .{ .action = .dispense },
                     }));

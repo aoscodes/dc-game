@@ -18,7 +18,7 @@
 //!
 //! A combo is a sequence of up to MAX_COMBO_LEN `ComboSlot` values.
 //! Each slot is either an `ActionChoice` (dispense/medicine) or an
-//! `Element` modifier (fire/earth/wind/water — the four agent colors).
+//! `Element` modifier (red/green/yellow/blue — the four agent colors).
 //! An element token applies to all following action tokens until the next
 //! element token or end of combo.  Trailing element tokens with no
 //! following action are ignored during resolution.  See
@@ -71,10 +71,10 @@ pub const ActionChoice = enum(u8) {
 /// Agent color / Modified Slime type.  Reskinned elements: the color of a
 /// slime communicates which Neutralizing Agent it requires.
 pub const Element = enum(u8) {
-    fire = 0,
-    earth = 1,
-    wind = 2,
-    water = 3,
+    red = 0,
+    green = 1,
+    yellow = 2,
+    blue = 3,
 
     pub const size = @typeInfo(Element).@"enum".fields.len;
 };

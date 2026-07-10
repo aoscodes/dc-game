@@ -115,7 +115,7 @@ All designer-tunable data lives in two JSON files:
 
 - `data/balance.json` — conversion rates, hunger costs, casts per round,
   default round duration, and the player/team recipe
-  tables (patterns are slot-name lists: `"fire"`, `"dispense"`, ...).
+  tables (patterns are slot-name lists: `"red"`, `"dispense"`, ...).
 - `data/encounters.json` — encounters (zones, slime amounts per color,
   hunger budget) plus which encounter is the default.
 
@@ -163,7 +163,7 @@ cast wins, `Esc` cancels:
 | ------------------------- | --------------------------------------------- |
 | `1`                       | Dispense (Neutralizing Agent of current color) |
 | `2`                       | Medicine (heals the Hunger bar)                |
-| `Q` / `W` / `E` / `R`     | Agent color: fire / earth / wind / water       |
+| `Q` / `W` / `E` / `R`     | Agent color: red / green / yellow / blue       |
 | `Escape`                  | Cancel combo                                   |
 
 At round end the current zone is consumed in its entirety:

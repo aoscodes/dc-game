@@ -332,35 +332,35 @@ test "parse_combo: action-only — element is null for all" {
 
 test "parse_combo: element persists across following actions" {
     const combo = mk(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .dispense },
         .{ .action = .dispense },
     });
     var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
     const n = parse_combo(combo, &out);
     try std.testing.expectEqual(@as(usize, 2), n);
-    try std.testing.expectEqual(c.Element.fire, out[0].element.?);
-    try std.testing.expectEqual(c.Element.fire, out[1].element.?);
+    try std.testing.expectEqual(c.Element.red, out[0].element.?);
+    try std.testing.expectEqual(c.Element.red, out[1].element.?);
 }
 
 test "parse_combo: second element overrides first" {
     const combo = mk(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .dispense },
-        .{ .element = .water },
+        .{ .element = .blue },
         .{ .action = .dispense },
     });
     var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
     const n = parse_combo(combo, &out);
     try std.testing.expectEqual(@as(usize, 2), n);
-    try std.testing.expectEqual(c.Element.fire, out[0].element.?);
-    try std.testing.expectEqual(c.Element.water, out[1].element.?);
+    try std.testing.expectEqual(c.Element.red, out[0].element.?);
+    try std.testing.expectEqual(c.Element.blue, out[1].element.?);
 }
 
 test "parse_combo: trailing element is silently dropped" {
     const combo = mk(&.{
         .{ .action = .dispense },
-        .{ .element = .fire },
+        .{ .element = .red },
     });
     var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
     const n = parse_combo(combo, &out);
@@ -369,16 +369,16 @@ test "parse_combo: trailing element is silently dropped" {
 }
 
 test "combos_equal: identical combos match" {
-    const a = mk(&.{ .{ .element = .fire }, .{ .action = .dispense } });
-    const b = mk(&.{ .{ .element = .fire }, .{ .action = .dispense } });
+    const a = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
+    const b = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
     try std.testing.expect(combos_equal(a, b));
 }
 
 test "combos_equal: different length / slot / order do not match" {
-    const base = mk(&.{ .{ .element = .fire }, .{ .action = .dispense } });
-    const longer = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
-    const other_el = mk(&.{ .{ .element = .water }, .{ .action = .dispense } });
-    const reordered = mk(&.{ .{ .action = .dispense }, .{ .element = .fire } });
+    const base = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
+    const longer = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const other_el = mk(&.{ .{ .element = .blue }, .{ .action = .dispense } });
+    const reordered = mk(&.{ .{ .action = .dispense }, .{ .element = .red } });
     try std.testing.expect(!combos_equal(base, longer));
     try std.testing.expect(!combos_equal(base, other_el));
     try std.testing.expect(!combos_equal(base, reordered));
@@ -386,11 +386,11 @@ test "combos_equal: different length / slot / order do not match" {
 
 test "flat_convert: elemental dispense yields UNITS_PER_SLOT per slot" {
     const out = flat_convert(test_bal, mk(&.{
-        .{ .element = .earth },
+        .{ .element = .green },
         .{ .action = .dispense },
         .{ .action = .dispense },
     }));
-    try std.testing.expectEqual(2 * test_bal.units_per_slot, out.units[@intFromEnum(c.Element.earth)]);
+    try std.testing.expectEqual(2 * test_bal.units_per_slot, out.units[@intFromEnum(c.Element.green)]);
     for (out.medicine) |m| try std.testing.expectEqual(@as(u32, 0), m);
 }
 
@@ -402,53 +402,53 @@ test "flat_convert: colorless dispense is wasted" {
 test "flat_convert: medicine is color-bound; colorless medicine wasted" {
     const out = flat_convert(test_bal, mk(&.{
         .{ .action = .medicine }, // colorless — wasted
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .medicine },
-        .{ .element = .water },
+        .{ .element = .blue },
         .{ .action = .medicine },
     }));
-    try std.testing.expectEqual(test_bal.medicine_per_slot, out.medicine[@intFromEnum(c.Element.fire)]);
-    try std.testing.expectEqual(test_bal.medicine_per_slot, out.medicine[@intFromEnum(c.Element.water)]);
-    try std.testing.expectEqual(@as(u32, 0), out.medicine[@intFromEnum(c.Element.earth)]);
+    try std.testing.expectEqual(test_bal.medicine_per_slot, out.medicine[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(test_bal.medicine_per_slot, out.medicine[@intFromEnum(c.Element.blue)]);
+    try std.testing.expectEqual(@as(u32, 0), out.medicine[@intFromEnum(c.Element.green)]);
     for (out.units) |u| try std.testing.expectEqual(@as(u32, 0), u);
 }
 
 test "match_recipes: player recipe replaces flat conversion" {
-    // crimson_flood: [fire, dispense×3] → 20 fire units (flat would be 15).
+    // crimson_flood: [red, dispense×3] → 20 red units (flat would be 15).
     const casts = [_]Cast{
-        .{ .player_id = 0, .combo = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }) },
+        .{ .player_id = 0, .combo = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }) },
     };
     const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(@as(u32, 20), out.units[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u32, 20), out.units[@intFromEnum(c.Element.red)]);
 }
 
 test "match_recipes: non-recipe combo falls back to flat conversion" {
     const casts = [_]Cast{
-        .{ .player_id = 0, .combo = mk(&.{ .{ .element = .wind }, .{ .action = .dispense } }) },
+        .{ .player_id = 0, .combo = mk(&.{ .{ .element = .yellow }, .{ .action = .dispense } }) },
     };
     const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(test_bal.units_per_slot, out.units[@intFromEnum(c.Element.wind)]);
+    try std.testing.expectEqual(test_bal.units_per_slot, out.units[@intFromEnum(c.Element.yellow)]);
 }
 
-/// twin_flames (fixtures.team_recipes[0]) output, fire channel — tests derive
+/// twin_flames (fixtures.team_recipes[0]) output, red channel — tests derive
 /// expectations from the fixture table.
-const twin_flames_units = fixtures.team_recipes[0].output.units[@intFromEnum(c.Element.fire)];
-const twin_flames_med = fixtures.team_recipes[0].output.medicine[@intFromEnum(c.Element.fire)];
+const twin_flames_units = fixtures.team_recipes[0].output.units[@intFromEnum(c.Element.red)];
+const twin_flames_med = fixtures.team_recipes[0].output.medicine[@intFromEnum(c.Element.red)];
 
 test "match_recipes: team recipe consumes both casts exactly once" {
-    // twin_flames: 2 × [fire, dispense, dispense] → one recipe output, once.
-    const pat = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
+    // twin_flames: 2 × [red, dispense, dispense] → one recipe output, once.
+    const pat = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
     const casts = [_]Cast{
         .{ .player_id = 0, .combo = pat },
         .{ .player_id = 1, .combo = pat },
     };
     const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(twin_flames_units, out.units[@intFromEnum(c.Element.fire)]);
-    try std.testing.expectEqual(twin_flames_med, out.medicine[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(twin_flames_units, out.units[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(twin_flames_med, out.medicine[@intFromEnum(c.Element.red)]);
 }
 
 test "match_recipes: team recipe fires twice for two disjoint pairs" {
-    const pat = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const pat = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
     const casts = [_]Cast{
         .{ .player_id = 0, .combo = pat },
         .{ .player_id = 1, .combo = pat },
@@ -456,85 +456,85 @@ test "match_recipes: team recipe fires twice for two disjoint pairs" {
         .{ .player_id = 3, .combo = pat },
     };
     const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(2 * twin_flames_units, out.units[@intFromEnum(c.Element.fire)]);
-    try std.testing.expectEqual(2 * twin_flames_med, out.medicine[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(2 * twin_flames_units, out.units[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(2 * twin_flames_med, out.medicine[@intFromEnum(c.Element.red)]);
 }
 
 test "match_recipes: same player casting both halves does NOT fire team recipe" {
     // Team recipes require distinct players; one player's two twin_flames
-    // halves fall back to flat conversion (2 × 2 × UNITS_PER_SLOT fire).
-    const pat = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
+    // halves fall back to flat conversion (2 × 2 × UNITS_PER_SLOT red).
+    const pat = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
     const casts = [_]Cast{
         .{ .player_id = 0, .combo = pat },
         .{ .player_id = 0, .combo = pat },
     };
     const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(4 * test_bal.units_per_slot, out.units[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(4 * test_bal.units_per_slot, out.units[@intFromEnum(c.Element.red)]);
     for (out.medicine) |m| try std.testing.expectEqual(@as(u32, 0), m);
 }
 
 test "match_recipes: distinct-player pair still fires alongside same-player extras" {
     // Players 0 and 1 form one twin_flames pair; player 0's second half has
     // no distinct partner left and converts flat.
-    const pat = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const pat = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
     const casts = [_]Cast{
         .{ .player_id = 0, .combo = pat },
         .{ .player_id = 0, .combo = pat },
         .{ .player_id = 1, .combo = pat },
     };
     const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(twin_flames_units + 2 * test_bal.units_per_slot, out.units[@intFromEnum(c.Element.fire)]);
-    try std.testing.expectEqual(twin_flames_med, out.medicine[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(twin_flames_units + 2 * test_bal.units_per_slot, out.units[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(twin_flames_med, out.medicine[@intFromEnum(c.Element.red)]);
 }
 
 test "match_recipes: lone half of a team recipe falls back to flat" {
-    // One [fire, dispense, dispense] alone: no team match, no player recipe
+    // One [red, dispense, dispense] alone: no team match, no player recipe
     // (crimson_flood needs 3 dispenses) → flat 2 × UNITS_PER_SLOT.
     const casts = [_]Cast{
-        .{ .player_id = 0, .combo = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } }) },
+        .{ .player_id = 0, .combo = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } }) },
     };
     const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(2 * test_bal.units_per_slot, out.units[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(2 * test_bal.units_per_slot, out.units[@intFromEnum(c.Element.red)]);
     for (out.medicine) |m| try std.testing.expectEqual(@as(u32, 0), m);
 }
 
 test "match_recipes: mixed — team pair + independent flat combo" {
-    const pat = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
-    const flat = mk(&.{ .{ .element = .water }, .{ .action = .dispense } });
+    const pat = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const flat = mk(&.{ .{ .element = .blue }, .{ .action = .dispense } });
     const casts = [_]Cast{
         .{ .player_id = 0, .combo = pat },
         .{ .player_id = 1, .combo = flat },
         .{ .player_id = 2, .combo = pat },
     };
     const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(twin_flames_units, out.units[@intFromEnum(c.Element.fire)]);
-    try std.testing.expectEqual(test_bal.units_per_slot, out.units[@intFromEnum(c.Element.water)]);
+    try std.testing.expectEqual(twin_flames_units, out.units[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(test_bal.units_per_slot, out.units[@intFromEnum(c.Element.blue)]);
 }
 
 test "apply_medicine: capped by matching-color healable portion" {
     var hunger = c.Health{ .current = 50, .max = 100 };
     var healable = [_]u16{0} ** c.Element.size;
-    healable[@intFromEnum(c.Element.fire)] = 10;
+    healable[@intFromEnum(c.Element.red)] = 10;
     var pools = [_]u32{0} ** c.Element.size;
-    pools[@intFromEnum(c.Element.fire)] = 25;
+    pools[@intFromEnum(c.Element.red)] = 25;
     const healed = apply_medicine(&hunger, &healable, pools);
-    try std.testing.expectEqual(@as(u16, 10), healed[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u16, 10), healed[@intFromEnum(c.Element.red)]);
     try std.testing.expectEqual(@as(u32, 10), sum_u16(healed));
     try std.testing.expectEqual(@as(u16, 40), hunger.current);
-    try std.testing.expectEqual(@as(u16, 0), healable[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u16, 0), healable[@intFromEnum(c.Element.red)]);
 }
 
 test "apply_medicine: asymmetric medicine heals nothing" {
-    // Water medicine vs fire healable hunger: no effect.
+    // Blue medicine vs red healable hunger: no effect.
     var hunger = c.Health{ .current = 50, .max = 100 };
     var healable = [_]u16{0} ** c.Element.size;
-    healable[@intFromEnum(c.Element.fire)] = 20;
+    healable[@intFromEnum(c.Element.red)] = 20;
     var pools = [_]u32{0} ** c.Element.size;
-    pools[@intFromEnum(c.Element.water)] = 99;
+    pools[@intFromEnum(c.Element.blue)] = 99;
     const healed = apply_medicine(&hunger, &healable, pools);
     try std.testing.expectEqual(@as(u32, 0), sum_u16(healed));
     try std.testing.expectEqual(@as(u16, 50), hunger.current);
-    try std.testing.expectEqual(@as(u16, 20), healable[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u16, 20), healable[@intFromEnum(c.Element.red)]);
 }
 
 test "apply_medicine: multiple colors heal independently" {
@@ -542,7 +542,7 @@ test "apply_medicine: multiple colors heal independently" {
     var healable = [_]u16{ 10, 0, 4, 8 };
     const pools = [_]u32{ 3, 99, 99, 8 };
     const healed = apply_medicine(&hunger, &healable, pools);
-    // fire 3 + earth 0 + wind 4 + water 8 = 15.
+    // red 3 + green 0 + yellow 4 + blue 8 = 15.
     try std.testing.expectEqual(@as(u32, 15), sum_u16(healed));
     try std.testing.expectEqual(@as(u16, 3), healed[0]);
     try std.testing.expectEqual(@as(u16, 8), healed[3]);
@@ -555,13 +555,13 @@ test "apply_medicine: multiple colors heal independently" {
 test "apply_medicine: capped by current hunger" {
     var hunger = c.Health{ .current = 3, .max = 100 };
     var healable = [_]u16{0} ** c.Element.size;
-    healable[@intFromEnum(c.Element.fire)] = 50;
+    healable[@intFromEnum(c.Element.red)] = 50;
     var pools = [_]u32{0} ** c.Element.size;
-    pools[@intFromEnum(c.Element.fire)] = 25;
+    pools[@intFromEnum(c.Element.red)] = 25;
     const healed = apply_medicine(&hunger, &healable, pools);
     try std.testing.expectEqual(@as(u32, 3), sum_u16(healed));
     try std.testing.expectEqual(@as(u16, 0), hunger.current);
-    try std.testing.expectEqual(@as(u16, 47), healable[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u16, 47), healable[@intFromEnum(c.Element.red)]);
 }
 
 test "apply_medicine: zero healable — neutral consumption not healable" {
@@ -582,33 +582,33 @@ test "add_hunger: clamps at max" {
 
 test "transmute: partial neutralization (25 of 50) moves units in place" {
     var zone = c.ZoneDef{};
-    zone.modified[@intFromEnum(c.Element.fire)] = 50;
+    zone.modified[@intFromEnum(c.Element.red)] = 50;
     var agents = [_]u32{0} ** c.Element.size;
-    agents[@intFromEnum(c.Element.fire)] = 25;
+    agents[@intFromEnum(c.Element.red)] = 25;
     const moved = transmute(&zone, agents);
-    try std.testing.expectEqual(@as(u16, 25), moved[@intFromEnum(c.Element.fire)]);
-    try std.testing.expectEqual(@as(u16, 25), zone.modified[@intFromEnum(c.Element.fire)]);
-    try std.testing.expectEqual(@as(u16, 25), zone.neutralized[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u16, 25), moved[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(@as(u16, 25), zone.modified[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(@as(u16, 25), zone.neutralized[@intFromEnum(c.Element.red)]);
     // Total units unchanged: transmutation converts, never consumes.
     try std.testing.expectEqual(@as(u32, 50), zone.total_units());
 
     const outcome = consume_zone(test_bal, zone);
-    try std.testing.expectEqual(@as(u16, 25), outcome.neutralized[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(@as(u16, 25), outcome.neutralized[@intFromEnum(c.Element.red)]);
     try std.testing.expectEqual(@as(u32, 25), outcome.modified_consumed);
     try std.testing.expectEqual(50 * test_bal.hunger_cost_normal, outcome.hunger_normal);
-    try std.testing.expectEqual(25 * test_bal.hunger_cost_modified_extra, outcome.hunger_extra[@intFromEnum(c.Element.fire)]);
+    try std.testing.expectEqual(25 * test_bal.hunger_cost_modified_extra, outcome.hunger_extra[@intFromEnum(c.Element.red)]);
     try std.testing.expectEqual(25 * test_bal.hunger_cost_modified_extra, outcome.hunger_extra_total());
     try std.testing.expectEqual(@as(u32, 25), outcome.score);
 }
 
 test "transmute: excess agents in a window are wasted" {
     var zone = c.ZoneDef{};
-    zone.modified[@intFromEnum(c.Element.water)] = 10;
+    zone.modified[@intFromEnum(c.Element.blue)] = 10;
     var agents = [_]u32{0} ** c.Element.size;
-    agents[@intFromEnum(c.Element.water)] = 999;
+    agents[@intFromEnum(c.Element.blue)] = 999;
     const moved = transmute(&zone, agents);
-    try std.testing.expectEqual(@as(u16, 10), moved[@intFromEnum(c.Element.water)]);
-    try std.testing.expectEqual(@as(u16, 0), zone.modified[@intFromEnum(c.Element.water)]);
+    try std.testing.expectEqual(@as(u16, 10), moved[@intFromEnum(c.Element.blue)]);
+    try std.testing.expectEqual(@as(u16, 0), zone.modified[@intFromEnum(c.Element.blue)]);
 
     const outcome = consume_zone(test_bal, zone);
     try std.testing.expectEqual(@as(u32, 0), outcome.modified_consumed);
@@ -618,16 +618,16 @@ test "transmute: excess agents in a window are wasted" {
 
 test "transmute: wrong-color agents have no effect" {
     var zone = c.ZoneDef{};
-    zone.modified[@intFromEnum(c.Element.fire)] = 20;
+    zone.modified[@intFromEnum(c.Element.red)] = 20;
     var agents = [_]u32{0} ** c.Element.size;
-    agents[@intFromEnum(c.Element.water)] = 20;
+    agents[@intFromEnum(c.Element.blue)] = 20;
     const moved = transmute(&zone, agents);
     for (moved) |m| try std.testing.expectEqual(@as(u16, 0), m);
 
     const outcome = consume_zone(test_bal, zone);
     try std.testing.expectEqual(@as(u32, 20), outcome.modified_consumed);
-    try std.testing.expectEqual(20 * test_bal.hunger_cost_modified_extra, outcome.hunger_extra[@intFromEnum(c.Element.fire)]);
-    try std.testing.expectEqual(@as(u32, 0), outcome.hunger_extra[@intFromEnum(c.Element.water)]);
+    try std.testing.expectEqual(20 * test_bal.hunger_cost_modified_extra, outcome.hunger_extra[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(@as(u32, 0), outcome.hunger_extra[@intFromEnum(c.Element.blue)]);
     try std.testing.expectEqual(@as(u32, 0), outcome.score);
 }
 
@@ -677,9 +677,9 @@ test "consume_zone: fully transmuted mixed zone" {
 }
 
 test "match_recipes: report records fire counts and per-cast consumption" {
-    const half = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
-    const flood = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } });
-    const plain = mk(&.{ .{ .element = .water }, .{ .action = .dispense } });
+    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const flood = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const plain = mk(&.{ .{ .element = .blue }, .{ .action = .dispense } });
     const casts = [_]Cast{
         .{ .player_id = 0, .combo = half }, // team pair w/ p1
         .{ .player_id = 1, .combo = half },
@@ -698,7 +698,7 @@ test "match_recipes: report records fire counts and per-cast consumption" {
 }
 
 test "combo_has_output: dangling element token fizzles" {
-    try std.testing.expect(!combo_has_output(test_bal, mk(&.{.{ .element = .fire }})));
+    try std.testing.expect(!combo_has_output(test_bal, mk(&.{.{ .element = .red }})));
 }
 
 test "combo_has_output: colorless actions fizzle" {
@@ -710,7 +710,7 @@ test "combo_has_output: colorless actions fizzle" {
 
 test "combo_has_output: colored dispense has output" {
     try std.testing.expect(combo_has_output(test_bal, mk(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .dispense },
     })));
 }
@@ -718,12 +718,12 @@ test "combo_has_output: colored dispense has output" {
 test "combo_has_output: recipe patterns have output" {
     // twin_flames half (team pattern) and panacea (player recipe).
     try std.testing.expect(combo_has_output(test_bal, mk(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .dispense },
         .{ .action = .dispense },
     })));
     try std.testing.expect(combo_has_output(test_bal, mk(&.{
-        .{ .element = .water },
+        .{ .element = .blue },
         .{ .action = .medicine },
         .{ .action = .medicine },
     })));

@@ -35,18 +35,18 @@ const DEFAULT_ENC = fixtures.test_config.encounters.default();
 // Minimal test encounters
 // ---------------------------------------------------------------------------
 
-/// One zone: 20 fire-modified units, no neutral.  Roomy hunger budget.
-const enc_single_fire = enc.Encounter{
-    .label = "test_single_fire",
+/// One zone: 20 red-modified units, no neutral.  Roomy hunger budget.
+const enc_single_red = enc.Encounter{
+    .label = "test_single_red",
     .hunger_max = 1000,
     .zones = &[_]c.ZoneDef{
         .{ .modified = .{ 20, 0, 0, 0 } },
     },
 };
 
-/// One zone: 50 fire-modified units (the 25-of-50 partial case).
-const enc_fifty_fire = enc.Encounter{
-    .label = "test_fifty_fire",
+/// One zone: 50 red-modified units (the 25-of-50 partial case).
+const enc_fifty_red = enc.Encounter{
+    .label = "test_fifty_red",
     .hunger_max = 1000,
     .zones = &[_]c.ZoneDef{
         .{ .modified = .{ 50, 0, 0, 0 } },
@@ -206,8 +206,8 @@ fn total_healable(sess: *const Session) u32 {
     return t;
 }
 
-const FIRE: usize = @intFromEnum(c.Element.fire);
-const EARTH: usize = @intFromEnum(c.Element.earth);
+const RED: usize = @intFromEnum(c.Element.red);
+const GREEN: usize = @intFromEnum(c.Element.green);
 
 // ---------------------------------------------------------------------------
 // Two-player session factory
@@ -353,10 +353,10 @@ test "choose_combo stores latest cast; cancel clears it" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start_playing(&s, &enc_single_fire);
+    try start_playing(&s, &enc_single_red);
 
-    const combo_a = mk(&.{ .{ .element = .fire }, .{ .action = .dispense } });
-    const combo_b = mk(&.{ .{ .element = .water }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const combo_a = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
+    const combo_b = mk(&.{ .{ .element = .blue }, .{ .action = .dispense }, .{ .action = .dispense } });
 
     try enqueue_combo(&s.sess, s.p[0].pid, combo_a);
     try flush(&s.sess);
@@ -380,7 +380,7 @@ test "action pool clears after round resolution" {
     defer s.deinit();
     try start_playing(&s, &enc_two_zones);
 
-    try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .fire }, .{ .action = .dispense } }));
+    try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .red }, .{ .action = .dispense } }));
     try flush(&s.sess);
     try std.testing.expect(s.sess.action_pool[s.p[0].pid] != null);
 
@@ -398,11 +398,11 @@ test "full neutralization: no extra hunger, full score" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start_playing(&s, &enc_single_fire); // 20 fire units
+    try start_playing(&s, &enc_single_red); // 20 red units
 
-    // crimson_flood recipe (20 fire agents) covers the zone exactly.
+    // crimson_flood recipe (20 red agents) covers the zone exactly.
     try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .dispense },
         .{ .action = .dispense },
         .{ .action = .dispense },
@@ -423,17 +423,17 @@ test "partial neutralization: 25 of 50 — split hunger and score" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start_playing(&s, &enc_fifty_fire); // 50 fire units
+    try start_playing(&s, &enc_fifty_red); // 50 red units
 
-    // 25 fire agents: crimson_flood (20) from p0 + one flat dispense (5) from p1.
+    // 25 red agents: crimson_flood (20) from p0 + one flat dispense (5) from p1.
     try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .dispense },
         .{ .action = .dispense },
         .{ .action = .dispense },
     }));
     try enqueue_combo(&s.sess, s.p[1].pid, mk(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .dispense },
     }));
     try resolve(&s.sess);
@@ -446,7 +446,7 @@ test "partial neutralization: 25 of 50 — split hunger and score" {
         @as(u16, @intCast(expected_normal + expected_extra)),
         s.sess.hunger.current,
     );
-    try std.testing.expectEqual(@as(u16, @intCast(expected_extra)), s.sess.hunger_healable[FIRE]);
+    try std.testing.expectEqual(@as(u16, @intCast(expected_extra)), s.sess.hunger_healable[RED]);
 }
 
 test "wrong-color agents have no effect on the zone" {
@@ -455,11 +455,11 @@ test "wrong-color agents have no effect on the zone" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start_playing(&s, &enc_single_fire); // 20 fire units
+    try start_playing(&s, &enc_single_red); // 20 red units
 
-    // Water agents vs fire slime: wasted.
+    // Blue agents vs red slime: wasted.
     try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .water },
+        .{ .element = .blue },
         .{ .action = .dispense },
         .{ .action = .dispense },
         .{ .action = .dispense },
@@ -471,7 +471,7 @@ test "wrong-color agents have no effect on the zone" {
     try std.testing.expectEqual(@as(u16, @intCast(expected)), s.sess.hunger.current);
     try std.testing.expectEqual(
         @as(u16, @intCast(20 * BAL.hunger_cost_modified_extra)),
-        s.sess.hunger_healable[FIRE],
+        s.sess.hunger_healable[RED],
     );
 }
 
@@ -481,11 +481,11 @@ test "excess agents are wasted (no carryover to next zone)" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start_playing(&s, &enc_two_zones); // zone 0: 10 fire + 5 neutral
+    try start_playing(&s, &enc_two_zones); // zone 0: 10 red + 5 neutral
 
-    // 20 fire agents vs 10 fire units — 10 wasted.
+    // 20 red agents vs 10 red units — 10 wasted.
     try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .dispense },
         .{ .action = .dispense },
         .{ .action = .dispense },
@@ -497,12 +497,12 @@ test "excess agents are wasted (no carryover to next zone)" {
     try std.testing.expectEqual(@as(u32, 0), total_healable(&s.sess));
     try std.testing.expectEqual(@as(u8, 1), s.sess.zone_index);
 
-    // Zone 1 (8 earth) untouched by the excess: consume with nothing.
+    // Zone 1 (8 green) untouched by the excess: consume with nothing.
     try resolve(&s.sess);
     try std.testing.expectEqual(@as(u32, 15 + 2), s.sess.score); // only neutral counts
     try std.testing.expectEqual(
         @as(u16, @intCast(8 * BAL.hunger_cost_modified_extra)),
-        s.sess.hunger_healable[EARTH],
+        s.sess.hunger_healable[GREEN],
     );
 }
 
@@ -512,11 +512,11 @@ test "team recipe (twin_flames) neutralizes more than two flat casts" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start_playing(&s, &enc_fifty_fire); // 50 fire units
+    try start_playing(&s, &enc_fifty_red); // 50 red units
 
-    // Both players cast the twin_flames half: 2 × [fire, dispense, dispense].
-    // Team recipe → 30 fire agents (flat would be 2 × 10 = 20).
-    const half = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
+    // Both players cast the twin_flames half: 2 × [red, dispense, dispense].
+    // Team recipe → 30 red agents (flat would be 2 × 10 = 20).
+    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
     try enqueue_combo(&s.sess, s.p[0].pid, half);
     try enqueue_combo(&s.sess, s.p[1].pid, half);
     try resolve(&s.sess);
@@ -524,7 +524,7 @@ test "team recipe (twin_flames) neutralizes more than two flat casts" {
     try std.testing.expectEqual(@as(u32, 30), s.sess.score);
     try std.testing.expectEqual(
         @as(u16, @intCast(20 * BAL.hunger_cost_modified_extra)),
-        s.sess.hunger_healable[FIRE],
+        s.sess.hunger_healable[RED],
     );
 }
 
@@ -543,20 +543,20 @@ test "cast window commits pending combo mid-round" {
     defer s.deinit();
     s.sess.round_duration = 3.0;
     s.sess.round_timer = 3.0;
-    try s.sess.start_game_encounter(&enc_fifty_fire); // window = 1.0s
+    try s.sess.start_game_encounter(&enc_fifty_red); // window = 1.0s
 
-    const combo = mk(&.{ .{ .element = .fire }, .{ .action = .dispense } });
+    const combo = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
     try enqueue_combo(&s.sess, s.p[0].pid, combo);
     s.p[1].clear();
 
     // Window 1 closes: pending combo commits, pool clears, and the cast's
-    // 5 fire agents transmute slime immediately (visible mid-round).
+    // 5 red agents transmute slime immediately (visible mid-round).
     try s.sess.tick(1.05);
     try std.testing.expectEqual(session_mod.SessionPhase.playing, s.sess.phase);
     try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.action_pool[s.p[0].pid]);
     try std.testing.expectEqual(@as(u8, 1), s.sess.casts_used[s.p[0].pid]);
-    try std.testing.expectEqual(@as(u16, 45), s.sess.zones[0].modified[FIRE]);
-    try std.testing.expectEqual(@as(u16, 5), s.sess.zones[0].neutralized[FIRE]);
+    try std.testing.expectEqual(@as(u16, 45), s.sess.zones[0].modified[RED]);
+    try std.testing.expectEqual(@as(u16, 5), s.sess.zones[0].neutralized[RED]);
 
     const msgs = try drain(s.p[1].buf.items, arena);
     try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_committed));
@@ -569,8 +569,8 @@ test "cast window commits pending combo mid-round" {
         last_gs = try proto.decode_game_state(fbs.reader());
     }
     const gs = last_gs orelse return error.NoGameState;
-    try std.testing.expectEqual(@as(u16, 45), gs.zones[0].modified[FIRE]);
-    try std.testing.expectEqual(@as(u16, 5), gs.zones[0].neutralized[FIRE]);
+    try std.testing.expectEqual(@as(u16, 45), gs.zones[0].modified[RED]);
+    try std.testing.expectEqual(@as(u16, 5), gs.zones[0].neutralized[RED]);
 }
 
 test "three casts across windows all feed round resolution" {
@@ -581,9 +581,9 @@ test "three casts across windows all feed round resolution" {
     defer s.deinit();
     s.sess.round_duration = 3.0;
     s.sess.round_timer = 3.0;
-    try s.sess.start_game_encounter(&enc_fifty_fire); // 50 fire units
+    try s.sess.start_game_encounter(&enc_fifty_red); // 50 red units
 
-    const combo = mk(&.{ .{ .element = .fire }, .{ .action = .dispense } }); // 5 agents flat
+    const combo = mk(&.{ .{ .element = .red }, .{ .action = .dispense } }); // 5 agents flat
 
     // Window 1 + 2 commit; the third combo commits at round resolution.
     try enqueue_combo(&s.sess, s.p[0].pid, combo);
@@ -591,11 +591,11 @@ test "three casts across windows all feed round resolution" {
     try enqueue_combo(&s.sess, s.p[0].pid, combo);
     try s.sess.tick(1.0);
     // Two windows applied: 10 transmuted so far.
-    try std.testing.expectEqual(@as(u16, 10), s.sess.zones[0].neutralized[FIRE]);
+    try std.testing.expectEqual(@as(u16, 10), s.sess.zones[0].neutralized[RED]);
     try enqueue_combo(&s.sess, s.p[0].pid, combo);
     try s.sess.tick(1.0); // round timer expires → final window + consume
 
-    // 3 casts × 5 fire agents = 15 neutralized of 50.
+    // 3 casts × 5 red agents = 15 neutralized of 50.
     try std.testing.expectEqual(@as(u32, 15), s.sess.score);
     try std.testing.expectEqual(@as(u8, 0), s.sess.casts_used[s.p[0].pid]);
 }
@@ -606,12 +606,12 @@ test "casts beyond CASTS_PER_ROUND are dropped" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start_playing(&s, &enc_fifty_fire);
+    try start_playing(&s, &enc_fifty_red);
 
     // White-box: player already used all casts this round; a pending combo
     // must not commit at resolution.
     s.sess.casts_used[s.p[0].pid] = BAL.casts_per_round;
-    try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .fire }, .{ .action = .dispense } }));
+    try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .red }, .{ .action = .dispense } }));
     try resolve(&s.sess);
 
     try std.testing.expectEqual(@as(u32, 0), s.sess.score); // nothing neutralized
@@ -628,16 +628,16 @@ test "zero-output combo fizzles: no cast consumed, no transmutation" {
     defer s.deinit();
     s.sess.round_duration = 3.0;
     s.sess.round_timer = 3.0;
-    try s.sess.start_game_encounter(&enc_fifty_fire);
+    try s.sess.start_game_encounter(&enc_fifty_red);
 
     // Dangling element token: converts to nothing, matches no recipe.
-    try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{.{ .element = .fire }}));
+    try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{.{ .element = .red }}));
     s.p[1].clear();
     try s.sess.tick(1.05); // window closes
 
     // Discarded: no cast used, nothing transmuted, pool cleared.
     try std.testing.expectEqual(@as(u8, 0), s.sess.casts_used[s.p[0].pid]);
-    try std.testing.expectEqual(@as(u16, 50), s.sess.zones[0].modified[FIRE]);
+    try std.testing.expectEqual(@as(u16, 50), s.sess.zones[0].modified[RED]);
     try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.action_pool[s.p[0].pid]);
 
     const msgs = try drain(s.p[1].buf.items, arena);
@@ -661,10 +661,10 @@ test "fully transmuted round broadcasts all-zero healable hunger" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start_playing(&s, &enc_single_fire); // 20 fire units
+    try start_playing(&s, &enc_single_red); // 20 red units
 
     try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .dispense },
         .{ .action = .dispense },
         .{ .action = .dispense },
@@ -696,12 +696,12 @@ test "recipe fires are broadcast at cast-window close" {
     defer s.deinit();
     s.sess.round_duration = 3.0;
     s.sess.round_timer = 3.0;
-    try s.sess.start_game_encounter(&enc_fifty_fire);
+    try s.sess.start_game_encounter(&enc_fifty_red);
 
     // Alice: crimson_flood (player recipe 0).  Bob + Alice can't pair (Alice's
     // combo is the flood, not the twin half), so exactly one player fire.
     try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .dispense },
         .{ .action = .dispense },
         .{ .action = .dispense },
@@ -722,7 +722,7 @@ test "recipe fires are broadcast at cast-window close" {
     try std.testing.expectEqual(@as(usize, 1), player_fires);
 
     // Window 2: twin_flames pair → one TEAM fire broadcast.
-    const half = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
     try enqueue_combo(&s.sess, s.p[0].pid, half);
     try enqueue_combo(&s.sess, s.p[1].pid, half);
     s.p[1].clear();
@@ -749,19 +749,19 @@ test "medicine heals immediately when the cast window closes" {
     defer s.deinit();
     s.sess.round_duration = 3.0;
     s.sess.round_timer = 3.0;
-    try s.sess.start_game_encounter(&enc_two_zones); // z0: 10 fire + 5 neutral
+    try s.sess.start_game_encounter(&enc_two_zones); // z0: 10 red + 5 neutral
 
-    // Round 1: idle → fire healable = 20 after consumption.
+    // Round 1: idle → red healable = 20 after consumption.
     try s.sess.tick(3.05);
     const hunger_r1 = s.sess.hunger.current;
     try std.testing.expectEqual(
         @as(u16, @intCast(10 * BAL.hunger_cost_modified_extra)),
-        s.sess.hunger_healable[FIRE],
+        s.sess.hunger_healable[RED],
     );
 
-    // Round 2, window 1: fire medicine heals MID-ROUND at commit time.
+    // Round 2, window 1: red medicine heals MID-ROUND at commit time.
     try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .medicine },
         .{ .action = .medicine },
     }));
@@ -771,7 +771,7 @@ test "medicine heals immediately when the cast window closes" {
     try std.testing.expectEqual(hunger_r1 - expected_heal, s.sess.hunger.current);
     try std.testing.expectEqual(
         @as(u16, @intCast(10 * BAL.hunger_cost_modified_extra)) - expected_heal,
-        s.sess.hunger_healable[FIRE],
+        s.sess.hunger_healable[RED],
     );
 }
 
@@ -783,9 +783,9 @@ test "team recipe requires both halves in the SAME cast window" {
     defer s.deinit();
     s.sess.round_duration = 3.0;
     s.sess.round_timer = 3.0;
-    try s.sess.start_game_encounter(&enc_fifty_fire);
+    try s.sess.start_game_encounter(&enc_fifty_red);
 
-    const half = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
 
     // Halves land in DIFFERENT windows: no twin_flames, flat only (10 + 10).
     try enqueue_combo(&s.sess, s.p[0].pid, half);
@@ -804,10 +804,10 @@ test "same player's own twin_flames halves do not fire the team recipe" {
     defer s.deinit();
     s.sess.round_duration = 3.0;
     s.sess.round_timer = 3.0;
-    try s.sess.start_game_encounter(&enc_fifty_fire);
+    try s.sess.start_game_encounter(&enc_fifty_red);
 
     // Player 0 casts the twin_flames half in two separate windows.
-    const half = mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
     try enqueue_combo(&s.sess, s.p[0].pid, half);
     try s.sess.tick(1.05);
     try enqueue_combo(&s.sess, s.p[0].pid, half);
@@ -831,35 +831,35 @@ test "symmetrical medicine heals matching-color healable hunger" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start_playing(&s, &enc_two_zones); // zone 0: 10 fire + 5 neutral
+    try start_playing(&s, &enc_two_zones); // zone 0: 10 red + 5 neutral
 
-    // Round 1: no combos → 10 fire modified consumed → fire healable.
+    // Round 1: no combos → 10 red modified consumed → red healable.
     try resolve(&s.sess);
-    const fire_healable_r1 = s.sess.hunger_healable[FIRE];
+    const red_healable_r1 = s.sess.hunger_healable[RED];
     try std.testing.expectEqual(
         @as(u16, @intCast(10 * BAL.hunger_cost_modified_extra)),
-        fire_healable_r1,
+        red_healable_r1,
     );
     const hunger_after_r1 = s.sess.hunger.current;
 
-    // Round 2: FIRE medicine (flat: 2 × MEDICINE_PER_SLOT) matches the fire
+    // Round 2: RED medicine (flat: 2 × MEDICINE_PER_SLOT) matches the red
     // healable bucket.
     s.p[0].clear();
     try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .medicine },
         .{ .action = .medicine },
     }));
     try resolve(&s.sess);
 
-    const expected_heal: u16 = @intCast(@min(2 * BAL.medicine_per_slot, fire_healable_r1));
-    // Round 2 also consumed zone 1 (8 earth modified + 2 neutral).
+    const expected_heal: u16 = @intCast(@min(2 * BAL.medicine_per_slot, red_healable_r1));
+    // Round 2 also consumed zone 1 (8 green modified + 2 neutral).
     const zone1_hunger = 10 * BAL.hunger_cost_normal + 8 * BAL.hunger_cost_modified_extra;
     try std.testing.expectEqual(
         hunger_after_r1 - expected_heal + @as(u16, @intCast(zone1_hunger)),
         s.sess.hunger.current,
     );
-    try std.testing.expectEqual(fire_healable_r1 - expected_heal, s.sess.hunger_healable[FIRE]);
+    try std.testing.expectEqual(red_healable_r1 - expected_heal, s.sess.hunger_healable[RED]);
 
     // A heal action_result was broadcast with the healed amount.
     const msgs = try drain(s.p[0].buf.items, arena);
@@ -882,29 +882,29 @@ test "asymmetric medicine heals nothing" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start_playing(&s, &enc_two_zones); // zone 0: 10 fire + 5 neutral
+    try start_playing(&s, &enc_two_zones); // zone 0: 10 red + 5 neutral
 
-    // Round 1: no combos → fire healable hunger accrues.
+    // Round 1: no combos → red healable hunger accrues.
     try resolve(&s.sess);
-    const fire_healable_r1 = s.sess.hunger_healable[FIRE];
-    try std.testing.expect(fire_healable_r1 > 0);
+    const red_healable_r1 = s.sess.hunger_healable[RED];
+    try std.testing.expect(red_healable_r1 > 0);
     const hunger_after_r1 = s.sess.hunger.current;
 
-    // Round 2: panacea is WATER medicine — wrong color, fully wasted.
+    // Round 2: panacea is BLUE medicine — wrong color, fully wasted.
     try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .water },
+        .{ .element = .blue },
         .{ .action = .medicine },
         .{ .action = .medicine },
     }));
     try resolve(&s.sess);
 
-    // No healing: hunger only grew by zone 1 consumption; fire bucket intact.
+    // No healing: hunger only grew by zone 1 consumption; red bucket intact.
     const zone1_hunger = 10 * BAL.hunger_cost_normal + 8 * BAL.hunger_cost_modified_extra;
     try std.testing.expectEqual(
         hunger_after_r1 + @as(u16, @intCast(zone1_hunger)),
         s.sess.hunger.current,
     );
-    try std.testing.expectEqual(fire_healable_r1, s.sess.hunger_healable[FIRE]);
+    try std.testing.expectEqual(red_healable_r1, s.sess.hunger_healable[RED]);
 }
 
 test "neutral-slime hunger is not healable" {
@@ -922,12 +922,12 @@ test "neutral-slime hunger is not healable" {
 
     // Round 2: heavy medicine — nothing to heal, overheal discarded.
     try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .water },
+        .{ .element = .blue },
         .{ .action = .medicine },
         .{ .action = .medicine },
     }));
     try enqueue_combo(&s.sess, s.p[1].pid, mk(&.{
-        .{ .element = .water },
+        .{ .element = .blue },
         .{ .action = .medicine },
         .{ .action = .medicine },
     }));
@@ -1004,10 +1004,10 @@ test "neutralizing the tight budget zone survives it" {
     defer s.deinit();
     try start_playing(&s, &enc_tight_budget);
 
-    // 10 fire agents (2 flat dispenses) neutralize the whole zone:
+    // 10 red agents (2 flat dispenses) neutralize the whole zone:
     // hunger = 10 normal only < 25 → game continues.
     try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .dispense },
         .{ .action = .dispense },
     }));
@@ -1055,22 +1055,22 @@ test "match stats: rounds, players, recipes, and reason are reported" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start_playing(&s, &enc_two_zones); // z0: 10 fire + 5 neutral; z1: 8 earth + 2 neutral
+    try start_playing(&s, &enc_two_zones); // z0: 10 red + 5 neutral; z1: 8 green + 2 neutral
 
     s.p[0].clear();
 
-    // Round 1: Alice casts crimson_flood (player recipe → 20 fire agents).
+    // Round 1: Alice casts crimson_flood (player recipe → 20 red agents).
     try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .dispense },
         .{ .action = .dispense },
         .{ .action = .dispense },
     }));
     try resolve(&s.sess);
 
-    // Round 2: Bob casts a flat water dispense (wrong color — wasted).
+    // Round 2: Bob casts a flat blue dispense (wrong color — wasted).
     try enqueue_combo(&s.sess, s.p[1].pid, mk(&.{
-        .{ .element = .water },
+        .{ .element = .blue },
         .{ .action = .dispense },
     }));
     try resolve(&s.sess); // zones exhausted → game over
@@ -1086,18 +1086,18 @@ test "match stats: rounds, players, recipes, and reason are reported" {
     // Round 1 row: recipe output, full neutralization, neutral consumed.
     const r0 = st.round_stats[0];
     try std.testing.expectEqual(@as(u8, 1), r0.casts);
-    try std.testing.expectEqual(@as(u16, 20), r0.agents_dispensed[FIRE]);
-    try std.testing.expectEqual(@as(u16, 10), r0.neutralized[FIRE]);
-    try std.testing.expectEqual(@as(u16, 0), r0.modified_escaped[FIRE]);
+    try std.testing.expectEqual(@as(u16, 20), r0.agents_dispensed[RED]);
+    try std.testing.expectEqual(@as(u16, 10), r0.neutralized[RED]);
+    try std.testing.expectEqual(@as(u16, 0), r0.modified_escaped[RED]);
     try std.testing.expectEqual(@as(u16, 5), r0.neutral_consumed);
     try std.testing.expectEqual(@as(u16, 0), r0.hunger_extra);
     try std.testing.expectEqual(@as(u16, 15), r0.hunger_after);
 
-    // Round 2 row: wrong-color agents, earth escapes.
+    // Round 2 row: wrong-color agents, green escapes.
     const r1 = st.round_stats[1];
     try std.testing.expectEqual(@as(u8, 1), r1.casts);
-    try std.testing.expectEqual(@as(u16, 5), r1.agents_dispensed[@intFromEnum(c.Element.water)]);
-    try std.testing.expectEqual(@as(u16, 8), r1.modified_escaped[EARTH]);
+    try std.testing.expectEqual(@as(u16, 5), r1.agents_dispensed[@intFromEnum(c.Element.blue)]);
+    try std.testing.expectEqual(@as(u16, 8), r1.modified_escaped[GREEN]);
     try std.testing.expectEqual(
         @as(u16, @intCast(8 * BAL.hunger_cost_modified_extra)),
         r1.hunger_extra,
@@ -1107,10 +1107,10 @@ test "match stats: rounds, players, recipes, and reason are reported" {
     try std.testing.expectEqual(@as(u8, 2), st.player_count);
     try std.testing.expectEqualSlices(u8, "Alice", st.players[0].name[0..st.players[0].name_len]);
     try std.testing.expectEqual(@as(u16, 1), st.players[0].casts);
-    try std.testing.expectEqual(@as(u16, 3), st.players[0].dispense_slots[FIRE]);
+    try std.testing.expectEqual(@as(u16, 3), st.players[0].dispense_slots[RED]);
     try std.testing.expectEqual(@as(u16, 1), st.players[0].recipe_casts);
     try std.testing.expectEqualSlices(u8, "Bob", st.players[1].name[0..st.players[1].name_len]);
-    try std.testing.expectEqual(@as(u16, 1), st.players[1].dispense_slots[@intFromEnum(c.Element.water)]);
+    try std.testing.expectEqual(@as(u16, 1), st.players[1].dispense_slots[@intFromEnum(c.Element.blue)]);
     try std.testing.expectEqual(@as(u16, 0), st.players[1].recipe_casts);
 
     // crimson_flood is player_recipes[0]; no team recipes fired.
@@ -1131,20 +1131,20 @@ test "match stats: medicine dispensed vs healed (overheal visible)" {
 
     s.p[0].clear();
 
-    // Round 1: idle — fire healable accrues (20).
+    // Round 1: idle — red healable accrues (20).
     try resolve(&s.sess);
 
-    // Round 2: heavy fire medicine (4 slots × 3 = 12 < 20 healable → all heals)
-    // plus water medicine (panacea 10 → overheal 10, nothing water-healable).
+    // Round 2: heavy red medicine (4 slots × 3 = 12 < 20 healable → all heals)
+    // plus blue medicine (panacea 10 → overheal 10, nothing blue-healable).
     try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .fire },
+        .{ .element = .red },
         .{ .action = .medicine },
         .{ .action = .medicine },
         .{ .action = .medicine },
         .{ .action = .medicine },
     }));
     try enqueue_combo(&s.sess, s.p[1].pid, mk(&.{
-        .{ .element = .water },
+        .{ .element = .blue },
         .{ .action = .medicine },
         .{ .action = .medicine },
     }));
@@ -1153,13 +1153,13 @@ test "match stats: medicine dispensed vs healed (overheal visible)" {
     const go = try game_over_stats(try drain(s.p[0].buf.items, arena));
     const r1 = go.stats.round_stats[1];
 
-    try std.testing.expectEqual(@as(u16, 12), r1.medicine_dispensed[FIRE]);
-    try std.testing.expectEqual(@as(u16, 12), r1.medicine_healed[FIRE]);
-    try std.testing.expectEqual(@as(u16, 10), r1.medicine_dispensed[@intFromEnum(c.Element.water)]);
-    try std.testing.expectEqual(@as(u16, 0), r1.medicine_healed[@intFromEnum(c.Element.water)]);
+    try std.testing.expectEqual(@as(u16, 12), r1.medicine_dispensed[RED]);
+    try std.testing.expectEqual(@as(u16, 12), r1.medicine_healed[RED]);
+    try std.testing.expectEqual(@as(u16, 10), r1.medicine_dispensed[@intFromEnum(c.Element.blue)]);
+    try std.testing.expectEqual(@as(u16, 0), r1.medicine_healed[@intFromEnum(c.Element.blue)]);
     // Raw medicine slot attribution.
-    try std.testing.expectEqual(@as(u16, 4), go.stats.players[0].medicine_slots[FIRE]);
-    try std.testing.expectEqual(@as(u16, 2), go.stats.players[1].medicine_slots[@intFromEnum(c.Element.water)]);
+    try std.testing.expectEqual(@as(u16, 4), go.stats.players[0].medicine_slots[RED]);
+    try std.testing.expectEqual(@as(u16, 2), go.stats.players[1].medicine_slots[@intFromEnum(c.Element.blue)]);
     // panacea is a player recipe → Bob participated in a recipe.
     try std.testing.expectEqual(@as(u16, 1), go.stats.players[1].recipe_casts);
 }
@@ -1239,7 +1239,7 @@ test "game_state broadcasts hunger, zones, score, and pending combos" {
     defer s.deinit();
     try start_playing(&s, &enc_two_zones);
 
-    const combo = mk(&.{ .{ .element = .fire }, .{ .action = .dispense } });
+    const combo = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
     try enqueue_combo(&s.sess, s.p[0].pid, combo);
 
     s.p[0].clear();
@@ -1268,7 +1268,7 @@ test "game_state broadcasts hunger, zones, score, and pending combos" {
         if (e.owner == s.p[0].pid) {
             found = true;
             try std.testing.expectEqual(combo.len, e.combo_len);
-            try std.testing.expectEqual(c.Element.fire, e.combo_slots[0].element);
+            try std.testing.expectEqual(c.Element.red, e.combo_slots[0].element);
             try std.testing.expectEqual(c.ActionChoice.dispense, e.combo_slots[1].action);
         }
     }
@@ -1287,7 +1287,7 @@ test "resolution broadcasts one cast per player who submitted a combo" {
     try start_playing(&s, &enc_two_zones);
 
     // Only player 0 casts this round.
-    try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .fire }, .{ .action = .dispense } }));
+    try enqueue_combo(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .red }, .{ .action = .dispense } }));
     s.p[1].clear();
     try resolve(&s.sess);
 

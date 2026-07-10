@@ -38,11 +38,11 @@ pub const BotTeam = struct {
     bots: []const BotEntry,
 };
 
-/// Dispenses fire agents every round (flat conversion: 2 slots).
-pub const profile_fire_dispenser = Profile{
-    .label = "fire_dispenser",
+/// Dispenses red agents every round (flat conversion: 2 slots).
+pub const profile_red_dispenser = Profile{
+    .label = "red_dispenser",
     .combos = &[_]c.ActionCombo{
-        mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } }),
     },
 };
 
@@ -50,10 +50,10 @@ pub const profile_fire_dispenser = Profile{
 pub const profile_rainbow = Profile{
     .label = "rainbow",
     .combos = &[_]c.ActionCombo{
-        mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        mk(&.{ .{ .element = .earth }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        mk(&.{ .{ .element = .wind }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        mk(&.{ .{ .element = .water }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        mk(&.{ .{ .element = .green }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        mk(&.{ .{ .element = .yellow }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        mk(&.{ .{ .element = .blue }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
     },
 };
 
@@ -61,7 +61,7 @@ pub const profile_rainbow = Profile{
 pub const profile_medic = Profile{
     .label = "medic",
     .combos = &[_]c.ActionCombo{
-        mk(&.{ .{ .element = .water }, .{ .action = .medicine }, .{ .action = .medicine } }),
+        mk(&.{ .{ .element = .blue }, .{ .action = .medicine }, .{ .action = .medicine } }),
     },
 };
 
@@ -69,12 +69,12 @@ pub const profile_medic = Profile{
 pub const profile_twin_flame = Profile{
     .label = "twin_flame",
     .combos = &[_]c.ActionCombo{
-        mk(&.{ .{ .element = .fire }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } }),
     },
 };
 
-pub const team_fire_pair = BotTeam{
-    .label = "team_fire_pair",
+pub const team_red_pair = BotTeam{
+    .label = "team_red_pair",
     .bots = &[_]BotEntry{
         .{ .name = "FlameBotA", .profile = &profile_twin_flame },
         .{ .name = "FlameBotB", .profile = &profile_twin_flame },
@@ -86,6 +86,6 @@ pub const team_mixed = BotTeam{
     .bots = &[_]BotEntry{
         .{ .name = "Rainbow", .profile = &profile_rainbow },
         .{ .name = "Medic", .profile = &profile_medic },
-        .{ .name = "Sprayer", .profile = &profile_fire_dispenser },
+        .{ .name = "Sprayer", .profile = &profile_red_dispenser },
     },
 };

@@ -173,9 +173,9 @@ pub const BotHarness = struct {
 // Test encounters
 // ---------------------------------------------------------------------------
 
-/// Fire-only field: exactly matched by two twin_flames rounds (30 agents/round).
-const enc_fire_field = enc.Encounter{
-    .label = "bot_fire_field",
+/// Red-only field: exactly matched by two twin_flames rounds (30 agents/round).
+const enc_red_field = enc.Encounter{
+    .label = "bot_red_field",
     .hunger_max = 1000,
     .zones = &[_]c.ZoneDef{
         .{ .modified = .{ 30, 0, 0, 0 } },
@@ -197,9 +197,9 @@ const enc_survival = enc.Encounter{
 // Tests
 // ---------------------------------------------------------------------------
 
-test "twin_flames pair fully neutralizes the fire field" {
+test "twin_flames pair fully neutralizes the red field" {
     const allocator = std.testing.allocator;
-    var h = try BotHarness.init(allocator, &bots.team_fire_pair, &enc_fire_field, "BOTKEY".*, .{});
+    var h = try BotHarness.init(allocator, &bots.team_red_pair, &enc_red_field, "BOTKEY".*, .{});
     defer h.deinit();
 
     const rounds = try h.run_to_completion(10);
@@ -223,8 +223,8 @@ test "neutralizing bots survive a hunger budget that idle play fails" {
     // Idle team: submits nothing (empty session, no combos injected).
     var idle_sess = try Session.init(allocator, "BOTK01".*, TEST_CFG);
     defer idle_sess.deinit();
-    var idle_bot = BotState{ .player_id = 0xFF, .profile = &bots.profile_fire_dispenser, .buf = .empty, .bt = undefined };
-    idle_bot.init(allocator, 0xFF, &bots.profile_fire_dispenser);
+    var idle_bot = BotState{ .player_id = 0xFF, .profile = &bots.profile_red_dispenser, .buf = .empty, .bt = undefined };
+    idle_bot.init(allocator, 0xFF, &bots.profile_red_dispenser);
     defer idle_bot.deinit(allocator);
     _ = idle_sess.join(idle_bot.transport(), "Idle") orelse return error.JoinFailed;
     idle_sess.round_duration = 0.001;
@@ -236,7 +236,7 @@ test "neutralizing bots survive a hunger budget that idle play fails" {
     try std.testing.expectEqual(@as(u32, 0), idle_sess.score);
 
     // Active pair: twin_flames neutralizes everything → survives with full score.
-    var h = try BotHarness.init(allocator, &bots.team_fire_pair, &enc_survival, "BOTK02".*, .{});
+    var h = try BotHarness.init(allocator, &bots.team_red_pair, &enc_survival, "BOTK02".*, .{});
     defer h.deinit();
     const rounds = try h.run_to_completion(10);
     try std.testing.expectEqual(@as(u32, 1), rounds);
