@@ -212,7 +212,7 @@ fn process_recv() void {
                 g_state.game.round_duration = p.round_duration;
                 g_state.game.casts_per_round = p.casts_per_round;
                 g_state.game.mode = p.mode;
-                g_state.game.cast_window_ms = p.cast_window_ms;
+                g_state.game.cast_buffer_ms = p.cast_buffer_ms;
                 g_state.game.encounter_label_len = p.encounter_label_len;
                 @memcpy(g_state.game.encounter_label[0..p.encounter_label_len], p.encounter_label[0..p.encounter_label_len]);
                 g_state.phase = .game;
@@ -289,8 +289,36 @@ fn process_recv() void {
                     g_state.game.recipe_count += 1;
                 }
             },
+            .cast_grouped => {
+                const p = proto.decode_cast_grouped(r) catch continue;
+                record_cast_event(.{ .grouped = p });
+            },
+            .cast_replaced => {
+                const p = proto.decode_cast_replaced(r) catch continue;
+                // Same local bookkeeping as cast_committed: the server
+                // accepted the replacement spell, so the pending buffer is
+                // stale and must clear.
+                if (p.player_id == g_state.player_id) {
+                    g_state.game.pending_combo.clear();
+                    send_cancel_combo();
+                }
+                record_cast_event(.{ .replaced = p });
+            },
+            .cast_fired => {
+                const p = proto.decode_cast_fired(r) catch continue;
+                record_cast_event(.{ .fired = p });
+            },
             else => {},
         }
+    }
+}
+
+/// Record a realtime cast-loop event for the renderer (transient, drained
+/// per frame like recipes_fired).
+fn record_cast_event(ev: sw.CastEvent) void {
+    if (g_state.game.cast_event_count < g_state.game.cast_events.len) {
+        g_state.game.cast_events[g_state.game.cast_event_count] = ev;
+        g_state.game.cast_event_count += 1;
     }
 }
 

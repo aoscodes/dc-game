@@ -22,16 +22,23 @@ const MAX_PATTERN_SLOTS = 5;
 const MAX_TEAM_PATTERNS = 6;
 const MAX_ZONES = 16;
 
-/** Scalar balance fields: [key, label, min, max, step]. */
+/**
+ * Scalar balance fields: [key, label, min, max, step, mode].
+ * `mode` gates VISIBILITY only ("classic" | "realtime" | "both" vs
+ * PAGE_MODE); hidden fields keep their loaded/default values in
+ * state.balance so the saved balance.json stays complete and valid.
+ */
 const RATE_FIELDS = [
-  ["casts_per_round", "casts per round", 1, 10, 1],
-  ["units_per_slot", "neutralization agent units per dispense", 0, 1000, 1],
-  ["medicine_per_slot", "medicine per dispense", 0, 1000, 1],
-  ["hunger_cost_normal", "hunger per unit eaten", 0, 1000, 1],
-  ["hunger_cost_modified_extra", "extra hunger from modified slime", 0, 1000, 1],
-  ["round_duration_default_s", "round duration (seconds)", 0.5, 300, 0.5],
-  ["eat_rate_units_per_s", "realtime: units eaten /s per lil guy", 0.1, 100, 0.1],
-  ["cast_window_ms", "realtime: cast window (ms)", 250, 60000, 250],
+  ["casts_per_round", "casts per round", 1, 10, 1, "classic"],
+  ["units_per_slot", "neutralization agent units per dispense", 0, 1000, 1, "both"],
+  ["medicine_per_slot", "medicine per dispense", 0, 1000, 1, "both"],
+  ["hunger_cost_normal", "hunger per unit eaten", 0, 1000, 1, "both"],
+  ["hunger_cost_modified_extra", "extra hunger from modified slime", 0, 1000, 1, "both"],
+  ["neutralize_residue_mult", "portion of neutralized slime left behind (0–1)", 0, 1, 0.05, "both"],
+  ["round_duration_default_s", "round duration (seconds)", 0.5, 300, 0.5, "classic"],
+  ["eat_rate_units_per_s", "units eaten /s per lil guy", 0.1, 100, 0.1, "realtime"],
+  ["cast_buffer_ms", "per-cast buffer (ms)", 0, 60000, 50, "realtime"],
+  ["cast_lock_ms", "cast lock/cooldown (ms)", 0, 60000, 50, "realtime"],
 ];
 
 /** @type {{balance: object, encounter: {hunger_max: number, zones: object[]}}} */
@@ -43,6 +50,23 @@ let state = null;
 
 const FROM_HASH = (new URLSearchParams(location.search).get("from") || "")
   .match(/^[0-9a-f]{16}$/)?.[0] ?? null;
+
+/**
+ * Which mode's values the editor shows ("classic" default; ?mode=realtime).
+ * The saved config always carries BOTH modes' values — this only filters
+ * the rows rendered (and which play link the save result offers).
+ */
+const PAGE_MODE = new URLSearchParams(location.search).get("mode") === "realtime"
+  ? "realtime" : "classic";
+
+/** /tune URL for `mode`, preserving the ?from= source config. */
+function tuneUrl(mode) {
+  const params = new URLSearchParams();
+  if (FROM_HASH) params.set("from", FROM_HASH);
+  if (mode === "realtime") params.set("mode", "realtime");
+  const qs = params.toString();
+  return qs ? `/tune?${qs}` : "/tune";
+}
 
 function dataUrl(file) {
   return FROM_HASH ? `/config/${FROM_HASH}/data/${file}` : `/data/${file}`;
@@ -68,10 +92,12 @@ async function load() {
       medicine_per_slot: bal.medicine_per_slot,
       hunger_cost_normal: bal.hunger_cost_normal,
       hunger_cost_modified_extra: bal.hunger_cost_modified_extra,
+      neutralize_residue_mult: bal.neutralize_residue_mult ?? 1.0,
       round_duration_default_s: bal.round_duration_default_s,
       // Realtime-mode fields; default like the server does for older configs.
       eat_rate_units_per_s: bal.eat_rate_units_per_s ?? 2.0,
-      cast_window_ms: bal.cast_window_ms ?? 3000,
+      cast_buffer_ms: bal.cast_buffer_ms ?? 500,
+      cast_lock_ms: bal.cast_lock_ms ?? 500,
       player_recipes: bal.player_recipes.map((r) => ({
         label: r.label,
         pattern: [...r.pattern],
@@ -172,10 +198,19 @@ function labelInput(recipe) {
 // Sections
 // ---------------------------------------------------------------------------
 
+function renderModeNote() {
+  const other = PAGE_MODE === "realtime" ? "classic" : "realtime";
+  document.getElementById("mode-note").replaceChildren(
+    el("span", {}, `Editing ${PAGE_MODE.toUpperCase()} values — `),
+    el("a", { href: tuneUrl(other) }, `switch to ${other}`),
+  );
+}
+
 function renderRates() {
   const box = document.getElementById("rates");
   box.replaceChildren(el("legend", {}, "Rates & costs"));
-  for (const [key, text, min, max, step] of RATE_FIELDS) {
+  for (const [key, text, min, max, step, mode] of RATE_FIELDS) {
+    if (mode !== "both" && mode !== PAGE_MODE) continue;
     box.append(
       el("label", {}, el("span", {}, text), numInput(state.balance, key, min, max, step)),
       el("br"),
@@ -271,6 +306,7 @@ function renderEncounter() {
 }
 
 function renderAll() {
+  renderModeNote();
   renderRates();
   renderPlayerRecipes();
   renderTeamRecipes();
@@ -331,14 +367,18 @@ document.getElementById("save").addEventListener("click", async () => {
     ]);
     return;
   }
-  const playUrl = `${location.origin}${data.url}`;
+  // Play link matches the editor's mode (the saved config works in both).
+  const playPath = PAGE_MODE === "realtime" ? `${data.url}?mode=realtime` : data.url;
+  const playUrl = `${location.origin}${playPath}`;
+  const editPath = PAGE_MODE === "realtime"
+    ? `/tune?from=${data.hash}&mode=realtime`
+    : `/tune?from=${data.hash}`;
   showResult(true, [
-    el("div", {}, "Saved! Play this configuration at: "),
-    el("a", { id: "play-link", href: data.url }, playUrl),
+    el("div", {}, `Saved! Play this ${PAGE_MODE} configuration at: `),
+    el("a", { id: "play-link", href: playPath }, playUrl),
     el("span", {}, " "),
     el("button", { onclick: () => navigator.clipboard.writeText(playUrl) }, "copy"),
-    el("div", { class: "muted" },
-      `Edit it later at /tune?from=${data.hash}.`),
+    el("div", { class: "muted" }, `Edit it later at ${editPath}.`),
   ]);
 });
 

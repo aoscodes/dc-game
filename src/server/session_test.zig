@@ -159,6 +159,9 @@ fn consume_payload(tag: proto.MsgTag, r: anytype) bool {
         .cast_committed => if (proto.decode_cast_committed(r)) |_| true else |_| false,
         .cast_fizzled => if (proto.decode_cast_fizzled(r)) |_| true else |_| false,
         .recipe_fired => if (proto.decode_recipe_fired(r)) |_| true else |_| false,
+        .cast_grouped => if (proto.decode_cast_grouped(r)) |_| true else |_| false,
+        .cast_replaced => if (proto.decode_cast_replaced(r)) |_| true else |_| false,
+        .cast_fired => if (proto.decode_cast_fired(r)) |_| true else |_| false,
     };
 }
 
@@ -1384,7 +1387,8 @@ test "disconnect in lobby frees the slot" {
 // Realtime mode
 //
 // Fixture balance: eat_rate_units_per_s = 2.0 (per connected player; two
-// players → 4 units/s), cast_window_ms = 3000 (3.0s windows).
+// players → 4 units/s), cast_buffer_ms = 500 (0.5s per-cast buffer),
+// cast_lock_ms = 500 (0.5s per-player cooldown).
 // ---------------------------------------------------------------------------
 
 /// One zone: 30 red-modified units — exactly one twin_flames output.
@@ -1406,7 +1410,7 @@ fn enqueue_submit(sess: *Session, pid: u8, combo: c.ActionCombo) !void {
     try enqueue_msg(sess, pid, .submit_spell, proto.SubmitSpell{ .combo = combo });
 }
 
-test "realtime: submit_spell locks the window; second submit silently ignored" {
+test "realtime: accepted cast starts its buffer + lock; locked resubmit ignored" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1417,6 +1421,9 @@ test "realtime: submit_spell locks the window; second submit silently ignored" {
     defer s.deinit();
     try start_realtime(&s, &enc_fifty_red);
 
+    // No submits yet: nothing counting down.
+    try std.testing.expectEqual(@as(?f32, null), s.sess.cast_fire_timers[s.p[0].pid]);
+
     const combo = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
     const combo_b = mk(&.{ .{ .element = .blue }, .{ .action = .dispense } });
 
@@ -1424,13 +1431,18 @@ test "realtime: submit_spell locks the window; second submit silently ignored" {
     try enqueue_submit(&s.sess, s.p[0].pid, combo);
     try flush(&s.sess);
 
-    // Locked: pool holds the spell, on-wire marker set, live preview cleared.
+    // Accepted: pool holds the spell, on-wire marker set, live preview
+    // cleared, the cast's own buffer counting down, lock cooling.
     try std.testing.expect(logic.combos_equal(combo, s.sess.submitted_pool[s.p[0].pid].?));
     try std.testing.expectEqual(@as(u8, 1), s.sess.casts_used[s.p[0].pid]);
     try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.action_pool[s.p[0].pid]);
+    try std.testing.expect(s.sess.cast_fire_timers[s.p[0].pid] != null);
+    try std.testing.expect(s.sess.cast_locks[s.p[0].pid] > 0.0);
 
     var msgs = try drain(s.p[1].buf.items, arena);
     try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_committed));
+    // A flat cast completes no team recipe: no grouping.
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_grouped));
     var cast_count: usize = 0;
     for (msgs) |m| {
         if (m.tag != .action_result) continue;
@@ -1443,17 +1455,18 @@ test "realtime: submit_spell locks the window; second submit silently ignored" {
     }
     try std.testing.expectEqual(@as(usize, 1), cast_count);
 
-    // Second submit in the same window: silent ignore, first spell kept.
+    // Resubmit while the lock is cooling: silent ignore, first spell kept.
     s.p[1].clear();
     try enqueue_submit(&s.sess, s.p[0].pid, combo_b);
     try flush(&s.sess);
 
     msgs = try drain(s.p[1].buf.items, arena);
     try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_committed));
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_replaced));
     try std.testing.expect(logic.combos_equal(combo, s.sess.submitted_pool[s.p[0].pid].?));
 }
 
-test "realtime: zero-output submit fizzles and does not lock the window" {
+test "realtime: solo cast fires at its own expiry only" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1464,7 +1477,64 @@ test "realtime: zero-output submit fizzles and does not lock the window" {
     defer s.deinit();
     try start_realtime(&s, &enc_fifty_red);
 
-    // Dangling element token: no output → fizzle, not locked.
+    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .red }, .{ .action = .dispense } }));
+    try flush(&s.sess);
+
+    // Before expiry (buffer 0.5s): nothing fires.
+    s.p[1].clear();
+    try s.sess.tick(0.3);
+    var msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_fired));
+    try std.testing.expect(s.sess.submitted_pool[s.p[0].pid] != null);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.zones[0].neutralized[RED]);
+
+    // At expiry: fires solo (5 red agents transmute), everything clears.
+    s.p[1].clear();
+    try s.sess.tick(0.3);
+    msgs = try drain(s.p[1].buf.items, arena);
+    const cf_msg = find_tag(msgs, .cast_fired) orelse return error.MissingCastFired;
+    var cf_fbs = std.io.fixedBufferStream(cf_msg.payload);
+    const cf = try proto.decode_cast_fired(cf_fbs.reader());
+    try std.testing.expectEqual(@as(u8, 1), cf.spell_count);
+    try std.testing.expectEqual(@as(u8, 1) << @intCast(s.p[0].pid), cf.player_mask);
+    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.submitted_pool[s.p[0].pid]);
+    try std.testing.expectEqual(@as(?f32, null), s.sess.cast_fire_timers[s.p[0].pid]);
+    try std.testing.expectEqual(@as(u8, 0), s.sess.casts_used[s.p[0].pid]);
+    try std.testing.expectEqual(@as(u16, 5), s.sess.zones[0].neutralized[RED]);
+}
+
+test "realtime: nothing pending → ticks never fire" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start_realtime(&s, &enc_fifty_red);
+
+    s.p[1].clear();
+    try s.sess.tick(1.0);
+    try s.sess.tick(1.0);
+
+    const msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_fired));
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_grouped));
+}
+
+test "realtime: zero-output submit fizzles — no buffer, no lock" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start_realtime(&s, &enc_fifty_red);
+
+    // Dangling element token: no output → fizzle, nothing else happens.
     s.p[1].clear();
     try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{.{ .element = .red }}));
     try flush(&s.sess);
@@ -1472,22 +1542,25 @@ test "realtime: zero-output submit fizzles and does not lock the window" {
     try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.submitted_pool[s.p[0].pid]);
     try std.testing.expectEqual(@as(u8, 0), s.sess.casts_used[s.p[0].pid]);
     try std.testing.expectEqual(@as(u16, 1), s.sess.stats.players[s.p[0].pid].fizzles);
+    try std.testing.expectEqual(@as(?f32, null), s.sess.cast_fire_timers[s.p[0].pid]);
+    try std.testing.expectEqual(@as(f32, 0.0), s.sess.cast_locks[s.p[0].pid]);
 
     var msgs = try drain(s.p[1].buf.items, arena);
     try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_fizzled));
     try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_committed));
 
-    // A later valid submit in the same window still locks.
+    // A valid submit right after is accepted and starts its buffer.
     s.p[1].clear();
     try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .red }, .{ .action = .dispense } }));
     try flush(&s.sess);
 
     try std.testing.expect(s.sess.submitted_pool[s.p[0].pid] != null);
+    try std.testing.expect(s.sess.cast_fire_timers[s.p[0].pid] != null);
     msgs = try drain(s.p[1].buf.items, arena);
     try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_committed));
 }
 
-test "realtime: window close converts the batch — twin_flames team recipe" {
+test "realtime: team-recipe match groups casts — they fire together at the joiner's expiry" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1498,28 +1571,62 @@ test "realtime: window close converts the batch — twin_flames team recipe" {
     defer s.deinit();
     try start_realtime(&s, &enc_thirty_red); // 30 red units
 
-    // Both players lock in the twin_flames half within the SAME window.
     const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
+
+    // p0 casts; 0.3s later (inside p0's 0.5s buffer) p1 completes twin_flames.
     try enqueue_submit(&s.sess, s.p[0].pid, half);
+    try flush(&s.sess);
+    try s.sess.tick(0.3);
+
+    s.p[1].clear();
     try enqueue_submit(&s.sess, s.p[1].pid, half);
     try flush(&s.sess);
 
-    s.p[1].clear();
-    try s.sess.tick(3.05); // window (3.0s) closes → batch converts
+    // Grouped: both timers equalised to the joiner's full buffer.
+    var msgs = try drain(s.p[1].buf.items, arena);
+    const g_msg = find_tag(msgs, .cast_grouped) orelse return error.MissingCastGrouped;
+    var g_fbs = std.io.fixedBufferStream(g_msg.payload);
+    const g = try proto.decode_cast_grouped(g_fbs.reader());
+    const expected_mask = (@as(u8, 1) << @intCast(s.p[0].pid)) |
+        (@as(u8, 1) << @intCast(s.p[1].pid));
+    try std.testing.expectEqual(expected_mask, g.player_mask);
+    try std.testing.expectEqual(@as(u32, 500), g.fires_in_ms);
 
-    // twin_flames → 30 agents: the ENTIRE zone transmuted (flat conversion
-    // would only cover 20, leaving modified slime behind even after eating).
+    // p0's ORIGINAL expiry (0.2s away) passes without firing — extended.
+    s.p[1].clear();
+    try s.sess.tick(0.3);
+    msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_fired));
+    try std.testing.expect(s.sess.submitted_pool[s.p[0].pid] != null);
+
+    // Joiner's expiry (0.5s after grouping): both fire as ONE batch.
+    s.p[1].clear();
+    try s.sess.tick(0.25);
+
+    // twin_flames → 30 agents: the ENTIRE remaining zone transmuted (flat
+    // conversion would only cover 20).
     try std.testing.expectEqual(@as(u16, 0), s.sess.zones[0].modified[RED]);
     try std.testing.expectEqual(session_mod.SessionPhase.playing, s.sess.phase);
 
-    // Window committed: pool + markers reset for the next window.
+    // Fired: pools + timers + markers reset, stats recorded once per spell.
     try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.submitted_pool[s.p[0].pid]);
     try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.submitted_pool[s.p[1].pid]);
+    try std.testing.expectEqual(@as(?f32, null), s.sess.cast_fire_timers[s.p[0].pid]);
+    try std.testing.expectEqual(@as(?f32, null), s.sess.cast_fire_timers[s.p[1].pid]);
     try std.testing.expectEqual(@as(u8, 0), s.sess.casts_used[s.p[0].pid]);
-    try std.testing.expectEqual(@as(u8, 0), s.sess.casts_used[s.p[1].pid]);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.players[s.p[0].pid].casts);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.players[s.p[1].pid].casts);
+
+    msgs = try drain(s.p[1].buf.items, arena);
+
+    // cast_fired announces the batch: both players, two spells.
+    const cf_msg = find_tag(msgs, .cast_fired) orelse return error.MissingCastFired;
+    var cf_fbs = std.io.fixedBufferStream(cf_msg.payload);
+    const cf = try proto.decode_cast_fired(cf_fbs.reader());
+    try std.testing.expectEqual(@as(u8, 2), cf.spell_count);
+    try std.testing.expectEqual(expected_mask, cf.player_mask);
 
     // Exactly one TEAM recipe fire broadcast.
-    const msgs = try drain(s.p[1].buf.items, arena);
     var team_fires: usize = 0;
     for (msgs) |m| {
         if (m.tag != .recipe_fired) continue;
@@ -1530,9 +1637,303 @@ test "realtime: window close converts the batch — twin_flames team recipe" {
         team_fires += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), team_fires);
+}
 
-    // Every unit eaten during the tick was neutralized → all score.
-    try std.testing.expectEqual(@as(u32, 12), s.sess.score); // 4 units/s × 3.05s → 12
+test "realtime: non-matching overlapping casts fire separately, no group" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start_realtime(&s, &enc_fifty_red);
+
+    // p0 red flat cast; p1 blue flat cast 0.3s later — no team recipe.
+    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .red }, .{ .action = .dispense } }));
+    try flush(&s.sess);
+    try s.sess.tick(0.3);
+
+    s.p[1].clear();
+    try enqueue_submit(&s.sess, s.p[1].pid, mk(&.{ .{ .element = .blue }, .{ .action = .dispense } }));
+    try flush(&s.sess);
+    var msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_grouped));
+
+    // p0 fires alone at its own expiry (t=0.5)...
+    s.p[1].clear();
+    try s.sess.tick(0.25);
+    msgs = try drain(s.p[1].buf.items, arena);
+    var cf_msg = find_tag(msgs, .cast_fired) orelse return error.MissingCastFired;
+    var cf_fbs = std.io.fixedBufferStream(cf_msg.payload);
+    var cf = try proto.decode_cast_fired(cf_fbs.reader());
+    try std.testing.expectEqual(@as(u8, 1), cf.spell_count);
+    try std.testing.expectEqual(@as(u8, 1) << @intCast(s.p[0].pid), cf.player_mask);
+    try std.testing.expect(s.sess.submitted_pool[s.p[1].pid] != null); // p1 still pending
+
+    // ...and p1 alone at its own (t=0.8).
+    s.p[1].clear();
+    try s.sess.tick(0.3);
+    msgs = try drain(s.p[1].buf.items, arena);
+    cf_msg = find_tag(msgs, .cast_fired) orelse return error.MissingCastFired;
+    cf_fbs = std.io.fixedBufferStream(cf_msg.payload);
+    cf = try proto.decode_cast_fired(cf_fbs.reader());
+    try std.testing.expectEqual(@as(u8, 1), cf.spell_count);
+    try std.testing.expectEqual(@as(u8, 1) << @intCast(s.p[1].pid), cf.player_mask);
+}
+
+test "realtime: matching cast arriving after the first fired does not group" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start_realtime(&s, &enc_thirty_red);
+
+    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
+    try enqueue_submit(&s.sess, s.p[0].pid, half);
+    try flush(&s.sess);
+    try s.sess.tick(0.55); // p0 fires alone (flat: 2 slots × 5 = 10 red agents)
+
+    s.p[1].clear();
+    try enqueue_submit(&s.sess, s.p[1].pid, half);
+    try flush(&s.sess);
+    var msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_grouped));
+
+    s.p[1].clear();
+    try s.sess.tick(0.55); // p1 fires alone too — no team recipe ever
+    msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .recipe_fired));
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.team_recipe_hits[0]);
+}
+
+test "realtime: unlocked resubmit replaces the pending cast and restarts its buffer" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    // Lock (0.1s) shorter than buffer (0.5s) so a replace window exists.
+    var custom_cfg = TEST_CFG.*;
+    custom_cfg.balance.cast_lock_ms = 100;
+    s.sess.cfg = &custom_cfg;
+    try start_realtime(&s, &enc_fifty_red);
+
+    const combo_a = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
+    const combo_b = mk(&.{ .{ .element = .blue }, .{ .action = .dispense } });
+
+    try enqueue_submit(&s.sess, s.p[0].pid, combo_a);
+    try flush(&s.sess);
+    try s.sess.tick(0.2); // lock (0.1s) expires; buffer has 0.3s left
+
+    s.p[1].clear();
+    try enqueue_submit(&s.sess, s.p[0].pid, combo_b);
+    try flush(&s.sess);
+
+    // Replaced: pool holds B, no duplicate commit, buffer restarted.
+    try std.testing.expect(logic.combos_equal(combo_b, s.sess.submitted_pool[s.p[0].pid].?));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), s.sess.cast_fire_timers[s.p[0].pid].?, 0.001);
+    var msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_replaced));
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_committed));
+    const rp_msg = find_tag(msgs, .cast_replaced) orelse return error.MissingReplaced;
+    var rp_fbs = std.io.fixedBufferStream(rp_msg.payload);
+    const rp = try proto.decode_cast_replaced(rp_fbs.reader());
+    try std.testing.expectEqual(s.p[0].pid, rp.player_id);
+
+    // A's original expiry (0.3s away) passes without firing — restarted.
+    s.p[1].clear();
+    try s.sess.tick(0.35);
+    msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_fired));
+
+    s.p[1].clear();
+    try s.sess.tick(0.2); // restarted buffer expires → fires the REPLACEMENT
+
+    // Stats counted once (fire time), and the batch used B (blue dispense),
+    // not A: flat blue agents can't transmute the red zone.
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.players[s.p[0].pid].casts);
+    const BLUE: usize = @intFromEnum(c.Element.blue);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.players[s.p[0].pid].dispense_slots[BLUE]);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.players[s.p[0].pid].dispense_slots[RED]);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.zones[0].neutralized[RED]);
+
+    msgs = try drain(s.p[1].buf.items, arena);
+    const cf_msg = find_tag(msgs, .cast_fired) orelse return error.MissingCastFired;
+    var cf_fbs = std.io.fixedBufferStream(cf_msg.payload);
+    const cf = try proto.decode_cast_fired(cf_fbs.reader());
+    try std.testing.expectEqual(@as(u8, 1), cf.spell_count);
+}
+
+test "realtime: zero cast_buffer_ms fires the cast the same tick" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    var custom_cfg = TEST_CFG.*;
+    custom_cfg.balance.cast_buffer_ms = 0;
+    s.sess.cfg = &custom_cfg;
+    try start_realtime(&s, &enc_fifty_red);
+
+    s.p[1].clear();
+    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .red }, .{ .action = .dispense } }));
+    try flush(&s.sess);
+
+    // Accepted AND fired within one tick: 5 red agents transmuted.
+    try std.testing.expectEqual(@as(u16, 5), s.sess.zones[0].neutralized[RED]);
+    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.submitted_pool[s.p[0].pid]);
+    try std.testing.expectEqual(@as(?f32, null), s.sess.cast_fire_timers[s.p[0].pid]);
+    const msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_committed));
+    try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_fired));
+}
+
+test "realtime: neutralize_residue_mult 0.5 halves surviving neutralized slime" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    var custom_cfg = TEST_CFG.*;
+    custom_cfg.balance.neutralize_residue_mult = 0.5;
+    custom_cfg.balance.cast_buffer_ms = 0; // fire immediately, no eating drift
+    s.sess.cfg = &custom_cfg;
+    try start_realtime(&s, &enc_thirty_red); // 30 red modified
+
+    // twin_flames (30 agents) transmutes all 30, but only 15 survive.
+    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
+    try enqueue_submit(&s.sess, s.p[0].pid, half);
+    try enqueue_submit(&s.sess, s.p[1].pid, half);
+    try flush(&s.sess);
+
+    try std.testing.expectEqual(@as(u16, 0), s.sess.zones[0].modified[RED]);
+    try std.testing.expectEqual(@as(u16, 15), s.sess.zones[0].neutralized[RED]);
+}
+
+test "realtime: zero cast_buffer_ms same-drain pair still fires the team recipe" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    var custom_cfg = TEST_CFG.*;
+    custom_cfg.balance.cast_buffer_ms = 0;
+    s.sess.cfg = &custom_cfg;
+    try start_realtime(&s, &enc_thirty_red);
+
+    // Both twin_flames halves land in ONE drain: both timers hit 0 in the
+    // same tick, so they convert as one batch and the recipe fires.
+    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
+    s.p[1].clear();
+    try enqueue_submit(&s.sess, s.p[0].pid, half);
+    try enqueue_submit(&s.sess, s.p[1].pid, half);
+    try flush(&s.sess);
+
+    try std.testing.expectEqual(@as(u16, 0), s.sess.zones[0].modified[RED]);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[0]);
+    const msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_fired));
+}
+
+test "realtime: cast_lock_ms above the buffer throttles the next cast" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    var custom_cfg = TEST_CFG.*;
+    custom_cfg.balance.cast_buffer_ms = 100;
+    custom_cfg.balance.cast_lock_ms = 1000;
+    s.sess.cfg = &custom_cfg;
+    try start_realtime(&s, &enc_fifty_red);
+
+    const combo = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
+    try enqueue_submit(&s.sess, s.p[0].pid, combo);
+    try flush(&s.sess);
+    try s.sess.tick(0.2); // cast fired; lock has 0.8s left
+
+    // Still locked after the fire: resubmit ignored.
+    s.p[1].clear();
+    try enqueue_submit(&s.sess, s.p[0].pid, combo);
+    try flush(&s.sess);
+    var msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_committed));
+    try std.testing.expectEqual(@as(?f32, null), s.sess.cast_fire_timers[s.p[0].pid]);
+
+    // Lock expires → next cast accepted.
+    try s.sess.tick(0.9);
+    s.p[1].clear();
+    try enqueue_submit(&s.sess, s.p[0].pid, combo);
+    try flush(&s.sess);
+    msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_committed));
+    try std.testing.expect(s.sess.cast_fire_timers[s.p[0].pid] != null);
+}
+
+test "realtime: snapshot carries soonest countdown (idle = -1), lock_ms and cast_ms" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start_realtime(&s, &enc_fifty_red);
+
+    // Idle: cast_timer sentinel -1, no locks, no pending casts.
+    s.p[1].clear();
+    try flush(&s.sess);
+    var msgs = try drain(s.p[1].buf.items, arena);
+    var gs_msg = find_tag(msgs, .game_state) orelse return error.MissingGameState;
+    var gs_fbs = std.io.fixedBufferStream(gs_msg.payload);
+    var gs = try proto.decode_game_state(gs_fbs.reader());
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), gs.cast_timer, 0.001);
+    for (gs.entities[0..gs.entity_count]) |e| {
+        try std.testing.expectEqual(@as(u16, 0), e.lock_ms);
+        try std.testing.expectEqual(@as(u16, 0), e.cast_ms);
+    }
+
+    // Cast pending: soonest countdown positive; the submitter's lock_ms and
+    // cast_ms count down, everyone else's stay 0.
+    s.p[1].clear();
+    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .red }, .{ .action = .dispense } }));
+    try flush(&s.sess);
+    msgs = try drain(s.p[1].buf.items, arena);
+    gs_msg = find_tag(msgs, .game_state) orelse return error.MissingGameState;
+    gs_fbs = std.io.fixedBufferStream(gs_msg.payload);
+    gs = try proto.decode_game_state(gs_fbs.reader());
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), gs.cast_timer, 0.001);
+    var found_submitter = false;
+    for (gs.entities[0..gs.entity_count]) |e| {
+        if (e.owner == s.p[0].pid) {
+            try std.testing.expectEqual(@as(u16, 500), e.lock_ms);
+            try std.testing.expectEqual(@as(u16, 500), e.cast_ms);
+            found_submitter = true;
+        } else {
+            try std.testing.expectEqual(@as(u16, 0), e.lock_ms);
+            try std.testing.expectEqual(@as(u16, 0), e.cast_ms);
+        }
+    }
+    try std.testing.expect(found_submitter);
 }
 
 test "realtime: eating grows hunger, shrinks the zone, and advances on empty" {

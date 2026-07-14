@@ -38,6 +38,7 @@ pub const Writer = struct {
         game.last_action_count = 0;
         game.fizzle_count = 0;
         game.recipe_count = 0;
+        game.cast_event_count = 0;
     }
 
     pub fn write_send(self: Writer, bytes: []const u8) void {
@@ -64,6 +65,14 @@ pub const LobbyState = struct {
 
 pub const LastActionEntry = struct { entity: u32, anim: c.ActionAnimation };
 
+/// Realtime cast-loop lifecycle event (transient, drained per frame).
+/// Trace: committed → (replaced | grouped)* → fired.
+pub const CastEvent = union(enum) {
+    grouped: proto.CastGrouped,
+    replaced: proto.CastReplaced,
+    fired: proto.CastFired,
+};
+
 pub const GameState = struct {
     snapshot: proto.GameState = proto.GameState.blank,
     player_id: u8 = 0xFF,
@@ -74,8 +83,8 @@ pub const GameState = struct {
     casts_per_round: u8 = 0,
     /// Play mode, as announced by the server in game_start.
     mode: c.GameMode = .classic,
-    /// Realtime mode: cast window length in ms (0 in classic mode).
-    cast_window_ms: u32 = 0,
+    /// Realtime mode: per-cast buffer length in ms (0 in classic mode).
+    cast_buffer_ms: u32 = 0,
     encounter_label: [32]u8 = [_]u8{0} ** 32,
     encounter_label_len: u8 = 0,
     /// Final score from game_over (null until the encounter ends).
@@ -94,6 +103,9 @@ pub const GameState = struct {
     /// Recipes fired since the last render write (transient).
     recipes_fired: [16]proto.RecipeFired = undefined,
     recipe_count: u8 = 0,
+    /// Realtime cast-loop events since the last render write (transient).
+    cast_events: [16]CastEvent = undefined,
+    cast_event_count: u8 = 0,
 };
 
 fn write_render_inner(
@@ -136,6 +148,8 @@ fn write_render_inner(
             .kind = e.kind,
             .owner = e.owner,
             .casts_used = e.casts_used,
+            .lock_ms = e.lock_ms,
+            .cast_ms = e.cast_ms,
             .last_action = anim,
             .combo = slot_bufs[i][0..e.combo_len],
         };
@@ -145,6 +159,24 @@ fn write_render_inner(
     var recipes_buf: [16]JsonRecipeFired = undefined;
     for (game.recipes_fired[0..game.recipe_count], 0..) |rf, i| {
         recipes_buf[i] = .{ .kind = rf.kind, .index = rf.index };
+    }
+
+    // Convert transient cast-loop events for JSON.
+    var cast_events_buf: [16]JsonCastEvent = undefined;
+    for (game.cast_events[0..game.cast_event_count], 0..) |ev, i| {
+        cast_events_buf[i] = switch (ev) {
+            .grouped => |g| .{
+                .type = "grouped",
+                .player_mask = g.player_mask,
+                .fires_in_ms = g.fires_in_ms,
+            },
+            .replaced => |rp| .{ .type = "replaced", .player_id = rp.player_id },
+            .fired => |f| .{
+                .type = "fired",
+                .spell_count = f.spell_count,
+                .player_mask = f.player_mask,
+            },
+        };
     }
 
     // Convert pending combo slots for JSON.
@@ -225,7 +257,7 @@ fn write_render_inner(
             .encounter = game.encounter_label[0..game.encounter_label_len],
             .player_id = game.player_id,
             .mode = game.mode,
-            .cast_window_ms = game.cast_window_ms,
+            .cast_buffer_ms = game.cast_buffer_ms,
             .pending_combo = pending_slots_buf[0..game.pending_combo.len],
             .round_timer = game.round_timer,
             .round_duration = game.round_duration,
@@ -249,6 +281,7 @@ fn write_render_inner(
             .zones = zones_buf[0..game.snapshot.zone_count],
             .fizzles = game.fizzles[0..game.fizzle_count],
             .recipes_fired = recipes_buf[0..game.recipe_count],
+            .cast_events = cast_events_buf[0..game.cast_event_count],
         } else null,
         .score = if (phase == .game_over) game.final_score else null,
         .stats = json_stats,
@@ -388,12 +421,14 @@ const JsonGame = struct {
     player_id: u8,
     /// Play mode ("classic" | "realtime").
     mode: c.GameMode,
-    /// Realtime mode: cast window length in ms (0 in classic mode).
-    cast_window_ms: u32,
+    /// Realtime mode: per-cast buffer length in ms (0 in classic mode).
+    cast_buffer_ms: u32,
     pending_combo: []const JsonComboSlot,
     round_timer: f32,
     round_duration: f32,
-    /// Countdown of the current cast window (round_duration / casts_per_round).
+    /// Classic: countdown of the current cast window (round_duration /
+    /// casts_per_round).  Realtime: the SOONEST pending cast's remaining
+    /// buffer, or -1 when nothing is pending (idle).
     cast_timer: f32,
     casts_per_round: u8,
     tick: u32,
@@ -409,11 +444,23 @@ const JsonGame = struct {
     /// to the balance recipe table for `kind` (JS resolves labels from the
     /// fetched data/balance.json, same order).
     recipes_fired: []const JsonRecipeFired,
+    /// Realtime cast-loop events since the previous frame (transient).
+    cast_events: []const JsonCastEvent,
 };
 
 const JsonRecipeFired = struct {
     kind: proto.RecipeKind,
     index: u8,
+};
+
+/// One realtime cast-loop event.  `type` is "grouped" | "replaced" |
+/// "fired"; unused fields are omitted (emit_null_optional_fields=false).
+const JsonCastEvent = struct {
+    type: []const u8,
+    player_id: ?u8 = null,
+    fires_in_ms: ?u32 = null,
+    spell_count: ?u8 = null,
+    player_mask: ?u8 = null,
 };
 
 const JsonEntity = struct {
@@ -422,6 +469,11 @@ const JsonEntity = struct {
     owner: u8,
     /// Spells committed this round (0..casts_per_round).
     casts_used: u8,
+    /// Realtime: remaining cast-lock cooldown in ms (0 in classic mode).
+    lock_ms: u16,
+    /// Realtime: remaining buffer of this player's pending cast in ms
+    /// (0 = no cast pending; 0 in classic mode).
+    cast_ms: u16,
     last_action: ?c.ActionAnimation,
     combo: []const JsonComboSlot,
 };

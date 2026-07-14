@@ -56,17 +56,29 @@ pub const Balance = struct {
     hunger_cost_normal: u32,
     /// EXTRA hunger per un-neutralized modified unit consumed (healable portion).
     hunger_cost_modified_extra: u32,
+    /// Portion (0.0–1.0) of transmuted modified slime that SURVIVES as
+    /// neutralized slime; the rest is destroyed outright (less to eat, less
+    /// hunger, less score).  Rounded down per transmute call per color, so
+    /// e.g. 0.5 on a single unit leaves nothing.  1.0 = everything survives.
+    neutralize_residue_mult: f32,
     /// Round length in seconds unless overridden with --round-duration.
     /// Classic mode only.
     round_duration_default_s: f32,
     /// Realtime mode: slime units eaten per second PER LIL GUY (one Lil Guy
     /// per connected player) — the team eats at rate × players.
     eat_rate_units_per_s: f32,
-    /// Realtime mode: length of the repeating cast window in milliseconds.
-    /// Submitted spells batch-convert (recipes → medicine → transmute) when
-    /// the window closes; team recipes require distinct players submitting
-    /// in the SAME window.
-    cast_window_ms: u32,
+    /// Realtime mode: PER-CAST buffer in milliseconds.  Each accepted
+    /// submit_spell fires solo when its own buffer expires — unless a newly
+    /// accepted cast COMPLETES a team recipe with pending casts, in which
+    /// case that recipe instance's members fire together at the newest
+    /// joiner's expiry.  0 = fire immediately (no grouping window).
+    cast_buffer_ms: u32,
+    /// Realtime mode: per-player cast cooldown in milliseconds, started on
+    /// each accepted submit.  While locked further submits are ignored; once
+    /// unlocked a resubmit REPLACES the player's pending cast (restarting
+    /// its buffer).  Values above cast_buffer_ms throttle overall cast
+    /// rate.  0 = no lock.
+    cast_lock_ms: u32,
     player_recipes: []const PlayerRecipe,
     team_recipes: []const TeamRecipe,
 };

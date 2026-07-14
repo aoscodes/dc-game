@@ -19,6 +19,9 @@ pub const MsgTag = enum(u8) {
     cast_committed = 0x16,
     cast_fizzled = 0x17,
     recipe_fired = 0x18,
+    cast_grouped = 0x19,
+    cast_replaced = 0x1a,
+    cast_fired = 0x1b,
 };
 
 pub const JoinLobby = struct {
@@ -74,6 +77,52 @@ pub fn decode_cast_fizzled(reader: anytype) !CastFizzled {
     return .{ .player_id = try reader.readByte() };
 }
 
+/// Realtime: a newly accepted cast COMPLETED a team recipe with pending
+/// casts — the instance's members now share one fire time (the joiner's
+/// buffer expiry).  Cast-loop trace: cast_committed →
+/// [cast_replaced | cast_grouped]* → cast_fired.
+pub const CastGrouped = struct {
+    /// Bit i set = player_id i's pending cast is in the group (MAX_PLAYERS <= 8).
+    player_mask: u8,
+    /// The group fires this many ms after this event (the joiner's buffer).
+    fires_in_ms: u32,
+};
+
+pub fn decode_cast_grouped(reader: anytype) !CastGrouped {
+    return .{
+        .player_mask = try reader.readByte(),
+        .fires_in_ms = try reader.readInt(u32, .little),
+    };
+}
+
+/// Realtime: an unlocked resubmit REPLACED the player's pending cast — its
+/// buffer restarts (no second cast_committed is sent).
+pub const CastReplaced = struct {
+    player_id: u8,
+};
+
+pub fn decode_cast_replaced(reader: anytype) !CastReplaced {
+    return .{ .player_id = try reader.readByte() };
+}
+
+/// Realtime: pending casts whose buffers expired converted as one batch —
+/// sent just before conversion (so it precedes the batch's recipe_fired /
+/// action_result messages).  Grouped casts share an expiry and fire
+/// together; a solo cast fires with spell_count = 1.
+pub const CastFired = struct {
+    /// Spells in the converting batch.
+    spell_count: u8,
+    /// Bit i set = player_id i contributed a spell (MAX_PLAYERS <= 8).
+    player_mask: u8,
+};
+
+pub fn decode_cast_fired(reader: anytype) !CastFired {
+    return .{
+        .spell_count = try reader.readByte(),
+        .player_mask = try reader.readByte(),
+    };
+}
+
 pub const RecipeKind = enum(u8) {
     player = 0,
     team = 1,
@@ -92,6 +141,11 @@ pub fn decode_recipe_fired(reader: anytype) !RecipeFired {
 }
 
 pub const MAX_PLAYERS: u8 = 6;
+
+// CastWaveFired.player_mask packs one bit per player.
+comptime {
+    std.debug.assert(MAX_PLAYERS <= 8);
+}
 
 pub const PlayerInfo = struct {
     player_id: u8,
@@ -118,7 +172,9 @@ pub const GameStart = struct {
     round_duration: f32,
     casts_per_round: u8,
     mode: components.GameMode = .classic,
-    cast_window_ms: u32 = 0,
+    /// Realtime: per-cast buffer length (balance.cast_buffer_ms); 0 in
+    /// classic mode.
+    cast_buffer_ms: u32 = 0,
 };
 
 pub const EntitySnapshot = struct {
@@ -126,6 +182,12 @@ pub const EntitySnapshot = struct {
     kind: components.EntityKind,
     owner: u8,
     casts_used: u8,
+    /// Realtime: remaining cast-lock cooldown in ms (saturated to u16);
+    /// 0 = may submit.  Always 0 in classic mode.
+    lock_ms: u16,
+    /// Realtime: remaining buffer of this player's PENDING cast in ms
+    /// (saturated to u16); 0 = no cast pending.  Always 0 in classic mode.
+    cast_ms: u16,
     combo_len: u8,
     combo_slots: [components.MAX_COMBO_LEN]components.ComboSlot,
 
@@ -134,6 +196,8 @@ pub const EntitySnapshot = struct {
         .kind = .player,
         .owner = 0xFF,
         .casts_used = 0,
+        .lock_ms = 0,
+        .cast_ms = 0,
         .combo_len = 0,
         .combo_slots = [_]components.ComboSlot{.{ .action = .dispense }} ** components.MAX_COMBO_LEN,
     };
@@ -286,6 +350,15 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
             try writer.writeByte(@intFromEnum(payload.kind));
             try writer.writeByte(payload.index);
         },
+        .cast_grouped => {
+            try writer.writeByte(payload.player_mask);
+            try writer.writeInt(u32, payload.fires_in_ms, .little);
+        },
+        .cast_replaced => try writer.writeByte(payload.player_id),
+        .cast_fired => {
+            try writer.writeByte(payload.spell_count);
+            try writer.writeByte(payload.player_mask);
+        },
 
         .lobby_update => try encode_lobby_update(writer, payload),
         .game_start => try encode_game_start(writer, payload),
@@ -328,7 +401,7 @@ fn encode_game_start(w: anytype, p: GameStart) !void {
     try w.writeInt(u32, @bitCast(p.round_duration), .little);
     try w.writeByte(p.casts_per_round);
     try w.writeByte(@intFromEnum(p.mode));
-    try w.writeInt(u32, p.cast_window_ms, .little);
+    try w.writeInt(u32, p.cast_buffer_ms, .little);
 }
 
 fn encode_bar_summary(w: anytype, s: BarSummary) !void {
@@ -354,6 +427,8 @@ fn encode_game_state(w: anytype, p: GameState) !void {
         try w.writeByte(@intFromEnum(e.kind));
         try w.writeByte(e.owner);
         try w.writeByte(e.casts_used);
+        try w.writeInt(u16, e.lock_ms, .little);
+        try w.writeInt(u16, e.cast_ms, .little);
         try w.writeByte(e.combo_len);
         var j: u8 = 0;
         while (j < e.combo_len) : (j += 1)
@@ -581,7 +656,7 @@ pub fn decode_game_start(reader: anytype) !GameStart {
     const mode_byte = try reader.readByte();
     p.mode = std.meta.intToEnum(components.GameMode, mode_byte) catch
         return DecodeError.InvalidGameMode;
-    p.cast_window_ms = try reader.readInt(u32, .little);
+    p.cast_buffer_ms = try reader.readInt(u32, .little);
     return p;
 }
 
@@ -616,6 +691,8 @@ pub fn decode_game_state(reader: anytype) !GameState {
             return DecodeError.InvalidKind;
         e.owner = try reader.readByte();
         e.casts_used = try reader.readByte();
+        e.lock_ms = try reader.readInt(u16, .little);
+        e.cast_ms = try reader.readInt(u16, .little);
         e.combo_len = try reader.readByte();
         if (e.combo_len > components.MAX_COMBO_LEN) return DecodeError.InvalidComboLen;
         e.combo_slots = [_]components.ComboSlot{.{ .action = .dispense }} ** components.MAX_COMBO_LEN;
@@ -767,6 +844,8 @@ test "round-trip: game_state — hunger, score, zones, and combo survive" {
         .kind = .player,
         .owner = 0,
         .casts_used = 2,
+        .lock_ms = 350,
+        .cast_ms = 420,
         .combo_len = 2,
         .combo_slots = [_]components.ComboSlot{
             .{ .element = .red },
@@ -788,6 +867,8 @@ test "round-trip: game_state — hunger, score, zones, and combo survive" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.6), decoded.cast_timer, 0.001);
     try std.testing.expectEqual(@as(u8, 1), decoded.entity_count);
     try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].casts_used);
+    try std.testing.expectEqual(@as(u16, 350), decoded.entities[0].lock_ms);
+    try std.testing.expectEqual(@as(u16, 420), decoded.entities[0].cast_ms);
     try std.testing.expectEqual(@as(u16, 80), decoded.hunger.current);
     try std.testing.expectEqual(@as(u16, 200), decoded.hunger.max);
     try std.testing.expectEqual(@as(u16, 30), decoded.hunger_healable[0]);
@@ -936,7 +1017,7 @@ test "round-trip: submit_spell carries the combo" {
     try std.testing.expectEqual(components.ActionChoice.dispense, decoded.combo.slots[1].action);
 }
 
-test "round-trip: game_start realtime mode + cast_window_ms survive" {
+test "round-trip: game_start realtime mode + cast_buffer_ms survive" {
     var buf: [64]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
 
@@ -948,7 +1029,7 @@ test "round-trip: game_start realtime mode + cast_window_ms survive" {
         .round_duration = 0.0,
         .casts_per_round = 1,
         .mode = .realtime,
-        .cast_window_ms = 3000,
+        .cast_buffer_ms = 500,
     };
     @memcpy(gs.encounter_label[0..label.len], label);
 
@@ -957,8 +1038,46 @@ test "round-trip: game_start realtime mode + cast_window_ms survive" {
     _ = try read_tag(fbs.reader());
     const decoded = try decode_game_start(fbs.reader());
     try std.testing.expectEqual(components.GameMode.realtime, decoded.mode);
-    try std.testing.expectEqual(@as(u32, 3000), decoded.cast_window_ms);
+    try std.testing.expectEqual(@as(u32, 500), decoded.cast_buffer_ms);
     try std.testing.expectEqual(@as(u8, 1), decoded.casts_per_round);
+}
+
+test "round-trip: cast_grouped carries player mask and fire delay" {
+    var buf: [16]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try encode(fbs.writer(), .cast_grouped, CastGrouped{
+        .player_mask = 0b0000_0011,
+        .fires_in_ms = 500,
+    });
+    fbs.reset();
+    try std.testing.expectEqual(MsgTag.cast_grouped, try read_tag(fbs.reader()));
+    const decoded = try decode_cast_grouped(fbs.reader());
+    try std.testing.expectEqual(@as(u8, 0b0000_0011), decoded.player_mask);
+    try std.testing.expectEqual(@as(u32, 500), decoded.fires_in_ms);
+}
+
+test "round-trip: cast_replaced carries player_id" {
+    var buf: [8]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try encode(fbs.writer(), .cast_replaced, CastReplaced{ .player_id = 4 });
+    fbs.reset();
+    try std.testing.expectEqual(MsgTag.cast_replaced, try read_tag(fbs.reader()));
+    const decoded = try decode_cast_replaced(fbs.reader());
+    try std.testing.expectEqual(@as(u8, 4), decoded.player_id);
+}
+
+test "round-trip: cast_fired carries count and player mask" {
+    var buf: [8]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try encode(fbs.writer(), .cast_fired, CastFired{
+        .spell_count = 2,
+        .player_mask = 0b0000_0101,
+    });
+    fbs.reset();
+    try std.testing.expectEqual(MsgTag.cast_fired, try read_tag(fbs.reader()));
+    const decoded = try decode_cast_fired(fbs.reader());
+    try std.testing.expectEqual(@as(u8, 2), decoded.spell_count);
+    try std.testing.expectEqual(@as(u8, 0b0000_0101), decoded.player_mask);
 }
 
 test "round-trip: lobby_update mode survives" {

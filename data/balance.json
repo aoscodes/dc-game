@@ -1,12 +1,14 @@
 {
-  "casts_per_round": 3,
+  "casts_per_round": 1,
   "units_per_slot": 5,
   "medicine_per_slot": 3,
   "hunger_cost_normal": 1,
   "hunger_cost_modified_extra": 2,
-  "round_duration_default_s": 15.0,
+  "neutralize_residue_mult": 0.5,
+  "round_duration_default_s": 5.0,
   "eat_rate_units_per_s": 2.0,
-  "cast_window_ms": 3000,
+  "cast_buffer_ms": 500,
+  "cast_lock_ms": 500,
   "player_recipes": [
     {
       "label": "big_red",

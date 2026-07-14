@@ -121,6 +121,9 @@ pub const MAX_CASTS: usize = 64;
 /// How a cast was converted during recipe matching.
 pub const ConsumedBy = enum(u8) { none, player_recipe, team_recipe };
 
+/// team_instance value for casts not consumed by a team recipe.
+pub const NO_TEAM_INSTANCE: u8 = 0xFF;
+
 /// Per-round recipe-matching report for tuning stats.  Hit arrays are sized
 /// by the wire caps; entries beyond the loaded table lengths stay zero.
 pub const MatchReport = struct {
@@ -132,6 +135,11 @@ pub const MatchReport = struct {
         [_]u16{0} ** balance.MAX_TEAM_RECIPES,
     /// Parallel to the casts slice: what consumed each cast.
     consumed: [MAX_CASTS]ConsumedBy = [_]ConsumedBy{.none} ** MAX_CASTS,
+    /// Parallel to the casts slice: team-recipe INSTANCE id (counter across
+    /// all fired team recipes; casts of the same instance share an id).
+    /// NO_TEAM_INSTANCE for casts not consumed by a team recipe.  Lets the
+    /// realtime server group exactly one recipe instance's casts.
+    team_instance: [MAX_CASTS]u8 = [_]u8{NO_TEAM_INSTANCE} ** MAX_CASTS,
 };
 
 /// Convert one round's committed casts into the team's combined AgentOutput.
@@ -149,6 +157,7 @@ pub fn match_recipes(bal: *const balance.Balance, casts: []const Cast, report: ?
     std.debug.assert(casts.len <= MAX_CASTS);
     var out = c.AgentOutput{};
     var consumed = [_]bool{false} ** MAX_CASTS;
+    var instance_counter: u8 = 0;
 
     // 1. Team recipes — greedy, repeatable, table order, distinct players.
     for (bal.team_recipes, 0..) |tr, ti| {
@@ -172,9 +181,13 @@ pub fn match_recipes(bal: *const balance.Balance, casts: []const Cast, report: ?
             }
             for (tr.patterns, 0..) |_, pi| {
                 consumed[picks[pi]] = true;
-                if (report) |r| r.consumed[picks[pi]] = .team_recipe;
+                if (report) |r| {
+                    r.consumed[picks[pi]] = .team_recipe;
+                    r.team_instance[picks[pi]] = instance_counter;
+                }
             }
             if (report) |r| r.team_hits[ti] +|= 1;
+            instance_counter +|= 1;
             out.add(tr.output);
         }
     }
@@ -246,17 +259,25 @@ pub fn hunger_full(hunger: c.Health) bool {
     return hunger.max > 0 and hunger.current >= hunger.max;
 }
 
-/// Transmute matching-color Modified Slime into Neutralized Slime using this
-/// cast window's agent units: per color `min(agents, modified)` moves from
-/// `zone.modified` to `zone.neutralized`.  Excess and wrong-color agents are
-/// wasted (no carry-over between windows).  Returns units transmuted per
-/// color this window.
-pub fn transmute(zone: *c.ZoneDef, agents: [c.Element.size]u32) [c.Element.size]u16 {
+/// Transmute matching-color Modified Slime using this cast window's agent
+/// units: per color `t = min(agents, modified)` units leave `zone.modified`,
+/// but only `floor(residue_mult × t)` survive into `zone.neutralized` — the
+/// rest are destroyed outright (residue_mult 1.0 = everything survives,
+/// today's default; rounding is per call per color, always down, so e.g.
+/// 0.5 × 1 unit leaves nothing).  Excess and wrong-color agents are wasted
+/// (no carry-over between windows).  Returns units transmuted (removed from
+/// modified) per color this window.
+pub fn transmute(
+    zone: *c.ZoneDef,
+    agents: [c.Element.size]u32,
+    residue_mult: f32,
+) [c.Element.size]u16 {
     var transmuted = [_]u16{0} ** c.Element.size;
     for (agents, 0..) |pool, i| {
         const n: u16 = @intCast(@min(pool, @as(u32, zone.modified[i])));
+        const survivors: u16 = @intFromFloat(@floor(residue_mult * @as(f32, @floatFromInt(n))));
         zone.modified[i] -= n;
-        zone.neutralized[i] +|= n;
+        zone.neutralized[i] +|= @min(survivors, n);
         transmuted[i] = n;
     }
     return transmuted;
@@ -556,6 +577,28 @@ test "match_recipes: team recipe fires twice for two disjoint pairs" {
     try std.testing.expectEqual(2 * twin_flames_med, out.medicine[@intFromEnum(c.Element.red)]);
 }
 
+test "match_recipes: team_instance groups each recipe instance's casts" {
+    // Two disjoint twin_flames pairs + one flat cast: instances {0,1} and
+    // {2,3} get distinct shared ids; the flat cast stays unassigned.
+    const pat = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const casts = [_]Cast{
+        .{ .player_id = 0, .combo = pat },
+        .{ .player_id = 1, .combo = pat },
+        .{ .player_id = 2, .combo = pat },
+        .{ .player_id = 3, .combo = pat },
+        .{ .player_id = 4, .combo = mk(&.{ .{ .element = .blue }, .{ .action = .dispense } }) },
+    };
+    var report = MatchReport{};
+    _ = match_recipes(test_bal, &casts, &report);
+
+    try std.testing.expectEqual(report.team_instance[0], report.team_instance[1]);
+    try std.testing.expectEqual(report.team_instance[2], report.team_instance[3]);
+    try std.testing.expect(report.team_instance[0] != report.team_instance[2]);
+    try std.testing.expect(report.team_instance[0] != NO_TEAM_INSTANCE);
+    try std.testing.expect(report.team_instance[2] != NO_TEAM_INSTANCE);
+    try std.testing.expectEqual(NO_TEAM_INSTANCE, report.team_instance[4]);
+}
+
 test "match_recipes: same player casting both halves does NOT fire team recipe" {
     // Team recipes require distinct players; one player's two twin_flames
     // halves fall back to flat conversion (2 × 2 × UNITS_PER_SLOT red).
@@ -681,7 +724,7 @@ test "transmute: partial neutralization (25 of 50) moves units in place" {
     zone.modified[@intFromEnum(c.Element.red)] = 50;
     var agents = [_]u32{0} ** c.Element.size;
     agents[@intFromEnum(c.Element.red)] = 25;
-    const moved = transmute(&zone, agents);
+    const moved = transmute(&zone, agents, 1.0);
     try std.testing.expectEqual(@as(u16, 25), moved[@intFromEnum(c.Element.red)]);
     try std.testing.expectEqual(@as(u16, 25), zone.modified[@intFromEnum(c.Element.red)]);
     try std.testing.expectEqual(@as(u16, 25), zone.neutralized[@intFromEnum(c.Element.red)]);
@@ -702,7 +745,7 @@ test "transmute: excess agents in a window are wasted" {
     zone.modified[@intFromEnum(c.Element.blue)] = 10;
     var agents = [_]u32{0} ** c.Element.size;
     agents[@intFromEnum(c.Element.blue)] = 999;
-    const moved = transmute(&zone, agents);
+    const moved = transmute(&zone, agents, 1.0);
     try std.testing.expectEqual(@as(u16, 10), moved[@intFromEnum(c.Element.blue)]);
     try std.testing.expectEqual(@as(u16, 0), zone.modified[@intFromEnum(c.Element.blue)]);
 
@@ -717,7 +760,7 @@ test "transmute: wrong-color agents have no effect" {
     zone.modified[@intFromEnum(c.Element.red)] = 20;
     var agents = [_]u32{0} ** c.Element.size;
     agents[@intFromEnum(c.Element.blue)] = 20;
-    const moved = transmute(&zone, agents);
+    const moved = transmute(&zone, agents, 1.0);
     for (moved) |m| try std.testing.expectEqual(@as(u16, 0), m);
 
     const outcome = consume_zone(test_bal, zone);
@@ -735,14 +778,14 @@ test "transmute: sequential windows equal one batched application" {
 
     var batch = [_]u32{0} ** c.Element.size;
     batch[0] = 25;
-    _ = transmute(&zone_a, batch);
+    _ = transmute(&zone_a, batch, 1.0);
 
     var w1 = [_]u32{0} ** c.Element.size;
     w1[0] = 10;
     var w2 = [_]u32{0} ** c.Element.size;
     w2[0] = 15;
-    _ = transmute(&zone_b, w1);
-    _ = transmute(&zone_b, w2);
+    _ = transmute(&zone_b, w1, 1.0);
+    _ = transmute(&zone_b, w2, 1.0);
 
     try std.testing.expectEqual(zone_a.modified[0], zone_b.modified[0]);
     try std.testing.expectEqual(zone_a.neutralized[0], zone_b.neutralized[0]);
@@ -750,6 +793,46 @@ test "transmute: sequential windows equal one batched application" {
     const ob = consume_zone(test_bal, zone_b);
     try std.testing.expectEqual(oa.score, ob.score);
     try std.testing.expectEqual(oa.hunger_extra_total(), ob.hunger_extra_total());
+}
+
+test "transmute: residue_mult 0.5 keeps half the transmuted units" {
+    var zone = c.ZoneDef{};
+    zone.modified[@intFromEnum(c.Element.red)] = 30;
+    var agents = [_]u32{0} ** c.Element.size;
+    agents[@intFromEnum(c.Element.red)] = 30;
+    const moved = transmute(&zone, agents, 0.5);
+    try std.testing.expectEqual(@as(u16, 30), moved[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(@as(u16, 0), zone.modified[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(@as(u16, 15), zone.neutralized[@intFromEnum(c.Element.red)]);
+    // Half the slime destroyed: total shrinks, and so does the score ceiling.
+    try std.testing.expectEqual(@as(u32, 15), zone.total_units());
+    try std.testing.expectEqual(@as(u32, 15), consume_zone(test_bal, zone).score);
+}
+
+test "transmute: residue rounds down per call per color (0.5 × 1 → 0)" {
+    var zone = c.ZoneDef{};
+    zone.modified[@intFromEnum(c.Element.red)] = 1;
+    zone.modified[@intFromEnum(c.Element.blue)] = 3;
+    var agents = [_]u32{0} ** c.Element.size;
+    agents[@intFromEnum(c.Element.red)] = 1;
+    agents[@intFromEnum(c.Element.blue)] = 3;
+    _ = transmute(&zone, agents, 0.5);
+    // 0.5 × 1 = 0 survivors; 0.5 × 3 = 1 survivor.
+    try std.testing.expectEqual(@as(u16, 0), zone.neutralized[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(@as(u16, 1), zone.neutralized[@intFromEnum(c.Element.blue)]);
+    try std.testing.expectEqual(@as(u16, 0), zone.modified[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(@as(u16, 0), zone.modified[@intFromEnum(c.Element.blue)]);
+}
+
+test "transmute: residue_mult 0 destroys all transmuted slime" {
+    var zone = c.ZoneDef{ .neutral = 5 };
+    zone.modified[@intFromEnum(c.Element.red)] = 20;
+    var agents = [_]u32{0} ** c.Element.size;
+    agents[@intFromEnum(c.Element.red)] = 20;
+    _ = transmute(&zone, agents, 0.0);
+    try std.testing.expectEqual(@as(u16, 0), zone.modified[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(@as(u16, 0), zone.neutralized[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(@as(u32, 5), zone.total_units()); // neutral untouched
 }
 
 test "eat_units: largest bucket eaten first, deterministic tiebreak order" {
@@ -818,7 +901,7 @@ test "eat_units: interleaved transmutation neutralizes remaining modified slime"
     try std.testing.expectEqual(4 * test_bal.hunger_cost_modified_extra, first.hunger_extra_total());
     var agents = [_]u32{0} ** c.Element.size;
     agents[@intFromEnum(c.Element.red)] = 99;
-    _ = transmute(&zone, agents);
+    _ = transmute(&zone, agents, 1.0);
     const rest = eat_units(test_bal, &zone, 99);
     try std.testing.expectEqual(@as(u32, 6), rest.eaten);
     try std.testing.expectEqual(@as(u32, 0), rest.hunger_extra_total());
@@ -837,7 +920,7 @@ test "consume_zone: fully transmuted mixed zone" {
     var zone = c.ZoneDef{ .neutral = 5 };
     zone.modified = .{ 10, 20, 0, 0 };
     const agents = [_]u32{ 10, 20, 0, 0 };
-    _ = transmute(&zone, agents);
+    _ = transmute(&zone, agents, 1.0);
     const outcome = consume_zone(test_bal, zone);
     try std.testing.expectEqual(@as(u32, 0), outcome.modified_consumed);
     try std.testing.expectEqual(@as(u32, 35), outcome.score);

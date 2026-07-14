@@ -59,7 +59,9 @@ pub const ConfigError = error{
     InvalidCastsPerRound,
     InvalidRoundDuration,
     InvalidEatRate,
-    InvalidCastWindow,
+    InvalidResidueMult,
+    InvalidCastBuffer,
+    InvalidCastLock,
     TooManyRecipes,
     InvalidTeamPatternCount,
     InvalidComboLength,
@@ -159,11 +161,19 @@ const BalanceJson = struct {
     medicine_per_slot: u32,
     hunger_cost_normal: u32,
     hunger_cost_modified_extra: u32,
+    /// Portion of transmuted slime surviving as neutralized; defaulted so
+    /// pre-residue configs keep validating unchanged.
+    neutralize_residue_mult: f32 = 1.0,
     round_duration_default_s: f32,
     /// Realtime mode fields; defaulted so pre-realtime configs (including
     /// saved /tune configs) keep validating unchanged.
     eat_rate_units_per_s: f32 = 2.0,
-    cast_window_ms: u32 = 3000,
+    cast_buffer_ms: u32 = 500,
+    cast_lock_ms: u32 = 500,
+    /// DEPRECATED (ignored): pre-buffer realtime configs carried a repeating
+    /// cast window.  Kept so old saved /tune configs still parse (std.json
+    /// rejects unknown fields).
+    cast_window_ms: u32 = 0,
     player_recipes: []const PlayerRecipeJson,
     team_recipes: []const TeamRecipeJson,
 };
@@ -209,9 +219,17 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         fail("{s}: eat_rate_units_per_s must be > 0", .{BALANCE_FILE});
         return ConfigError.InvalidEatRate;
     }
-    if (raw.cast_window_ms == 0) {
-        fail("{s}: cast_window_ms must be >= 1", .{BALANCE_FILE});
-        return ConfigError.InvalidCastWindow;
+    if (!(raw.neutralize_residue_mult >= 0.0 and raw.neutralize_residue_mult <= 1.0)) {
+        fail("{s}: neutralize_residue_mult must be within 0.0..1.0", .{BALANCE_FILE});
+        return ConfigError.InvalidResidueMult;
+    }
+    if (raw.cast_buffer_ms > 60_000) {
+        fail("{s}: cast_buffer_ms must be <= 60000", .{BALANCE_FILE});
+        return ConfigError.InvalidCastBuffer;
+    }
+    if (raw.cast_lock_ms > 60_000) {
+        fail("{s}: cast_lock_ms must be <= 60000", .{BALANCE_FILE});
+        return ConfigError.InvalidCastLock;
     }
     if (raw.player_recipes.len > balance.MAX_PLAYER_RECIPES) {
         fail("{s}: {} player recipes exceeds cap {}", .{ BALANCE_FILE, raw.player_recipes.len, balance.MAX_PLAYER_RECIPES });
@@ -256,9 +274,11 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         .medicine_per_slot = raw.medicine_per_slot,
         .hunger_cost_normal = raw.hunger_cost_normal,
         .hunger_cost_modified_extra = raw.hunger_cost_modified_extra,
+        .neutralize_residue_mult = raw.neutralize_residue_mult,
         .round_duration_default_s = raw.round_duration_default_s,
         .eat_rate_units_per_s = raw.eat_rate_units_per_s,
-        .cast_window_ms = raw.cast_window_ms,
+        .cast_buffer_ms = raw.cast_buffer_ms,
+        .cast_lock_ms = raw.cast_lock_ms,
         .player_recipes = players,
         .team_recipes = teams,
     };
@@ -452,7 +472,57 @@ test "realtime fields default when absent (pre-realtime configs stay valid)" {
     var loaded = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
     defer loaded.deinit();
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), loaded.config.balance.eat_rate_units_per_s, 0.001);
-    try std.testing.expectEqual(@as(u32, 3000), loaded.config.balance.cast_window_ms);
+    try std.testing.expectEqual(@as(u32, 500), loaded.config.balance.cast_buffer_ms);
+    try std.testing.expectEqual(@as(u32, 500), loaded.config.balance.cast_lock_ms);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), loaded.config.balance.neutralize_residue_mult, 0.001);
+}
+
+test "out-of-range neutralize_residue_mult is rejected" {
+    const over =
+        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
+        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
+        \\ "round_duration_default_s":15,"neutralize_residue_mult":1.5,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidResidueMult,
+        parse(std.testing.allocator, over, minimal_encounters),
+    );
+    const negative =
+        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
+        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
+        \\ "round_duration_default_s":15,"neutralize_residue_mult":-0.1,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidResidueMult,
+        parse(std.testing.allocator, negative, minimal_encounters),
+    );
+}
+
+test "zero neutralize_residue_mult is valid" {
+    const doc =
+        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
+        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
+        \\ "round_duration_default_s":15,"neutralize_residue_mult":0,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), loaded.config.balance.neutralize_residue_mult, 0.001);
+}
+
+test "deprecated cast_window_ms is accepted and ignored" {
+    const old =
+        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
+        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
+        \\ "round_duration_default_s":15,"cast_window_ms":3000,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    var loaded = try parse(std.testing.allocator, old, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u32, 500), loaded.config.balance.cast_buffer_ms);
+    try std.testing.expectEqual(@as(u32, 500), loaded.config.balance.cast_lock_ms);
 }
 
 test "zero eat_rate_units_per_s is rejected" {
@@ -468,17 +538,43 @@ test "zero eat_rate_units_per_s is rejected" {
     );
 }
 
-test "zero cast_window_ms is rejected" {
+test "over-cap cast_buffer_ms is rejected" {
     const bad =
         \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
         \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,"cast_window_ms":0,
+        \\ "round_duration_default_s":15,"cast_buffer_ms":60001,
         \\ "player_recipes":[],"team_recipes":[]}
     ;
     try std.testing.expectError(
-        ConfigError.InvalidCastWindow,
+        ConfigError.InvalidCastBuffer,
         parse(std.testing.allocator, bad, minimal_encounters),
     );
+}
+
+test "over-cap cast_lock_ms is rejected" {
+    const bad =
+        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
+        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
+        \\ "round_duration_default_s":15,"cast_lock_ms":60001,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidCastLock,
+        parse(std.testing.allocator, bad, minimal_encounters),
+    );
+}
+
+test "zero cast_buffer_ms and cast_lock_ms are valid" {
+    const doc =
+        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
+        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
+        \\ "round_duration_default_s":15,"cast_buffer_ms":0,"cast_lock_ms":0,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u32, 0), loaded.config.balance.cast_buffer_ms);
+    try std.testing.expectEqual(@as(u32, 0), loaded.config.balance.cast_lock_ms);
 }
 
 test "zero casts_per_round is rejected" {

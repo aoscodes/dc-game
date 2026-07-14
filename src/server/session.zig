@@ -26,12 +26,19 @@
 //!   3. Advances to the next zone.
 //!
 //! The round loop above is CLASSIC mode.  In REALTIME mode (`mode =
-//! .realtime`) there is no round timer: the Lil Guys eat the current zone
-//! continuously (`eat_rate_units_per_s` per connected player), and players
-//! explicitly lock in one spell per fixed cast window (`submit_spell`,
-//! window length `cast_window_ms`).  At window close every submitted spell
-//! converts as one batch — the same pipeline as classic (recipes, medicine,
-//! transmutation).  An emptied zone advances immediately (round_reset).
+//! .realtime`) there is no round timer and no repeating cast timer: the Lil
+//! Guys eat the current zone continuously (`eat_rate_units_per_s` per
+//! connected player) and casts fire on demand (`submit_spell`).  Each
+//! accepted cast gets its OWN `cast_buffer_ms` countdown and fires solo at
+//! its expiry — UNLESS a newly accepted cast COMPLETES a team recipe with
+//! pending casts: that recipe instance's members then share the joiner's
+//! expiry (`cast_grouped`) and fire together.  Expired casts convert as one
+//! batch (`cast_fired`) through the same pipeline as classic (recipes,
+//! medicine, transmutation).  Each accepted submit also starts a per-player
+//! `cast_lock_ms` cooldown: locked submits are silently ignored, and an
+//! unlocked resubmit REPLACES the player's pending cast, restarting its
+//! buffer (`cast_replaced`).  An emptied zone advances immediately
+//! (round_reset).
 //!
 //! The encounter ends when all zones are consumed OR the hunger bar fills.
 //! Either way the final shared score is broadcast via game_over.
@@ -109,13 +116,21 @@ pub const Session = struct {
     action_pool: [MAX_PLAYERS]?c.ActionCombo,
     /// Play style: classic timed rounds or realtime continuous eating.
     mode: c.GameMode = .classic,
-    /// Realtime: spells locked in for the current cast window (null = none).
-    /// Reset when the window commits and on game start.
+    /// Realtime: each player's PENDING cast (null = none).  Cleared when the
+    /// cast fires and on game start.
     submitted_pool: [MAX_PLAYERS]?c.ActionCombo = [_]?c.ActionCombo{null} ** MAX_PLAYERS,
     /// Realtime: fractional eaten-units carried between ticks.
     eat_accum: f32 = 0,
-    /// Countdown of the current cast window; pending combos commit at 0.
+    /// Classic: countdown of the current cast window; pending combos commit
+    /// at 0.
     cast_timer: f32 = 0,
+    /// Realtime: per-player countdown of the pending cast's buffer (null =
+    /// no cast pending, parallel to submitted_pool).  A cast fires when its
+    /// timer reaches 0; team-recipe grouping equalises members' timers so
+    /// they expire (and convert) together.
+    cast_fire_timers: [MAX_PLAYERS]?f32 = [_]?f32{null} ** MAX_PLAYERS,
+    /// Realtime: per-player cast-lock cooldowns (seconds remaining).
+    cast_locks: [MAX_PLAYERS]f32 = [_]f32{0} ** MAX_PLAYERS,
     /// Per-player committed-spell count this round (capped casts_per_round).
     casts_used: [MAX_PLAYERS]u8 = [_]u8{0} ** MAX_PLAYERS,
     /// Tuning stats accumulated over the match; broadcast with game_over.
@@ -238,10 +253,9 @@ pub const Session = struct {
         self.phase = .playing;
         self.current_encounter = encounter;
         self.round_timer = self.round_duration;
-        self.cast_timer = if (self.mode == .realtime)
-            self.cast_window_s()
-        else
-            self.cast_duration();
+        self.cast_timer = self.cast_duration();
+        self.cast_fire_timers = [_]?f32{null} ** MAX_PLAYERS;
+        self.cast_locks = [_]f32{0} ** MAX_PLAYERS;
         for (&self.submitted_pool) |*sp| sp.* = null;
         self.eat_accum = 0;
 
@@ -296,12 +310,15 @@ pub const Session = struct {
                 }
             },
             .realtime => {
-                self.cast_timer -= dt;
-                if (self.cast_timer <= 0.0) {
-                    try self.commit_realtime_window();
-                    // Drift-free: carry the overshoot into the next window.
-                    self.cast_timer += self.cast_window_s();
+                for (&self.cast_locks) |*lock| lock.* = @max(lock.* - dt, 0.0);
+                var any_expired = false;
+                for (&self.cast_fire_timers) |*t| {
+                    if (t.*) |*remaining| {
+                        remaining.* -= dt;
+                        if (remaining.* <= 0.0) any_expired = true;
+                    }
                 }
+                if (any_expired) try self.fire_expired_casts();
                 try self.eat_tick(dt);
             },
         }
@@ -325,9 +342,14 @@ pub const Session = struct {
         return self.round_duration / @as(f32, @floatFromInt(self.cfg.balance.casts_per_round));
     }
 
-    /// Realtime cast window length in seconds (from balance data).
-    fn cast_window_s(self: *const Session) f32 {
-        return @as(f32, @floatFromInt(self.cfg.balance.cast_window_ms)) / 1000.0;
+    /// Realtime group-cast buffer length in seconds (from balance data).
+    fn cast_buffer_s(self: *const Session) f32 {
+        return @as(f32, @floatFromInt(self.cfg.balance.cast_buffer_ms)) / 1000.0;
+    }
+
+    /// Realtime per-player cast-lock cooldown in seconds (from balance data).
+    fn cast_lock_s(self: *const Session) f32 {
+        return @as(f32, @floatFromInt(self.cfg.balance.cast_lock_ms)) / 1000.0;
     }
 
     /// Classic: commit every pending combo as a spell (up to casts_per_round
@@ -381,21 +403,80 @@ pub const Session = struct {
         try self.convert_batch(batch[0..batch_len]);
     }
 
-    /// Realtime: close the current cast window.  Collects every locked-in
-    /// spell from `submitted_pool` into a batch (nulling the slots), clears
-    /// the on-wire submission markers (`casts_used`), and converts the batch
+    /// Realtime: collect every pending cast whose buffer expired (timer <=
+    /// 0) into one batch — grouped casts share an expiry, so a team recipe's
+    /// members convert together — clearing their pool slots, timers and
+    /// on-wire submission markers (`casts_used`).  Records cast stats (here,
+    /// not at submit time, so replacements count once), broadcasts
+    /// cast_fired (before conversion, so it precedes the batch's
+    /// recipe_fired / action_result messages), and converts the batch
     /// through the same pipeline as classic cast windows.
-    fn commit_realtime_window(self: *Session) !void {
+    fn fire_expired_casts(self: *Session) !void {
         var batch: [MAX_PLAYERS]logic.Cast = undefined;
         var batch_len: usize = 0;
-        for (&self.submitted_pool, 0..) |*sp, pid| {
-            const combo = sp.* orelse continue;
-            sp.* = null;
+        var player_mask: u8 = 0;
+        for (&self.cast_fire_timers, 0..) |*t, pid| {
+            const remaining = t.* orelse continue;
+            if (remaining > 0.0) continue;
+            t.* = null;
+            const combo = self.submitted_pool[pid] orelse continue;
+            self.submitted_pool[pid] = null;
+            self.casts_used[pid] = 0;
             batch[batch_len] = .{ .player_id = @intCast(pid), .combo = combo };
             batch_len += 1;
+            player_mask |= @as(u8, 1) << @intCast(pid);
+            self.record_cast_stats(pid, combo);
         }
-        self.casts_used = [_]u8{0} ** MAX_PLAYERS;
+        if (batch_len == 0) return;
+
+        var buf: [8]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        try proto.encode(fbs.writer(), .cast_fired, proto.CastFired{
+            .spell_count = @intCast(batch_len),
+            .player_mask = player_mask,
+        });
+        try self.broadcast_raw(fbs.getWritten());
+
         try self.convert_batch(batch[0..batch_len]);
+    }
+
+    /// Realtime: after accepting `player_id`'s cast, check whether it
+    /// COMPLETES a team recipe with the other pending casts (dry-run of the
+    /// same matcher used at fire time).  If so, equalise that recipe
+    /// INSTANCE's fire timers to the joiner's full buffer — the group fires
+    /// together at the newest joiner's expiry — and broadcast cast_grouped.
+    /// Partial matches never hold casts.
+    fn group_team_casts(self: *Session, player_id: u8) !void {
+        var pending: [MAX_PLAYERS]logic.Cast = undefined;
+        var pending_len: usize = 0;
+        var joiner_index: ?usize = null;
+        for (&self.submitted_pool, 0..) |*sp, pid| {
+            const combo = sp.* orelse continue;
+            if (pid == player_id) joiner_index = pending_len;
+            pending[pending_len] = .{ .player_id = @intCast(pid), .combo = combo };
+            pending_len += 1;
+        }
+        const ji = joiner_index orelse return;
+
+        var report = logic.MatchReport{};
+        _ = logic.match_recipes(&self.cfg.balance, pending[0..pending_len], &report);
+        const instance = report.team_instance[ji];
+        if (instance == logic.NO_TEAM_INSTANCE) return;
+
+        var player_mask: u8 = 0;
+        for (pending[0..pending_len], 0..) |cast, ci| {
+            if (report.team_instance[ci] != instance) continue;
+            self.cast_fire_timers[cast.player_id] = self.cast_buffer_s();
+            player_mask |= @as(u8, 1) << @intCast(cast.player_id);
+        }
+
+        var buf: [8]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        try proto.encode(fbs.writer(), .cast_grouped, proto.CastGrouped{
+            .player_mask = player_mask,
+            .fires_in_ms = self.cfg.balance.cast_buffer_ms,
+        });
+        try self.broadcast_raw(fbs.getWritten());
     }
 
     /// CONVERT one cast window's batch of committed spells (shared by
@@ -443,7 +524,11 @@ pub const Session = struct {
 
         // Agents transmute the current zone's slime in place (visible live).
         if (self.zone_index < self.zone_count) {
-            _ = logic.transmute(&self.zones[self.zone_index], output.units);
+            _ = logic.transmute(
+                &self.zones[self.zone_index],
+                output.units,
+                self.cfg.balance.neutralize_residue_mult,
+            );
         }
 
         // Per-round tuning stats accumulate per window.
@@ -644,10 +729,11 @@ pub const Session = struct {
                 // messages queued after this one.
                 const p = try proto.decode_submit_spell(fbs.reader());
                 if (self.phase != .playing or self.mode != .realtime or player_id >= MAX_PLAYERS) return;
-                // Already locked in this window: silent ignore.
-                if (self.submitted_pool[player_id] != null) return;
+                // Cast lock still cooling down: silent ignore.
+                if (self.cast_locks[player_id] > 0.0) return;
 
-                // Zero-output combos FIZZLE without locking the window.
+                // Zero-output combos FIZZLE without starting a lock or
+                // a cast buffer.
                 if (!logic.combo_has_output(&self.cfg.balance, p.combo)) {
                     self.stats.players[player_id].fizzles +|= 1;
                     var fbuf: [4]u8 = undefined;
@@ -659,20 +745,36 @@ pub const Session = struct {
                     return;
                 }
 
+                const replacing = self.submitted_pool[player_id] != null;
                 self.submitted_pool[player_id] = p.combo;
                 self.action_pool[player_id] = null; // clears the live preview
+                self.cast_locks[player_id] = self.cast_lock_s();
+                // The cast's own buffer: fires at expiry unless a later
+                // joiner completes a team recipe (group_team_casts).  A
+                // replacement is a NEW cast — its buffer restarts.
+                self.cast_fire_timers[player_id] = self.cast_buffer_s();
                 // On-wire submission marker (game_start announces
                 // casts_per_round = 1 in realtime, so the existing
                 // "casts used" client UI reads correctly).
                 self.casts_used[player_id] = 1;
-                self.record_cast_stats(player_id, p.combo);
 
+                // New vs replace: a resubmit swaps the pending spell and
+                // announces cast_replaced (no duplicate cast_committed).
                 var buf: [4]u8 = undefined;
                 var cfbs = std.io.fixedBufferStream(&buf);
-                try proto.encode(cfbs.writer(), .cast_committed, proto.CastCommitted{
-                    .player_id = player_id,
-                });
+                if (replacing) {
+                    try proto.encode(cfbs.writer(), .cast_replaced, proto.CastReplaced{
+                        .player_id = player_id,
+                    });
+                } else {
+                    try proto.encode(cfbs.writer(), .cast_committed, proto.CastCommitted{
+                        .player_id = player_id,
+                    });
+                }
                 try self.broadcast_raw(cfbs.getWritten());
+
+                // Completed a team recipe with pending casts? Group them.
+                try self.group_team_casts(player_id);
 
                 const slot = &self.players[player_id];
                 if (slot.entity != std.math.maxInt(ecs.Entity)) {
@@ -683,7 +785,9 @@ pub const Session = struct {
                         .value = 0,
                     });
                 }
-                std.log.debug("player {} submitted spell (realtime)", .{player_id});
+                std.log.debug("player {} submitted spell (realtime, {s})", .{
+                    player_id, if (replacing) "replaced" else "joined",
+                });
             },
             .reconnect => {},
             else => {},
@@ -693,6 +797,13 @@ pub const Session = struct {
     /// Saturating u32 → u16 for stats fields.
     fn stat_u16(v: u32) u16 {
         return @intCast(@min(v, std.math.maxInt(u16)));
+    }
+
+    /// Remaining countdown (seconds) → whole milliseconds on the wire,
+    /// saturated to u16 (caps at ~65s; both ms tunables are capped at 60s).
+    fn wire_ms(seconds: f32) u16 {
+        const ms = @ceil(@max(seconds, 0.0) * 1000.0);
+        return @intFromFloat(@min(ms, @as(f32, std.math.maxInt(u16))));
     }
 
     /// Resolve one round: close the final cast window (conversion happens in
@@ -824,7 +935,7 @@ pub const Session = struct {
             .round_duration = self.round_duration,
             .casts_per_round = if (self.mode == .realtime) 1 else self.cfg.balance.casts_per_round,
             .mode = self.mode,
-            .cast_window_ms = if (self.mode == .realtime) self.cfg.balance.cast_window_ms else 0,
+            .cast_buffer_ms = if (self.mode == .realtime) self.cfg.balance.cast_buffer_ms else 0,
         };
         @memcpy(gs_msg.encounter_label[0..gs_msg.encounter_label_len], encounter.label[0..gs_msg.encounter_label_len]);
         try proto.encode(fbs.writer(), .game_start, gs_msg);
@@ -876,7 +987,7 @@ pub const Session = struct {
                 .round_duration = self.round_duration,
                 .casts_per_round = if (self.mode == .realtime) 1 else self.cfg.balance.casts_per_round,
                 .mode = self.mode,
-                .cast_window_ms = if (self.mode == .realtime) self.cfg.balance.cast_window_ms else 0,
+                .cast_buffer_ms = if (self.mode == .realtime) self.cfg.balance.cast_buffer_ms else 0,
             };
             @memcpy(gs_msg.encounter_label[0..gs_msg.encounter_label_len], encounter_label[0..gs_msg.encounter_label_len]);
             try proto.encode(fbs.writer(), .game_start, gs_msg);
@@ -888,7 +999,17 @@ pub const Session = struct {
         var snap = proto.GameState.blank;
         snap.tick = self.tick_count;
         snap.round_timer = if (self.mode == .realtime) 0.0 else @max(self.round_timer, 0.0);
-        snap.cast_timer = @max(self.cast_timer, 0.0);
+        // Realtime: cast_timer carries the SOONEST pending cast's remaining
+        // buffer, or -1 when nothing is pending (the idle sentinel clients
+        // key off).  Per-player countdowns ride on each entity's cast_ms.
+        snap.cast_timer = if (self.mode == .realtime) blk: {
+            var soonest: f32 = -1.0;
+            for (self.cast_fire_timers) |t| {
+                const remaining = @max(t orelse continue, 0.0);
+                if (soonest < 0.0 or remaining < soonest) soonest = remaining;
+            }
+            break :blk soonest;
+        } else @max(self.cast_timer, 0.0);
         snap.hunger = .{
             .current = self.hunger.current,
             .max = self.hunger.max,
@@ -921,6 +1042,8 @@ pub const Session = struct {
                 .kind = kd.tag,
                 .owner = own,
                 .casts_used = self.casts_used[own],
+                .lock_ms = wire_ms(self.cast_locks[own]),
+                .cast_ms = wire_ms(self.cast_fire_timers[own] orelse 0.0),
                 .combo_len = combo_len,
                 .combo_slots = combo_slots,
             };

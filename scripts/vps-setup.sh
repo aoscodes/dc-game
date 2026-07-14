@@ -140,6 +140,13 @@ server {
         try_files /index.html =404;
     }
 
+    # /realtime serves the game shell defaulting lobby creation to realtime
+    # mode (game.js reads location.pathname).
+    location = /realtime {
+        add_header Cache-Control "no-cache";
+        try_files /index.html =404;
+    }
+
     # The tuning editor (static, ships with web/).
     location = /tune {
         add_header Cache-Control "no-cache";

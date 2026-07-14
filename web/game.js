@@ -33,10 +33,6 @@ const LAYOUT = {
   // Per-player pending-combo rows, bottom-left beside the action menu.
   comboPanel: { x: 24, y0: 652, rowH: 18, font: 13, slotW: 14, nameW: 42 },
 
-  // Realtime mode: clickable CAST button between the combo panel and the
-  // action menu (clicking = pressing Enter).
-  castButton: { x: 208, y: 664, w: 118, h: 44, font: 16, hintFont: 11, hintDy: 14 },
-
   // Cosmetic critters: one spawns per player entity (see tickLilGuys).
   lilGuys: { size: 48, speed: 60, chompMin: 0.9, chompMax: 2.2 },
 
@@ -141,8 +137,12 @@ function slotFromName(name) {
 const PAGE_CONFIG_HASH =
   (location.pathname.match(/^\/config\/([0-9a-f]{16})/) || [])[1] ?? null;
 
-/** Served at /realtime → lobby creation defaults to realtime mode. */
-const PAGE_REALTIME = location.pathname === "/realtime";
+/**
+ * Lobby creation defaults to realtime mode when served at /realtime or when
+ * the URL carries ?mode=realtime (composable with /config/{hash}).
+ */
+const PAGE_REALTIME = location.pathname === "/realtime" ||
+  new URLSearchParams(location.search).get("mode") === "realtime";
 
 /**
  * The current room's game mode: "classic" | "realtime".
@@ -181,6 +181,8 @@ async function loadBalanceData(hash = PAGE_CONFIG_HASH) {
   UNITS_PER_SLOT = bal.units_per_slot;
   MEDICINE_PER_SLOT = bal.medicine_per_slot;
   CASTS_PER_ROUND = bal.casts_per_round;
+  CAST_BUFFER_MS = bal.cast_buffer_ms ?? 500;
+  CAST_LOCK_MS = bal.cast_lock_ms ?? 500;
   PLAYER_RECIPES = bal.player_recipes.map((r) => ({
     label: r.label,
     pattern: r.pattern.map(slotFromName),
@@ -321,7 +323,7 @@ function drawPreLobby() {
   text("Slime Feast", L.titleX, L.titleY, L.titleFont, C_HEADER);
 
   if (preLobbyMode === "choose") {
-    // [C] creates in the page's default mode (/realtime → realtime),
+    // [C] creates in the page's default mode (PAGE_REALTIME → realtime),
     // [R] creates in the other mode.  The default line is emphasized.
     const primaryLabel = PAGE_REALTIME
       ? "[C]  Create REAL-TIME lobby" : "[C]  Create new lobby";
@@ -381,7 +383,7 @@ function drawLobby(lobby) {
   const readyLabel = lobby.ready ? "Press ENTER to un-ready" : "Press ENTER when ready";
   text(readyLabel, L.rowX, pickerY, L.readyFont, C_TEXT);
 
-  drawRecipeGuide();
+  drawRecipeGuide(roomModeFrom(lobby));
 }
 
 /** Key bindings per element / action — mirrors src/client/input.zig. */
@@ -429,17 +431,31 @@ function outputParts(output) {
 }
 
 /**
- * Lobby study guide: how casting works + every defined recipe with its key
- * sequence AND symbols, all in parity colors (slime = agent = medicine =
- * hunger block).  Recipes appear in data/balance.json order.
+ * Lobby study guide: how casting works (mode-aware) + every defined recipe
+ * with its key sequence AND symbols, all in parity colors (slime = agent =
+ * medicine = hunger block).  Recipes appear in data/balance.json order.
+ * @param {"classic" | "realtime"} mode - the room's play mode
  */
-function drawRecipeGuide() {
+function drawRecipeGuide(mode) {
   const L = LAYOUT.lobby;
   let y = L.guideY;
 
   text("HOW CASTING WORKS", L.guideX, y, L.guideFont + 2, C_HEADER);
   y += L.guideLineH;
   const descColor = "rgba(200,200,210,0.9)";
+  // Classic: spells auto-commit on a timer.  Realtime: ENTER fires a cast
+  // after its own buffer; team-recipe matches merge and fire together.
+  const castingLine = mode === "realtime"
+    ? [
+      { str: `Press ENTER to cast — it fires ${(CAST_BUFFER_MS / 1000).toFixed(1)}s later.`, color: descColor },
+      { str: "Casts completing a team recipe in that window merge and fire together!", color: RECIPE_COLOR_TEAM },
+      ...(CAST_LOCK_MS > 0
+        ? [{ str: `${(CAST_LOCK_MS / 1000).toFixed(1)}s cooldown per cast.`, color: descColor }]
+        : []),
+    ]
+    : [
+      { str: `Spells auto-cast when the cast bar empties — ${CASTS_PER_ROUND} per round. Exact combos below are RECIPES (stronger).`, color: descColor },
+    ];
   const descLines = [
     [
       { str: "Pick an agent color —", color: descColor },
@@ -455,9 +471,7 @@ function drawRecipeGuide() {
       { str: "Dispensed agents transmute matching-color slime to neutral;", color: ACTION_COLOR.dispense },
       { str: "medicine heals matching-color hunger.", color: ACTION_COLOR.medicine },
     ],
-    [
-      { str: `Spells auto-cast when the cast bar empties — ${CASTS_PER_ROUND} per round. Exact combos below are RECIPES (stronger).`, color: descColor },
-    ],
+    castingLine,
   ];
   for (const line of descLines) {
     drawParts(L.guideX, y, L.guideFont, line, 8);
@@ -600,13 +614,60 @@ function spawnRecipeFloaters(game) {
   });
 }
 
+/** Cast lifecycle floater color (matches the realtime cast bar). */
+const CAST_EVENT_COLOR = "rgba(120,220,255,1)";
+
+/**
+ * Realtime cast-loop event floaters (`game.cast_events`, transient):
+ *   grouped  — a new cast completed a team recipe; members now fire together
+ *   replaced — Px swapped their pending cast (its buffer restarted)
+ *   fired    — expired casts converted (spell_count spells; solo fires are
+ *              silent — the ✦ cast action floater already covers those)
+ * Player-scoped events rise from that player's combo-panel row; group-level
+ * events from the active zone's center (where recipe floaters appear).
+ */
+function spawnCastEventFloaters(game) {
+  const events = game.cast_events ?? [];
+  if (events.length === 0) return;
+
+  const CP = LAYOUT.comboPanel;
+  const rowPos = (pid) => {
+    const i = (game.entities || []).findIndex((e) => e.owner === pid);
+    if (i === -1) return null;
+    return { x: CP.x + CP.nameW + 5 * CP.slotW + 24, y: CP.y0 + i * CP.rowH };
+  };
+  const zoneCenter = () => {
+    const count = Math.max(game.zones?.length ?? 1, 1);
+    const zoneIndex = Math.min(game.zone_index ?? 0, count - 1);
+    const rectZ = zoneColumnRect(zoneIndex, count);
+    return { x: (rectZ.x0 + rectZ.x1) / 2, y: (rectZ.y0 + rectZ.y1) / 2 + 28 };
+  };
+
+  for (const ev of events) {
+    if (ev.type === "grouped") {
+      const { x, y } = zoneCenter();
+      spawnFloater("team combo locked!", x, y, RECIPE_COLOR_TEAM,
+        LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
+    } else if (ev.type === "replaced") {
+      const p = rowPos(ev.player_id);
+      if (p) spawnFloater("spell replaced", p.x, p.y, "rgba(200,180,255,0.9)");
+    } else if (ev.type === "fired" && ev.spell_count > 1) {
+      const { x, y } = zoneCenter();
+      spawnFloater(`casts fired ×${ev.spell_count}`, x, y, CAST_EVENT_COLOR,
+        LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
+    }
+  }
+}
+
 /**
  * Compact per-player pending-combo rows (bottom-left UI panel).  No player
  * sprites are rendered — combos are the only per-player element on screen.
- * The local player's row is highlighted.
+ * The local player's row is highlighted.  In realtime mode a per-player
+ * cast countdown replaces the classic casts-used counter.
  */
 function drawComboPanel(game) {
   const CP = LAYOUT.comboPanel;
+  const realtime = roomModeFrom(game) === "realtime";
   const castsPerRound = game.casts_per_round ?? 3;
   const entities = game.entities || [];
   entities.forEach((e, i) => {
@@ -629,67 +690,19 @@ function drawComboPanel(game) {
       }
     }
 
-    // Spells committed this round.
     const usedX = CP.x + CP.nameW + 5 * CP.slotW + 8;
-    text(`${e.casts_used ?? 0}/${castsPerRound}`, usedX, y, CP.font, "rgba(160,170,200,0.8)");
+    if (realtime) {
+      // Pending-cast countdown (matchable window for team recipes).
+      const castS = (e.cast_ms ?? 0) / 1000;
+      if (castS > 0) {
+        text(`⌛${castS.toFixed(1)}`, usedX, y, CP.font, CAST_EVENT_COLOR);
+      }
+    } else {
+      // Spells committed this round.
+      text(`${e.casts_used ?? 0}/${castsPerRound}`, usedX, y, CP.font, "rgba(160,170,200,0.8)");
+    }
   });
 }
-
-// ---------------------------------------------------------------------------
-// Realtime CAST button (canvas hit region; clicking = pressing Enter)
-// ---------------------------------------------------------------------------
-
-/**
- * Clickable rect (canvas coords) for the CAST button, or null when the
- * button is hidden or disabled.  Refreshed every rendered frame.
- * @type {{x:number, y:number, w:number, h:number} | null}
- */
-let castButtonRect = null;
-
-/**
- * Realtime only: CAST button beside the local player's combo rows.
- * Enabled when the player has a pending combo and no spell locked into the
- * current window; clicking sends {key:"Enter"} — the same message the
- * keyboard handler sends, so both paths hit the Zig client identically.
- */
-function drawCastButton(game) {
-  const B = LAYOUT.castButton;
-  const own = (game.entities ?? []).find(e => e.owner === game.player_id);
-  const comboEmpty = !own || (own.combo ?? []).length === 0;
-  const lockedIn = own ? (own.casts_used ?? 0) > 0 : false;
-  const enabled = !comboEmpty && !lockedIn;
-
-  const label = lockedIn ? "LOCKED IN" : "CAST";
-  const bg = enabled ? "rgba(60,140,80,0.95)" : "rgba(45,45,60,0.9)";
-  const border = enabled ? "rgba(160,255,160,0.95)" : "rgba(120,120,140,0.5)";
-  const labelColor = enabled ? "rgba(240,255,240,1)"
-    : lockedIn ? "rgba(140,240,255,0.9)" : "rgba(130,130,150,0.8)";
-
-  rect(B.x, B.y, B.w, B.h, bg);
-  rectStroke(B.x, B.y, B.w, B.h, 2, border);
-  ctx.save();
-  ctx.font = `bold ${B.font}px monospace`;
-  ctx.fillStyle = labelColor;
-  ctx.textAlign = "center";
-  ctx.fillText(label, B.x + B.w / 2, B.y + B.h / 2 + B.font / 3);
-  ctx.restore();
-  ctx.save();
-  ctx.font = `${B.hintFont}px monospace`;
-  ctx.fillStyle = "rgba(170,170,190,0.8)";
-  ctx.textAlign = "center";
-  ctx.fillText("Enter to cast", B.x + B.w / 2, B.y + B.h + B.hintDy);
-  ctx.restore();
-
-  castButtonRect = enabled ? { x: B.x, y: B.y, w: B.w, h: B.h } : null;
-}
-
-// ---------------------------------------------------------------------------
-// Floater system
-// ---------------------------------------------------------------------------
-
-/**
- * @typedef {{ text: string, x: number, y: number, color: string, age: number, lifetime: number }} Floater
- */
 
 /** @type {Floater[]} */
 const floaters = [];
@@ -768,6 +781,9 @@ function parseComboSlots(slots) {
 let UNITS_PER_SLOT = 0;
 let MEDICINE_PER_SLOT = 0;
 let CASTS_PER_ROUND = 0;
+/** Realtime: group-cast buffer / per-cast cooldown (ms) from balance.json. */
+let CAST_BUFFER_MS = 500;
+let CAST_LOCK_MS = 500;
 /** @type {Array<{label: string, pattern: Array<object>, output: object}>} */
 let PLAYER_RECIPES = [];
 /** @type {Array<{label: string, patterns: Array<Array<object>>, output: object}>} */
@@ -1184,28 +1200,35 @@ function drawActionMenu(game) {
   const tbw = mw - M.padX * 2;
 
   if (roomModeFrom(game) === "realtime") {
-    // Realtime: no round countdown (round_timer is meaningless).  One
-    // prominent bar for the repeating cast window — submitted spells
-    // batch-convert when it empties.
-    const windowS = (game.cast_window_ms ?? 0) / 1000;
-    const castFrac = windowS > 0
-      ? Math.max(0, Math.min(1, (game.cast_timer ?? 0) / windowS))
+    // Realtime: no round countdown, no shared cast timer.  Every cast fires
+    // at the end of its OWN buffer (entity.cast_ms); casts completing a team
+    // recipe merge and fire together.  The bar tracks the local player's
+    // pending cast.
+    const bufferS = (game.cast_buffer_ms ?? 0) / 1000;
+    const own = (game.entities ?? []).find(e => e.owner === game.player_id);
+    const ownCastS = own ? (own.cast_ms ?? 0) / 1000 : 0;
+    const lockS = own ? (own.lock_ms ?? 0) / 1000 : 0;
+    const othersPending = (game.entities ?? [])
+      .some(e => e.owner !== game.player_id && (e.cast_ms ?? 0) > 0);
+
+    const castFrac = ownCastS > 0 && bufferS > 0
+      ? Math.max(0, Math.min(1, ownCastS / bufferS))
       : 0;
     const barH = M.timerBarDy + M.timerBarH - M.castBarDy; // span both classic bars
     rect(px, my + M.castBarDy, tbw, barH, "rgba(30,30,30,0.8)");
-    rect(px, my + M.castBarDy, tbw * castFrac, barH, "rgba(120,220,255,0.9)");
+    if (ownCastS > 0) {
+      rect(px, my + M.castBarDy, tbw * castFrac, barH, "rgba(120,220,255,0.9)");
+    }
     rectStroke(px, my + M.castBarDy, tbw, barH, 1, "rgba(255,255,255,0.3)");
 
-    const own = (game.entities ?? []).find(e => e.owner === game.player_id);
-    const lockedIn = own ? (own.casts_used ?? 0) > 0 : false;
-    const castText = game.cast_timer !== undefined ? game.cast_timer.toFixed(1) : "?";
-    const status = lockedIn ? "spell locked in" : "CAST (or Enter) to submit";
-    text(`Next cast wave: ${castText}s  ·  ${status}`,
-      px, my + M.timerTextDy, M.timerTextFont, C_TEXT);
+    let status;
+    if (ownCastS > 0) {
+      status = `Dispensing: ${ownCastS.toFixed(1)}s`;
+    }
+    if (lockS > 0 && ownCastS <= 0) status = `Cooldown: ${lockS.toFixed(1)}s`;
+    text(status, px, my + M.timerTextDy, M.timerTextFont, C_TEXT);
   } else {
-    // Cast-window timer bar (round_duration / casts_per_round per window).
-    // Pending combo commits as a spell when it empties.
-    const castsPerRound = game.casts_per_round ?? 3;
+    const castsPerRound = game.casts_per_round ?? 1;
     const castDuration = game.round_duration > 0 ? game.round_duration / castsPerRound : 0;
     const castFrac = castDuration > 0
       ? Math.max(0, Math.min(1, (game.cast_timer ?? 0) / castDuration))
@@ -1228,9 +1251,6 @@ function drawActionMenu(game) {
       px, my + M.timerTextDy, M.timerTextFont, C_TEXT);
   }
 
-  // Projected team output from everyone's PENDING combos (recipe-aware).
-  // Already-committed casts this round are not in the snapshot, so this
-  // previews only the current cast window.
   const combos = (game.entities ?? []).map(e => e.combo ?? []);
   const projected = matchRecipes(combos);
 
@@ -1269,6 +1289,7 @@ function drawGame(game, dt) {
   tickLilGuys(game, dt);
   spawnCastFloaters(game);
   spawnRecipeFloaters(game);
+  spawnCastEventFloaters(game);
 
   clear();
 
@@ -1284,7 +1305,6 @@ function drawGame(game, dt) {
   drawLilGuys(dt);
   drawComboPanel(game);
   drawActionMenu(game);
-  if (roomModeFrom(game) === "realtime") drawCastButton(game);
 
   // Floaters drawn last so they appear on top of everything.
   drawFloaters();
@@ -1441,9 +1461,6 @@ function renderFrame(msg, dt) {
   if (lastPhase === "game" && msg.phase !== "game") clearEntityState();
   lastPhase = msg.phase;
 
-  // The CAST hit region only exists while a realtime game frame draws it.
-  castButtonRect = null;
-
   switch (msg.phase) {
     case "pre_lobby": drawPreLobby(); break;
     case "connecting": drawConnecting(); break;
@@ -1505,8 +1522,8 @@ function connect() {
       // the reason.
       const errMsg =
         msg.reason === "not_found" ? "Lobby not found." :
-        msg.reason === "config_not_found" ? "Saved config not found — re-save it at /tune." :
-        `Error: ${msg.reason}`;
+          msg.reason === "config_not_found" ? "Saved config not found — re-save it at /tune." :
+            `Error: ${msg.reason}`;
       resetPreLobby();
       preLobbyError = errMsg;
       latestMsg = { phase: "pre_lobby" };
@@ -1545,20 +1562,6 @@ document.addEventListener("keydown", (e) => {
   sendKey(e.key);
 });
 
-// Realtime CAST button: clicking inside its hit region is exactly an Enter
-// keypress (same ws message the keydown handler sends).
-canvas.addEventListener("click", (e) => {
-  if (!castButtonRect) return;
-  // Map client coords → canvas coords (robust to CSS scaling).
-  const r = canvas.getBoundingClientRect();
-  const x = (e.clientX - r.left) * (canvas.width / r.width);
-  const y = (e.clientY - r.top) * (canvas.height / r.height);
-  const b = castButtonRect;
-  if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) {
-    sendKey("Enter");
-  }
-});
-
 /** Send a pre-lobby room action to the bridge. */
 function sendPreLobbyAction(action) {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1577,7 +1580,7 @@ function handlePreLobbyKey(e) {
   if (preLobbyMode === "choose") {
     if (e.key === "c" || e.key === "C" || e.key === "r" || e.key === "R") {
       preLobbyError = "";
-      // [C] = the page's default mode (/realtime → realtime); [R] = the
+      // [C] = the page's default mode (PAGE_REALTIME → realtime); [R] = the
       // other mode.  Creating from /config/{hash} keeps that saved config.
       const isC = e.key === "c" || e.key === "C";
       const mode = (isC === PAGE_REALTIME) ? "realtime" : "classic";

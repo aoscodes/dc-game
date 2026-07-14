@@ -41,9 +41,11 @@ pub const Health = struct {
 ///              round end (the original play style).
 ///   realtime — Lil Guys eat the current zone at a constant rate
 ///              (balance.eat_rate_units_per_s × connected players); spells
-///              are explicitly SUBMITTED (submit_spell) and batch-convert at
-///              the close of each repeating cast window
-///              (balance.cast_window_ms); zones advance when fully eaten.
+///              are explicitly SUBMITTED (submit_spell): each cast fires at
+///              the end of its own balance.cast_buffer_ms buffer, casts
+///              completing a team recipe merge and fire together, and each
+///              accepted submit starts a balance.cast_lock_ms cooldown;
+///              zones advance when fully eaten.
 pub const GameMode = enum(u8) {
     classic = 0,
     realtime = 1,
