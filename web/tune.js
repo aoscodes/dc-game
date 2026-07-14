@@ -34,11 +34,11 @@ const RATE_FIELDS = [
   ["medicine_per_slot", "medicine per dispense", 0, 1000, 1, "both"],
   ["hunger_cost_normal", "hunger per unit eaten", 0, 1000, 1, "both"],
   ["hunger_cost_modified_extra", "extra hunger from modified slime", 0, 1000, 1, "both"],
-  ["neutralize_residue_mult", "portion of neutralized slime left behind (0–1)", 0, 1, 0.05, "both"],
+  ["neutralize_residue_mult", "neutralized slime residue (0–1)", 0, 1, 0.05, "both"],
   ["round_duration_default_s", "round duration (seconds)", 0.5, 300, 0.5, "classic"],
   ["eat_rate_units_per_s", "units eaten /s per lil guy", 0.1, 100, 0.1, "realtime"],
-  ["cast_buffer_ms", "per-cast buffer (ms)", 0, 60000, 50, "realtime"],
-  ["cast_lock_ms", "cast lock/cooldown (ms)", 0, 60000, 50, "realtime"],
+  ["cast_buffer_ms", "team recipe window (ms)", 0, 60000, 50, "realtime"],
+  ["cast_lock_ms", "cooldown (ms)", 0, 60000, 50, "realtime"],
 ];
 
 /** @type {{balance: object, encounter: {hunger_max: number, zones: object[]}}} */
