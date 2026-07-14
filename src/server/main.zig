@@ -4,7 +4,8 @@
 //! connection is handled by the websocket.zig server with our `Handler` type.
 //!
 //! A single global `Session` is kept for simplicity (one room at a time).
-//! The game loop runs on a dedicated tick thread at TICK_HZ.
+//! The game loop runs on a dedicated tick thread paced at --tick-ms
+//! (default 50ms), passing measured wall-clock dt to the session.
 
 const std = @import("std");
 const ws = @import("websocket");
@@ -17,8 +18,11 @@ const session_mod = @import("session.zig");
 const Session = session_mod.Session;
 const ws_server = @import("net/ws_server.zig");
 
-const TICK_HZ: u64 = 20;
-const TICK_NS: u64 = std.time.ns_per_s / TICK_HZ;
+/// Default tick period in milliseconds; override with --tick-ms.
+const DEFAULT_TICK_MS: u32 = 50;
+/// Upper bound on a single tick's dt: a stalled thread (debugger, laptop
+/// sleep) must not simulate a huge time jump in one step.
+const MAX_DT_S: f32 = 0.25;
 const DEFAULT_PORT: u16 = 9001;
 /// Default directory holding balance.json / encounters.json (relative to
 /// cwd); override with --data-dir.
@@ -106,9 +110,15 @@ const Handler = struct {
     }
 };
 
-fn tick_loop(_: void) void {
+fn tick_loop(tick_ns: u64) void {
     var timer = std.time.Timer.start() catch |err| {
         std.log.err("tick_loop: failed to start timer: {}", .{err});
+        return;
+    };
+    // Measures REAL elapsed time between iterations so the simulation stays
+    // wall-clock accurate regardless of tick pacing jitter.
+    var dt_timer = std.time.Timer.start() catch |err| {
+        std.log.err("tick_loop: failed to start dt timer: {}", .{err});
         return;
     };
     while (true) {
@@ -117,7 +127,9 @@ fn tick_loop(_: void) void {
         {
             session_lock.lock();
             if (session) |*sess| {
-                const dt: f32 = @as(f32, @floatFromInt(TICK_NS)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+                const dt_raw: f32 = @as(f32, @floatFromInt(dt_timer.lap())) /
+                    @as(f32, @floatFromInt(std.time.ns_per_s));
+                const dt = @min(dt_raw, MAX_DT_S);
                 sess.tick(dt) catch |err| {
                     std.log.err("tick error: {}", .{err});
                 };
@@ -126,8 +138,8 @@ fn tick_loop(_: void) void {
         }
 
         const elapsed = timer.read() - start;
-        if (elapsed < TICK_NS) {
-            std.Thread.sleep(TICK_NS - elapsed);
+        if (elapsed < tick_ns) {
+            std.Thread.sleep(tick_ns - elapsed);
         }
     }
 }
@@ -143,6 +155,8 @@ pub fn main() !void {
     var join_code_override: ?[6]u8 = null;
     var data_dir: []const u8 = DEFAULT_DATA_DIR;
     var validate_only = false;
+    var tick_ms: u32 = DEFAULT_TICK_MS;
+    var mode: shared.components.GameMode = .classic;
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // skip argv[0]
@@ -169,6 +183,27 @@ pub fn main() !void {
             }
         } else if (std.mem.eql(u8, arg, "--data-dir")) {
             if (args.next()) |val| data_dir = val;
+        } else if (std.mem.eql(u8, arg, "--tick-ms")) {
+            if (args.next()) |val| {
+                tick_ms = std.fmt.parseInt(u32, val, 10) catch blk: {
+                    std.log.warn("invalid --tick-ms value '{s}', using default {d}", .{ val, DEFAULT_TICK_MS });
+                    break :blk DEFAULT_TICK_MS;
+                };
+                if (tick_ms == 0) {
+                    std.log.warn("--tick-ms must be >= 1, using default {d}", .{DEFAULT_TICK_MS});
+                    tick_ms = DEFAULT_TICK_MS;
+                }
+            }
+        } else if (std.mem.eql(u8, arg, "--mode")) {
+            if (args.next()) |val| {
+                if (std.mem.eql(u8, val, "classic")) {
+                    mode = .classic;
+                } else if (std.mem.eql(u8, val, "realtime")) {
+                    mode = .realtime;
+                } else {
+                    std.log.warn("invalid --mode value '{s}' (classic|realtime), using classic", .{val});
+                }
+            }
         } else if (std.mem.eql(u8, arg, "--validate")) {
             // Load + validate the data files, then exit — used by the bridge's
             // /api/tune/save endpoint to vet designer configs with the exact
@@ -209,11 +244,14 @@ pub fn main() !void {
     defer if (session) |*s| s.deinit();
     session.?.round_duration = round_duration;
     session.?.round_timer = round_duration;
+    session.?.mode = mode;
 
     std.log.info("Room code: {s}", .{join_code});
+    std.log.info("Mode: {s}", .{@tagName(mode)});
     std.log.info("Listening on port {d}", .{port});
 
-    const tick_thread = try std.Thread.spawn(.{}, tick_loop, .{{}});
+    const tick_ns: u64 = @as(u64, tick_ms) * std.time.ns_per_ms;
+    const tick_thread = try std.Thread.spawn(.{}, tick_loop, .{tick_ns});
     tick_thread.detach();
 
     var server = try ws.Server(Handler).init(allocator, .{

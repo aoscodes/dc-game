@@ -25,6 +25,14 @@
 //!      units consumed (neutralized + naturally-neutral).
 //!   3. Advances to the next zone.
 //!
+//! The round loop above is CLASSIC mode.  In REALTIME mode (`mode =
+//! .realtime`) there is no round timer: the Lil Guys eat the current zone
+//! continuously (`eat_rate_units_per_s` per connected player), and players
+//! explicitly lock in one spell per fixed cast window (`submit_spell`,
+//! window length `cast_window_ms`).  At window close every submitted spell
+//! converts as one batch — the same pipeline as classic (recipes, medicine,
+//! transmutation).  An emptied zone advances immediately (round_reset).
+//!
 //! The encounter ends when all zones are consumed OR the hunger bar fills.
 //! Either way the final shared score is broadcast via game_over.
 
@@ -99,6 +107,13 @@ pub const Session = struct {
     /// Shared team score: neutral slime units consumed.
     score: u32 = 0,
     action_pool: [MAX_PLAYERS]?c.ActionCombo,
+    /// Play style: classic timed rounds or realtime continuous eating.
+    mode: c.GameMode = .classic,
+    /// Realtime: spells locked in for the current cast window (null = none).
+    /// Reset when the window commits and on game start.
+    submitted_pool: [MAX_PLAYERS]?c.ActionCombo = [_]?c.ActionCombo{null} ** MAX_PLAYERS,
+    /// Realtime: fractional eaten-units carried between ticks.
+    eat_accum: f32 = 0,
     /// Countdown of the current cast window; pending combos commit at 0.
     cast_timer: f32 = 0,
     /// Per-player committed-spell count this round (capped casts_per_round).
@@ -223,7 +238,12 @@ pub const Session = struct {
         self.phase = .playing;
         self.current_encounter = encounter;
         self.round_timer = self.round_duration;
-        self.cast_timer = self.cast_duration();
+        self.cast_timer = if (self.mode == .realtime)
+            self.cast_window_s()
+        else
+            self.cast_duration();
+        for (&self.submitted_pool) |*sp| sp.* = null;
+        self.eat_accum = 0;
 
         self.hunger = .{ .current = 0, .max = encounter.hunger_max };
         self.hunger_healable = [_]u16{0} ** c.Element.size;
@@ -260,16 +280,30 @@ pub const Session = struct {
         self.tick_count += 1;
 
         self.profiler.begin(.round);
-        self.round_timer -= dt;
-        self.cast_timer -= dt;
-        if (self.round_timer <= 0.0) {
-            try self.resolve_round();
-            self.reset_round();
-        } else if (self.cast_timer <= 0.0) {
-            // Cast window closed mid-round: commit pending spells and open
-            // the next window (round resolution commits the final window).
-            try self.commit_pending_casts();
-            self.cast_timer += self.cast_duration();
+        switch (self.mode) {
+            .classic => {
+                self.round_timer -= dt;
+                self.cast_timer -= dt;
+                if (self.round_timer <= 0.0) {
+                    try self.resolve_round();
+                    self.reset_round();
+                } else if (self.cast_timer <= 0.0) {
+                    // Cast window closed mid-round: commit pending spells and
+                    // open the next window (round resolution commits the
+                    // final window).
+                    try self.commit_pending_casts();
+                    self.cast_timer += self.cast_duration();
+                }
+            },
+            .realtime => {
+                self.cast_timer -= dt;
+                if (self.cast_timer <= 0.0) {
+                    try self.commit_realtime_window();
+                    // Drift-free: carry the overshoot into the next window.
+                    self.cast_timer += self.cast_window_s();
+                }
+                try self.eat_tick(dt);
+            },
         }
         self.profiler.end(.round);
 
@@ -291,14 +325,15 @@ pub const Session = struct {
         return self.round_duration / @as(f32, @floatFromInt(self.cfg.balance.casts_per_round));
     }
 
-    /// Commit every pending combo as a spell (up to casts_per_round per
-    /// player per round; zero-output combos fizzle for free) and CONVERT the
-    /// window's batch immediately:
-    /// recipes match within the batch (team recipes = same window only),
-    /// medicine heals right away, and agents transmute matching-color
-    /// Modified Slime into Neutralized Slime in the current zone.
-    /// Broadcasts cast_committed + a .cast action_result per commit, and a
-    /// .heal action_result when medicine lands.
+    /// Realtime cast window length in seconds (from balance data).
+    fn cast_window_s(self: *const Session) f32 {
+        return @as(f32, @floatFromInt(self.cfg.balance.cast_window_ms)) / 1000.0;
+    }
+
+    /// Classic: commit every pending combo as a spell (up to casts_per_round
+    /// per player per round; zero-output combos fizzle for free) and CONVERT
+    /// the window's batch immediately via `convert_batch`.  Broadcasts
+    /// cast_committed + a .cast action_result per commit.
     fn commit_pending_casts(self: *Session) !void {
         var batch: [MAX_PLAYERS]logic.Cast = undefined;
         var batch_len: usize = 0;
@@ -343,10 +378,37 @@ pub const Session = struct {
             }
         }
 
-        if (batch_len == 0) return;
+        try self.convert_batch(batch[0..batch_len]);
+    }
+
+    /// Realtime: close the current cast window.  Collects every locked-in
+    /// spell from `submitted_pool` into a batch (nulling the slots), clears
+    /// the on-wire submission markers (`casts_used`), and converts the batch
+    /// through the same pipeline as classic cast windows.
+    fn commit_realtime_window(self: *Session) !void {
+        var batch: [MAX_PLAYERS]logic.Cast = undefined;
+        var batch_len: usize = 0;
+        for (&self.submitted_pool, 0..) |*sp, pid| {
+            const combo = sp.* orelse continue;
+            sp.* = null;
+            batch[batch_len] = .{ .player_id = @intCast(pid), .combo = combo };
+            batch_len += 1;
+        }
+        self.casts_used = [_]u8{0} ** MAX_PLAYERS;
+        try self.convert_batch(batch[0..batch_len]);
+    }
+
+    /// CONVERT one cast window's batch of committed spells (shared by
+    /// classic's commit_pending_casts and realtime's window commit):
+    /// recipes match within the batch (team recipes = same window only),
+    /// medicine heals right away (broadcasting a .heal action_result), and
+    /// agents transmute matching-color Modified Slime into Neutralized
+    /// Slime in the current zone.  Each recipe fire is broadcast.
+    fn convert_batch(self: *Session, batch: []const logic.Cast) !void {
+        if (batch.len == 0) return;
 
         var report = logic.MatchReport{};
-        const output = logic.match_recipes(&self.cfg.balance, batch[0..batch_len], &report);
+        const output = logic.match_recipes(&self.cfg.balance, batch, &report);
 
         // Recipe stats: fire counts + per-player participation.  Each fire is
         // also broadcast so clients can show recipe floaters live.  Only the
@@ -361,7 +423,7 @@ pub const Session = struct {
             self.stats.team_recipe_hits[ri] +|= hit;
             try self.broadcast_recipe_fired(.team, @intCast(ri), hit);
         }
-        for (batch[0..batch_len], 0..) |cast, ci| {
+        for (batch, 0..) |cast, ci| {
             if (report.consumed[ci] != .none) {
                 self.stats.players[cast.player_id].recipe_casts +|= 1;
             }
@@ -390,6 +452,72 @@ pub const Session = struct {
             for (&rs.agents_dispensed, output.units) |*d, u| d.* +|= stat_u16(u);
             for (&rs.medicine_dispensed, output.medicine) |*d, m| d.* +|= stat_u16(m);
             for (&rs.medicine_healed, healed) |*d, h| d.* +|= h;
+        }
+    }
+
+    /// Realtime: the Lil Guys eat the current zone continuously.  Whole
+    /// units accumulate at `eat_rate_units_per_s` per connected player;
+    /// each batch of bites adds hunger (normal + healable extra), score,
+    /// and per-round stats, broadcasting a .damage action_result.  An
+    /// emptied zone advances immediately (round_reset) — the cast window
+    /// keeps running across zone boundaries.
+    fn eat_tick(self: *Session, dt: f32) !void {
+        var connected: u32 = 0;
+        for (&self.players) |*p| {
+            if (p.occupied and p.connected) connected += 1;
+        }
+        if (connected == 0) connected = 1;
+
+        self.eat_accum += self.cfg.balance.eat_rate_units_per_s *
+            @as(f32, @floatFromInt(connected)) * dt;
+        const n: u32 = @intFromFloat(@floor(self.eat_accum));
+        if (n < 1) return;
+        self.eat_accum -= @floatFromInt(n);
+
+        if (self.zone_index >= self.zone_count) return;
+        const zone = &self.zones[self.zone_index];
+        const out = logic.eat_units(&self.cfg.balance, zone, n);
+
+        const hunger_added = out.hunger_normal + out.hunger_extra_total();
+        logic.add_hunger(&self.hunger, hunger_added);
+        for (&self.hunger_healable, out.hunger_extra) |*healable, extra| {
+            const grown = @as(u32, healable.*) + extra;
+            healable.* = @intCast(@min(grown, @as(u32, std.math.maxInt(u16))));
+        }
+        self.score += out.score;
+
+        // Per-round consumption stats accumulate bite by bite (round index
+        // == zone index, as in classic).
+        if (self.zone_index < enc.MAX_ZONES) {
+            const rs = &self.stats.round_stats[self.zone_index];
+            for (&rs.neutralized, out.eaten_neutralized) |*d, v| d.* +|= v;
+            for (&rs.modified_escaped, out.eaten_modified) |*d, v| d.* +|= v;
+            rs.neutral_consumed +|= out.eaten_neutral;
+            rs.hunger_normal +|= stat_u16(out.hunger_normal);
+            rs.hunger_extra +|= stat_u16(out.hunger_extra_total());
+            rs.hunger_after = self.hunger.current;
+        }
+
+        if (hunger_added > 0) {
+            try self.broadcast_action_result(.{
+                .tag = .damage,
+                .actor_entity = std.math.maxInt(u32),
+                .target_entity = std.math.maxInt(u32),
+                .value = @intCast(@min(hunger_added, std.math.maxInt(u16))),
+            });
+        }
+
+        if (zone.total_units() == 0) {
+            // Zone fully eaten: advance immediately.  The cast window and
+            // locked-in spells are independent of zone boundaries.
+            self.zones[self.zone_index] = .{};
+            self.zone_index += 1;
+            self.round_count += 1;
+            self.casts_used = [_]u8{0} ** MAX_PLAYERS;
+            var buf: [2]u8 = undefined;
+            var fbs = std.io.fixedBufferStream(&buf);
+            proto.encode(fbs.writer(), .round_reset, {}) catch return;
+            self.broadcast_raw(fbs.getWritten()) catch {};
         }
     }
 
@@ -510,6 +638,52 @@ pub const Session = struct {
                     self.action_pool[player_id] = null;
                     std.log.debug("player {} cancelled combo", .{player_id});
                 }
+            },
+            .submit_spell => {
+                // Always decode so the stream stays in sync for any
+                // messages queued after this one.
+                const p = try proto.decode_submit_spell(fbs.reader());
+                if (self.phase != .playing or self.mode != .realtime or player_id >= MAX_PLAYERS) return;
+                // Already locked in this window: silent ignore.
+                if (self.submitted_pool[player_id] != null) return;
+
+                // Zero-output combos FIZZLE without locking the window.
+                if (!logic.combo_has_output(&self.cfg.balance, p.combo)) {
+                    self.stats.players[player_id].fizzles +|= 1;
+                    var fbuf: [4]u8 = undefined;
+                    var ffbs = std.io.fixedBufferStream(&fbuf);
+                    try proto.encode(ffbs.writer(), .cast_fizzled, proto.CastFizzled{
+                        .player_id = player_id,
+                    });
+                    try self.broadcast_raw(ffbs.getWritten());
+                    return;
+                }
+
+                self.submitted_pool[player_id] = p.combo;
+                self.action_pool[player_id] = null; // clears the live preview
+                // On-wire submission marker (game_start announces
+                // casts_per_round = 1 in realtime, so the existing
+                // "casts used" client UI reads correctly).
+                self.casts_used[player_id] = 1;
+                self.record_cast_stats(player_id, p.combo);
+
+                var buf: [4]u8 = undefined;
+                var cfbs = std.io.fixedBufferStream(&buf);
+                try proto.encode(cfbs.writer(), .cast_committed, proto.CastCommitted{
+                    .player_id = player_id,
+                });
+                try self.broadcast_raw(cfbs.getWritten());
+
+                const slot = &self.players[player_id];
+                if (slot.entity != std.math.maxInt(ecs.Entity)) {
+                    try self.broadcast_action_result(.{
+                        .tag = .cast,
+                        .actor_entity = slot.entity,
+                        .target_entity = std.math.maxInt(u32),
+                        .value = 0,
+                    });
+                }
+                std.log.debug("player {} submitted spell (realtime)", .{player_id});
             },
             .reconnect => {},
             else => {},
@@ -648,7 +822,9 @@ pub const Session = struct {
             .encounter_label_len = @intCast(@min(encounter.label.len, 32)),
             .player_id = slot.player_id,
             .round_duration = self.round_duration,
-            .casts_per_round = self.cfg.balance.casts_per_round,
+            .casts_per_round = if (self.mode == .realtime) 1 else self.cfg.balance.casts_per_round,
+            .mode = self.mode,
+            .cast_window_ms = if (self.mode == .realtime) self.cfg.balance.cast_window_ms else 0,
         };
         @memcpy(gs_msg.encounter_label[0..gs_msg.encounter_label_len], encounter.label[0..gs_msg.encounter_label_len]);
         try proto.encode(fbs.writer(), .game_start, gs_msg);
@@ -662,6 +838,7 @@ pub const Session = struct {
             .players = [_]proto.PlayerInfo{std.mem.zeroes(proto.PlayerInfo)} ** proto.MAX_PLAYERS,
             .player_id = 0xFF,
             .round_duration = self.round_duration,
+            .mode = self.mode,
         };
         for (&self.players, 0..) |*slot, i| {
             if (!slot.occupied) continue;
@@ -697,7 +874,9 @@ pub const Session = struct {
                 .encounter_label_len = @intCast(@min(encounter_label.len, 32)),
                 .player_id = slot.player_id,
                 .round_duration = self.round_duration,
-                .casts_per_round = self.cfg.balance.casts_per_round,
+                .casts_per_round = if (self.mode == .realtime) 1 else self.cfg.balance.casts_per_round,
+                .mode = self.mode,
+                .cast_window_ms = if (self.mode == .realtime) self.cfg.balance.cast_window_ms else 0,
             };
             @memcpy(gs_msg.encounter_label[0..gs_msg.encounter_label_len], encounter_label[0..gs_msg.encounter_label_len]);
             try proto.encode(fbs.writer(), .game_start, gs_msg);
@@ -708,7 +887,7 @@ pub const Session = struct {
     fn broadcast_game_state(self: *Session) !void {
         var snap = proto.GameState.blank;
         snap.tick = self.tick_count;
-        snap.round_timer = @max(self.round_timer, 0.0);
+        snap.round_timer = if (self.mode == .realtime) 0.0 else @max(self.round_timer, 0.0);
         snap.cast_timer = @max(self.cast_timer, 0.0);
         snap.hunger = .{
             .current = self.hunger.current,

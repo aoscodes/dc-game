@@ -6,26 +6,18 @@ const balance = @import("balance.zig");
 pub const MsgTag = enum(u8) {
     join_lobby = 0x01,
     ready_up = 0x03,
-    // 0x04 was the legacy single-action choose_action; retired.
     reconnect = 0x05,
-    // 0x06 was the legacy set_statblock; retired (statblocks removed).
     choose_combo = 0x07,
     cancel_combo = 0x08,
-
+    submit_spell = 0x09,
     lobby_update = 0x10,
     game_start = 0x11,
     game_state = 0x12,
     action_result = 0x13,
     round_reset = 0x14,
     game_over = 0x15,
-    /// A player's pending combo was committed as a spell (cast window closed).
-    /// Payload: player_id.  The owning client clears its pending combo.
     cast_committed = 0x16,
-    /// A player's pending combo had zero possible output and was DISCARDED at
-    /// window close without consuming a cast.  Payload: player_id.
     cast_fizzled = 0x17,
-    /// A recipe fired during a cast window.  Payload: kind (player/team) +
-    /// index into the corresponding balance recipe table.
     recipe_fired = 0x18,
 };
 
@@ -35,6 +27,10 @@ pub const JoinLobby = struct {
 };
 
 pub const ChooseCombo = struct {
+    combo: components.ActionCombo,
+};
+
+pub const SubmitSpell = struct {
     combo: components.ActionCombo,
 };
 
@@ -83,9 +79,6 @@ pub const RecipeKind = enum(u8) {
     team = 1,
 };
 
-/// A recipe fired: `index` refers to the balance table for `kind`
-/// (player_recipes / team_recipes, table order — same convention as the
-/// match-stats hit arrays and the JS mirror tables).
 pub const RecipeFired = struct {
     kind: RecipeKind,
     index: u8,
@@ -115,6 +108,7 @@ pub const LobbyUpdate = struct {
     players: [MAX_PLAYERS]PlayerInfo,
     player_id: u8,
     round_duration: f32,
+    mode: components.GameMode = .classic,
 };
 
 pub const GameStart = struct {
@@ -122,16 +116,15 @@ pub const GameStart = struct {
     encounter_label_len: u8,
     player_id: u8,
     round_duration: f32,
-    /// Spells each player may commit per round (from the server's balance
-    /// data; clients must not hardcode it).
     casts_per_round: u8,
+    mode: components.GameMode = .classic,
+    cast_window_ms: u32 = 0,
 };
 
 pub const EntitySnapshot = struct {
     entity: u32,
     kind: components.EntityKind,
     owner: u8,
-    /// Spells already committed by this player this round (0..CASTS_PER_ROUND).
     casts_used: u8,
     combo_len: u8,
     combo_slots: [components.MAX_COMBO_LEN]components.ComboSlot,
@@ -149,15 +142,11 @@ pub const EntitySnapshot = struct {
 pub const MAX_ENTITIES_WIRE: u16 = 64;
 pub const MAX_ZONES_WIRE: u8 = encounter.MAX_ZONES;
 
-/// A filled bar on the wire (currently only the Total Hunger bar).
 pub const BarSummary = struct {
     current: u16,
     max: u16,
 };
 
-/// Per-zone slime contents on the wire.  `neutralized` = modified units
-/// transmuted by agents this round (per original color), consumed at round
-/// end.  Consumed zones are all zeros.
 pub const ZoneSnapshot = struct {
     modified: [components.Element.size]u16,
     neutralized: [components.Element.size]u16,
@@ -173,22 +162,14 @@ pub const ZoneSnapshot = struct {
 pub const GameState = struct {
     tick: u32,
     round_timer: f32,
-    /// Countdown of the current cast window (round_duration / CASTS_PER_ROUND).
-    /// Pending combos commit when it reaches 0.
     cast_timer: f32,
     entity_count: u8,
     entities: [MAX_ENTITIES_WIRE]EntitySnapshot,
-    /// Hunger bar: current fills toward max; full = encounter over.
     hunger: BarSummary,
-    /// Portion of current hunger healable by medicine, per slime color
-    /// (Element ordinal).  Only matching-color medicine heals each bucket.
     hunger_healable: [components.Element.size]u16,
-    /// Shared team score: neutral slime units consumed so far.
     score: u32,
-    /// Index of the zone being eaten this round (== rounds resolved).
     zone_index: u8,
     zone_count: u8,
-    /// All zones (current + upcoming visible to players; consumed = zeros).
     zones: [MAX_ZONES_WIRE]ZoneSnapshot,
 
     pub const blank = GameState{
@@ -207,15 +188,9 @@ pub const GameState = struct {
 };
 
 pub const ActionResultTag = enum(u8) {
-    /// Hunger added by zone consumption this round (value = hunger).
     damage = 0,
-    /// Medicine healed the hunger bar (value = amount healed).
     heal = 1,
-    // 0x02 was `shield` (units neutralized per round); retired — clients
-    // read transmutation live from zone snapshots instead.
     death = 4,
-    /// A player's spell committed (cast window closed).  actor_entity = the
-    /// caster's entity; clients play the cast/attack animation on it.
     cast = 5,
 };
 
@@ -231,43 +206,29 @@ pub const EndReason = enum(u8) {
     field_cleared = 1,
 };
 
-/// One resolved round's tuning numbers (all per-color arrays use Element
-/// ordinal order: red, green, yellow, blue).
 pub const RoundStats = struct {
-    /// Spells committed this round.
     casts: u8 = 0,
-    /// Team agent output after recipe conversion.
     agents_dispensed: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
     medicine_dispensed: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
-    /// Actually healed; overheal = dispensed - healed (derived client-side).
     medicine_healed: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
     neutralized: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
-    /// Modified slime eaten un-neutralized.
     modified_escaped: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
     neutral_consumed: u16 = 0,
     hunger_normal: u16 = 0,
     hunger_extra: u16 = 0,
-    /// Hunger bar level after this round resolved.
     hunger_after: u16 = 0,
 };
 
-/// Per-player tuning numbers.  Slot counts are RAW (pre-recipe) per-color
-/// counts from committed combos, so attribution is unambiguous.
 pub const PlayerStats = struct {
     name: [16]u8 = [_]u8{0} ** 16,
     name_len: u8 = 0,
     casts: u16 = 0,
     dispense_slots: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
     medicine_slots: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
-    /// Casts consumed by any recipe (player or team).
     recipe_casts: u16 = 0,
-    /// Zero-output combos discarded at window close (did not cost a cast).
     fizzles: u16 = 0,
 };
 
-/// Full-match tuning report broadcast with game_over.  Rounds are bounded by
-/// MAX_ZONES (one zone per round).  Match totals are derived client-side by
-/// summing round_stats.
 pub const MatchStats = struct {
     reason: EndReason = .field_cleared,
     /// Rounds resolved; round_stats[0..rounds] are valid.
@@ -312,6 +273,11 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
             for (payload.combo.slots[0..payload.combo.len]) |slot|
                 try encode_combo_slot(writer, slot);
         },
+        .submit_spell => {
+            try writer.writeByte(payload.combo.len);
+            for (payload.combo.slots[0..payload.combo.len]) |slot|
+                try encode_combo_slot(writer, slot);
+        },
         .cancel_combo => {},
         .round_reset => {},
         .cast_committed => try writer.writeByte(payload.player_id),
@@ -342,6 +308,7 @@ fn encode_lobby_update(w: anytype, p: LobbyUpdate) !void {
     try w.writeByte(p.player_count);
     try w.writeByte(p.player_id);
     try w.writeInt(u32, @bitCast(p.round_duration), .little);
+    try w.writeByte(@intFromEnum(p.mode));
     var i: u8 = 0;
     while (i < p.player_count) : (i += 1) {
         const pl = p.players[i];
@@ -360,6 +327,8 @@ fn encode_game_start(w: anytype, p: GameStart) !void {
     try w.writeByte(p.player_id);
     try w.writeInt(u32, @bitCast(p.round_duration), .little);
     try w.writeByte(p.casts_per_round);
+    try w.writeByte(@intFromEnum(p.mode));
+    try w.writeInt(u32, p.cast_window_ms, .little);
 }
 
 fn encode_bar_summary(w: anytype, s: BarSummary) !void {
@@ -530,6 +499,7 @@ pub const DecodeError = error{
     InvalidEndReason,
     TooManyRecipes,
     InvalidRecipeKind,
+    InvalidGameMode,
 };
 
 pub fn read_tag(reader: anytype) !MsgTag {
@@ -545,7 +515,7 @@ pub fn decode_join_lobby(reader: anytype) !JoinLobby {
     return p;
 }
 
-pub fn decode_choose_combo(reader: anytype) !ChooseCombo {
+fn decode_combo_payload(reader: anytype) !components.ActionCombo {
     const len = try reader.readByte();
     if (len == 0 or len > components.MAX_COMBO_LEN) return DecodeError.InvalidComboLen;
     var combo = components.ActionCombo{
@@ -557,7 +527,15 @@ pub fn decode_choose_combo(reader: anytype) !ChooseCombo {
         const byte = try reader.readByte();
         combo.slots[i] = try decode_combo_slot(byte);
     }
-    return .{ .combo = combo };
+    return combo;
+}
+
+pub fn decode_choose_combo(reader: anytype) !ChooseCombo {
+    return .{ .combo = try decode_combo_payload(reader) };
+}
+
+pub fn decode_submit_spell(reader: anytype) !SubmitSpell {
+    return .{ .combo = try decode_combo_payload(reader) };
 }
 
 pub fn decode_reconnect(reader: anytype) !Reconnect {
@@ -571,6 +549,9 @@ pub fn decode_lobby_update(reader: anytype) !LobbyUpdate {
     p.player_id = try reader.readByte();
     if (p.player_count > MAX_PLAYERS) return DecodeError.TooManyEntities;
     p.round_duration = @bitCast(try reader.readInt(u32, .little));
+    const mode_byte = try reader.readByte();
+    p.mode = std.meta.intToEnum(components.GameMode, mode_byte) catch
+        return DecodeError.InvalidGameMode;
     var i: u8 = 0;
     while (i < p.player_count) : (i += 1) {
         p.players[i].player_id = try reader.readByte();
@@ -597,6 +578,10 @@ pub fn decode_game_start(reader: anytype) !GameStart {
     p.player_id = try reader.readByte();
     p.round_duration = @bitCast(try reader.readInt(u32, .little));
     p.casts_per_round = try reader.readByte();
+    const mode_byte = try reader.readByte();
+    p.mode = std.meta.intToEnum(components.GameMode, mode_byte) catch
+        return DecodeError.InvalidGameMode;
+    p.cast_window_ms = try reader.readInt(u32, .little);
     return p;
 }
 
@@ -930,6 +915,69 @@ test "round-trip: choose_combo with element slots [red, dispense, blue, dispense
     try std.testing.expectEqual(components.ActionChoice.dispense, decoded.combo.slots[1].action);
     try std.testing.expectEqual(components.Element.blue, decoded.combo.slots[2].element);
     try std.testing.expectEqual(components.ActionChoice.dispense, decoded.combo.slots[3].action);
+}
+
+test "round-trip: submit_spell carries the combo" {
+    var buf: [16]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    const combo = components.make_combo(&.{
+        .{ .element = .red },
+        .{ .action = .dispense },
+        .{ .action = .dispense },
+    });
+    try encode(fbs.writer(), .submit_spell, SubmitSpell{ .combo = combo });
+    fbs.reset();
+    const tag = try read_tag(fbs.reader());
+    try std.testing.expectEqual(MsgTag.submit_spell, tag);
+    const decoded = try decode_submit_spell(fbs.reader());
+    try std.testing.expectEqual(@as(u8, 3), decoded.combo.len);
+    try std.testing.expectEqual(components.Element.red, decoded.combo.slots[0].element);
+    try std.testing.expectEqual(components.ActionChoice.dispense, decoded.combo.slots[1].action);
+}
+
+test "round-trip: game_start realtime mode + cast_window_ms survive" {
+    var buf: [64]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    const label = "rt";
+    var gs = GameStart{
+        .encounter_label = [_]u8{0} ** 32,
+        .encounter_label_len = @intCast(label.len),
+        .player_id = 1,
+        .round_duration = 0.0,
+        .casts_per_round = 1,
+        .mode = .realtime,
+        .cast_window_ms = 3000,
+    };
+    @memcpy(gs.encounter_label[0..label.len], label);
+
+    try encode(fbs.writer(), .game_start, gs);
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    const decoded = try decode_game_start(fbs.reader());
+    try std.testing.expectEqual(components.GameMode.realtime, decoded.mode);
+    try std.testing.expectEqual(@as(u32, 3000), decoded.cast_window_ms);
+    try std.testing.expectEqual(@as(u8, 1), decoded.casts_per_round);
+}
+
+test "round-trip: lobby_update mode survives" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    const lu = LobbyUpdate{
+        .join_code = "ABCDEF".*,
+        .player_count = 0,
+        .players = [_]PlayerInfo{std.mem.zeroes(PlayerInfo)} ** MAX_PLAYERS,
+        .player_id = 0,
+        .round_duration = 15.0,
+        .mode = .realtime,
+    };
+    try encode(fbs.writer(), .lobby_update, lu);
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    const decoded = try decode_lobby_update(fbs.reader());
+    try std.testing.expectEqual(components.GameMode.realtime, decoded.mode);
 }
 
 test "decode_choose_combo: len=0 returns InvalidComboLen" {

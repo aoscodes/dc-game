@@ -148,6 +148,7 @@ fn consume_payload(tag: proto.MsgTag, r: anytype) bool {
         .reconnect => if (proto.decode_reconnect(r)) |_| true else |_| false,
         .ready_up => true, // zero-payload
         .choose_combo => if (proto.decode_choose_combo(r)) |_| true else |_| false,
+        .submit_spell => if (proto.decode_submit_spell(r)) |_| true else |_| false,
         .cancel_combo => true, // zero-payload
         .lobby_update => if (proto.decode_lobby_update(r)) |_| true else |_| false,
         .game_start => if (proto.decode_game_start(r)) |_| true else |_| false,
@@ -1377,4 +1378,276 @@ test "disconnect in lobby frees the slot" {
     s.sess.disconnect(s.p[1].pid);
     try std.testing.expectEqual(@as(u8, 1), s.sess.player_count);
     try std.testing.expect(!s.sess.players[s.p[1].pid].occupied);
+}
+
+// ---------------------------------------------------------------------------
+// Realtime mode
+//
+// Fixture balance: eat_rate_units_per_s = 2.0 (per connected player; two
+// players → 4 units/s), cast_window_ms = 3000 (3.0s windows).
+// ---------------------------------------------------------------------------
+
+/// One zone: 30 red-modified units — exactly one twin_flames output.
+const enc_thirty_red = enc.Encounter{
+    .label = "test_thirty_red",
+    .hunger_max = 1000,
+    .zones = &[_]c.ZoneDef{
+        .{ .modified = .{ 30, 0, 0, 0 } },
+    },
+};
+
+/// Two players in a REALTIME game against `encounter`.
+fn start_realtime(s: *TwoPlayerSession, encounter: *const enc.Encounter) !void {
+    s.sess.mode = .realtime;
+    try s.sess.start_game_encounter(encounter);
+}
+
+fn enqueue_submit(sess: *Session, pid: u8, combo: c.ActionCombo) !void {
+    try enqueue_msg(sess, pid, .submit_spell, proto.SubmitSpell{ .combo = combo });
+}
+
+test "realtime: submit_spell locks the window; second submit silently ignored" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start_realtime(&s, &enc_fifty_red);
+
+    const combo = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
+    const combo_b = mk(&.{ .{ .element = .blue }, .{ .action = .dispense } });
+
+    s.p[1].clear();
+    try enqueue_submit(&s.sess, s.p[0].pid, combo);
+    try flush(&s.sess);
+
+    // Locked: pool holds the spell, on-wire marker set, live preview cleared.
+    try std.testing.expect(logic.combos_equal(combo, s.sess.submitted_pool[s.p[0].pid].?));
+    try std.testing.expectEqual(@as(u8, 1), s.sess.casts_used[s.p[0].pid]);
+    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.action_pool[s.p[0].pid]);
+
+    var msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_committed));
+    var cast_count: usize = 0;
+    for (msgs) |m| {
+        if (m.tag != .action_result) continue;
+        var fbs = std.io.fixedBufferStream(m.payload);
+        const ar = try proto.decode_action_result(fbs.reader());
+        if (ar.tag == .cast) {
+            cast_count += 1;
+            try std.testing.expectEqual(s.sess.players[s.p[0].pid].entity, ar.actor_entity);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), cast_count);
+
+    // Second submit in the same window: silent ignore, first spell kept.
+    s.p[1].clear();
+    try enqueue_submit(&s.sess, s.p[0].pid, combo_b);
+    try flush(&s.sess);
+
+    msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_committed));
+    try std.testing.expect(logic.combos_equal(combo, s.sess.submitted_pool[s.p[0].pid].?));
+}
+
+test "realtime: zero-output submit fizzles and does not lock the window" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start_realtime(&s, &enc_fifty_red);
+
+    // Dangling element token: no output → fizzle, not locked.
+    s.p[1].clear();
+    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{.{ .element = .red }}));
+    try flush(&s.sess);
+
+    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.submitted_pool[s.p[0].pid]);
+    try std.testing.expectEqual(@as(u8, 0), s.sess.casts_used[s.p[0].pid]);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.players[s.p[0].pid].fizzles);
+
+    var msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_fizzled));
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_committed));
+
+    // A later valid submit in the same window still locks.
+    s.p[1].clear();
+    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .red }, .{ .action = .dispense } }));
+    try flush(&s.sess);
+
+    try std.testing.expect(s.sess.submitted_pool[s.p[0].pid] != null);
+    msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_committed));
+}
+
+test "realtime: window close converts the batch — twin_flames team recipe" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start_realtime(&s, &enc_thirty_red); // 30 red units
+
+    // Both players lock in the twin_flames half within the SAME window.
+    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
+    try enqueue_submit(&s.sess, s.p[0].pid, half);
+    try enqueue_submit(&s.sess, s.p[1].pid, half);
+    try flush(&s.sess);
+
+    s.p[1].clear();
+    try s.sess.tick(3.05); // window (3.0s) closes → batch converts
+
+    // twin_flames → 30 agents: the ENTIRE zone transmuted (flat conversion
+    // would only cover 20, leaving modified slime behind even after eating).
+    try std.testing.expectEqual(@as(u16, 0), s.sess.zones[0].modified[RED]);
+    try std.testing.expectEqual(session_mod.SessionPhase.playing, s.sess.phase);
+
+    // Window committed: pool + markers reset for the next window.
+    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.submitted_pool[s.p[0].pid]);
+    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.submitted_pool[s.p[1].pid]);
+    try std.testing.expectEqual(@as(u8, 0), s.sess.casts_used[s.p[0].pid]);
+    try std.testing.expectEqual(@as(u8, 0), s.sess.casts_used[s.p[1].pid]);
+
+    // Exactly one TEAM recipe fire broadcast.
+    const msgs = try drain(s.p[1].buf.items, arena);
+    var team_fires: usize = 0;
+    for (msgs) |m| {
+        if (m.tag != .recipe_fired) continue;
+        var fbs = std.io.fixedBufferStream(m.payload);
+        const rf = try proto.decode_recipe_fired(fbs.reader());
+        try std.testing.expectEqual(proto.RecipeKind.team, rf.kind);
+        try std.testing.expectEqual(@as(u8, 0), rf.index); // twin_flames
+        team_fires += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), team_fires);
+
+    // Every unit eaten during the tick was neutralized → all score.
+    try std.testing.expectEqual(@as(u32, 12), s.sess.score); // 4 units/s × 3.05s → 12
+}
+
+test "realtime: eating grows hunger, shrinks the zone, and advances on empty" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start_realtime(&s, &enc_two_zones); // z0: 10 red + 5 neutral = 15 units
+
+    s.p[1].clear();
+    try s.sess.tick(1.0); // 2 players × 2.0/s × 1s = 4 units eaten
+
+    // Largest-bucket-first: all 4 bites hit the red modified pile (10 > 5).
+    try std.testing.expectEqual(@as(u16, 6), s.sess.zones[0].modified[RED]);
+    const expected_hunger_1s = 4 * BAL.hunger_cost_normal + 4 * BAL.hunger_cost_modified_extra;
+    try std.testing.expectEqual(@as(u16, @intCast(expected_hunger_1s)), s.sess.hunger.current);
+    try std.testing.expectEqual(
+        @as(u16, @intCast(4 * BAL.hunger_cost_modified_extra)),
+        s.sess.hunger_healable[RED],
+    );
+    try std.testing.expectEqual(@as(u8, 0), s.sess.zone_index);
+
+    // 3 more seconds: the remaining 11 units are gone by t=4s → zone advance.
+    try s.sess.tick(1.0);
+    try s.sess.tick(1.0);
+    try s.sess.tick(1.0);
+
+    try std.testing.expectEqual(@as(u8, 1), s.sess.zone_index);
+    try std.testing.expectEqual(@as(u32, 1), s.sess.round_count);
+    try std.testing.expectEqual(session_mod.SessionPhase.playing, s.sess.phase);
+    // Zone 0 total: 15 normal + 10 modified × extra.
+    const expected_hunger_z0 = 15 * BAL.hunger_cost_normal + 10 * BAL.hunger_cost_modified_extra;
+    try std.testing.expectEqual(@as(u16, @intCast(expected_hunger_z0)), s.sess.hunger.current);
+
+    const msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .round_reset));
+}
+
+test "classic: submit_spell is ignored" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start_playing(&s, &enc_fifty_red); // classic mode
+
+    s.p[1].clear();
+    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .red }, .{ .action = .dispense } }));
+    try flush(&s.sess);
+
+    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.submitted_pool[s.p[0].pid]);
+    const msgs = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_committed));
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_fizzled));
+}
+
+test "realtime: hunger_full ends the game" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    // z0: 10 red un-neutralized = 30 hunger ≥ max 25.
+    try start_realtime(&s, &enc_tight_budget);
+
+    s.p[0].clear();
+    var i: usize = 0;
+    while (i < 5 and s.sess.phase == .playing) : (i += 1) {
+        try s.sess.tick(1.0);
+    }
+
+    try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
+    try std.testing.expectEqual(@as(u16, 25), s.sess.hunger.current); // clamped at max
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+    const go_msg = find_tag(msgs, .game_over) orelse return error.NoGameOver;
+    var fbs = std.io.fixedBufferStream(go_msg.payload);
+    const go = try proto.decode_game_over(fbs.reader());
+    try std.testing.expectEqual(proto.EndReason.hunger_full, go.stats.reason);
+}
+
+test "realtime: eating everything ends the game field_cleared" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start_realtime(&s, &enc_neutral_only); // 30 + 10 neutral, roomy budget
+
+    s.p[0].clear();
+    var i: usize = 0;
+    while (i < 20 and s.sess.phase == .playing) : (i += 1) {
+        try s.sess.tick(1.0);
+    }
+
+    try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
+    try std.testing.expectEqual(@as(u32, 40), s.sess.score); // all neutral eaten
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+    const go_msg = find_tag(msgs, .game_over) orelse return error.NoGameOver;
+    var fbs = std.io.fixedBufferStream(go_msg.payload);
+    const go = try proto.decode_game_over(fbs.reader());
+    try std.testing.expectEqual(proto.EndReason.field_cleared, go.stats.reason);
+    try std.testing.expectEqual(@as(u32, 40), go.score);
 }

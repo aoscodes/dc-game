@@ -262,6 +262,102 @@ pub fn transmute(zone: *c.ZoneDef, agents: [c.Element.size]u32) [c.Element.size]
     return transmuted;
 }
 
+/// Result of Lil Guys eating `n` units from a zone (realtime mode).
+/// Field semantics mirror ZoneOutcome, but scoped to the bites taken.
+pub const EatOutcome = struct {
+    /// Units actually eaten (== requested n unless the zone ran out).
+    eaten: u32 = 0,
+    /// Modified units eaten WITHOUT neutralization, per color.
+    eaten_modified: [c.Element.size]u16 = [_]u16{0} ** c.Element.size,
+    /// Neutralized (transmuted) units eaten, per original color.
+    eaten_neutralized: [c.Element.size]u16 = [_]u16{0} ** c.Element.size,
+    /// Naturally-neutral units eaten.
+    eaten_neutral: u16 = 0,
+    /// Hunger from eating every unit at the normal rate (never healable).
+    hunger_normal: u32 = 0,
+    /// Extra hunger per color from un-neutralized modified units eaten.
+    /// Healable only by matching-color medicine.
+    hunger_extra: [c.Element.size]u32 = [_]u32{0} ** c.Element.size,
+    /// Score gained: neutralized + naturally-neutral units eaten.
+    score: u32 = 0,
+
+    pub fn hunger_extra_total(self: EatOutcome) u32 {
+        var total: u32 = 0;
+        for (self.hunger_extra) |e| total += e;
+        return total;
+    }
+};
+
+/// Which bucket a single bite comes from.
+const Bite = union(enum) {
+    neutral,
+    neutralized: usize,
+    modified: usize,
+};
+
+/// Pick the bucket the next bite comes from: the LARGEST remaining bucket
+/// among neutral, neutralized[color], modified[color] (deterministic
+/// tiebreak in that order, colors in Element ordinal order).  Eating the
+/// biggest bucket first keeps consumption roughly proportional — every
+/// bucket shrinks throughout the zone, so players have the whole zone
+/// duration to transmute modified slime.  Returns null when the zone is
+/// empty.
+fn pick_bite(zone: *const c.ZoneDef) ?Bite {
+    var best: ?Bite = null;
+    var best_count: u16 = 0;
+    if (zone.neutral > best_count) {
+        best = .neutral;
+        best_count = zone.neutral;
+    }
+    for (zone.neutralized, 0..) |count, i| {
+        if (count > best_count) {
+            best = .{ .neutralized = i };
+            best_count = count;
+        }
+    }
+    for (zone.modified, 0..) |count, i| {
+        if (count > best_count) {
+            best = .{ .modified = i };
+            best_count = count;
+        }
+    }
+    return best;
+}
+
+/// Realtime mode: eat `n` units from the zone in place (one bite at a time
+/// via `pick_bite`), stopping early if the zone empties.  Every unit costs
+/// bal.hunger_cost_normal; each un-neutralized modified unit additionally
+/// costs bal.hunger_cost_modified_extra (healable, tracked per color);
+/// neutralized + naturally-neutral units score.  Equivalent in totals to
+/// consume_zone once the zone is fully eaten with no further transmutation.
+pub fn eat_units(bal: *const balance.Balance, zone: *c.ZoneDef, n: u32) EatOutcome {
+    var out = EatOutcome{};
+    var remaining = n;
+    while (remaining > 0) : (remaining -= 1) {
+        const bite = pick_bite(zone) orelse break;
+        out.eaten += 1;
+        out.hunger_normal += bal.hunger_cost_normal;
+        switch (bite) {
+            .neutral => {
+                zone.neutral -= 1;
+                out.eaten_neutral += 1;
+                out.score += 1;
+            },
+            .neutralized => |i| {
+                zone.neutralized[i] -= 1;
+                out.eaten_neutralized[i] += 1;
+                out.score += 1;
+            },
+            .modified => |i| {
+                zone.modified[i] -= 1;
+                out.eaten_modified[i] += 1;
+                out.hunger_extra[i] += bal.hunger_cost_modified_extra;
+            },
+        }
+    }
+    return out;
+}
+
 pub const ZoneOutcome = struct {
     /// Neutralized (transmuted) units consumed per original color.
     neutralized: [c.Element.size]u16,
@@ -654,6 +750,79 @@ test "transmute: sequential windows equal one batched application" {
     const ob = consume_zone(test_bal, zone_b);
     try std.testing.expectEqual(oa.score, ob.score);
     try std.testing.expectEqual(oa.hunger_extra_total(), ob.hunger_extra_total());
+}
+
+test "eat_units: largest bucket eaten first, deterministic tiebreak order" {
+    var zone = c.ZoneDef{ .neutral = 2 };
+    zone.modified[@intFromEnum(c.Element.red)] = 3;
+    // First bite: modified red (3 is largest).
+    const o1 = eat_units(test_bal, &zone, 1);
+    try std.testing.expectEqual(@as(u16, 1), o1.eaten_modified[@intFromEnum(c.Element.red)]);
+    // Now 2 vs 2: tiebreak order picks neutral before modified.
+    const o2 = eat_units(test_bal, &zone, 1);
+    try std.testing.expectEqual(@as(u16, 1), o2.eaten_neutral);
+}
+
+test "eat_units: hunger and score accrue per unit" {
+    var zone = c.ZoneDef{ .neutral = 1 };
+    zone.modified[@intFromEnum(c.Element.blue)] = 2;
+    zone.neutralized[@intFromEnum(c.Element.green)] = 1;
+    const out = eat_units(test_bal, &zone, 4);
+    try std.testing.expectEqual(@as(u32, 4), out.eaten);
+    try std.testing.expectEqual(4 * test_bal.hunger_cost_normal, out.hunger_normal);
+    try std.testing.expectEqual(2 * test_bal.hunger_cost_modified_extra, out.hunger_extra[@intFromEnum(c.Element.blue)]);
+    // Score: 1 neutral + 1 neutralized.
+    try std.testing.expectEqual(@as(u32, 2), out.score);
+    try std.testing.expectEqual(@as(u32, 0), zone.total_units());
+}
+
+test "eat_units: stops early when the zone empties" {
+    var zone = c.ZoneDef{ .neutral = 3 };
+    const out = eat_units(test_bal, &zone, 10);
+    try std.testing.expectEqual(@as(u32, 3), out.eaten);
+    try std.testing.expectEqual(@as(u32, 3), out.score);
+    try std.testing.expectEqual(@as(u32, 0), zone.total_units());
+    // Eating an empty zone is a no-op.
+    const again = eat_units(test_bal, &zone, 5);
+    try std.testing.expectEqual(@as(u32, 0), again.eaten);
+    try std.testing.expectEqual(@as(u32, 0), again.hunger_normal);
+}
+
+test "eat_units: incremental bites total the same as consume_zone" {
+    var zone_inc = c.ZoneDef{ .neutral = 7 };
+    zone_inc.modified = .{ 10, 4, 0, 0 };
+    zone_inc.neutralized = .{ 0, 0, 6, 0 };
+    const zone_batch = zone_inc;
+
+    var total = EatOutcome{};
+    while (zone_inc.total_units() > 0) {
+        const bite = eat_units(test_bal, &zone_inc, 3);
+        total.eaten += bite.eaten;
+        total.hunger_normal += bite.hunger_normal;
+        total.score += bite.score;
+        for (&total.hunger_extra, bite.hunger_extra) |*acc, e| acc.* += e;
+    }
+
+    const batch = consume_zone(test_bal, zone_batch);
+    try std.testing.expectEqual(zone_batch.total_units(), total.eaten);
+    try std.testing.expectEqual(batch.hunger_normal, total.hunger_normal);
+    try std.testing.expectEqual(batch.hunger_extra_total(), total.hunger_extra_total());
+    try std.testing.expectEqual(batch.score, total.score);
+}
+
+test "eat_units: interleaved transmutation neutralizes remaining modified slime" {
+    // 10 modified red; eat 4, then transmute the rest, then eat the rest.
+    var zone = c.ZoneDef{};
+    zone.modified[@intFromEnum(c.Element.red)] = 10;
+    const first = eat_units(test_bal, &zone, 4);
+    try std.testing.expectEqual(4 * test_bal.hunger_cost_modified_extra, first.hunger_extra_total());
+    var agents = [_]u32{0} ** c.Element.size;
+    agents[@intFromEnum(c.Element.red)] = 99;
+    _ = transmute(&zone, agents);
+    const rest = eat_units(test_bal, &zone, 99);
+    try std.testing.expectEqual(@as(u32, 6), rest.eaten);
+    try std.testing.expectEqual(@as(u32, 0), rest.hunger_extra_total());
+    try std.testing.expectEqual(@as(u32, 6), rest.score);
 }
 
 test "consume_zone: naturally-neutral slime counts toward score, costs normal hunger" {

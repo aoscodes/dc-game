@@ -57,7 +57,16 @@ pub const Balance = struct {
     /// EXTRA hunger per un-neutralized modified unit consumed (healable portion).
     hunger_cost_modified_extra: u32,
     /// Round length in seconds unless overridden with --round-duration.
+    /// Classic mode only.
     round_duration_default_s: f32,
+    /// Realtime mode: slime units eaten per second PER LIL GUY (one Lil Guy
+    /// per connected player) — the team eats at rate × players.
+    eat_rate_units_per_s: f32,
+    /// Realtime mode: length of the repeating cast window in milliseconds.
+    /// Submitted spells batch-convert (recipes → medicine → transmute) when
+    /// the window closes; team recipes require distinct players submitting
+    /// in the SAME window.
+    cast_window_ms: u32,
     player_recipes: []const PlayerRecipe,
     team_recipes: []const TeamRecipe,
 };

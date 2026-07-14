@@ -72,6 +72,7 @@ pub const DrainResult = enum {
     unchanged,
     appended,
     cancelled,
+    submitted,
 };
 
 pub fn drain_into_combo(queue: *KeyQueue, combo: *ComboBuffer) DrainResult {
@@ -79,6 +80,9 @@ pub fn drain_into_combo(queue: *KeyQueue, combo: *ComboBuffer) DrainResult {
     while (queue.pop()) |key| {
         switch (key) {
             .escape => return .cancelled,
+            // Realtime mode: submit the pending combo as a spell.  Classic
+            // mode treats this as a no-op at the call site.
+            .enter => return .submitted,
             // Action keys: 1=dispense  2=medicine
             .one, .two => {
                 const action: c.ActionChoice = switch (key) {
@@ -99,8 +103,36 @@ pub fn drain_into_combo(queue: *KeyQueue, combo: *ComboBuffer) DrainResult {
                 };
                 if (combo.push(.{ .element = element })) result = .appended;
             },
-            else => {},
         }
     }
     return result;
+}
+
+test "drain_into_combo: enter returns submitted, keeps buffer" {
+    var queue = KeyQueue{};
+    var combo = ComboBuffer{};
+    queue.push(.one);
+    queue.push(.enter);
+    // Drain appends '1' then hits enter -> submitted (buffer untouched).
+    try std.testing.expectEqual(DrainResult.submitted, drain_into_combo(&queue, &combo));
+    try std.testing.expectEqual(@as(u8, 1), combo.len);
+}
+
+test "drain_into_combo: escape returns cancelled before later enter" {
+    var queue = KeyQueue{};
+    var combo = ComboBuffer{};
+    queue.push(.escape);
+    queue.push(.enter);
+    try std.testing.expectEqual(DrainResult.cancelled, drain_into_combo(&queue, &combo));
+}
+
+test "drain_into_combo: action keys append" {
+    var queue = KeyQueue{};
+    var combo = ComboBuffer{};
+    queue.push(.one);
+    queue.push(.q);
+    try std.testing.expectEqual(DrainResult.appended, drain_into_combo(&queue, &combo));
+    try std.testing.expectEqual(@as(u8, 2), combo.len);
+    try std.testing.expectEqual(c.ActionChoice.dispense, combo.slots[0].action);
+    try std.testing.expectEqual(c.Element.red, combo.slots[1].element);
 }

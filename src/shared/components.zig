@@ -35,6 +35,20 @@ pub const Health = struct {
     max: u16,
 };
 
+/// How the encounter is paced.
+///   classic  — timed rounds split into cast windows; pending combos
+///              auto-commit at window close; the whole zone is consumed at
+///              round end (the original play style).
+///   realtime — Lil Guys eat the current zone at a constant rate
+///              (balance.eat_rate_units_per_s × connected players); spells
+///              are explicitly SUBMITTED (submit_spell) and batch-convert at
+///              the close of each repeating cast window
+///              (balance.cast_window_ms); zones advance when fully eaten.
+pub const GameMode = enum(u8) {
+    classic = 0,
+    realtime = 1,
+};
+
 /// Kind of entity on the wire.  Only players exist server-side; the browser
 /// renders cosmetic Lil Guys/slime itself.  Extend when new server-side
 /// entity kinds appear.

@@ -30,6 +30,8 @@ const RATE_FIELDS = [
   ["hunger_cost_normal", "hunger per unit eaten", 0, 1000, 1],
   ["hunger_cost_modified_extra", "extra hunger from modified slime", 0, 1000, 1],
   ["round_duration_default_s", "round duration (seconds)", 0.5, 300, 0.5],
+  ["eat_rate_units_per_s", "realtime: units eaten /s per lil guy", 0.1, 100, 0.1],
+  ["cast_window_ms", "realtime: cast window (ms)", 250, 60000, 250],
 ];
 
 /** @type {{balance: object, encounter: {hunger_max: number, zones: object[]}}} */
@@ -67,6 +69,9 @@ async function load() {
       hunger_cost_normal: bal.hunger_cost_normal,
       hunger_cost_modified_extra: bal.hunger_cost_modified_extra,
       round_duration_default_s: bal.round_duration_default_s,
+      // Realtime-mode fields; default like the server does for older configs.
+      eat_rate_units_per_s: bal.eat_rate_units_per_s ?? 2.0,
+      cast_window_ms: bal.cast_window_ms ?? 3000,
       player_recipes: bal.player_recipes.map((r) => ({
         label: r.label,
         pattern: [...r.pattern],

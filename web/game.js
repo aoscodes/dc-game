@@ -33,6 +33,10 @@ const LAYOUT = {
   // Per-player pending-combo rows, bottom-left beside the action menu.
   comboPanel: { x: 24, y0: 652, rowH: 18, font: 13, slotW: 14, nameW: 42 },
 
+  // Realtime mode: clickable CAST button between the combo panel and the
+  // action menu (clicking = pressing Enter).
+  castButton: { x: 208, y: 664, w: 118, h: 44, font: 16, hintFont: 11, hintDy: 14 },
+
   // Cosmetic critters: one spawns per player entity (see tickLilGuys).
   lilGuys: { size: 48, speed: 60, chompMin: 0.9, chompMax: 2.2 },
 
@@ -136,6 +140,24 @@ function slotFromName(name) {
  */
 const PAGE_CONFIG_HASH =
   (location.pathname.match(/^\/config\/([0-9a-f]{16})/) || [])[1] ?? null;
+
+/** Served at /realtime → lobby creation defaults to realtime mode. */
+const PAGE_REALTIME = location.pathname === "/realtime";
+
+/**
+ * The current room's game mode: "classic" | "realtime".
+ * Set from the bridge's `joining` ack; render frames win when they carry
+ * `game.mode` / `lobby.mode` (see roomModeFrom).
+ */
+let roomMode = "classic";
+
+/** Resolve the effective mode for a render frame (frame value wins). */
+function roomModeFrom(obj) {
+  if (obj && (obj.mode === "realtime" || obj.mode === "classic")) {
+    roomMode = obj.mode;
+  }
+  return roomMode;
+}
 
 /** Config hash whose balance tables are currently loaded. */
 let loadedConfigHash = null;
@@ -299,10 +321,18 @@ function drawPreLobby() {
   text("Slime Feast", L.titleX, L.titleY, L.titleFont, C_HEADER);
 
   if (preLobbyMode === "choose") {
-    text("[C]  Create new lobby", L.optX, L.optY0, L.optFont, C_TEXT);
-    text("[J]  Join existing lobby", L.optX, L.optY0 + L.optGap, L.optFont, C_TEXT);
+    // [C] creates in the page's default mode (/realtime → realtime),
+    // [R] creates in the other mode.  The default line is emphasized.
+    const primaryLabel = PAGE_REALTIME
+      ? "[C]  Create REAL-TIME lobby" : "[C]  Create new lobby";
+    const altLabel = PAGE_REALTIME
+      ? "[R]  Create classic lobby" : "[R]  Create REAL-TIME lobby";
+    text(primaryLabel, L.optX, L.optY0, L.optFont,
+      PAGE_REALTIME ? "rgba(255,255,100,1)" : C_TEXT);
+    text(altLabel, L.optX, L.optY0 + L.optGap, L.optFont, C_TEXT);
+    text("[J]  Join existing lobby", L.optX, L.optY0 + 2 * L.optGap, L.optFont, C_TEXT);
     if (preLobbyError) {
-      text(preLobbyError, L.optX, L.optY0 + L.optGap + L.errorDy, L.errorFont, "rgba(255,100,100,1)");
+      text(preLobbyError, L.optX, L.optY0 + 2 * L.optGap + L.errorDy, L.errorFont, "rgba(255,100,100,1)");
     }
   } else if (preLobbyMode === "entering_code") {
     text("Enter lobby code:", L.optX, L.codePromptY, L.optFont, C_TEXT);
@@ -327,6 +357,13 @@ function drawLobby(lobby) {
   clear();
   const L = LAYOUT.lobby;
   text("Slime Feast", L.titleX, L.titleY, L.titleFont, C_HEADER);
+
+  // REAL-TIME badge beside the title when the room runs realtime rules.
+  if (roomModeFrom(lobby) === "realtime") {
+    ctx.font = `${L.titleFont}px monospace`;
+    const badgeX = L.titleX + ctx.measureText("Slime Feast").width + 24;
+    text("REAL-TIME", badgeX, L.titleY, L.codeFont, "rgba(255,150,50,1)");
+  }
 
   const joinCode = lobby.join_code || "??????";
   text(`Room: ${joinCode}`, L.codeX, L.codeY, L.codeFont, C_TEXT);
@@ -596,6 +633,54 @@ function drawComboPanel(game) {
     const usedX = CP.x + CP.nameW + 5 * CP.slotW + 8;
     text(`${e.casts_used ?? 0}/${castsPerRound}`, usedX, y, CP.font, "rgba(160,170,200,0.8)");
   });
+}
+
+// ---------------------------------------------------------------------------
+// Realtime CAST button (canvas hit region; clicking = pressing Enter)
+// ---------------------------------------------------------------------------
+
+/**
+ * Clickable rect (canvas coords) for the CAST button, or null when the
+ * button is hidden or disabled.  Refreshed every rendered frame.
+ * @type {{x:number, y:number, w:number, h:number} | null}
+ */
+let castButtonRect = null;
+
+/**
+ * Realtime only: CAST button beside the local player's combo rows.
+ * Enabled when the player has a pending combo and no spell locked into the
+ * current window; clicking sends {key:"Enter"} — the same message the
+ * keyboard handler sends, so both paths hit the Zig client identically.
+ */
+function drawCastButton(game) {
+  const B = LAYOUT.castButton;
+  const own = (game.entities ?? []).find(e => e.owner === game.player_id);
+  const comboEmpty = !own || (own.combo ?? []).length === 0;
+  const lockedIn = own ? (own.casts_used ?? 0) > 0 : false;
+  const enabled = !comboEmpty && !lockedIn;
+
+  const label = lockedIn ? "LOCKED IN" : "CAST";
+  const bg = enabled ? "rgba(60,140,80,0.95)" : "rgba(45,45,60,0.9)";
+  const border = enabled ? "rgba(160,255,160,0.95)" : "rgba(120,120,140,0.5)";
+  const labelColor = enabled ? "rgba(240,255,240,1)"
+    : lockedIn ? "rgba(140,240,255,0.9)" : "rgba(130,130,150,0.8)";
+
+  rect(B.x, B.y, B.w, B.h, bg);
+  rectStroke(B.x, B.y, B.w, B.h, 2, border);
+  ctx.save();
+  ctx.font = `bold ${B.font}px monospace`;
+  ctx.fillStyle = labelColor;
+  ctx.textAlign = "center";
+  ctx.fillText(label, B.x + B.w / 2, B.y + B.h / 2 + B.font / 3);
+  ctx.restore();
+  ctx.save();
+  ctx.font = `${B.hintFont}px monospace`;
+  ctx.fillStyle = "rgba(170,170,190,0.8)";
+  ctx.textAlign = "center";
+  ctx.fillText("Enter to cast", B.x + B.w / 2, B.y + B.h + B.hintDy);
+  ctx.restore();
+
+  castButtonRect = enabled ? { x: B.x, y: B.y, w: B.w, h: B.h } : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,29 +1183,50 @@ function drawActionMenu(game) {
 
   const tbw = mw - M.padX * 2;
 
-  // Cast-window timer bar (round_duration / casts_per_round per window).
-  // Pending combo commits as a spell when it empties.
-  const castsPerRound = game.casts_per_round ?? 3;
-  const castDuration = game.round_duration > 0 ? game.round_duration / castsPerRound : 0;
-  const castFrac = castDuration > 0
-    ? Math.max(0, Math.min(1, (game.cast_timer ?? 0) / castDuration))
-    : 0;
-  rect(px, my + M.castBarDy, tbw, M.castBarH, "rgba(30,30,30,0.8)");
-  rect(px, my + M.castBarDy, tbw * castFrac, M.castBarH, "rgba(120,220,255,0.9)");
+  if (roomModeFrom(game) === "realtime") {
+    // Realtime: no round countdown (round_timer is meaningless).  One
+    // prominent bar for the repeating cast window — submitted spells
+    // batch-convert when it empties.
+    const windowS = (game.cast_window_ms ?? 0) / 1000;
+    const castFrac = windowS > 0
+      ? Math.max(0, Math.min(1, (game.cast_timer ?? 0) / windowS))
+      : 0;
+    const barH = M.timerBarDy + M.timerBarH - M.castBarDy; // span both classic bars
+    rect(px, my + M.castBarDy, tbw, barH, "rgba(30,30,30,0.8)");
+    rect(px, my + M.castBarDy, tbw * castFrac, barH, "rgba(120,220,255,0.9)");
+    rectStroke(px, my + M.castBarDy, tbw, barH, 1, "rgba(255,255,255,0.3)");
 
-  // Round timer bar
-  const timerFrac = game.round_duration > 0
-    ? Math.max(0, Math.min(1, game.round_timer / game.round_duration))
-    : 0;
-  rect(px, my + M.timerBarDy, tbw, M.timerBarH, "rgba(30,30,30,0.8)");
-  rect(px, my + M.timerBarDy, tbw * timerFrac, M.timerBarH, "rgba(255,200,50,0.9)");
+    const own = (game.entities ?? []).find(e => e.owner === game.player_id);
+    const lockedIn = own ? (own.casts_used ?? 0) > 0 : false;
+    const castText = game.cast_timer !== undefined ? game.cast_timer.toFixed(1) : "?";
+    const status = lockedIn ? "spell locked in" : "CAST (or Enter) to submit";
+    text(`Next cast wave: ${castText}s  ·  ${status}`,
+      px, my + M.timerTextDy, M.timerTextFont, C_TEXT);
+  } else {
+    // Cast-window timer bar (round_duration / casts_per_round per window).
+    // Pending combo commits as a spell when it empties.
+    const castsPerRound = game.casts_per_round ?? 3;
+    const castDuration = game.round_duration > 0 ? game.round_duration / castsPerRound : 0;
+    const castFrac = castDuration > 0
+      ? Math.max(0, Math.min(1, (game.cast_timer ?? 0) / castDuration))
+      : 0;
+    rect(px, my + M.castBarDy, tbw, M.castBarH, "rgba(30,30,30,0.8)");
+    rect(px, my + M.castBarDy, tbw * castFrac, M.castBarH, "rgba(120,220,255,0.9)");
 
-  const own = (game.entities ?? []).find(e => e.owner === game.player_id);
-  const castsUsed = own ? (own.casts_used ?? 0) : 0;
-  const castText = game.cast_timer !== undefined ? game.cast_timer.toFixed(1) : "?";
-  const roundText = game.round_timer !== undefined ? game.round_timer.toFixed(1) : "?";
-  text(`Cast: ${castText}s (${castsUsed}/${castsPerRound})  ·  Round: ${roundText}s`,
-    px, my + M.timerTextDy, M.timerTextFont, C_TEXT);
+    // Round timer bar
+    const timerFrac = game.round_duration > 0
+      ? Math.max(0, Math.min(1, game.round_timer / game.round_duration))
+      : 0;
+    rect(px, my + M.timerBarDy, tbw, M.timerBarH, "rgba(30,30,30,0.8)");
+    rect(px, my + M.timerBarDy, tbw * timerFrac, M.timerBarH, "rgba(255,200,50,0.9)");
+
+    const own = (game.entities ?? []).find(e => e.owner === game.player_id);
+    const castsUsed = own ? (own.casts_used ?? 0) : 0;
+    const castText = game.cast_timer !== undefined ? game.cast_timer.toFixed(1) : "?";
+    const roundText = game.round_timer !== undefined ? game.round_timer.toFixed(1) : "?";
+    text(`Cast: ${castText}s (${castsUsed}/${castsPerRound})  ·  Round: ${roundText}s`,
+      px, my + M.timerTextDy, M.timerTextFont, C_TEXT);
+  }
 
   // Projected team output from everyone's PENDING combos (recipe-aware).
   // Already-committed casts this round are not in the snapshot, so this
@@ -1178,6 +1284,7 @@ function drawGame(game, dt) {
   drawLilGuys(dt);
   drawComboPanel(game);
   drawActionMenu(game);
+  if (roomModeFrom(game) === "realtime") drawCastButton(game);
 
   // Floaters drawn last so they appear on top of everything.
   drawFloaters();
@@ -1334,6 +1441,9 @@ function renderFrame(msg, dt) {
   if (lastPhase === "game" && msg.phase !== "game") clearEntityState();
   lastPhase = msg.phase;
 
+  // The CAST hit region only exists while a realtime game frame draws it.
+  castButtonRect = null;
+
   switch (msg.phase) {
     case "pre_lobby": drawPreLobby(); break;
     case "connecting": drawConnecting(); break;
@@ -1381,6 +1491,8 @@ function connect() {
       // and any stale error text disappears.
       resetPreLobby();
       latestMsg = { phase: "connecting" };
+      // Adopt the room's mode (render frames overwrite this later).
+      roomMode = msg.mode === "realtime" ? "realtime" : "classic";
       // Adopt the lobby's config: a room created from /config/{hash} uses
       // that hash's balance tables; joiners from any page must match.
       const roomConfig = typeof msg.config === "string" ? msg.config : null;
@@ -1414,6 +1526,13 @@ const FORWARDED_KEYS = new Set([
   "q", "w", "e", "r",
 ]);
 
+/** Forward one key to the Zig client via the tab WebSocket. */
+function sendKey(key) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ key }));
+  }
+}
+
 document.addEventListener("keydown", (e) => {
   // During pre_lobby, handle input locally — do not forward to Zig.
   if (latestMsg && latestMsg.phase === "pre_lobby") {
@@ -1423,8 +1542,20 @@ document.addEventListener("keydown", (e) => {
 
   if (!FORWARDED_KEYS.has(e.key)) return;
   e.preventDefault();
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ key: e.key }));
+  sendKey(e.key);
+});
+
+// Realtime CAST button: clicking inside its hit region is exactly an Enter
+// keypress (same ws message the keydown handler sends).
+canvas.addEventListener("click", (e) => {
+  if (!castButtonRect) return;
+  // Map client coords → canvas coords (robust to CSS scaling).
+  const r = canvas.getBoundingClientRect();
+  const x = (e.clientX - r.left) * (canvas.width / r.width);
+  const y = (e.clientY - r.top) * (canvas.height / r.height);
+  const b = castButtonRect;
+  if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) {
+    sendKey("Enter");
   }
 });
 
@@ -1444,10 +1575,13 @@ function handlePreLobbyKey(e) {
   e.preventDefault();
 
   if (preLobbyMode === "choose") {
-    if (e.key === "c" || e.key === "C") {
+    if (e.key === "c" || e.key === "C" || e.key === "r" || e.key === "R") {
       preLobbyError = "";
-      // Creating from /config/{hash} runs the lobby with that saved config.
-      sendPreLobbyAction({ action: "create", config: PAGE_CONFIG_HASH ?? undefined });
+      // [C] = the page's default mode (/realtime → realtime); [R] = the
+      // other mode.  Creating from /config/{hash} keeps that saved config.
+      const isC = e.key === "c" || e.key === "C";
+      const mode = (isC === PAGE_REALTIME) ? "realtime" : "classic";
+      sendPreLobbyAction({ action: "create", mode, config: PAGE_CONFIG_HASH ?? undefined });
     } else if (e.key === "j" || e.key === "J") {
       preLobbyMode = "entering_code";
       preLobbyCode = "";

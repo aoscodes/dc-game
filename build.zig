@@ -244,4 +244,16 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(bot_harness_tests).step);
 
+    // Client input tests (key → combo-slot mapping, submit/cancel results).
+    const client_input_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/client/input.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "shared", .module = shared_mod },
+            },
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(client_input_tests).step);
 }

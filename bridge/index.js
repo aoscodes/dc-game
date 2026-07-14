@@ -132,6 +132,13 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // /realtime — the game shell defaulting lobby creation to realtime mode
+  // (game.js reads location.pathname).
+  if (rawPath === "/realtime") {
+    serveFile(res, WEB_DIR, "/index.html", { "Cache-Control": "no-cache" });
+    return;
+  }
+
   // /config/{hash}[/...] — play (or fetch data for) a saved custom config.
   const cfgMatch = rawPath.match(/^\/config\/([0-9a-f]{16})(\/.*)?$/);
   if (cfgMatch) {
@@ -320,6 +327,7 @@ function findFreePort() {
  *   tabCount:    number,
  *   idleTimer:   ReturnType<typeof setTimeout> | null,
  *   configHash:  string | null,
+ *   mode:        "classic" | "realtime",
  * }} LobbyRoom
  */
 
@@ -348,14 +356,17 @@ function uniqueCode() {
  * @param {string} code
  * @param {number} port
  * @param {string | null} configHash - saved /tune config, or null for defaults
+ * @param {"classic" | "realtime"} mode - game mode for the spawned server
  * @returns {LobbyRoom}
  */
-function spawnLobbyServer(code, port, configHash) {
+function spawnLobbyServer(code, port, configHash, mode) {
   const dataDir = dataDirFor(configHash);
-  console.log(`[lobby] spawning server for code=${code} port=${port} config=${configHash ?? "default"}`);
+  console.log(`[lobby] spawning server for code=${code} port=${port} config=${configHash ?? "default"} mode=${mode}`);
   usedPorts.add(port);
 
-  const proc = spawn(SERVER_BIN, [String(port), "--join-code", code, "--data-dir", dataDir], {
+  const args = [String(port), "--join-code", code, "--data-dir", dataDir];
+  if (mode === "realtime") args.push("--mode", "realtime");
+  const proc = spawn(SERVER_BIN, args, {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -385,7 +396,7 @@ function spawnLobbyServer(code, port, configHash) {
   });
 
   /** @type {LobbyRoom} */
-  const room = { code, port, proc, tabCount: 0, idleTimer: null, configHash };
+  const room = { code, port, proc, tabCount: 0, idleTimer: null, configHash, mode };
   lobbyRegistry.set(code, room);
   return room;
 }
@@ -603,6 +614,8 @@ class TabSession {
         }
         configHash = msg.config;
       }
+      // Game mode for the new lobby: "classic" (default) or "realtime".
+      const mode = msg.mode === "realtime" ? "realtime" : "classic";
       const code = uniqueCode();
       let port;
       try { port = await findFreePort(); } catch (err) {
@@ -610,13 +623,13 @@ class TabSession {
         this.sendPreLobbyError("server_error");
         return;
       }
-      const room = spawnLobbyServer(code, port, configHash);
-      console.log(`[lobby] created room code=${code} port=${port}`);
+      const room = spawnLobbyServer(code, port, configHash, mode);
+      console.log(`[lobby] created room code=${code} port=${port} mode=${mode}`);
       // Acknowledge before the Zig client has connected so the browser
       // transitions away from pre_lobby immediately.  `config` lets the tab
-      // load the matching balance tables.
+      // load the matching balance tables; `mode` tells it the room's rules.
       if (this.tabWs.readyState === WebSocket.OPEN) {
-        this.tabWs.send(JSON.stringify({ tag: "joining", config: room.configHash }));
+        this.tabWs.send(JSON.stringify({ tag: "joining", config: room.configHash, mode: room.mode }));
       }
       this.startInRoom(room);
       return;
@@ -638,9 +651,9 @@ class TabSession {
       // Acknowledge immediately so the browser clears the pre_lobby screen
       // before the Zig client finishes connecting to the server.  `config`
       // makes joiners adopt the lobby's balance tables (may differ from the
-      // page they joined from).
+      // page they joined from); `mode` tells them the room's rules.
       if (this.tabWs.readyState === WebSocket.OPEN) {
-        this.tabWs.send(JSON.stringify({ tag: "joining", config: room.configHash }));
+        this.tabWs.send(JSON.stringify({ tag: "joining", config: room.configHash, mode: room.mode }));
       }
       this.startInRoom(room);
       return;

@@ -59,6 +59,7 @@ pub const LobbyState = struct {
     update: proto.LobbyUpdate = std.mem.zeroes(proto.LobbyUpdate),
     player_id: u8 = 0xFF,
     ready: bool = false,
+    mode: c.GameMode = .classic,
 };
 
 pub const LastActionEntry = struct { entity: u32, anim: c.ActionAnimation };
@@ -71,6 +72,10 @@ pub const GameState = struct {
     round_duration: f32 = 0.0,
     /// Spells per round, as announced by the server in game_start.
     casts_per_round: u8 = 0,
+    /// Play mode, as announced by the server in game_start.
+    mode: c.GameMode = .classic,
+    /// Realtime mode: cast window length in ms (0 in classic mode).
+    cast_window_ms: u32 = 0,
     encounter_label: [32]u8 = [_]u8{0} ** 32,
     encounter_label_len: u8 = 0,
     /// Final score from game_over (null until the encounter ends).
@@ -212,12 +217,15 @@ fn write_render_inner(
             .join_code = lobby.update.join_code[0..jc_end],
             .player_id = lobby.update.player_id,
             .ready = lobby.ready,
+            .mode = lobby.mode,
             .round_duration = lobby.update.round_duration,
             .players = players_buf[0..lobby.update.player_count],
         } else null,
         .game = if (phase == .game) JsonGame{
             .encounter = game.encounter_label[0..game.encounter_label_len],
             .player_id = game.player_id,
+            .mode = game.mode,
+            .cast_window_ms = game.cast_window_ms,
             .pending_combo = pending_slots_buf[0..game.pending_combo.len],
             .round_timer = game.round_timer,
             .round_duration = game.round_duration,
@@ -333,6 +341,8 @@ const JsonLobby = struct {
     join_code: []const u8,
     player_id: u8,
     ready: bool,
+    /// Play mode the host selected ("classic" | "realtime").
+    mode: c.GameMode,
     round_duration: f32,
     players: []const JsonPlayer,
 };
@@ -376,6 +386,10 @@ const JsonZone = struct {
 const JsonGame = struct {
     encounter: []const u8,
     player_id: u8,
+    /// Play mode ("classic" | "realtime").
+    mode: c.GameMode,
+    /// Realtime mode: cast window length in ms (0 in classic mode).
+    cast_window_ms: u32,
     pending_combo: []const JsonComboSlot,
     round_timer: f32,
     round_duration: f32,

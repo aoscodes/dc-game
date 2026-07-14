@@ -58,6 +58,8 @@ pub const ConfigError = error{
     InvalidEncountersJson,
     InvalidCastsPerRound,
     InvalidRoundDuration,
+    InvalidEatRate,
+    InvalidCastWindow,
     TooManyRecipes,
     InvalidTeamPatternCount,
     InvalidComboLength,
@@ -158,6 +160,10 @@ const BalanceJson = struct {
     hunger_cost_normal: u32,
     hunger_cost_modified_extra: u32,
     round_duration_default_s: f32,
+    /// Realtime mode fields; defaulted so pre-realtime configs (including
+    /// saved /tune configs) keep validating unchanged.
+    eat_rate_units_per_s: f32 = 2.0,
+    cast_window_ms: u32 = 3000,
     player_recipes: []const PlayerRecipeJson,
     team_recipes: []const TeamRecipeJson,
 };
@@ -198,6 +204,14 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
     if (!(raw.round_duration_default_s > 0)) {
         fail("{s}: round_duration_default_s must be > 0", .{BALANCE_FILE});
         return ConfigError.InvalidRoundDuration;
+    }
+    if (!(raw.eat_rate_units_per_s > 0)) {
+        fail("{s}: eat_rate_units_per_s must be > 0", .{BALANCE_FILE});
+        return ConfigError.InvalidEatRate;
+    }
+    if (raw.cast_window_ms == 0) {
+        fail("{s}: cast_window_ms must be >= 1", .{BALANCE_FILE});
+        return ConfigError.InvalidCastWindow;
     }
     if (raw.player_recipes.len > balance.MAX_PLAYER_RECIPES) {
         fail("{s}: {} player recipes exceeds cap {}", .{ BALANCE_FILE, raw.player_recipes.len, balance.MAX_PLAYER_RECIPES });
@@ -243,6 +257,8 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         .hunger_cost_normal = raw.hunger_cost_normal,
         .hunger_cost_modified_extra = raw.hunger_cost_modified_extra,
         .round_duration_default_s = raw.round_duration_default_s,
+        .eat_rate_units_per_s = raw.eat_rate_units_per_s,
+        .cast_window_ms = raw.cast_window_ms,
         .player_recipes = players,
         .team_recipes = teams,
     };
@@ -428,6 +444,39 @@ test "over-long combo pattern is rejected" {
     ;
     try std.testing.expectError(
         ConfigError.InvalidComboLength,
+        parse(std.testing.allocator, bad, minimal_encounters),
+    );
+}
+
+test "realtime fields default when absent (pre-realtime configs stay valid)" {
+    var loaded = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), loaded.config.balance.eat_rate_units_per_s, 0.001);
+    try std.testing.expectEqual(@as(u32, 3000), loaded.config.balance.cast_window_ms);
+}
+
+test "zero eat_rate_units_per_s is rejected" {
+    const bad =
+        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
+        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
+        \\ "round_duration_default_s":15,"eat_rate_units_per_s":0,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidEatRate,
+        parse(std.testing.allocator, bad, minimal_encounters),
+    );
+}
+
+test "zero cast_window_ms is rejected" {
+    const bad =
+        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
+        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
+        \\ "round_duration_default_s":15,"cast_window_ms":0,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidCastWindow,
         parse(std.testing.allocator, bad, minimal_encounters),
     );
 }

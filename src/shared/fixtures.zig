@@ -94,6 +94,8 @@ pub const test_config = config.Config{
         .hunger_cost_normal = 1,
         .hunger_cost_modified_extra = 2,
         .round_duration_default_s = 15.0,
+        .eat_rate_units_per_s = 2.0,
+        .cast_window_ms = 3000,
         .player_recipes = &player_recipes,
         .team_recipes = &team_recipes,
     },

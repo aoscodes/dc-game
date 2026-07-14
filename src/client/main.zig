@@ -163,6 +163,12 @@ fn send_combo(combo: *const inp.ComboBuffer) void {
     emit_send(fbs.getWritten());
 }
 
+fn send_submit_spell(combo: *const inp.ComboBuffer) void {
+    var fbs = std.io.fixedBufferStream(&g_state.send_buf);
+    proto.encode(fbs.writer(), .submit_spell, proto.SubmitSpell{ .combo = combo.to_combo() }) catch return;
+    emit_send(fbs.getWritten());
+}
+
 fn send_cancel_combo() void {
     var fbs = std.io.fixedBufferStream(&g_state.send_buf);
     proto.encode(fbs.writer(), .cancel_combo, {}) catch return;
@@ -189,6 +195,7 @@ fn process_recv() void {
                 }
                 g_state.lobby.update = p;
                 g_state.lobby.player_id = g_state.player_id;
+                g_state.lobby.mode = p.mode;
                 // The server broadcasts a lobby_update right after game_over
                 // (ready flags reset).  Keep showing the outcome screen; the
                 // stored lobby state is used once the player presses a key.
@@ -204,6 +211,8 @@ fn process_recv() void {
                 g_state.game.round_timer = p.round_duration;
                 g_state.game.round_duration = p.round_duration;
                 g_state.game.casts_per_round = p.casts_per_round;
+                g_state.game.mode = p.mode;
+                g_state.game.cast_window_ms = p.cast_window_ms;
                 g_state.game.encounter_label_len = p.encounter_label_len;
                 @memcpy(g_state.game.encounter_label[0..p.encounter_label_len], p.encounter_label[0..p.encounter_label_len]);
                 g_state.phase = .game;
@@ -305,6 +314,14 @@ fn update_game() void {
         .cancelled => {
             gs.pending_combo.clear();
             send_cancel_combo();
+        },
+        // Realtime mode: explicitly submit the pending combo as a spell.
+        // Do NOT clear locally — the server's cast_committed/cast_fizzled
+        // reply triggers the clear.  Classic mode: Enter is a no-op.
+        .submitted => {
+            if (gs.mode == .realtime and gs.pending_combo.len > 0) {
+                send_submit_spell(&gs.pending_combo);
+            }
         },
     }
 }
