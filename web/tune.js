@@ -51,21 +51,28 @@ let state = null;
 const FROM_HASH = (new URLSearchParams(location.search).get("from") || "")
   .match(/^[0-9a-f]{16}$/)?.[0] ?? null;
 
-/**
- * Which mode's values the editor shows ("classic" default; ?mode=realtime).
- * The saved config always carries BOTH modes' values — this only filters
- * the rows rendered (and which play link the save result offers).
- */
-const PAGE_MODE = new URLSearchParams(location.search).get("mode") === "realtime"
-  ? "realtime" : "classic";
+/** Explicit ?mode= override in the URL, or null when absent/invalid. */
+const MODE_PARAM = (() => {
+  const m = new URLSearchParams(location.search).get("mode");
+  return m === "realtime" || m === "classic" ? m : null;
+})();
 
-/** /tune URL for `mode`, preserving the ?from= source config. */
+/**
+ * Which game type the editor targets.  The saved config is LOCKED to this
+ * mode (recorded in meta.json; lobbies created from it always run it).
+ * Precedence: explicit ?mode= param > the ?from= config's meta.json
+ * (resolved in load()) > "classic".  Switching modes via the header link
+ * forks the config into the other game type on the next save.
+ */
+let PAGE_MODE = MODE_PARAM ?? "classic";
+
+/** /tune URL for `mode`, preserving the ?from= source config.  The mode is
+ *  always explicit so it overrides the source config's meta.json. */
 function tuneUrl(mode) {
   const params = new URLSearchParams();
   if (FROM_HASH) params.set("from", FROM_HASH);
-  if (mode === "realtime") params.set("mode", "realtime");
-  const qs = params.toString();
-  return qs ? `/tune?${qs}` : "/tune";
+  params.set("mode", mode);
+  return `/tune?${params.toString()}`;
 }
 
 function dataUrl(file) {
@@ -81,6 +88,19 @@ async function load() {
     fetch(dataUrl("encounters.json")),
   ]);
   if (!balRes.ok || !encRes.ok) throw new Error("failed to fetch config data");
+  // Without an explicit ?mode= the editor adopts the source config's game
+  // type (legacy configs have no meta.json → keep the classic default).
+  if (!MODE_PARAM && FROM_HASH) {
+    try {
+      const metaRes = await fetch(dataUrl("meta.json"));
+      if (metaRes.ok) {
+        const meta = await metaRes.json();
+        if (meta.mode === "realtime" || meta.mode === "classic") {
+          PAGE_MODE = meta.mode;
+        }
+      }
+    } catch { /* legacy config — classic default stands */ }
+  }
   const bal = await balRes.json();
   const encs = await encRes.json();
   const def = encs.encounters.find((e) => e.label === encs.default) ?? encs.encounters[0];
@@ -201,7 +221,7 @@ function labelInput(recipe) {
 function renderModeNote() {
   const other = PAGE_MODE === "realtime" ? "classic" : "realtime";
   document.getElementById("mode-note").replaceChildren(
-    el("span", {}, `Editing ${PAGE_MODE.toUpperCase()} values — `),
+    el("span", {}, `Editing a ${PAGE_MODE.toUpperCase()} config (saves lock this game type) — `),
     el("a", { href: tuneUrl(other) }, `switch to ${other}`),
   );
 }
@@ -353,7 +373,7 @@ document.getElementById("save").addEventListener("click", async () => {
     res = await fetch("/api/tune/save", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(state),
+      body: JSON.stringify({ ...state, mode: PAGE_MODE }),
     });
     data = await res.json();
   } catch (err) {
@@ -367,12 +387,11 @@ document.getElementById("save").addEventListener("click", async () => {
     ]);
     return;
   }
-  // Play link matches the editor's mode (the saved config works in both).
-  const playPath = PAGE_MODE === "realtime" ? `${data.url}?mode=realtime` : data.url;
+  // The saved config is locked to the editor's mode (meta.json) — the play
+  // page reads it and only offers that game type.
+  const playPath = data.url;
   const playUrl = `${location.origin}${playPath}`;
-  const editPath = PAGE_MODE === "realtime"
-    ? `/tune?from=${data.hash}&mode=realtime`
-    : `/tune?from=${data.hash}`;
+  const editPath = `/tune?from=${data.hash}`;
   showResult(true, [
     el("div", {}, `Saved! Play this ${PAGE_MODE} configuration at: `),
     el("a", { id: "play-link", href: playPath }, playUrl),

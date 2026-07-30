@@ -1,7 +1,7 @@
 "use strict";
 
 const LAYOUT = {
-  screen: { w: 1024, h: 768 },
+  screen: { w: 2048, h: 1536 },
   bg: "#14141e",
 
   // Slime field: zone columns eaten left-to-right, one per round.
@@ -11,8 +11,22 @@ const LAYOUT = {
     activeBorder: "rgba(255,255,100,0.85)",
     border: "rgba(180,200,255,0.25)",
     eatenFill: "rgba(20,20,30,0.75)",
-    blobMinR: 10, blobRScale: 4.5,
-    blobFont: 12,
+
+    // Organic ooze layer (see drawOoze): slime renders as one contiguous
+    // carpet of goo; colors interdigitate instead of sitting in uniform blobs.
+    oozeScale: 20,                 // screen px per ooze px (low-res goo canvas)
+    oozeParticleCap: 20,          // max metaball particles per color per zone
+    oozeFillFactor: 1.5,          // footprint overfill: 1.0 = exactly zone
+    // area at full coverage; >1 closes gaps
+    oozeShrinkGamma: 1.8,         // coverage exponent: counteracts overfill
+    // so a half-eaten zone reads half-covered
+    oozeMinR: 1.7,                // min particle core radius (ooze px)
+    oozeAlphaCutoff: 20,          // 0-255 silhouette threshold (goo fusing)
+    oozeOutline: [58, 34, 96],    // rim color [r,g,b] — deep violet, distinct
+    // from all element colors / neutral / bg
+    oozeWobbleAmp: 1.4,           // idle wobble amplitude (ooze px)
+    oozeWobbleFreq: 0.7,          // idle wobble base frequency (rad/s)
+    oozeBleed: 0.0,               // horiz. bleed past column edge (col-w frac)
   },
 
   hungerBar: {
@@ -64,7 +78,6 @@ const LAYOUT = {
     codeX: 40, codeY: 92, codeFont: 22,
     listY: 130, rowGap: 36, rowDy: 20, rowX: 60, rowFont: 20,
     readyDy: 20, readyFont: 18,
-    // Recipe study guide below the player list.
     guideX: 40, guideY: 408, guideFont: 13, guideLineH: 19,
     recipeHeaderGap: 10, recipeRowH: 25, recipeFont: 14,
     recipeLabelW: 170, recipeSlotGap: 10, recipeArrowGap: 24,
@@ -107,6 +120,7 @@ const sprites = new Map();
 async function loadAssets() {
   await Promise.all([
     loadBalanceData(),
+    loadConfigMeta(),
     ...CLASSES.map(async cls => {
       // Absolute paths: the page may be served at /config/{hash}.
       const [meta, img] = await Promise.all([
@@ -143,6 +157,28 @@ const PAGE_CONFIG_HASH =
  */
 const PAGE_REALTIME = location.pathname === "/realtime" ||
   new URLSearchParams(location.search).get("mode") === "realtime";
+
+/**
+ * Game type a saved config is LOCKED to (custom-configs meta.json, written
+ * at /tune save time).  Lobbies created from a locked config only offer
+ * that mode — game types are only reachable through configs of their type.
+ * null = no config on this page, or a legacy config saved before modes
+ * were recorded (those still offer both modes).
+ */
+let configLockedMode = null;
+
+/** Fetch the page config's meta.json (missing = legacy config → null). */
+async function loadConfigMeta() {
+  if (!PAGE_CONFIG_HASH) return;
+  try {
+    const res = await fetch(`/config/${PAGE_CONFIG_HASH}/data/meta.json`);
+    if (!res.ok) return;
+    const meta = await res.json();
+    if (meta.mode === "realtime" || meta.mode === "classic") {
+      configLockedMode = meta.mode;
+    }
+  } catch { /* legacy config — both modes stay available */ }
+}
 
 /**
  * The current room's game mode: "classic" | "realtime".
@@ -265,6 +301,7 @@ function clearEntityState() {
   lastHungerSeen = 0;
   lastZoneIndexSeen = 0;
   lilGuys.length = 0;
+  zoneOozeInitTotals.clear();
 }
 
 const canvas = document.getElementById("canvas");
@@ -323,16 +360,22 @@ function drawPreLobby() {
   text("Slime Feast", L.titleX, L.titleY, L.titleFont, C_HEADER);
 
   if (preLobbyMode === "choose") {
-    // [C] creates in the page's default mode (PAGE_REALTIME → realtime),
-    // [R] creates in the other mode.  The default line is emphasized.
-    const primaryLabel = PAGE_REALTIME
-      ? "[C]  Create REAL-TIME lobby" : "[C]  Create new lobby";
-    const altLabel = PAGE_REALTIME
-      ? "[R]  Create classic lobby" : "[R]  Create REAL-TIME lobby";
-    text(primaryLabel, L.optX, L.optY0, L.optFont,
-      PAGE_REALTIME ? "rgba(255,255,100,1)" : C_TEXT);
-    text(altLabel, L.optX, L.optY0 + L.optGap, L.optFont, C_TEXT);
-    text("[J]  Join existing lobby", L.optX, L.optY0 + 2 * L.optGap, L.optFont, C_TEXT);
+    const highlight = "rgba(255,255,100,1)";
+    if (configLockedMode !== null) {
+      // Saved config locked to one game type: a single create option.
+      const modeLabel = configLockedMode === "realtime" ? "REAL-TIME" : "CLASSIC";
+      text(`[C]  Create ${modeLabel} lobby (this config's game type)`,
+        L.optX, L.optY0, L.optFont, highlight);
+      text("[J]  Join existing lobby", L.optX, L.optY0 + L.optGap, L.optFont, C_TEXT);
+    } else {
+      // Fixed key → mode mapping ([C] = classic, [R] = realtime, always);
+      // the page's default mode only picks which line is emphasized.
+      text("[C]  Create CLASSIC lobby", L.optX, L.optY0, L.optFont,
+        PAGE_REALTIME ? C_TEXT : highlight);
+      text("[R]  Create REAL-TIME lobby", L.optX, L.optY0 + L.optGap, L.optFont,
+        PAGE_REALTIME ? highlight : C_TEXT);
+      text("[J]  Join existing lobby", L.optX, L.optY0 + 2 * L.optGap, L.optFont, C_TEXT);
+    }
     if (preLobbyError) {
       text(preLobbyError, L.optX, L.optY0 + 2 * L.optGap + L.errorDy, L.errorFont, "rgba(255,100,100,1)");
     }
@@ -360,11 +403,14 @@ function drawLobby(lobby) {
   const L = LAYOUT.lobby;
   text("Slime Feast", L.titleX, L.titleY, L.titleFont, C_HEADER);
 
-  // REAL-TIME badge beside the title when the room runs realtime rules.
-  if (roomModeFrom(lobby) === "realtime") {
+  // Game-type badge beside the title — always shown so a classic room is
+  // never mistaken for a realtime one (or vice versa).
+  {
     ctx.font = `${L.titleFont}px monospace`;
     const badgeX = L.titleX + ctx.measureText("Slime Feast").width + 24;
-    text("REAL-TIME", badgeX, L.titleY, L.codeFont, "rgba(255,150,50,1)");
+    const realtime = roomModeFrom(lobby) === "realtime";
+    text(realtime ? "REAL-TIME" : "CLASSIC", badgeX, L.titleY, L.codeFont,
+      realtime ? "rgba(255,150,50,1)" : "rgba(140,180,255,1)");
   }
 
   const joinCode = lobby.join_code || "??????";
@@ -948,7 +994,7 @@ const ELEMENT_COLOR = {
 };
 
 /** Neutral / transmuted slime (matches nothing — needs no agent). */
-const NEUTRAL_COLOR = "rgba(190,190,200,1)";
+const NEUTRAL_COLOR = "rgba(138,43,226,1)";
 
 // ---------------------------------------------------------------------------
 // Hunger bar + score
@@ -1013,29 +1059,217 @@ function zoneColumnRect(i, count) {
   return { x0: FIELD.x0 + i * w, x1: FIELD.x0 + (i + 1) * w, y0: FIELD.y0, y1: FIELD.y1 };
 }
 
+// --- Organic ooze layer ------------------------------------------------------
+//
+// Slime is drawn as one contiguous carpet of goo built from seeded "metaball"
+// particles:
+//   1. Per live zone, per color, scatter soft radial-gradient particles on a
+//      low-res offscreen canvas (count ∝ units, deterministic seed → stable
+//      shapes, slow sine wobble → living ooze).
+//   2. Threshold the offscreen alpha so overlapping halos fuse into a single
+//      silhouette; overlapping colors have already blended → organic mixing.
+//   3. Paint a 1-ooze-px rim (FIELD.oozeOutline) around the silhouette.
+//   4. Blit to the slime field unsmoothed (chunky pixels match the art style).
+
+/** Deterministic PRNG (mulberry32); same seed → same particle layout. */
+function mulberry32(seed) {
+  let s = seed | 0;
+  return function () {
+    s = (s + 0x6d2b79f5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** Parse "rgb(a)(r,g,b…)" → [r,g,b]; white fallback for malformed input. */
+function parseRgb(str) {
+  const m = /rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(str);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : [255, 255, 255];
+}
+
+/** Ooze fill colors, index-aligned with zoneOozeUnits(): 4 elements + neutral.
+ *  Derived from ELEMENT_COLOR/NEUTRAL_COLOR (single source of color truth). */
+const OOZE_RGB = [
+  ...ELEMENT_NAMES.map((name) => parseRgb(ELEMENT_COLOR[name])),
+  parseRgb(NEUTRAL_COLOR),
+];
+
+/** Low-res goo canvas covering the slime field. */
+const oozeCanvas = document.createElement("canvas");
+oozeCanvas.width = Math.ceil((FIELD.x1 - FIELD.x0) / FIELD.oozeScale);
+oozeCanvas.height = Math.ceil((FIELD.y1 - FIELD.y0) / FIELD.oozeScale);
+const octx = oozeCanvas.getContext("2d", { willReadFrequently: true });
+
+/** Per-zone ooze unit counts, index-aligned with OOZE_RGB.  Transmuted
+ *  (neutralized) slime folds into neutral, as the old blobs did. */
+function zoneOozeUnits(z) {
+  return [
+    z.red ?? 0, z.green ?? 0, z.yellow ?? 0, z.blue ?? 0,
+    (z.neutral ?? 0) + sumColors(z.neutralized),
+  ];
+}
+
+/** Zone idx → total units when the zone was first seen this game.  Coverage
+ *  = totalNow / totalInit: a fresh zone is fully carpeted, then the ooze
+ *  recedes as slime is eaten/transmuted.  Cleared in clearEntityState(). */
+const zoneOozeInitTotals = new Map();
+
+/** Coverage ratio (0..1) for zone `i` with current total `totalNow`.
+ *  First sighting records the initial total; `max` guards against counts
+ *  growing later (a fuller zone re-becomes the 100% baseline). */
+function zoneOozeCoverage(i, totalNow) {
+  const init = Math.max(zoneOozeInitTotals.get(i) ?? 0, totalNow);
+  zoneOozeInitTotals.set(i, init);
+  return init > 0 ? totalNow / init : 0;
+}
+
 /**
- * Draw one slime blob (filled circle + unit count).
+ * Build wobbled particles for one (zone, color) at time `t` (seconds).
+ * Particles gather around 1-3 seeded cluster centers so each color forms
+ * organic pools that interdigitate with its neighbours; positions/phases are
+ * pure functions of (seed, t) so nothing flickers frame-to-frame.
+ * `x0..x1` is the zone's column span (ooze px); only scatter particles and
+ * cluster fringes may stray up to `bleed` px outside it, so a zone's mass
+ * stays in its own column while edges still fuse with neighbours.
+ * `footprint` is this color's total solid area budget (ooze px²) — the
+ * zone's area × its unit share × coverage, so a fresh zone is carpeted and
+ * the ooze recedes as slime is eaten / transmuted.
  */
-function drawBlob(x, y, units, color) {
-  const r = FIELD.blobMinR + Math.sqrt(units) * FIELD.blobRScale;
+function oozeParticles(zoneIdx, colorIdx, units, footprint, x0, x1, bleed, t) {
+  if (units <= 0 || footprint <= 0) return [];
+  const rng = mulberry32(((zoneIdx + 1) * 131071) ^ ((colorIdx + 1) * 8191));
+  const h = oozeCanvas.height;
+  const count = Math.min(units, FIELD.oozeParticleCap);
+  const r = Math.max(FIELD.oozeMinR, Math.sqrt(footprint / count / Math.PI));
+
+  const nClusters = Math.min(3, 1 + Math.floor(count / 12));
+  const inset = (x1 - x0) * 0.08;
+  const clusters = [];
+  for (let c = 0; c < nClusters; c++) {
+    // Centers stay inside the column proper (and on-canvas) so the zone's
+    // mass reads in its own round; fringes/halos provide the mixing.
+    const cx = Math.min(oozeCanvas.width - 4,
+      Math.max(4, x0 + inset + rng() * (x1 - x0 - 2 * inset)));
+    clusters.push({ cx, cy: h * (0.15 + 0.7 * rng()) });
+  }
+  const spreadX = (x1 - x0) * 0.3;
+  const spreadY = h * 0.32;
+
+  const ps = [];
+  for (let i = 0; i < count; i++) {
+    // Every 3rd particle scatters uniformly across the bled span (fills
+    // corners the clusters miss); the rest gather on cluster centers with a
+    // triangular distribution: dense cores, ragged fringes.
+    const scatter = i % 3 === 2;
+    const cl = clusters[i % nClusters];
+    const bx = scatter ? x0 - bleed + rng() * (x1 - x0 + 2 * bleed)
+      : cl.cx + (rng() + rng() - 1) * spreadX;
+    const by = scatter ? h * (0.04 + 0.92 * rng())
+      : cl.cy + (rng() + rng() - 1) * spreadY;
+    const phase = rng() * Math.PI * 2;
+    const freq = FIELD.oozeWobbleFreq * (0.5 + rng());
+    const amp = FIELD.oozeWobbleAmp * (0.5 + rng());
+    // No clamping: particles past the field edge clip naturally (clamping
+    // piles cores on the border pixel → dense bar artifact).
+    ps.push({
+      x: bx + Math.sin(t * freq + phase) * amp,
+      y: by + Math.cos(t * freq * 1.37 + phase * 1.7) * amp,
+      r,
+      colorIdx,
+    });
+  }
+  return ps;
+}
+
+/** Paint one soft particle: solid-ish core, wide faint halo.  Halos of nearby
+ *  particles sum past the alpha cutoff, fusing them into contiguous goo. */
+function paintOozeParticle(p) {
+  const [r, g, b] = OOZE_RGB[p.colorIdx];
+  const R = p.r * 2.2;
+  const grad = octx.createRadialGradient(p.x, p.y, 0, p.x, p.y, R);
+  grad.addColorStop(0, `rgba(${r},${g},${b},0.95)`);
+  grad.addColorStop(0.45, `rgba(${r},${g},${b},0.5)`);
+  grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+  octx.fillStyle = grad;
+  octx.beginPath();
+  octx.arc(p.x, p.y, R, 0, Math.PI * 2);
+  octx.fill();
+}
+
+/** Threshold the goo alpha into a solid silhouette, then paint the rim. */
+function oozeThresholdAndOutline() {
+  const w = oozeCanvas.width, h = oozeCanvas.height;
+  const img = octx.getImageData(0, 0, w, h);
+  const d = img.data;
+  const cutoff = FIELD.oozeAlphaCutoff;
+  for (let i = 3; i < d.length; i += 4) d[i] = d[i] < cutoff ? 0 : 255;
+
+  const [or_, og, ob] = FIELD.oozeOutline;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      if (d[i + 3] === 0) continue;
+      // Rim = opaque pixel touching the field edge or a transparent 4-neighbour.
+      // (Alpha offsets: left i-1, right i+7, up i-w*4+3, down i+w*4+3.)
+      const rim = x === 0 || x === w - 1 || y === 0 || y === h - 1 ||
+        d[i - 1] === 0 || d[i + 7] === 0 ||
+        d[i - w * 4 + 3] === 0 || d[i + w * 4 + 3] === 0;
+      if (rim) { d[i] = or_; d[i + 1] = og; d[i + 2] = ob; }
+    }
+  }
+  octx.putImageData(img, 0, 0);
+}
+
+/**
+ * Draw the full ooze carpet for all live zones at time `t` (seconds).
+ * Zones bleed into each other horizontally so the carpet reads as one
+ * continuous organic layer; per-color particle lists are painted round-robin
+ * so no color systematically sits on top where they mix.
+ */
+function drawOoze(zones, zoneIndex, t) {
+  const w = oozeCanvas.width, h = oozeCanvas.height;
+  octx.clearRect(0, 0, w, h);
+
+  const colW = w / Math.max(zones.length, 1);
+  const bleed = colW * FIELD.oozeBleed;
+  const zoneArea = colW * h;
+  const lists = [];
+  for (let i = zoneIndex; i < zones.length; i++) {
+    const units = zoneOozeUnits(zones[i]);
+    const total = units.reduce((a, u) => a + u, 0);
+    const coverage = zoneOozeCoverage(i, total);
+    // Footprint budget: full coverage tiles the zone (× overfill so random
+    // gaps close); shrinks with coverage as the zone is eaten down.  The
+    // gamma counteracts the overfill headroom, which would otherwise keep a
+    // half-eaten zone looking fully carpeted.
+    const budget = zoneArea * Math.pow(coverage, FIELD.oozeShrinkGamma) *
+      FIELD.oozeFillFactor;
+    const x0 = i * colW;
+    const x1 = (i + 1) * colW;
+    for (let c = 0; c < units.length; c++) {
+      const footprint = total > 0 ? budget * (units[c] / total) : 0;
+      lists.push(oozeParticles(i, c, units[c], footprint, x0, x1, bleed, t));
+    }
+  }
+  const maxLen = lists.reduce((m, l) => Math.max(m, l.length), 0);
+  for (let k = 0; k < maxLen; k++) {
+    for (const l of lists) if (k < l.length) paintOozeParticle(l[k]);
+  }
+
+  oozeThresholdAndOutline();
+
   ctx.save();
-  ctx.fillStyle = color;
-  ctx.globalAlpha = 0.85;
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.globalAlpha = 1.0;
-  ctx.fillStyle = "rgba(10,10,20,0.95)";
-  ctx.font = `bold ${FIELD.blobFont}px monospace`;
-  ctx.textAlign = "center";
-  ctx.fillText(String(units), x, y + 4);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(oozeCanvas, FIELD.x0, FIELD.y0, FIELD.x1 - FIELD.x0, FIELD.y1 - FIELD.y0);
   ctx.restore();
 }
 
 /**
- * Draw the slime field: one column per zone, colored blobs sized by remaining
- * units (color = slime type = required agent), grey blob = naturally-neutral.
- * Consumed zones are dimmed; the active zone is highlighted.
+ * Draw the slime field: a continuous organic ooze carpet across the live
+ * zones (color = slime type = required agent, grey = neutral/transmuted),
+ * with zone columns overlaid.  Consumed zones are dimmed; the active zone is
+ * highlighted.
  */
 function drawSlimeField(game) {
   const zones = game.zones ?? [];
@@ -1043,12 +1277,18 @@ function drawSlimeField(game) {
   if (count === 0) return;
   const zoneIndex = game.zone_index ?? 0;
 
+  // Backdrop under the ooze carpet.
+  rect(FIELD.x0, FIELD.y0, FIELD.x1 - FIELD.x0, FIELD.y1 - FIELD.y0,
+    "rgba(255,255,255,0.03)");
+
+  drawOoze(zones, zoneIndex, performance.now() / 1000);
+
+  // Zone overlays: eaten dimming, borders, and round labels sit on top of
+  // the goo so the round structure stays legible.
   for (let i = 0; i < count; i++) {
     const rectZ = zoneColumnRect(i, count);
     const zw = rectZ.x1 - rectZ.x0;
     const zh = rectZ.y1 - rectZ.y0;
-
-    rect(rectZ.x0, rectZ.y0, zw, zh, "rgba(255,255,255,0.03)");
 
     if (i < zoneIndex) {
       // Consumed zone.
@@ -1059,27 +1299,6 @@ function drawSlimeField(game) {
       ctx.textAlign = "center";
       ctx.fillText("EATEN", (rectZ.x0 + rectZ.x1) / 2, (rectZ.y0 + rectZ.y1) / 2);
       ctx.restore();
-    } else {
-      // Blobs: red, green, yellow, blue, neutral stacked vertically.
-      // Transmuted (neutralized) slime folds into the grey neutral blob, so
-      // it visibly grows as casts land mid-round while modified blobs shrink.
-      const z = zones[i];
-      const neutralTotal = (z.neutral ?? 0) + sumColors(z.neutralized);
-      const entries = [
-        { units: z.red, color: ELEMENT_COLOR.red },
-        { units: z.green, color: ELEMENT_COLOR.green },
-        { units: z.yellow, color: ELEMENT_COLOR.yellow },
-        { units: z.blue, color: ELEMENT_COLOR.blue },
-        { units: neutralTotal, color: NEUTRAL_COLOR },
-      ].filter(b => b.units > 0);
-
-      const cx = (rectZ.x0 + rectZ.x1) / 2;
-      for (let b = 0; b < entries.length; b++) {
-        const by = rectZ.y0 + zh * (b + 1) / (entries.length + 1);
-        // Slight horizontal wobble so columns don't look like bar charts.
-        const bx = cx + ((b % 2 === 0) ? -1 : 1) * zw * 0.12;
-        drawBlob(bx, by, entries[b].units, entries[b].color);
-      }
     }
 
     const isActive = i === zoneIndex;
@@ -1247,7 +1466,9 @@ function drawActionMenu(game) {
     const castsUsed = own ? (own.casts_used ?? 0) : 0;
     const castText = game.cast_timer !== undefined ? game.cast_timer.toFixed(1) : "?";
     const roundText = game.round_timer !== undefined ? game.round_timer.toFixed(1) : "?";
-    text(`Cast: ${castText}s (${castsUsed}/${castsPerRound})  ·  Round: ${roundText}s`,
+    // "Auto-cast" spells it out: classic commits the pending combo when the
+    // cast bar empties — Enter does nothing in this mode.
+    text(`Auto-cast in: ${castText}s (${castsUsed}/${castsPerRound})  ·  Round: ${roundText}s`,
       px, my + M.timerTextDy, M.timerTextFont, C_TEXT);
   }
 
@@ -1578,12 +1799,15 @@ function handlePreLobbyKey(e) {
   e.preventDefault();
 
   if (preLobbyMode === "choose") {
-    if (e.key === "c" || e.key === "C" || e.key === "r" || e.key === "R") {
+    const isC = e.key === "c" || e.key === "C";
+    const isR = e.key === "r" || e.key === "R";
+    if (isC || isR) {
+      // Locked config: [C] creates its game type, [R] does nothing.
+      // Otherwise fixed mapping: [C] = classic, [R] = realtime, always.
+      // Creating from /config/{hash} keeps that saved config.
+      if (configLockedMode !== null && isR) return;
       preLobbyError = "";
-      // [C] = the page's default mode (PAGE_REALTIME → realtime); [R] = the
-      // other mode.  Creating from /config/{hash} keeps that saved config.
-      const isC = e.key === "c" || e.key === "C";
-      const mode = (isC === PAGE_REALTIME) ? "realtime" : "classic";
+      const mode = configLockedMode ?? (isR ? "realtime" : "classic");
       sendPreLobbyAction({ action: "create", mode, config: PAGE_CONFIG_HASH ?? undefined });
     } else if (e.key === "j" || e.key === "J") {
       preLobbyMode = "entering_code";

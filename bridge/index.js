@@ -214,9 +214,29 @@ function validateDataDir(dir) {
 }
 
 /**
+ * Intended play mode of a saved config, from custom-configs/<hash>/meta.json.
+ * Returns "classic" | "realtime" | null (legacy config saved before modes
+ * were recorded — playable in whichever mode the creator requests).
+ */
+function configMode(hash) {
+  try {
+    const meta = JSON.parse(
+      fs.readFileSync(path.join(dataDirFor(hash), "meta.json"), "utf8"));
+    return meta.mode === "realtime" || meta.mode === "classic" ? meta.mode : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * POST body: { balance: <balance.json object>,
- *              encounter: { hunger_max, zones: [...] } }
+ *              encounter: { hunger_max, zones: [...] },
+ *              mode: "classic" | "realtime" }
  * The encounter is saved as the single default encounter labelled "custom".
+ * `mode` is the game type the config is designed for: it is part of the
+ * content hash and recorded in meta.json — lobbies created from this config
+ * always run this mode (see handlePreLobbyAction).  Missing/invalid mode
+ * defaults to "classic".
  * Responds 200 { url, hash } or 400 { errors: [...] }.
  */
 function handleTuneSave(req, res) {
@@ -255,20 +275,25 @@ function handleTuneSave(req, res) {
         zones: msg.encounter.zones,
       }],
     };
+    const mode = msg.mode === "realtime" ? "realtime" : "classic";
 
+    // Mode is part of the hash: identical tables saved for different game
+    // types are distinct configs (each locked to its own mode).
     const hash = require("crypto").createHash("sha256")
-      .update(stableStringify({ balance: balanceDoc, encounters: encountersDoc }))
+      .update(stableStringify({ balance: balanceDoc, encounters: encountersDoc, mode }))
       .digest("hex").slice(0, 16);
     const dir = path.join(CUSTOM_DIR, hash);
     const url = `/config/${hash}`;
 
     // Content-addressed: an existing dir already passed validation.
-    if (fs.existsSync(dir)) { reply(200, { url, hash }); return; }
+    if (fs.existsSync(dir)) { reply(200, { url, hash, mode }); return; }
 
     try {
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(path.join(dir, "balance.json"), JSON.stringify(balanceDoc, null, 2) + "\n");
       fs.writeFileSync(path.join(dir, "encounters.json"), JSON.stringify(encountersDoc, null, 2) + "\n");
+      // Game-type lock (bridge-only metadata; the Zig loader never reads it).
+      fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify({ mode }, null, 2) + "\n");
     } catch (err) {
       console.error("[tune] save write failed:", err.message);
       fs.rmSync(dir, { recursive: true, force: true });
@@ -283,7 +308,7 @@ function handleTuneSave(req, res) {
       return;
     }
     console.log(`[tune] saved config ${hash}`);
-    reply(200, { url, hash });
+    reply(200, { url, hash, mode });
   });
 }
 
@@ -614,8 +639,12 @@ class TabSession {
         }
         configHash = msg.config;
       }
-      // Game mode for the new lobby: "classic" (default) or "realtime".
-      const mode = msg.mode === "realtime" ? "realtime" : "classic";
+      // Game mode for the new lobby.  A saved config's meta.json LOCKS the
+      // mode (game types are only reachable through configs of that type);
+      // legacy configs without meta.json — and the shipped defaults — honor
+      // the requested mode ("classic" default).
+      const lockedMode = configHash !== null ? configMode(configHash) : null;
+      const mode = lockedMode ?? (msg.mode === "realtime" ? "realtime" : "classic");
       const code = uniqueCode();
       let port;
       try { port = await findFreePort(); } catch (err) {
