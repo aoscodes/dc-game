@@ -26,6 +26,9 @@
  *
  * Shared:
  *   - HTTP static file server on port 3000 (serves web/)
+ *   - Hardware controller discovery/pairing over USB serial (controllers.js):
+ *     board buttons feed the same KEY: path; pending-combo feedback flows
+ *     back to the board's e-paper.
  *
  * Stdio protocol (Zig ↔ bridge):
  *   Zig stdin  ← WIRE:<hex>\n   raw server message bytes, hex-encoded
@@ -41,6 +44,8 @@ const net         = require("net");
 const fs          = require("fs");
 const path        = require("path");
 const { WebSocketServer, WebSocket } = require("ws");
+const { PlayerSession } = require("./session");
+const { ControllerManager, comboFromRender } = require("./controllers");
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -77,8 +82,6 @@ function dataDirFor(hash) {
   return hash ? path.join(CUSTOM_DIR, hash) : DATA_DIR;
 }
 
-const RECONNECT_INITIAL_MS  = 1_000;
-const RECONNECT_MAX_MS      = 16_000;
 const MAX_SESSIONS          = 6;
 // Grace period before an empty lobby's server process is killed.
 const LOBBY_IDLE_TIMEOUT_MS = 30_000;
@@ -457,138 +460,54 @@ function roomTabJoined(room) {
 /** @type {Set<TabSession>} */
 const activeSessions = new Set();
 
-class TabSession {
+// Hardware controllers (dc_rp2040 boards on USB serial). Hybrid player model:
+// a linked board first tries to pair with a started tab session (drives that
+// tab's player); with no tab free it becomes its own headless player
+// (ControllerSession) in the active lobby. Sessions iterate in Set insertion
+// order = tab-connection order, so pairing picks the oldest started tab first.
+const controllerManager = new ControllerManager({
+  clientBin: CLIENT_BIN,
+  getSessions: () => activeSessions,
+  onKey: (session, key) => {
+    if (session.started) session.writeToZig(`KEY:${key}\n`);
+  },
+  // Headless boards join the single active lobby, or the newest when several
+  // exist (Map preserves insertion order), or wait when there is none.
+  pickRoom: () => {
+    const rooms = [...lobbyRegistry.values()];
+    return rooms.length > 0 ? rooms[rooms.length - 1] : null;
+  },
+  // Controller players count as room occupants so a lobby that is all boards
+  // doesn't get idle-killed under the players' feet.
+  roomJoined: (room) => roomTabJoined(room),
+  roomLeft: (room) => roomTabLeft(room),
+  isRoomAlive: (room) => lobbyRegistry.get(room.code) === room,
+});
+
+class TabSession extends PlayerSession {
   /** @param {WebSocket} tabWs */
   constructor(tabWs) {
+    super({ clientBin: CLIENT_BIN, label: "tab" });
     this.tabWs          = tabWs;
-    this.zigProc        = null;
-    this.zigWritable    = false;
-    this.serverWs       = null;
-    this.serverConnected = false;
-    this.lineBuf        = "";
-    this.closed         = false;
-    this.reconnectTimer = null;
-    this.reconnectDelay = RECONNECT_INITIAL_MS;
-    /** @type {LobbyRoom | null} */
-    this.room           = null;
-    this.started        = false;
+    /** Paired hardware controller (managed by ControllerManager). */
+    this.controller     = null;
   }
 
-  // ---- Zig stdin ----------------------------------------------------------
+  // ---- PlayerSession hooks --------------------------------------------------
 
-  writeToZig(line) {
-    if (this.zigProc && this.zigWritable) {
-      this.zigProc.stdin.write(line);
-    } else {
-      console.warn("[bridge] writeToZig: dropped (Zig not running):", line.trimEnd().slice(0, 60));
-    }
-  }
-
-  // ---- Server WebSocket ---------------------------------------------------
-
-  sendToServer(bytes) {
-    if (this.serverWs && this.serverConnected &&
-        this.serverWs.readyState === WebSocket.OPEN) {
-      this.serverWs.send(bytes);
-    } else {
-      console.warn(`[bridge] sendToServer: dropped ${bytes.length} bytes (not connected)`);
-    }
-  }
-
-  connectToServer(port) {
-    const url = `ws://127.0.0.1:${port}`;
-    console.log(`[bridge] tab connecting to server ${url}`);
-    const ws = new WebSocket(url, { perMessageDeflate: false });
-    this.serverWs = ws;
-
-    ws.on("open", () => {
-      if (this.closed) { ws.close(); return; }
-      console.log("[bridge] tab server connected");
-      this.serverConnected = true;
-      this.reconnectDelay  = RECONNECT_INITIAL_MS;
-      this.writeToZig("READY\n");
-    });
-
-    ws.on("message", (data) => {
-      if (this.closed) return;
-      const hex = Buffer.from(data).toString("hex");
-      this.writeToZig(`WIRE:${hex}\n`);
-    });
-
-    ws.on("close", () => {
-      this.serverConnected = false;
-      this.serverWs = null;
-      if (this.closed) return;
-      console.warn(`[bridge] tab server disconnected; retry in ${this.reconnectDelay}ms`);
-      this.reconnectTimer = setTimeout(() => {
-        this.reconnectTimer = null;
-        this.reconnectDelay = Math.min(this.reconnectDelay * 2, RECONNECT_MAX_MS);
-        if (!this.closed && this.room) this.connectToServer(this.room.port);
-      }, this.reconnectDelay);
-    });
-
-    ws.on("error", (err) => {
-      console.error("[bridge] tab server WS error:", err.message);
-    });
-  }
-
-  // ---- Zig process --------------------------------------------------------
-
-  spawnZig() {
-    console.log(`[bridge] spawning ${CLIENT_BIN} for tab`);
-    const proc = spawn(CLIENT_BIN, [], { stdio: ["pipe", "pipe", "inherit"] });
-    this.zigProc     = proc;
-    this.zigWritable = true;
-
-    proc.on("error", (err) => {
-      // Spawn failure (e.g. ENOENT: binary missing) emits 'error' without
-      // 'exit' — without handling, the tab hangs on "Connecting..." forever.
-      console.error("[bridge] Zig spawn error:", err.message);
-      this.zigWritable = false;
-      this.failToPreLobby("server_error");
-    });
-
-    proc.stdin.on("error", (err) => {
-      console.error("[bridge] Zig stdin error:", err.message);
-      this.zigWritable = false;
-    });
-
-    proc.stdout.on("data", (chunk) => {
-      this.lineBuf += chunk.toString();
-      let nl;
-      while ((nl = this.lineBuf.indexOf("\n")) !== -1) {
-        const line = this.lineBuf.slice(0, nl);
-        this.lineBuf = this.lineBuf.slice(nl + 1);
-        this.handleZigLine(line.trimEnd());
-      }
-    });
-
-    proc.on("exit", (code) => {
-      this.zigProc     = null;
-      this.zigWritable = false;
-      if (this.closed) return;
-      console.warn(`[bridge] Zig client exited (code=${code}); restarting in 1s`);
-      this.reconnectDelay = RECONNECT_INITIAL_MS;
-      setTimeout(() => { if (!this.closed) this.spawnZig(); }, 1_000);
-    });
-  }
-
-  handleZigLine(line) {
-    if (!line) return;
-    let msg;
-    try { msg = JSON.parse(line); } catch {
-      console.error("[bridge] bad Zig stdout line (not JSON):", line.slice(0, 120));
-      return;
-    }
-
+  onZigFrame(msg, line) {
     if (msg.tag === "render") {
       if (this.tabWs.readyState === WebSocket.OPEN) this.tabWs.send(line);
-    } else if (msg.tag === "send" && typeof msg.bytes === "string") {
-      const bytes = hexToBytes(msg.bytes);
-      if (bytes !== null) this.sendToServer(bytes);
+      // Mirror the pending combo to a paired hardware controller's e-paper.
+      if (this.controller !== null) this.controller.sendCombo(comboFromRender(msg));
     } else {
       console.warn("[bridge] unknown Zig frame tag:", msg.tag);
     }
+  }
+
+  onZigSpawnError(_err) {
+    // Without handling, the tab hangs on "Connecting..." forever.
+    this.failToPreLobby("server_error");
   }
 
   // ---- Room routing -------------------------------------------------------
@@ -604,6 +523,8 @@ class TabSession {
     this.room    = room;
     roomTabJoined(room);
     this.spawnZig();
+    // A waiting hardware controller may now pair with this session.
+    controllerManager.sessionStarted();
     // Small delay: give the server process a moment to bind its port if just spawned.
     setTimeout(() => {
       if (!this.closed) this.connectToServer(room.port);
@@ -708,29 +629,12 @@ class TabSession {
    */
   failToPreLobby(reason) {
     if (this.closed) return;
-    if (this.reconnectTimer !== null) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.zigProc) {
-      // Drop the 'exit' listener so killing it doesn't trigger a restart.
-      this.zigProc.removeAllListeners("exit");
-      // Only signal procs that actually spawned: pid is undefined when spawn
-      // failed (e.g. ENOENT), and calling kill() before the pending 'error'
-      // event fires wedges the node process.
-      if (this.zigProc.pid !== undefined) this.zigProc.kill();
-      this.zigProc = null;
-    }
-    this.zigWritable = false;
-    if (this.serverWs) {
-      // Drop the 'close' listener so closing doesn't trigger a reconnect.
-      this.serverWs.removeAllListeners("close");
-      this.serverWs.close();
-      this.serverWs = null;
-    }
-    this.serverConnected = false;
+    this.closeShared();
     if (this.room) { roomTabLeft(this.room); this.room = null; }
     this.started = false;
+    // Detach the controller but keep its sticky mapping: if this tab starts
+    // again, the same board re-pairs to it.
+    controllerManager.releaseSession(this);
     console.warn(`[bridge] tab bounced to pre_lobby (${reason})`);
     this.sendPreLobbyError(reason);
   }
@@ -738,18 +642,9 @@ class TabSession {
   teardown() {
     if (this.closed) return;
     this.closed = true;
-    if (this.reconnectTimer !== null) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.zigProc)  {
-      // pid is undefined when spawn failed; kill() before the pending
-      // 'error' event fires wedges the node process.
-      if (this.zigProc.pid !== undefined) this.zigProc.kill();
-      this.zigProc = null;
-    }
-    if (this.serverWs) { this.serverWs.close(); this.serverWs = null; }
+    this.closeShared();
     if (this.room)     { roomTabLeft(this.room); this.room = null; }
+    controllerManager.releaseSession(this, { forget: true });
     activeSessions.delete(this);
     console.log(`[bridge] tab session torn down (${activeSessions.size} active)`);
   }
@@ -802,26 +697,11 @@ browserWss.on("connection", (tabWs) => {
 });
 
 // ---------------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------------
-
-function hexToBytes(hex) {
-  if (hex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(hex)) {
-    console.error("[bridge] hexToBytes: invalid hex string:", hex.slice(0, 40));
-    return null;
-  }
-  const len = hex.length >> 1;
-  const buf = Buffer.allocUnsafe(len);
-  for (let i = 0; i < len; i++) {
-    buf[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return buf;
-}
-
-// ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
 
 httpServer.listen(PORT, () => {
   console.log(`[bridge] listening on http://localhost:${PORT}`);
 });
+
+controllerManager.start();

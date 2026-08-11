@@ -12,6 +12,7 @@ const GameState = sw.GameState;
 
 const WIRE_PREFIX = "WIRE:";
 const KEY_PREFIX  = "KEY:";
+const NAME_PREFIX = "NAME:";
 
 const RENDER_HZ: u64 = 60;
 const TICK_NS: u64 = std.time.ns_per_s / RENDER_HZ;
@@ -93,6 +94,13 @@ const ClientState = struct {
 var g_state: ClientState = .{};
 var g_key_queue: inp.KeyQueue = .{};
 
+// Display name for JoinLobby, set via the NAME: stdio line (e.g. hardware
+// controller sessions send "NAME:Board-1" before READY). Written and read
+// only on the stdin thread (send_join runs in the READY handler), so no
+// synchronisation is needed. Capacity matches proto.JoinLobby.name.
+var g_name_buf: [16]u8 = undefined;
+var g_name_len: usize = 0;
+
 var g_stdout_mu: std.Thread.Mutex = .{};
 
 fn stdout_writer() sw.Writer {
@@ -129,6 +137,10 @@ fn stdin_reader(_: void) void {
             if (inp.parse_key_name(key_name)) |key| {
                 g_key_queue.push(key);
             }
+        } else if (std.mem.startsWith(u8, trimmed, NAME_PREFIX)) {
+            const name = trimmed[NAME_PREFIX.len..];
+            g_name_len = @min(name.len, g_name_buf.len);
+            @memcpy(g_name_buf[0..g_name_len], name[0..g_name_len]);
         }
     }
 }
@@ -143,7 +155,7 @@ fn send_join() void {
     if (g_state.player_id != 0xFF) {
         proto.encode(w, .reconnect, proto.Reconnect{ .player_id = g_state.player_id }) catch return;
     } else {
-        const name = "Player";
+        const name: []const u8 = if (g_name_len > 0) g_name_buf[0..g_name_len] else "Player";
         var p = proto.JoinLobby{ .name = [_]u8{0} ** 16, .name_len = @intCast(name.len) };
         @memcpy(p.name[0..name.len], name);
         proto.encode(w, .join_lobby, p) catch return;

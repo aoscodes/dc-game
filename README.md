@@ -203,9 +203,24 @@ Stdio protocol between client and bridge:
 | ---------------------- | ---------------------------------- | ------------------------------------- |
 | bridge → client stdin  | `WIRE:<hex>\n`                     | Raw server message bytes, hex-encoded |
 | bridge → client stdin  | `KEY:<name>\n`                     | Browser `KeyboardEvent.key` value     |
+| bridge → client stdin  | `NAME:<name>\n`                    | Display name for JoinLobby (default "Player") |
 | bridge → client stdin  | `READY\n`                          | Server WebSocket connected; send join |
 | client stdout → bridge | `{"tag":"render",...}\n`           | Full UI snapshot for the browser      |
 | client stdout → bridge | `{"tag":"send","bytes":"<hex>"}\n` | Forward bytes to server               |
+
+### Hardware controllers
+
+The bridge also discovers dc_rp2040 boards over USB serial
+(`bridge/controllers.js`). Buttons map to the same `KEY:` path (d-pad =
+Q/W/E/R colors, A=`1`, B=`2`, C=`Enter`, D=`Escape`) and the pending combo is
+mirrored back to the board's e-paper via `FB:COMBO`.
+
+Hybrid player model: a linked board first pairs with the oldest started tab
+session lacking a controller (it drives that tab's player); when no tab is
+free it becomes its own player — a headless Zig client named `Board-N` joined
+to the active lobby (C toggles ready). Assignment is sticky by the board's
+USB serial number: replugging returns it to its tab pairing, or (within a 30s
+grace window) to its headless player.
 
 ## Project layout
 
