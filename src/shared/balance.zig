@@ -40,13 +40,26 @@ pub const TeamRecipe = struct {
     output: c.AgentOutput,
 };
 
+/// Slime grid dimensions — a GLOBAL knob (not per-encounter), so every game
+/// presents the same playfield shape and the renderer's layout is stable.
+/// Validated by config.zig against components.MAX_GRID_ROWS/COLS.
+pub const SlimeGridDims = struct {
+    rows: u8,
+    cols: u8,
+
+    /// Live cell count of a grid with these dimensions.
+    pub fn cells(self: SlimeGridDims) u16 {
+        return @as(u16, self.rows) * @as(u16, self.cols);
+    }
+};
+
+/// Default grid used when `slime_grid` is absent from balance.json, so
+/// pre-grid configs (including the saved /tune configs) keep validating.
+pub const DEFAULT_SLIME_GRID = SlimeGridDims{ .rows = 6, .cols = 10 };
+
 /// All designer-tunable balance numbers.  Loaded from `data/balance.json`
 /// (see config.zig); tests use the frozen fixture in fixtures.zig.
 pub const Balance = struct {
-    /// Spells (combos) each player may commit per round.  The cast window is
-    /// round_duration / casts_per_round; the pending combo commits when the
-    /// window closes.
-    casts_per_round: u8,
     /// Agent units released per elemental dispense slot in a non-recipe combo.
     units_per_slot: u32,
     /// Medicine contributed per elemental medicine slot in a non-recipe combo.
@@ -61,19 +74,20 @@ pub const Balance = struct {
     /// hunger, less score).  Rounded down per transmute call per color, so
     /// e.g. 0.5 on a single unit leaves nothing.  1.0 = everything survives.
     neutralize_residue_mult: f32,
-    /// Round length in seconds unless overridden with --round-duration.
-    /// Classic mode only.
-    round_duration_default_s: f32,
-    /// Realtime mode: slime units eaten per second PER LIL GUY (one Lil Guy
-    /// per connected player) — the team eats at rate × players.
+    /// Dimensions of the slime grid.  Slime beyond `rows * cols` waits in the
+    /// off-grid reservoir and refills emptied cells from the top row.
+    slime_grid: SlimeGridDims,
+    /// Slime units eaten per second PER LIL GUY (one Lil Guy per connected
+    /// player) — the team eats at rate × players.  Its inverse is one Lil
+    /// Guy's per-bite interval.
     eat_rate_units_per_s: f32,
-    /// Realtime mode: PER-CAST buffer in milliseconds.  Each accepted
+    /// PER-CAST buffer in milliseconds.  Each accepted
     /// submit_spell fires solo when its own buffer expires — unless a newly
     /// accepted cast COMPLETES a team recipe with pending casts, in which
     /// case that recipe instance's members fire together at the newest
     /// joiner's expiry.  0 = fire immediately (no grouping window).
     cast_buffer_ms: u32,
-    /// Realtime mode: per-player cast cooldown in milliseconds, started on
+    /// Per-player cast cooldown in milliseconds, started on
     /// each accepted submit.  While locked further submits are ignored; once
     /// unlocked a resubmit REPLACES the player's pending cast (restarting
     /// its buffer).  Values above cast_buffer_ms throttle overall cast

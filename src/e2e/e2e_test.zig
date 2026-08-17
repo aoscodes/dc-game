@@ -2,6 +2,10 @@
 //! WebSocket, play through the default Slime Feast encounter, assert the
 //! game ends with a positive shared score.
 //!
+//! This exercises the whole real-time stack: the server-authoritative slime
+//! grid, the reservoir refill, one Lil Guy per player biting on its own timer,
+//! and team-recipe grouping across two independent WebSocket clients.
+//!
 //! Run with:  zig build e2e
 //!
 //! The test binary and server are both installed into zig-out/bin/.
@@ -20,8 +24,9 @@ const c = shared.components;
 const PORT: u16 = 19001;
 const SERVER_STARTUP_TIMEOUT_MS: u64 = 3000;
 const BOT_TIMEOUT_MS: u32 = 30_000;
-/// Fast rounds so the encounter completes quickly.
-const ROUND_DURATION_S = "0.3";
+/// game_state frames to skip between submits, so each cast lands after the
+/// previous one's lock has expired.
+const CAST_INTERVAL_TICKS: u32 = 30;
 
 // ---------------------------------------------------------------------------
 // Bot result (written by bot thread, read by main after join)
@@ -32,8 +37,13 @@ const BotResult = struct {
     got_game_over: bool = false,
     score: u32 = 0,
     hunger_events: u32 = 0,
-    stats_rounds: u8 = 0,
+    /// Grid dimensions announced in game_start — proves the client is told how
+    /// to lay the field out.
+    grid_cells: u16 = 0,
+    /// Lil Guys seen in the last game_state: one per connected player.
+    lil_guys: u8 = 0,
     stats_neutralized: u32 = 0,
+    casts_total: u16 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -77,7 +87,7 @@ pub fn main() !void {
     defer allocator.free(port_str);
 
     var server_child = std.process.Child.init(
-        &.{ server_path, port_str, "--round-duration", ROUND_DURATION_S },
+        &.{ server_path, port_str },
         allocator,
     );
     server_child.stdout_behavior = .Ignore;
@@ -127,16 +137,29 @@ pub fn main() !void {
             failed = true;
             continue;
         }
-        if (ctx.result.stats_rounds == 0 or ctx.result.stats_neutralized == 0) {
-            std.debug.print("[e2e] FAIL {s}: empty match stats (rounds={}, neutralized={})\n", .{
-                ctx.name, ctx.result.stats_rounds, ctx.result.stats_neutralized,
+        if (ctx.result.grid_cells == 0) {
+            std.debug.print("[e2e] FAIL {s}: game_start carried no grid dimensions\n", .{ctx.name});
+            failed = true;
+            continue;
+        }
+        if (ctx.result.lil_guys < 2) {
+            std.debug.print("[e2e] FAIL {s}: saw {} Lil Guys, want one per player\n", .{
+                ctx.name, ctx.result.lil_guys,
             });
             failed = true;
             continue;
         }
-        std.debug.print("[e2e] OK   {s}: score={}, {} hunger events, {} rounds, {} neutralized\n", .{
-            ctx.name, ctx.result.score, ctx.result.hunger_events,
-            ctx.result.stats_rounds, ctx.result.stats_neutralized,
+        if (ctx.result.casts_total == 0 or ctx.result.stats_neutralized == 0) {
+            std.debug.print("[e2e] FAIL {s}: empty match stats (casts={}, neutralized={})\n", .{
+                ctx.name, ctx.result.casts_total, ctx.result.stats_neutralized,
+            });
+            failed = true;
+            continue;
+        }
+        std.debug.print("[e2e] OK   {s}: score={}, {} hunger events, {}-cell grid, {} lil guys, {} casts, {} neutralized\n", .{
+            ctx.name,          ctx.result.score,     ctx.result.hunger_events,
+            ctx.result.grid_cells, ctx.result.lil_guys, ctx.result.casts_total,
+            ctx.result.stats_neutralized,
         });
     }
 
@@ -180,7 +203,10 @@ fn run_bot_inner(ctx: *BotCtx) !void {
     var sent_join: bool = false;
     var sent_ready: bool = false;
     var in_game: bool = false;
-    var last_zone: u8 = 0xFF;
+    // Ticks to wait between casts.  The server rejects submits while a
+    // player's cast lock is cooling, so we pace ourselves rather than
+    // spamming every frame.
+    var ticks_until_cast: u32 = 0;
 
     while (true) {
         const msg = try client.read() orelse continue;
@@ -216,24 +242,36 @@ fn run_bot_inner(ctx: *BotCtx) !void {
             },
 
             .game_start => {
+                var fbs = std.io.fixedBufferStream(payload);
+                const start = proto.decode_game_start(fbs.reader()) catch continue;
                 in_game = true;
-                std.debug.print("[e2e] {s} game_start\n", .{ctx.name});
+                ctx.result.grid_cells =
+                    @as(u16, start.grid_rows) * @as(u16, start.grid_cols);
+                std.debug.print("[e2e] {s} game_start: {}x{} grid\n", .{
+                    ctx.name, start.grid_rows, start.grid_cols,
+                });
             },
 
             .game_state => {
                 var fbs = std.io.fixedBufferStream(payload);
                 const gs = proto.decode_game_state(fbs.reader()) catch continue;
-                // Once per zone: both bots cast the twin_flames half so the
-                // team recipe fires and red slime gets neutralized.
-                if (in_game and gs.zone_index != last_zone and gs.zone_index < gs.zone_count) {
-                    last_zone = gs.zone_index;
-                    std.debug.print("[e2e] {s} dispensing for zone {}\n", .{ ctx.name, gs.zone_index });
-                    try send_combo(&client, c.make_combo(&.{
-                        .{ .element = .red },
-                        .{ .action = .dispense },
-                        .{ .action = .dispense },
-                    }));
+                if (!in_game) continue;
+
+                ctx.result.lil_guys = @max(ctx.result.lil_guys, gs.lil_guy_count);
+
+                // Both bots repeatedly submit the twin_flames half, so the
+                // team recipe fires and red slime gets neutralized before the
+                // Lil Guys reach it.
+                if (ticks_until_cast > 0) {
+                    ticks_until_cast -= 1;
+                    continue;
                 }
+                ticks_until_cast = CAST_INTERVAL_TICKS;
+                try send_submit(&client, c.make_combo(&.{
+                    .{ .element = .red },
+                    .{ .action = .dispense },
+                    .{ .action = .dispense },
+                }));
             },
 
             .action_result => {
@@ -249,12 +287,13 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                 const go = proto.decode_game_over(fbs.reader()) catch continue;
                 ctx.result.got_game_over = true;
                 ctx.result.score = go.score;
-                ctx.result.stats_rounds = go.stats.rounds;
-                for (go.stats.round_stats[0..go.stats.rounds]) |rs| {
-                    for (rs.neutralized) |n| ctx.result.stats_neutralized += n;
-                }
-                std.debug.print("[e2e] {s} game_over: score={} reason={s} rounds={} neutralized={}\n", .{
-                    ctx.name, go.score, @tagName(go.stats.reason), go.stats.rounds, ctx.result.stats_neutralized,
+                ctx.result.casts_total = go.stats.casts_total;
+                for (go.stats.feast.neutralized) |n| ctx.result.stats_neutralized += n;
+                std.debug.print("[e2e] {s} game_over: score={} reason={s} slime={}/{} casts={} neutralized={}\n", .{
+                    ctx.name,             go.score,
+                    @tagName(go.stats.reason), go.stats.slime_left,
+                    go.stats.slime_total, go.stats.casts_total,
+                    ctx.result.stats_neutralized,
                 });
                 break;
             },
@@ -285,10 +324,11 @@ fn send_ready_up(client: *ws.Client) !void {
     try client.writeBin(fbs.getWritten());
 }
 
-fn send_combo(client: *ws.Client, combo: c.ActionCombo) !void {
+/// Submit a spell for real (choose_combo is only the live preview).
+fn send_submit(client: *ws.Client, combo: c.ActionCombo) !void {
     var buf: [16]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    try proto.encode(fbs.writer(), .choose_combo, proto.ChooseCombo{ .combo = combo });
+    try proto.encode(fbs.writer(), .submit_spell, proto.SubmitSpell{ .combo = combo });
     try client.writeBin(fbs.getWritten());
 }
 

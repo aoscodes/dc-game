@@ -11,7 +11,7 @@
  *
  * Limits mirrored from src/shared/config.zig / protocol caps:
  *   recipes <= 64 per table, pattern 1..5 slots, team patterns 1..6,
- *   zones 1..16, encounter hunger_max 1..65535.
+ *   encounter hunger_max 1..65535, slime grid rows 1..16 × cols 1..16.
  */
 
 const ELEMENTS = ["red", "green", "yellow", "blue"];
@@ -20,28 +20,33 @@ const SLOT_OPTIONS = ["dispense", "medicine", "red", "green", "yellow", "blue"];
 const MAX_RECIPES = 64;
 const MAX_PATTERN_SLOTS = 5;
 const MAX_TEAM_PATTERNS = 6;
-const MAX_ZONES = 16;
+/** Mirrors components.MAX_GRID_ROWS / MAX_GRID_COLS. */
+const MAX_GRID_ROWS = 16;
+const MAX_GRID_COLS = 16;
+/** Mirrors balance.DEFAULT_SLIME_GRID (used for pre-grid configs). */
+const DEFAULT_SLIME_GRID = { rows: 6, cols: 10 };
 
-/**
- * Scalar balance fields: [key, label, min, max, step, mode].
- * `mode` gates VISIBILITY only ("classic" | "realtime" | "both" vs
- * PAGE_MODE); hidden fields keep their loaded/default values in
- * state.balance so the saved balance.json stays complete and valid.
- */
+/** Scalar balance fields: [key, label, min, max, step]. */
 const RATE_FIELDS = [
-  ["casts_per_round", "casts per round", 1, 10, 1, "classic"],
-  ["units_per_slot", "neutralization agent units per dispense", 0, 1000, 1, "both"],
-  ["medicine_per_slot", "medicine per dispense", 0, 1000, 1, "both"],
-  ["hunger_cost_normal", "hunger per unit eaten", 0, 1000, 1, "both"],
-  ["hunger_cost_modified_extra", "extra hunger from modified slime", 0, 1000, 1, "both"],
-  ["neutralize_residue_mult", "neutralized slime residue (0–1)", 0, 1, 0.05, "both"],
-  ["round_duration_default_s", "round duration (seconds)", 0.5, 300, 0.5, "classic"],
-  ["eat_rate_units_per_s", "units eaten /s per lil guy", 0.1, 100, 0.1, "realtime"],
-  ["cast_buffer_ms", "team recipe window (ms)", 0, 60000, 50, "realtime"],
-  ["cast_lock_ms", "cooldown (ms)", 0, 60000, 50, "realtime"],
+  ["units_per_slot", "neutralization agent units per dispense", 0, 1000, 1],
+  ["medicine_per_slot", "medicine per dispense", 0, 1000, 1],
+  ["hunger_cost_normal", "hunger per unit eaten", 0, 1000, 1],
+  ["hunger_cost_modified_extra", "extra hunger from modified slime", 0, 1000, 1],
+  ["neutralize_residue_mult", "neutralized slime residue (0–1)", 0, 1, 0.05],
+  ["eat_rate_units_per_s", "units eaten /s per lil guy", 0.1, 100, 0.1],
+  ["cast_buffer_ms", "team recipe window (ms)", 0, 60000, 50],
+  ["cast_lock_ms", "cooldown (ms)", 0, 60000, 50],
 ];
 
-/** @type {{balance: object, encounter: {hunger_max: number, zones: object[]}}} */
+/**
+ * @type {{
+ *   balance: object,
+ *   encounter: { hunger_max: number,
+ *                slime: { modified: object, neutral: number } },
+ * }}
+ * `encounter.slime` is the ONE slime pool of the encounter: whatever does not
+ * fit on the grid waits in the reservoir and refills from the top.
+ */
 let state = null;
 
 // ---------------------------------------------------------------------------
@@ -51,30 +56,6 @@ let state = null;
 const FROM_HASH = (new URLSearchParams(location.search).get("from") || "")
   .match(/^[0-9a-f]{16}$/)?.[0] ?? null;
 
-/** Explicit ?mode= override in the URL, or null when absent/invalid. */
-const MODE_PARAM = (() => {
-  const m = new URLSearchParams(location.search).get("mode");
-  return m === "realtime" || m === "classic" ? m : null;
-})();
-
-/**
- * Which game type the editor targets.  The saved config is LOCKED to this
- * mode (recorded in meta.json; lobbies created from it always run it).
- * Precedence: explicit ?mode= param > the ?from= config's meta.json
- * (resolved in load()) > "classic".  Switching modes via the header link
- * forks the config into the other game type on the next save.
- */
-let PAGE_MODE = MODE_PARAM ?? "classic";
-
-/** /tune URL for `mode`, preserving the ?from= source config.  The mode is
- *  always explicit so it overrides the source config's meta.json. */
-function tuneUrl(mode) {
-  const params = new URLSearchParams();
-  if (FROM_HASH) params.set("from", FROM_HASH);
-  params.set("mode", mode);
-  return `/tune?${params.toString()}`;
-}
-
 function dataUrl(file) {
   return FROM_HASH ? `/config/${FROM_HASH}/data/${file}` : `/data/${file}`;
 }
@@ -82,39 +63,42 @@ function dataUrl(file) {
 const colorsFrom = (sparse) =>
   Object.fromEntries(ELEMENTS.map((e) => [e, (sparse ?? {})[e] ?? 0]));
 
+/**
+ * Collapse a legacy `zones` array into the one slime pool, mirroring
+ * config.zig: per-color modified counts and neutral units are summed.
+ */
+function sumZones(zones) {
+  const pool = { modified: colorsFrom(null), neutral: 0 };
+  for (const z of zones) {
+    for (const e of ELEMENTS) pool.modified[e] += (z.modified ?? {})[e] ?? 0;
+    pool.neutral += z.neutral ?? 0;
+  }
+  return pool;
+}
+
 async function load() {
   const [balRes, encRes] = await Promise.all([
     fetch(dataUrl("balance.json")),
     fetch(dataUrl("encounters.json")),
   ]);
   if (!balRes.ok || !encRes.ok) throw new Error("failed to fetch config data");
-  // Without an explicit ?mode= the editor adopts the source config's game
-  // type (legacy configs have no meta.json → keep the classic default).
-  if (!MODE_PARAM && FROM_HASH) {
-    try {
-      const metaRes = await fetch(dataUrl("meta.json"));
-      if (metaRes.ok) {
-        const meta = await metaRes.json();
-        if (meta.mode === "realtime" || meta.mode === "classic") {
-          PAGE_MODE = meta.mode;
-        }
-      }
-    } catch { /* legacy config — classic default stands */ }
-  }
   const bal = await balRes.json();
   const encs = await encRes.json();
   const def = encs.encounters.find((e) => e.label === encs.default) ?? encs.encounters[0];
 
   state = {
     balance: {
-      casts_per_round: bal.casts_per_round,
       units_per_slot: bal.units_per_slot,
       medicine_per_slot: bal.medicine_per_slot,
       hunger_cost_normal: bal.hunger_cost_normal,
       hunger_cost_modified_extra: bal.hunger_cost_modified_extra,
       neutralize_residue_mult: bal.neutralize_residue_mult ?? 1.0,
-      round_duration_default_s: bal.round_duration_default_s,
-      // Realtime-mode fields; default like the server does for older configs.
+      // Grid dimensions; default like the server does for pre-grid configs.
+      slime_grid: {
+        rows: bal.slime_grid?.rows ?? DEFAULT_SLIME_GRID.rows,
+        cols: bal.slime_grid?.cols ?? DEFAULT_SLIME_GRID.cols,
+      },
+      // Default like the server does for older configs.
       eat_rate_units_per_s: bal.eat_rate_units_per_s ?? 2.0,
       cast_buffer_ms: bal.cast_buffer_ms ?? 500,
       cast_lock_ms: bal.cast_lock_ms ?? 500,
@@ -131,7 +115,9 @@ async function load() {
     },
     encounter: {
       hunger_max: def.hunger_max,
-      zones: def.zones.map((z) => ({ modified: colorsFrom(z.modified), neutral: z.neutral ?? 0 })),
+      // Multi-zone configs collapse into the single pool, exactly as the Zig
+      // loader does, so an old config round-trips to the same game.
+      slime: sumZones(def.zones ?? []),
     },
   };
   renderAll();
@@ -160,7 +146,7 @@ const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
  * Bounded number input bound to obj[key].  Clamps on change; steps of 1
  * force integers (the data files use integer fields except round duration).
  */
-function numInput(obj, key, min, max, step = 1, cls = "") {
+function numInput(obj, key, min, max, step = 1, cls = "", onChange = null) {
   const input = el("input", { type: "number", min, max, step, class: cls });
   input.value = obj[key];
   input.addEventListener("change", () => {
@@ -170,17 +156,21 @@ function numInput(obj, key, min, max, step = 1, cls = "") {
     if (step === 1) v = Math.round(v);
     obj[key] = v;
     input.value = v;
+    if (onChange) onChange();
   });
   return input;
 }
 
-/** Row of 4 per-color inputs bound to a {red, green,yellow,blue} object. */
-function colorRow(prefix, colors, max = 1000) {
+/**
+ * Row of 4 per-color inputs bound to a {red, green, yellow, blue} object.
+ * `onChange` (optional) fires after any of them is edited.
+ */
+function colorRow(prefix, colors, max = 1000, onChange = null) {
   const row = el("span", { class: "colors" });
   if (prefix) row.append(el("span", { class: "muted" }, `${prefix} `));
   for (const e of ELEMENTS) {
     row.append(el("span", { class: e }, `${e[0].toUpperCase()} `));
-    row.append(numInput(colors, e, 0, max));
+    row.append(numInput(colors, e, 0, max, 1, "", onChange));
   }
   return row;
 }
@@ -218,24 +208,46 @@ function labelInput(recipe) {
 // Sections
 // ---------------------------------------------------------------------------
 
-function renderModeNote() {
-  const other = PAGE_MODE === "realtime" ? "classic" : "realtime";
-  document.getElementById("mode-note").replaceChildren(
-    el("span", {}, `Editing a ${PAGE_MODE.toUpperCase()} config (saves lock this game type) — `),
-    el("a", { href: tuneUrl(other) }, `switch to ${other}`),
-  );
+function renderConfigNote() {
+  const note = FROM_HASH
+    ? `Editing saved config ${FROM_HASH} — saving forks it into a new one.`
+    : "Editing the shipped defaults — saving creates a new config.";
+  document.getElementById("config-note").replaceChildren(el("span", {}, note));
 }
 
 function renderRates() {
   const box = document.getElementById("rates");
   box.replaceChildren(el("legend", {}, "Rates & costs"));
-  for (const [key, text, min, max, step, mode] of RATE_FIELDS) {
-    if (mode !== "both" && mode !== PAGE_MODE) continue;
+  for (const [key, text, min, max, step] of RATE_FIELDS) {
     box.append(
       el("label", {}, el("span", {}, text), numInput(state.balance, key, min, max, step)),
       el("br"),
     );
   }
+  box.append(slimeGridRow());
+}
+
+/**
+ * Slime grid dimensions — nested under balance.slime_grid, with a live
+ * readout of the resulting on-grid cell count (slime beyond it waits in the
+ * reservoir and refills from the top).
+ */
+function slimeGridRow() {
+  const grid = state.balance.slime_grid;
+  const cells = el("span", { class: "muted" });
+  const refresh = () => {
+    cells.textContent = ` = ${grid.rows * grid.cols} cells on grid`;
+    // Resizing the grid changes how much slime starts in the reservoir.
+    if (document.getElementById("slime-total").textContent) renderSlimeTotal();
+  };
+  refresh();
+  return el("label", {},
+    el("span", {}, "slime grid (rows × cols)"),
+    numInput(grid, "rows", 1, MAX_GRID_ROWS, 1, "", refresh),
+    el("span", { class: "muted" }, " × "),
+    numInput(grid, "cols", 1, MAX_GRID_COLS, 1, "", refresh),
+    cells,
+  );
 }
 
 function renderPlayerRecipes() {
@@ -296,37 +308,42 @@ function renderTeamRecipes() {
     state.balance.team_recipes.length >= MAX_RECIPES;
 }
 
+/**
+ * The encounter's single slime pool.  The readout compares the total against
+ * the grid capacity so a designer can see how much starts in the reservoir.
+ */
 function renderEncounter() {
   const scalars = document.getElementById("encounter-scalars");
   scalars.replaceChildren(el("label", {},
     el("span", {}, "hunger budget (bar capacity)"),
     numInput(state.encounter, "hunger_max", 1, 65535)));
 
-  const box = document.getElementById("zones");
-  box.replaceChildren();
-  state.encounter.zones.forEach((z, i) => {
-    const del = el("button", {
-      class: "danger",
-      onclick: () => { state.encounter.zones.splice(i, 1); renderEncounter(); },
-    }, "remove round");
-    if (state.encounter.zones.length <= 1) del.disabled = true;
-    box.append(el("div", { class: "card" },
-      el("div", { class: "row" },
-        el("span", { class: "muted" }, `round ${i + 1} — modified slime `),
-        del),
-      el("div", { class: "row" },
-        colorRow("", z.modified),
-        el("span", { class: "muted" }, " neutral "),
-        numInput(z, "neutral", 0, 1000)),
-    ));
-  });
-  document.getElementById("zone-count").textContent =
-    `(${state.encounter.zones.length}/${MAX_ZONES} rounds — one zone eaten per round)`;
-  document.getElementById("add-zone").disabled = state.encounter.zones.length >= MAX_ZONES;
+  const pool = state.encounter.slime;
+  const box = document.getElementById("slime-pool");
+  box.replaceChildren(el("div", { class: "card" },
+    el("div", { class: "row" }, el("span", { class: "muted" }, "modified slime units")),
+    el("div", { class: "row" }, colorRow("", pool.modified, 65535, renderSlimeTotal)),
+    el("div", { class: "row" },
+      el("span", { class: "muted" }, "neutral slime units "),
+      numInput(pool, "neutral", 0, 65535, 1, "", renderSlimeTotal)),
+  ));
+  renderSlimeTotal();
+}
+
+/** Live "N units — M on grid, K waiting in the reservoir" readout. */
+function renderSlimeTotal() {
+  const pool = state.encounter.slime;
+  const grid = state.balance.slime_grid;
+  const total = ELEMENTS.reduce((n, e) => n + pool.modified[e], 0) + pool.neutral;
+  const cells = grid.rows * grid.cols;
+  const reserved = Math.max(0, total - cells);
+  document.getElementById("slime-total").textContent = reserved > 0
+    ? `(${total} units — ${cells} on grid, ${reserved} in the reservoir)`
+    : `(${total} units — all on grid, ${cells - total} cells spare)`;
 }
 
 function renderAll() {
-  renderModeNote();
+  renderConfigNote();
   renderRates();
   renderPlayerRecipes();
   renderTeamRecipes();
@@ -355,11 +372,6 @@ document.getElementById("add-team-recipe").addEventListener("click", () => {
   renderTeamRecipes();
 });
 
-document.getElementById("add-zone").addEventListener("click", () => {
-  state.encounter.zones.push({ modified: colorsFrom(null), neutral: 0 });
-  renderEncounter();
-});
-
 function showResult(ok, children) {
   const box = document.getElementById("save-result");
   box.className = ok ? "ok" : "error";
@@ -373,7 +385,15 @@ document.getElementById("save").addEventListener("click", async () => {
     res = await fetch("/api/tune/save", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...state, mode: PAGE_MODE }),
+      // `zones` is the loader's legacy field name for the slime pool; the
+      // Zig side sums the array, so a single entry is the whole encounter.
+      body: JSON.stringify({
+        balance: state.balance,
+        encounter: {
+          hunger_max: state.encounter.hunger_max,
+          zones: [state.encounter.slime],
+        },
+      }),
     });
     data = await res.json();
   } catch (err) {
@@ -387,13 +407,11 @@ document.getElementById("save").addEventListener("click", async () => {
     ]);
     return;
   }
-  // The saved config is locked to the editor's mode (meta.json) — the play
-  // page reads it and only offers that game type.
   const playPath = data.url;
   const playUrl = `${location.origin}${playPath}`;
   const editPath = `/tune?from=${data.hash}`;
   showResult(true, [
-    el("div", {}, `Saved! Play this ${PAGE_MODE} configuration at: `),
+    el("div", {}, "Saved! Play this configuration at: "),
     el("a", { id: "play-link", href: playPath }, playUrl),
     el("span", {}, " "),
     el("button", { onclick: () => navigator.clipboard.writeText(playUrl) }, "copy"),

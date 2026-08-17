@@ -207,7 +207,6 @@ fn process_recv() void {
                 }
                 g_state.lobby.update = p;
                 g_state.lobby.player_id = g_state.player_id;
-                g_state.lobby.mode = p.mode;
                 // The server broadcasts a lobby_update right after game_over
                 // (ready flags reset).  Keep showing the outcome screen; the
                 // stored lobby state is used once the player presses a key.
@@ -220,10 +219,6 @@ fn process_recv() void {
                 g_state.player_id = p.player_id;
                 g_state.game = .{};
                 g_state.game.player_id = p.player_id;
-                g_state.game.round_timer = p.round_duration;
-                g_state.game.round_duration = p.round_duration;
-                g_state.game.casts_per_round = p.casts_per_round;
-                g_state.game.mode = p.mode;
                 g_state.game.cast_buffer_ms = p.cast_buffer_ms;
                 g_state.game.encounter_label_len = p.encounter_label_len;
                 @memcpy(g_state.game.encounter_label[0..p.encounter_label_len], p.encounter_label[0..p.encounter_label_len]);
@@ -232,7 +227,6 @@ fn process_recv() void {
             .game_state => {
                 const p = proto.decode_game_state(r) catch continue;
                 g_state.game.snapshot = p;
-                g_state.game.round_timer = p.round_timer;
             },
             .game_over => {
                 const p = proto.decode_game_over(r) catch continue;
@@ -266,10 +260,6 @@ fn process_recv() void {
                     }
                 }
             },
-            .round_reset => {
-                g_state.game.round += 1;
-                g_state.game.pending_combo.clear();
-            },
             .cast_committed => {
                 const p = proto.decode_cast_committed(r) catch continue;
                 // Our pending combo was committed server-side; clear the
@@ -299,6 +289,15 @@ fn process_recv() void {
                 if (g_state.game.recipe_count < g_state.game.recipes_fired.len) {
                     g_state.game.recipes_fired[g_state.game.recipe_count] = p;
                     g_state.game.recipe_count += 1;
+                }
+            },
+            .agents_dispensed => {
+                const p = proto.decode_agents_dispensed(r) catch continue;
+                // Record for the renderer (transient, drained per frame).
+                const gs = &g_state.game;
+                if (gs.agents_dispensed_count < gs.agents_dispensed.len) {
+                    gs.agents_dispensed[gs.agents_dispensed_count] = p;
+                    gs.agents_dispensed_count += 1;
                 }
             },
             .cast_grouped => {
@@ -355,13 +354,11 @@ fn update_game() void {
             gs.pending_combo.clear();
             send_cancel_combo();
         },
-        // Realtime mode: explicitly submit the pending combo as a spell.
-        // Do NOT clear locally — the server's cast_committed/cast_fizzled
-        // reply triggers the clear.  Classic mode: Enter is a no-op.
+        // Explicitly submit the pending combo as a spell.  Do NOT clear
+        // locally — the server's cast_committed/cast_fizzled reply triggers
+        // the clear.
         .submitted => {
-            if (gs.mode == .realtime and gs.pending_combo.len > 0) {
-                send_submit_spell(&gs.pending_combo);
-            }
+            if (gs.pending_combo.len > 0) send_submit_spell(&gs.pending_combo);
         },
     }
 }

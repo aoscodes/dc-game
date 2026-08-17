@@ -1,41 +1,59 @@
 "use strict";
 
 const LAYOUT = {
-  screen: { w: 2048, h: 1536 },
+  // DESIGN SPACE.  Every coordinate in this file is authored in these units.
+  // The canvas backing store is `renderScale` times larger (index.html) and a
+  // single setTransform at boot scales design units up to it, so art and text
+  // gain resolution without any coordinate in here changing.
+  screen: { w: 1024, h: 768 },
+  renderScale: 2,
   bg: "#14141e",
 
-  // Slime field: zone columns eaten left-to-right, one per round.
+  // Slime field: the server-authoritative grid.  Its rows × cols come from
+  // the wire (balance.slime_grid), so cell size is derived, not fixed: the
+  // grid is square-celled and letterboxed inside this rect (see gridRect).
   slimeField: {
     x0: 40, x1: 984, y0: 220, y1: 620,
-    labelDy: 24, labelFont: 14,
-    activeBorder: "rgba(255,255,100,0.85)",
+    labelDy: 24,
     border: "rgba(180,200,255,0.25)",
-    eatenFill: "rgba(20,20,30,0.75)",
+    reservoirFont: 14,
 
-    // Organic ooze layer (see drawOoze): slime renders as one contiguous
-    // carpet of goo; colors interdigitate instead of sitting in uniform blobs.
-    oozeScale: 20,                 // screen px per ooze px (low-res goo canvas)
-    oozeParticleCap: 20,          // max metaball particles per color per zone
-    oozeFillFactor: 1.5,          // footprint overfill: 1.0 = exactly zone
-    // area at full coverage; >1 closes gaps
-    oozeShrinkGamma: 1.8,         // coverage exponent: counteracts overfill
-    // so a half-eaten zone reads half-covered
-    oozeMinR: 1.7,                // min particle core radius (ooze px)
-    oozeAlphaCutoff: 20,          // 0-255 silhouette threshold (goo fusing)
-    oozeOutline: [58, 34, 96],    // rim color [r,g,b] — deep violet, distinct
-    // from all element colors / neutral / bg
-    oozeWobbleAmp: 1.4,           // idle wobble amplitude (ooze px)
-    oozeWobbleFreq: 0.7,          // idle wobble base frequency (rad/s)
-    oozeBleed: 0.0,               // horiz. bleed past column edge (col-w frac)
+    // Empty cell: a dim recessed socket, so a hole reads as "awaiting the
+    // reservoir" rather than as background.
+    socketFill: "rgba(0,0,0,0.22)",
+    socketBorder: "rgba(255,255,255,0.05)",
+
+    // --- Individual slime unit tiles (see tileSprite) --------------------
+    tileMax: 72,        // cap on cell size (design px); small grids letterbox
+    tileGap: 0.18,      // inset per side as a fraction of the cell: large, so
+    // units read as discrete candies rather than a contiguous mass
+    tileRadius: 0.28,   // body corner radius as a fraction of the body size
+    symbolAlpha: 0.42,  // element glyph opacity stamped on the body
+    // Per-cell animation durations (seconds) and idle wobble.
+    dropS: 0.15,        // refill slide-in from above
+    popS: 0.22,         // eaten-tile burst
+    flashS: 0.25,       // neutralized white bloom
+    dissolveS: 0.3,     // agent-destroyed tile: shrink + fade in place
+    bobAmp: 0.02,       // idle breathing: ±fraction of tile size
+    bobFreq: 1.6,       // idle breathing rate (rad/s)
+
+    // --- Transmute cohort highlight (see cohortHighlight) -----------------
+    //
+    // Drawn at the SOCKET edge, outside the tile body, so it can never be
+    // read as the static inner ring that marks an already-neutralized unit.
+    cohortWidth: 2.5,     // outline stroke width (design px)
+    cohortPulseHz: 2.4,   // pulse rate
+    cohortAlphaMin: 0.35, // pulse trough
+    cohortAlphaMax: 0.95, // pulse crest
   },
 
   hungerBar: {
     x0: 40, x1: 984, y: 150, h: 18,
     labelFont: 14, labelDy: -8,
     bg: "rgba(30,10,10,0.78)",
-    // Dim purple: normal (neutral) consumption must not read as any slime
-    // color — element colors are reserved for the healable segments.
-    fill: "rgba(140,100,185,0.9)",
+    // Grey, matching neutral/neutralized slime: this portion is not healable,
+    // and element colors are reserved for the healable segments.
+    fill: "rgba(150,150,162,0.9)",
     dangerBorder: "rgba(255,60,60,0.95)",
     textFont: 13,
   },
@@ -47,8 +65,10 @@ const LAYOUT = {
   // Per-player pending-combo rows, bottom-left beside the action menu.
   comboPanel: { x: 24, y0: 652, rowH: 18, font: 13, slotW: 14, nameW: 42 },
 
-  // Cosmetic critters: one spawns per player entity (see tickLilGuys).
-  lilGuys: { size: 48, speed: 60, chompMin: 0.9, chompMax: 2.2 },
+  // Lil Guys: one per connected player, walking to the grid cell the SERVER
+  // reserved for them (see tickLilGuys).  `speed` is px/s; `snap` is how
+  // close counts as arrived.
+  lilGuys: { size: 48, speed: 220, snap: 3 },
 
   actionMenu: {
     w: 340, h: 108, marginBottom: 128,
@@ -56,8 +76,7 @@ const LAYOUT = {
     actionRowDy: 16, actionFont: 16, actionCols: [0, 150],
     elementRowDy: 34, elementFont: 13, elementCols: [0, 80, 160, 240],
     cancelRowDy: 48, cancelFont: 12,
-    castBarDy: 56, castBarH: 6,
-    timerBarDy: 66, timerBarH: 6,
+    castBarDy: 56, castBarH: 16,
     timerTextDy: 86, timerTextFont: 13,
     previewDy: 102, previewFont: 13,
   },
@@ -89,8 +108,9 @@ const LAYOUT = {
     x: 40, titleY: 56, titleFont: 26,
     scoreY: 92, scoreFont: 20,
     sectionFont: 15, rowFont: 13, rowH: 20,
-    roundsY: 150,
-    cols: { round: 40, casts: 92, agents: 150, neutralized: 330, escaped: 500, healed: 650, hunger: 830 },
+    feastY: 150,
+    // Match-wide feast tallies (one row per measure, label + colored cells).
+    fcols: { label: 40, cells: 260 },
     pcols: { name: 40, casts: 200, dispense: 260, medicine: 460, recipes: 660, fizzles: 790 },
     hintFont: 14,
   },
@@ -108,6 +128,11 @@ const C_SLIME_HDR = "rgba(160,255,140,1)";
 const C_OWN_ROW = "rgba(255,255,60,0.9)";
 const C_MENU_BG = "rgba(20,20,40,0.86)";
 const C_MENU_BORDER = C_HEADER;
+/** Warning red: wasted agents, and a projected color with no cohort to hit. */
+const C_BAD = "rgba(255,110,110,1)";
+/** Muted tint for the "wasted" tail of a dispense floater — present but not
+ *  competing with the transmute count that actually accomplished something. */
+const C_MUTED = "rgba(190,150,150,0.85)";
 
 /** Sprite used for the cosmetic Lil Guys roaming the slime field. */
 const LIL_GUY_SPRITE = "grunt";
@@ -120,7 +145,6 @@ const sprites = new Map();
 async function loadAssets() {
   await Promise.all([
     loadBalanceData(),
-    loadConfigMeta(),
     ...CLASSES.map(async cls => {
       // Absolute paths: the page may be served at /config/{hash}.
       const [meta, img] = await Promise.all([
@@ -151,50 +175,6 @@ function slotFromName(name) {
 const PAGE_CONFIG_HASH =
   (location.pathname.match(/^\/config\/([0-9a-f]{16})/) || [])[1] ?? null;
 
-/**
- * Lobby creation defaults to realtime mode when served at /realtime or when
- * the URL carries ?mode=realtime (composable with /config/{hash}).
- */
-const PAGE_REALTIME = location.pathname === "/realtime" ||
-  new URLSearchParams(location.search).get("mode") === "realtime";
-
-/**
- * Game type a saved config is LOCKED to (custom-configs meta.json, written
- * at /tune save time).  Lobbies created from a locked config only offer
- * that mode — game types are only reachable through configs of their type.
- * null = no config on this page, or a legacy config saved before modes
- * were recorded (those still offer both modes).
- */
-let configLockedMode = null;
-
-/** Fetch the page config's meta.json (missing = legacy config → null). */
-async function loadConfigMeta() {
-  if (!PAGE_CONFIG_HASH) return;
-  try {
-    const res = await fetch(`/config/${PAGE_CONFIG_HASH}/data/meta.json`);
-    if (!res.ok) return;
-    const meta = await res.json();
-    if (meta.mode === "realtime" || meta.mode === "classic") {
-      configLockedMode = meta.mode;
-    }
-  } catch { /* legacy config — both modes stay available */ }
-}
-
-/**
- * The current room's game mode: "classic" | "realtime".
- * Set from the bridge's `joining` ack; render frames win when they carry
- * `game.mode` / `lobby.mode` (see roomModeFrom).
- */
-let roomMode = "classic";
-
-/** Resolve the effective mode for a render frame (frame value wins). */
-function roomModeFrom(obj) {
-  if (obj && (obj.mode === "realtime" || obj.mode === "classic")) {
-    roomMode = obj.mode;
-  }
-  return roomMode;
-}
-
 /** Config hash whose balance tables are currently loaded. */
 let loadedConfigHash = null;
 
@@ -216,7 +196,6 @@ async function loadBalanceData(hash = PAGE_CONFIG_HASH) {
   const output = (o) => ({ units: o.units ?? {}, medicine: o.medicine ?? {} });
   UNITS_PER_SLOT = bal.units_per_slot;
   MEDICINE_PER_SLOT = bal.medicine_per_slot;
-  CASTS_PER_ROUND = bal.casts_per_round;
   CAST_BUFFER_MS = bal.cast_buffer_ms ?? 500;
   CAST_LOCK_MS = bal.cast_lock_ms ?? 500;
   PLAYER_RECIPES = bal.player_recipes.map((r) => ({
@@ -296,16 +275,27 @@ function tickAnimator(id, cls, lastAction, dt) {
 function clearEntityState() {
   animState.clear();
   floaters.length = 0;
-  lastRoundSeen = -1;
   lastScoreSeen = 0;
   lastHungerSeen = 0;
-  lastZoneIndexSeen = 0;
-  lilGuys.length = 0;
-  zoneOozeInitTotals.clear();
+  lilGuys.clear();
+  lastBitePos = null;
+  // Grid animation state is per-match: a new game's first frame must adopt its
+  // grid silently rather than diff it against the last game's board.
+  prevGrid = [];
+  cellAnim.clear();
+  bittenThisFrame.clear();
+  dispensedColorsThisFrame.clear();
+  lastTransientGame = null;
 }
 
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
+
+// Map design space onto the larger backing store, once.  Everything below
+// draws in design units; nothing else touches the base transform (the few
+// ctx.save()/restore() pairs in this file apply only relative transforms, so
+// this survives them).
+ctx.setTransform(LAYOUT.renderScale, 0, 0, LAYOUT.renderScale, 0, 0);
 
 function clear() {
   ctx.fillStyle = C_BG;
@@ -361,20 +351,11 @@ function drawPreLobby() {
 
   if (preLobbyMode === "choose") {
     const highlight = "rgba(255,255,100,1)";
-    if (configLockedMode !== null) {
-      // Saved config locked to one game type: a single create option.
-      const modeLabel = configLockedMode === "realtime" ? "REAL-TIME" : "CLASSIC";
-      text(`[C]  Create ${modeLabel} lobby (this config's game type)`,
-        L.optX, L.optY0, L.optFont, highlight);
-      text("[J]  Join existing lobby", L.optX, L.optY0 + L.optGap, L.optFont, C_TEXT);
-    } else {
-      // Fixed key → mode mapping ([C] = classic, [R] = realtime, always);
-      // the page's default mode only picks which line is emphasized.
-      text("[C]  Create CLASSIC lobby", L.optX, L.optY0, L.optFont,
-        PAGE_REALTIME ? C_TEXT : highlight);
-      text("[R]  Create REAL-TIME lobby", L.optX, L.optY0 + L.optGap, L.optFont,
-        PAGE_REALTIME ? highlight : C_TEXT);
-      text("[J]  Join existing lobby", L.optX, L.optY0 + 2 * L.optGap, L.optFont, C_TEXT);
+    text("[C]  Create lobby", L.optX, L.optY0, L.optFont, highlight);
+    text("[J]  Join existing lobby", L.optX, L.optY0 + L.optGap, L.optFont, C_TEXT);
+    if (PAGE_CONFIG_HASH) {
+      text(`(custom config ${PAGE_CONFIG_HASH})`,
+        L.optX, L.optY0 + 2 * L.optGap, L.errorFont, "rgba(170,170,170,1)");
     }
     if (preLobbyError) {
       text(preLobbyError, L.optX, L.optY0 + 2 * L.optGap + L.errorDy, L.errorFont, "rgba(255,100,100,1)");
@@ -403,16 +384,6 @@ function drawLobby(lobby) {
   const L = LAYOUT.lobby;
   text("Slime Feast", L.titleX, L.titleY, L.titleFont, C_HEADER);
 
-  // Game-type badge beside the title — always shown so a classic room is
-  // never mistaken for a realtime one (or vice versa).
-  {
-    ctx.font = `${L.titleFont}px monospace`;
-    const badgeX = L.titleX + ctx.measureText("Slime Feast").width + 24;
-    const realtime = roomModeFrom(lobby) === "realtime";
-    text(realtime ? "REAL-TIME" : "CLASSIC", badgeX, L.titleY, L.codeFont,
-      realtime ? "rgba(255,150,50,1)" : "rgba(140,180,255,1)");
-  }
-
   const joinCode = lobby.join_code || "??????";
   text(`Room: ${joinCode}`, L.codeX, L.codeY, L.codeFont, C_TEXT);
 
@@ -429,7 +400,7 @@ function drawLobby(lobby) {
   const readyLabel = lobby.ready ? "Press ENTER to un-ready" : "Press ENTER when ready";
   text(readyLabel, L.rowX, pickerY, L.readyFont, C_TEXT);
 
-  drawRecipeGuide(roomModeFrom(lobby));
+  drawRecipeGuide();
 }
 
 /** Key bindings per element / action — mirrors src/client/input.zig. */
@@ -477,31 +448,26 @@ function outputParts(output) {
 }
 
 /**
- * Lobby study guide: how casting works (mode-aware) + every defined recipe
- * with its key sequence AND symbols, all in parity colors (slime = agent =
- * medicine = hunger block).  Recipes appear in data/balance.json order.
- * @param {"classic" | "realtime"} mode - the room's play mode
+ * Lobby study guide: how casting works + every defined recipe with its key
+ * sequence AND symbols, all in parity colors (slime = agent = medicine =
+ * hunger block).  Recipes appear in data/balance.json order.
  */
-function drawRecipeGuide(mode) {
+function drawRecipeGuide() {
   const L = LAYOUT.lobby;
   let y = L.guideY;
 
   text("HOW CASTING WORKS", L.guideX, y, L.guideFont + 2, C_HEADER);
   y += L.guideLineH;
   const descColor = "rgba(200,200,210,0.9)";
-  // Classic: spells auto-commit on a timer.  Realtime: ENTER fires a cast
-  // after its own buffer; team-recipe matches merge and fire together.
-  const castingLine = mode === "realtime"
-    ? [
-      { str: `Press ENTER to cast — it fires ${(CAST_BUFFER_MS / 1000).toFixed(1)}s later.`, color: descColor },
-      { str: "Casts completing a team recipe in that window merge and fire together!", color: RECIPE_COLOR_TEAM },
-      ...(CAST_LOCK_MS > 0
-        ? [{ str: `${(CAST_LOCK_MS / 1000).toFixed(1)}s cooldown per cast.`, color: descColor }]
-        : []),
-    ]
-    : [
-      { str: `Spells auto-cast when the cast bar empties — ${CASTS_PER_ROUND} per round. Exact combos below are RECIPES (stronger).`, color: descColor },
-    ];
+  // ENTER fires a cast after its own buffer; team-recipe matches merge and
+  // fire together.
+  const castingLine = [
+    { str: `Press ENTER to cast — it fires ${(CAST_BUFFER_MS / 1000).toFixed(1)}s later.`, color: descColor },
+    { str: "Casts completing a team recipe in that window merge and fire together!", color: RECIPE_COLOR_TEAM },
+    ...(CAST_LOCK_MS > 0
+      ? [{ str: `${(CAST_LOCK_MS / 1000).toFixed(1)}s cooldown per cast.`, color: descColor }]
+      : []),
+  ];
   const descLines = [
     [
       { str: "Pick an agent color —", color: descColor },
@@ -514,8 +480,11 @@ function drawRecipeGuide(mode) {
       { str: "2m medicine", color: ACTION_COLOR.medicine },
     ],
     [
-      { str: "Dispensed agents transmute matching-color slime to neutral;", color: ACTION_COLOR.dispense },
+      { str: "Dispensed agents neutralize matching-color slime ON THE GRID;", color: ACTION_COLOR.dispense },
       { str: "medicine heals matching-color hunger.", color: ACTION_COLOR.medicine },
+    ],
+    [
+      { str: "Agents are split across the cells of that color — extras are wasted, so time your casts.", color: descColor },
     ],
     castingLine,
   ];
@@ -635,18 +604,14 @@ const RECIPE_COLOR_TEAM = "rgba(140,240,255,1)";
  * Big celebratory floaters when recipes fire (server broadcasts one event
  * per fire at cast-window close).  Labels are resolved by table index into
  * the tables loaded from data/balance.json (same file the server reads, so
- * indices agree by construction).  Floaters rise from the active zone's
- * center, stacked when several fire at once.
+ * indices agree by construction).  Floaters rise from the field's center,
+ * stacked when several fire at once.
  */
 function spawnRecipeFloaters(game) {
   const fired = game.recipes_fired ?? [];
   if (fired.length === 0) return;
 
-  const count = Math.max(game.zones?.length ?? 1, 1);
-  const zoneIndex = Math.min(game.zone_index ?? 0, count - 1);
-  const rectZ = zoneColumnRect(zoneIndex, count);
-  const cx = (rectZ.x0 + rectZ.x1) / 2;
-  const cy = (rectZ.y0 + rectZ.y1) / 2;
+  const { x: cx, y: cy } = fieldCenter();
   const STACK = LAYOUT.floater.stack + 8;
 
   fired.forEach((rf, i) => {
@@ -660,6 +625,38 @@ function spawnRecipeFloaters(game) {
   });
 }
 
+/**
+ * Dispense-outcome floaters (`game.agents_dispensed`, transient): what a cast's
+ * agents actually accomplished, one label per color per converted batch.
+ *
+ * Also records which colors fired, so updateGridAnims can tell a cell that was
+ * DESTROYED by the transmutation from one that was merely refilled.  That set
+ * is consumed and cleared by updateGridAnims on the same frame.
+ */
+function spawnDispenseFloaters(game) {
+  const events = game.agents_dispensed ?? [];
+  if (events.length === 0) return;
+
+  const { x: cx, y: cy } = fieldCenter();
+  const STACK = LAYOUT.floater.stack;
+
+  events.forEach((ev, i) => {
+    dispensedColorsThisFrame.add(ev.color);
+    const wasted = ev.dispensed - ev.transmuted;
+    const glyph = ELEMENT_CHAR[ev.color] ?? "";
+    const head = `${glyph}${ev.dispensed} → ${ev.transmuted} transmuted`;
+    const y = cy + i * STACK;
+    spawnFloater(head, cx, y, ELEMENT_COLOR[ev.color] ?? C_TEXT,
+      LAYOUT.floater.lifetime, LAYOUT.floater.font);
+    // Overshoot gets its own muted label: the count that matters is the one
+    // that landed, but a player tuning combo size needs to see the surplus.
+    if (wasted > 0) {
+      spawnFloater(`(${wasted} wasted)`, cx, y + LAYOUT.floater.stack * 0.7,
+        C_MUTED, LAYOUT.floater.lifetime, LAYOUT.floater.font);
+    }
+  });
+}
+
 /** Cast lifecycle floater color (matches the realtime cast bar). */
 const CAST_EVENT_COLOR = "rgba(120,220,255,1)";
 
@@ -670,7 +667,7 @@ const CAST_EVENT_COLOR = "rgba(120,220,255,1)";
  *   fired    — expired casts converted (spell_count spells; solo fires are
  *              silent — the ✦ cast action floater already covers those)
  * Player-scoped events rise from that player's combo-panel row; group-level
- * events from the active zone's center (where recipe floaters appear).
+ * events from the field's center (where recipe floaters appear).
  */
 function spawnCastEventFloaters(game) {
   const events = game.cast_events ?? [];
@@ -682,23 +679,22 @@ function spawnCastEventFloaters(game) {
     if (i === -1) return null;
     return { x: CP.x + CP.nameW + 5 * CP.slotW + 24, y: CP.y0 + i * CP.rowH };
   };
-  const zoneCenter = () => {
-    const count = Math.max(game.zones?.length ?? 1, 1);
-    const zoneIndex = Math.min(game.zone_index ?? 0, count - 1);
-    const rectZ = zoneColumnRect(zoneIndex, count);
-    return { x: (rectZ.x0 + rectZ.x1) / 2, y: (rectZ.y0 + rectZ.y1) / 2 + 28 };
+  // Group events sit just below the recipe floaters so both stay readable.
+  const groupPos = () => {
+    const p = fieldCenter();
+    return { x: p.x, y: p.y + 28 };
   };
 
   for (const ev of events) {
     if (ev.type === "grouped") {
-      const { x, y } = zoneCenter();
+      const { x, y } = groupPos();
       spawnFloater("team combo locked!", x, y, RECIPE_COLOR_TEAM,
         LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
     } else if (ev.type === "replaced") {
       const p = rowPos(ev.player_id);
       if (p) spawnFloater("spell replaced", p.x, p.y, "rgba(200,180,255,0.9)");
     } else if (ev.type === "fired" && ev.spell_count > 1) {
-      const { x, y } = zoneCenter();
+      const { x, y } = groupPos();
       spawnFloater(`casts fired ×${ev.spell_count}`, x, y, CAST_EVENT_COLOR,
         LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
     }
@@ -708,13 +704,10 @@ function spawnCastEventFloaters(game) {
 /**
  * Compact per-player pending-combo rows (bottom-left UI panel).  No player
  * sprites are rendered — combos are the only per-player element on screen.
- * The local player's row is highlighted.  In realtime mode a per-player
- * cast countdown replaces the classic casts-used counter.
+ * The local player's row is highlighted and carries its cast countdown.
  */
 function drawComboPanel(game) {
   const CP = LAYOUT.comboPanel;
-  const realtime = roomModeFrom(game) === "realtime";
-  const castsPerRound = game.casts_per_round ?? 3;
   const entities = game.entities || [];
   entities.forEach((e, i) => {
     const y = CP.y0 + i * CP.rowH;
@@ -736,16 +729,11 @@ function drawComboPanel(game) {
       }
     }
 
+    // Pending-cast countdown (the matchable window for team recipes).
     const usedX = CP.x + CP.nameW + 5 * CP.slotW + 8;
-    if (realtime) {
-      // Pending-cast countdown (matchable window for team recipes).
-      const castS = (e.cast_ms ?? 0) / 1000;
-      if (castS > 0) {
-        text(`⌛${castS.toFixed(1)}`, usedX, y, CP.font, CAST_EVENT_COLOR);
-      }
-    } else {
-      // Spells committed this round.
-      text(`${e.casts_used ?? 0}/${castsPerRound}`, usedX, y, CP.font, "rgba(160,170,200,0.8)");
+    const castS = (e.cast_ms ?? 0) / 1000;
+    if (castS > 0) {
+      text(`⌛${castS.toFixed(1)}`, usedX, y, CP.font, CAST_EVENT_COLOR);
     }
   });
 }
@@ -826,8 +814,7 @@ function parseComboSlots(slots) {
 // medicine heals only color-X healable hunger (symmetrical healing).
 let UNITS_PER_SLOT = 0;
 let MEDICINE_PER_SLOT = 0;
-let CASTS_PER_ROUND = 0;
-/** Realtime: group-cast buffer / per-cast cooldown (ms) from balance.json. */
+/** Group-cast buffer / per-cast cooldown (ms) from balance.json. */
 let CAST_BUFFER_MS = 500;
 let CAST_LOCK_MS = 500;
 /** @type {Array<{label: string, pattern: Array<object>, output: object}>} */
@@ -920,48 +907,117 @@ function matchRecipes(combos) {
   return sum;
 }
 
-// ---------------------------------------------------------------------------
-// Round tracking (score / hunger deltas → floaters over the eaten zone)
-// ---------------------------------------------------------------------------
-
-let lastRoundSeen = -1;
-let lastScoreSeen = 0;
-let lastHungerSeen = 0;
-let lastZoneIndexSeen = 0;
+/**
+ * The combo to project per player: the COMMITTED one if they have a cast
+ * buffering, otherwise whatever they are currently typing.
+ *
+ * Submitted wins because it is what will actually fire — and the two are
+ * independent server-side (submitting clears the typing pool, but the player
+ * may immediately start a new combo), so a player mid-cast who has begun
+ * typing again would otherwise flip the preview to a combo that is not the
+ * one about to land.
+ */
+function projectedCombos(game) {
+  return (game.entities ?? []).map(e => {
+    const submitted = e.submitted ?? [];
+    return submitted.length > 0 ? submitted : (e.combo ?? []);
+  });
+}
 
 /**
- * Call at the start of every drawGame frame.
- * Detects round boundary and spawns summary floaters over the zone that was
- * just consumed, using score/hunger deltas from the previous frame.
+ * Per-color risk readout for the projected agents: how many of the on-grid
+ * cohort they can transmute, and how many overshoot into nothing.
+ *
+ * Reach is the on-grid cohort ONLY — surplus agents are wasted, never banked
+ * against the off-grid reservoir — so `wasted` is the tuning signal that tells
+ * a player their combo is too big for the board.
+ *
+ * @returns {Array<{color: string, agents: number, hit: number, cohort: number,
+ *   wasted: number}>} one entry per projected color, in ELEMENT_NAMES order.
  */
-function updateRoundTracking(game) {
-  if (game.round !== lastRoundSeen && lastRoundSeen !== -1) {
-    const zoneRect = zoneColumnRect(lastZoneIndexSeen, Math.max(game.zones?.length ?? 1, 1));
-    const cx = (zoneRect.x0 + zoneRect.x1) / 2;
-    const cy = (zoneRect.y0 + zoneRect.y1) / 2;
-    const jitter = () => (Math.random() - 0.5) * LAYOUT.floater.jitter;
-    const STACK = LAYOUT.floater.stack;
-
-    const scoreGain = (game.score ?? 0) - lastScoreSeen;
-    const hungerGain = (game.hunger?.current ?? 0) - lastHungerSeen;
-
-    // Chomp burst over the consumed zone.
-    for (let i = 0; i < 4; i++) {
-      spawnFloater("chomp!", cx + jitter() * 2, cy + jitter() * 2, "rgba(255,255,255,0.9)", 1.0); // cosmetic: exempt from 3s rule
-    }
-    if (scoreGain > 0) {
-      spawnFloater(`+${scoreGain} score`, cx + jitter(), cy - STACK, "rgba(100,220,100,1)");
-    }
-    if (hungerGain > 0) {
-      spawnFloater(`+${hungerGain} hunger`, cx + jitter(), cy + STACK, "rgba(255,150,50,1)");
-    } else if (hungerGain < 0) {
-      spawnFloater(`${hungerGain} hunger (medicine)`, cx + jitter(), cy + STACK, "rgba(255,80,180,1)");
-    }
+function cohortRisk(game) {
+  const projected = matchRecipes(projectedCombos(game));
+  const grid = game.grid ?? [];
+  const cohorts = {};
+  for (const name of grid) {
+    const el = modifiedElement(name);
+    if (el !== null) cohorts[el] = (cohorts[el] ?? 0) + 1;
   }
-  lastRoundSeen = game.round;
-  lastScoreSeen = game.score ?? 0;
-  lastHungerSeen = game.hunger?.current ?? 0;
-  lastZoneIndexSeen = Math.min(game.zone_index ?? 0, Math.max((game.zones?.length ?? 1) - 1, 0));
+
+  const out = [];
+  for (const color of ELEMENT_NAMES) {
+    const agents = projected.units[color] ?? 0;
+    if (agents === 0) continue;
+    const cohort = cohorts[color] ?? 0;
+    const hit = Math.min(agents, cohort);
+    out.push({ color, agents, hit, cohort, wasted: agents - hit });
+  }
+  return out;
+}
+
+/**
+ * Flat indices of every cell a projected cast could transmute, with the color
+ * driving each highlight.
+ *
+ * Deliberately the WHOLE eligible cohort, never a predicted subset: the server
+ * picks its victims with a seeded random shuffle (slime.zig neutralize), so
+ * marking specific cells would be a guess the client cannot honour.  The count
+ * in the action-menu readout carries the precision instead.
+ *
+ * @returns {Map<number, string>} flat index → element color
+ */
+function cohortHighlight(game) {
+  const marks = new Map();
+  const risk = cohortRisk(game);
+  if (risk.length === 0) return marks;
+
+  const colors = new Set(risk.map(r => r.color));
+  const grid = game.grid ?? [];
+  for (let flat = 0; flat < grid.length; flat++) {
+    const el = modifiedElement(grid[flat]);
+    if (el !== null && colors.has(el)) marks.set(flat, el);
+  }
+  return marks;
+}
+
+// ---------------------------------------------------------------------------
+// Feast tracking (score / hunger deltas → floaters over the bitten cell)
+// ---------------------------------------------------------------------------
+
+let lastScoreSeen = 0;
+let lastHungerSeen = 0;
+
+/**
+ * Call once per drawGame frame, AFTER tickLilGuys so `lastBitePos` already
+ * points at the cell bitten on this frame.  Score and hunger only move when a
+ * Lil Guy eats or medicine lands, so the deltas are floated over that cell
+ * (falling back to the field center for medicine, which has no cell).
+ */
+function updateFeastTracking(game) {
+  const score = game.score ?? 0;
+  const hunger = game.hunger?.current ?? 0;
+  const scoreGain = score - lastScoreSeen;
+  const hungerGain = hunger - lastHungerSeen;
+  lastScoreSeen = score;
+  lastHungerSeen = hunger;
+
+  if (scoreGain === 0 && hungerGain === 0) return;
+
+  const at = lastBitePos ?? fieldCenter();
+  const jitter = () => (Math.random() - 0.5) * LAYOUT.floater.jitter;
+  const STACK = LAYOUT.floater.stack;
+
+  if (scoreGain > 0) {
+    spawnFloater(`+${scoreGain}`, at.x + jitter(), at.y - STACK, "rgba(100,220,100,1)");
+  }
+  if (hungerGain > 0) {
+    spawnFloater(`+${hungerGain} hunger`, at.x + jitter(), at.y + STACK, "rgba(255,150,50,1)");
+  } else if (hungerGain < 0) {
+    // Medicine: healing is cast-driven, so anchor it at the field center.
+    const p = fieldCenter();
+    spawnFloater(`${hungerGain} hunger (medicine)`, p.x + jitter(), p.y + STACK,
+      "rgba(255,80,180,1)");
+  }
 }
 
 /** Map ActionChoice enum string → display character. */
@@ -993,8 +1049,10 @@ const ELEMENT_COLOR = {
   blue: "rgba(110,160,255,1)",
 };
 
-/** Neutral / transmuted slime (matches nothing — needs no agent). */
-const NEUTRAL_COLOR = "rgba(138,43,226,1)";
+/** Neutral slime: needs no agent, so it must not read as any element color.
+ *  Grey is the "safe / inert" color — shared by neutral and neutralized
+ *  tiles, and by the non-healable portion of the hunger bar. */
+const NEUTRAL_COLOR = "rgba(150,150,162,1)";
 
 // ---------------------------------------------------------------------------
 // Hunger bar + score
@@ -1050,28 +1108,80 @@ function drawScore(game) {
 }
 
 // ---------------------------------------------------------------------------
-// Slime field (zone columns)
+// Slime field (the server-authoritative grid)
 // ---------------------------------------------------------------------------
+//
+// The server owns one grid of individual slime units plus an off-grid
+// reservoir that refills emptied cells from the top row.  Render frames carry
+// the whole grid (`game.grid`, row-major, row 0 = top) with its dimensions, so
+// every client draws exactly the same field.
+//
+// Each unit is drawn as its own tile — a gel blob stamped with its element
+// glyph — so the field reads as a board of discrete pieces rather than a
+// blanket of goo.  A cell's flat index is its identity: the server refills
+// holes in place and never slides existing units around, so tiles never move
+// between cells.  (No cascade: faking one would make tile identity lie about
+// server state.)
 
-/** Rect for zone column `i` of `count` within the slime field. */
-function zoneColumnRect(i, count) {
-  const w = (FIELD.x1 - FIELD.x0) / Math.max(count, 1);
-  return { x0: FIELD.x0 + i * w, x1: FIELD.x0 + (i + 1) * w, y0: FIELD.y0, y1: FIELD.y1 };
+/** Grid dimensions from a render frame, floored at 1×1 so geometry is safe
+ *  even on a frame that arrives before the grid does. */
+function gridDims(game) {
+  return {
+    rows: Math.max(game?.grid_rows ?? 0, 1),
+    cols: Math.max(game?.grid_cols ?? 0, 1),
+  };
 }
 
-// --- Organic ooze layer ------------------------------------------------------
-//
-// Slime is drawn as one contiguous carpet of goo built from seeded "metaball"
-// particles:
-//   1. Per live zone, per color, scatter soft radial-gradient particles on a
-//      low-res offscreen canvas (count ∝ units, deterministic seed → stable
-//      shapes, slow sine wobble → living ooze).
-//   2. Threshold the offscreen alpha so overlapping halos fuse into a single
-//      silhouette; overlapping colors have already blended → organic mixing.
-//   3. Paint a 1-ooze-px rim (FIELD.oozeOutline) around the silhouette.
-//   4. Blit to the slime field unsmoothed (chunky pixels match the art style).
+/**
+ * Placement of a rows×cols grid inside the slime field: square cells, sized
+ * to fit and capped at FIELD.tileMax, then centered — small grids letterbox
+ * inside the field rather than stretching to fill it.  Square cells keep the
+ * tile art circular at any grid shape and make the sprite cache one
+ * dimensional (see tileSprite).
+ */
+function gridRect(rows, cols) {
+  const fieldW = FIELD.x1 - FIELD.x0;
+  const fieldH = FIELD.y1 - FIELD.y0;
+  const cell = Math.min(fieldW / cols, fieldH / rows, FIELD.tileMax);
+  const w = cell * cols;
+  const h = cell * rows;
+  return {
+    x0: FIELD.x0 + (fieldW - w) / 2,
+    y0: FIELD.y0 + (fieldH - h) / 2,
+    w, h, cell,
+  };
+}
 
-/** Deterministic PRNG (mulberry32); same seed → same particle layout. */
+/** Screen rect of the cell at flat index `flat` (row-major, row 0 = top). */
+function cellRect(flat, rows, cols) {
+  const g = gridRect(rows, cols);
+  const x0 = g.x0 + (flat % cols) * g.cell;
+  const y0 = g.y0 + Math.floor(flat / cols) * g.cell;
+  return { x0, y0, x1: x0 + g.cell, y1: y0 + g.cell, w: g.cell, h: g.cell };
+}
+
+/** Screen center of a cell — the anchor for chomp floaters and Lil Guy walks. */
+function cellCenter(flat, rows, cols) {
+  const r = cellRect(flat, rows, cols);
+  return { x: (r.x0 + r.x1) / 2, y: (r.y0 + r.y1) / 2 };
+}
+
+/** Center of the whole field: the fallback anchor for cast-wide floaters. */
+function fieldCenter() {
+  return { x: (FIELD.x0 + FIELD.x1) / 2, y: (FIELD.y0 + FIELD.y1) / 2 };
+}
+
+// --- Slime unit tiles --------------------------------------------------------
+//
+// A tile is pure function of (cell state, cell size), so each distinct tile is
+// rendered ONCE into an offscreen canvas and thereafter blitted.  There are
+// only 9 states (4 modified + 4 neutralized + neutral), and a 16×16 grid draws
+// 256 cells per frame — drawing gel bodies with live gradients at that rate
+// would mean thousands of gradient allocations per second, so the cache is
+// what makes the look affordable.  Animation varies only the destination rect.
+
+/** Deterministic PRNG (mulberry32); same seed → same value.  Used to give
+ *  every cell a stable idle-wobble phase from its flat index. */
 function mulberry32(seed) {
   let s = seed | 0;
   return function () {
@@ -1088,304 +1198,482 @@ function parseRgb(str) {
   return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : [255, 255, 255];
 }
 
-/** Ooze fill colors, index-aligned with zoneOozeUnits(): 4 elements + neutral.
- *  Derived from ELEMENT_COLOR/NEUTRAL_COLOR (single source of color truth). */
-const OOZE_RGB = [
-  ...ELEMENT_NAMES.map((name) => parseRgb(ELEMENT_COLOR[name])),
-  parseRgb(NEUTRAL_COLOR),
-];
+/** Tile body colors by element name, plus neutral's grey.  Derived from
+ *  ELEMENT_COLOR/NEUTRAL_COLOR (single source of color truth). */
+const TILE_RGB = {
+  ...Object.fromEntries(ELEMENT_NAMES.map((n) => [n, parseRgb(ELEMENT_COLOR[n])])),
+  neutral: parseRgb(NEUTRAL_COLOR),
+};
 
-/** Low-res goo canvas covering the slime field. */
-const oozeCanvas = document.createElement("canvas");
-oozeCanvas.width = Math.ceil((FIELD.x1 - FIELD.x0) / FIELD.oozeScale);
-oozeCanvas.height = Math.ceil((FIELD.y1 - FIELD.y0) / FIELD.oozeScale);
-const octx = oozeCanvas.getContext("2d", { willReadFrequently: true });
-
-/** Per-zone ooze unit counts, index-aligned with OOZE_RGB.  Transmuted
- *  (neutralized) slime folds into neutral, as the old blobs did. */
-function zoneOozeUnits(z) {
-  return [
-    z.red ?? 0, z.green ?? 0, z.yellow ?? 0, z.blue ?? 0,
-    (z.neutral ?? 0) + sumColors(z.neutralized),
-  ];
+/**
+ * Decode a wire cell name into what to draw.
+ *   "empty"   → null (no tile; the socket shows through)
+ *   "neutral" → grey body, no glyph
+ *   "red"     → red body + ♦ glyph            (threat: needs a red agent)
+ *   "red_n"   → grey body + red ring          (defused, and by which agent)
+ * Neutralized slime is safe to eat, so its BODY is grey like neutral; the ring
+ * preserves which color was spent neutralizing it.
+ */
+function cellStyle(name) {
+  if (!name || name === "empty") return null;
+  if (name === "neutral") return { body: "neutral", glyph: null, ring: null };
+  if (name.endsWith("_n")) {
+    const el = name.slice(0, -2);
+    return ELEMENT_NAMES.includes(el)
+      ? { body: "neutral", glyph: null, ring: el }
+      : { body: "neutral", glyph: null, ring: null };
+  }
+  return ELEMENT_NAMES.includes(name)
+    ? { body: name, glyph: ELEMENT_CHAR[name], ring: null }
+    : { body: "neutral", glyph: null, ring: null };
 }
 
-/** Zone idx → total units when the zone was first seen this game.  Coverage
- *  = totalNow / totalInit: a fresh zone is fully carpeted, then the ooze
- *  recedes as slime is eaten/transmuted.  Cleared in clearEntityState(). */
-const zoneOozeInitTotals = new Map();
-
-/** Coverage ratio (0..1) for zone `i` with current total `totalNow`.
- *  First sighting records the initial total; `max` guards against counts
- *  growing later (a fuller zone re-becomes the 100% baseline). */
-function zoneOozeCoverage(i, totalNow) {
-  const init = Math.max(zoneOozeInitTotals.get(i) ?? 0, totalNow);
-  zoneOozeInitTotals.set(i, init);
-  return init > 0 ? totalNow / init : 0;
+/** True when the cell name denotes slime a Lil Guy could bite. */
+function cellIsSlime(name) {
+  return cellStyle(name) !== null;
 }
 
 /**
- * Build wobbled particles for one (zone, color) at time `t` (seconds).
- * Particles gather around 1-3 seeded cluster centers so each color forms
- * organic pools that interdigitate with its neighbours; positions/phases are
- * pure functions of (seed, t) so nothing flickers frame-to-frame.
- * `x0..x1` is the zone's column span (ooze px); only scatter particles and
- * cluster fringes may stray up to `bleed` px outside it, so a zone's mass
- * stays in its own column while edges still fuse with neighbours.
- * `footprint` is this color's total solid area budget (ooze px²) — the
- * zone's area × its unit share × coverage, so a fresh zone is carpeted and
- * the ooze recedes as slime is eaten / transmuted.
+ * The element of a cell that is still MODIFIED, or null for anything else
+ * (empty, neutral, or already-neutralized `x_n`).
+ *
+ * This is exactly the set agents can transmute, so it drives both the cohort
+ * highlight and the dissolve classification.  Neutralized units keep their
+ * element in the name for the ring color, hence the explicit `_n` rejection.
  */
-function oozeParticles(zoneIdx, colorIdx, units, footprint, x0, x1, bleed, t) {
-  if (units <= 0 || footprint <= 0) return [];
-  const rng = mulberry32(((zoneIdx + 1) * 131071) ^ ((colorIdx + 1) * 8191));
-  const h = oozeCanvas.height;
-  const count = Math.min(units, FIELD.oozeParticleCap);
-  const r = Math.max(FIELD.oozeMinR, Math.sqrt(footprint / count / Math.PI));
-
-  const nClusters = Math.min(3, 1 + Math.floor(count / 12));
-  const inset = (x1 - x0) * 0.08;
-  const clusters = [];
-  for (let c = 0; c < nClusters; c++) {
-    // Centers stay inside the column proper (and on-canvas) so the zone's
-    // mass reads in its own round; fringes/halos provide the mixing.
-    const cx = Math.min(oozeCanvas.width - 4,
-      Math.max(4, x0 + inset + rng() * (x1 - x0 - 2 * inset)));
-    clusters.push({ cx, cy: h * (0.15 + 0.7 * rng()) });
-  }
-  const spreadX = (x1 - x0) * 0.3;
-  const spreadY = h * 0.32;
-
-  const ps = [];
-  for (let i = 0; i < count; i++) {
-    // Every 3rd particle scatters uniformly across the bled span (fills
-    // corners the clusters miss); the rest gather on cluster centers with a
-    // triangular distribution: dense cores, ragged fringes.
-    const scatter = i % 3 === 2;
-    const cl = clusters[i % nClusters];
-    const bx = scatter ? x0 - bleed + rng() * (x1 - x0 + 2 * bleed)
-      : cl.cx + (rng() + rng() - 1) * spreadX;
-    const by = scatter ? h * (0.04 + 0.92 * rng())
-      : cl.cy + (rng() + rng() - 1) * spreadY;
-    const phase = rng() * Math.PI * 2;
-    const freq = FIELD.oozeWobbleFreq * (0.5 + rng());
-    const amp = FIELD.oozeWobbleAmp * (0.5 + rng());
-    // No clamping: particles past the field edge clip naturally (clamping
-    // piles cores on the border pixel → dense bar artifact).
-    ps.push({
-      x: bx + Math.sin(t * freq + phase) * amp,
-      y: by + Math.cos(t * freq * 1.37 + phase * 1.7) * amp,
-      r,
-      colorIdx,
-    });
-  }
-  return ps;
+function modifiedElement(name) {
+  return ELEMENT_NAMES.includes(name) ? name : null;
 }
 
-/** Paint one soft particle: solid-ish core, wide faint halo.  Halos of nearby
- *  particles sum past the alpha cutoff, fusing them into contiguous goo. */
-function paintOozeParticle(p) {
-  const [r, g, b] = OOZE_RGB[p.colorIdx];
-  const R = p.r * 2.2;
-  const grad = octx.createRadialGradient(p.x, p.y, 0, p.x, p.y, R);
-  grad.addColorStop(0, `rgba(${r},${g},${b},0.95)`);
-  grad.addColorStop(0.45, `rgba(${r},${g},${b},0.5)`);
-  grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
-  octx.fillStyle = grad;
-  octx.beginPath();
-  octx.arc(p.x, p.y, R, 0, Math.PI * 2);
-  octx.fill();
+/** state|size → rendered tile canvas.  Cleared when the cell size changes. */
+const tileCache = new Map();
+let tileCacheSize = -1;
+
+/** Trace a rounded rect onto `c` (no fill/stroke). */
+function roundRectPath(c, x, y, w, h, r) {
+  const rr = Math.min(r, w / 2, h / 2);
+  c.beginPath();
+  c.moveTo(x + rr, y);
+  c.lineTo(x + w - rr, y);
+  c.quadraticCurveTo(x + w, y, x + w, y + rr);
+  c.lineTo(x + w, y + h - rr);
+  c.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+  c.lineTo(x + rr, y + h);
+  c.quadraticCurveTo(x, y + h, x, y + h - rr);
+  c.lineTo(x, y + rr);
+  c.quadraticCurveTo(x, y, x + rr, y);
+  c.closePath();
 }
 
-/** Threshold the goo alpha into a solid silhouette, then paint the rim. */
-function oozeThresholdAndOutline() {
-  const w = oozeCanvas.width, h = oozeCanvas.height;
-  const img = octx.getImageData(0, 0, w, h);
-  const d = img.data;
-  const cutoff = FIELD.oozeAlphaCutoff;
-  for (let i = 3; i < d.length; i += 4) d[i] = d[i] < cutoff ? 0 : 255;
+/**
+ * Render (and cache) the tile for one cell state at one cell size.
+ * The blob is inset by FIELD.tileGap per side, giving the large gutter that
+ * makes units read as separate pieces.  Returns a canvas the size of a cell,
+ * so callers blit it at the cell rect (scaled/offset for animation).
+ */
+function tileSprite(name, size) {
+  if (size !== tileCacheSize) {
+    tileCache.clear();
+    tileCacheSize = size;
+  }
+  const key = `${name}|${size}`;
+  const hit = tileCache.get(key);
+  if (hit) return hit;
 
-  const [or_, og, ob] = FIELD.oozeOutline;
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const i = (y * w + x) * 4;
-      if (d[i + 3] === 0) continue;
-      // Rim = opaque pixel touching the field edge or a transparent 4-neighbour.
-      // (Alpha offsets: left i-1, right i+7, up i-w*4+3, down i+w*4+3.)
-      const rim = x === 0 || x === w - 1 || y === 0 || y === h - 1 ||
-        d[i - 1] === 0 || d[i + 7] === 0 ||
-        d[i - w * 4 + 3] === 0 || d[i + w * 4 + 3] === 0;
-      if (rim) { d[i] = or_; d[i + 1] = og; d[i + 2] = ob; }
+  const style = cellStyle(name);
+  if (!style) return null;
+
+  const cv = document.createElement("canvas");
+  cv.width = size;
+  cv.height = size;
+  const c = cv.getContext("2d");
+
+  const inset = size * FIELD.tileGap;
+  const bw = size - inset * 2;
+  const radius = bw * FIELD.tileRadius;
+  const [r, g, b] = TILE_RGB[style.body];
+
+  // Body: vertical gradient (lit top, shaded bottom) reads as a gel volume.
+  const grad = c.createLinearGradient(0, inset, 0, inset + bw);
+  grad.addColorStop(0, `rgba(${Math.min(255, r + 45)},${Math.min(255, g + 45)},${Math.min(255, b + 45)},1)`);
+  grad.addColorStop(0.55, `rgba(${r},${g},${b},1)`);
+  grad.addColorStop(1, `rgba(${Math.round(r * 0.62)},${Math.round(g * 0.62)},${Math.round(b * 0.62)},1)`);
+  roundRectPath(c, inset, inset, bw, bw, radius);
+  c.fillStyle = grad;
+  c.fill();
+
+  // Rim: darker outline so adjacent tiles stay separate even at small sizes.
+  c.strokeStyle = `rgba(${Math.round(r * 0.35)},${Math.round(g * 0.35)},${Math.round(b * 0.35)},0.95)`;
+  c.lineWidth = Math.max(1, size * 0.035);
+  c.stroke();
+
+  // Specular highlight, upper-left: the "candy" cue.
+  c.save();
+  roundRectPath(c, inset, inset, bw, bw, radius);
+  c.clip();
+  c.fillStyle = "rgba(255,255,255,0.34)";
+  c.beginPath();
+  c.ellipse(inset + bw * 0.34, inset + bw * 0.26, bw * 0.24, bw * 0.15,
+    -Math.PI / 5, 0, Math.PI * 2);
+  c.fill();
+  c.restore();
+
+  // Ring: which agent color neutralized this unit.
+  if (style.ring) {
+    const [rr_, rg, rb] = TILE_RGB[style.ring];
+    c.strokeStyle = `rgba(${rr_},${rg},${rb},0.85)`;
+    c.lineWidth = Math.max(1.5, size * 0.055);
+    roundRectPath(c, inset + bw * 0.16, inset + bw * 0.16, bw * 0.68, bw * 0.68,
+      radius * 0.68);
+    c.stroke();
+  }
+
+  // Element glyph: colorblind parity with the action menu and combo panel.
+  if (style.glyph) {
+    c.fillStyle = `rgba(20,16,32,${FIELD.symbolAlpha})`;
+    c.font = `bold ${Math.round(bw * 0.5)}px monospace`;
+    c.textAlign = "center";
+    c.textBaseline = "middle";
+    c.fillText(style.glyph, size / 2, size / 2 + bw * 0.02);
+  }
+
+  tileCache.set(key, cv);
+  return cv;
+}
+
+// --- Per-cell animation ------------------------------------------------------
+//
+// The server sends the whole grid every tick, so the client classifies changes
+// by diffing against the previous frame.  Diffing is idempotent: an unchanged
+// grid queues nothing, which matters because frames arrive at ~20Hz while we
+// render at 60.
+//
+// Eats are the exception — they are NOT diffed.  The server refills in the same
+// tick it bites, so a bitten cell goes straight from one color to another with
+// no empty frame in between.  The Lil Guy bite-timer wrap already identifies
+// the exact cell (see tickLilGuys), and that is what drives the pop.
+
+/** Previous frame's cell names, for change classification. */
+let prevGrid = [];
+
+/** flat → { kind: "drop"|"pop"|"flash", t } with `t` counting down in seconds.
+ *  A "pop" also carries `from`: the tile that was eaten, bursting outward
+ *  while its replacement drops in behind it. */
+const cellAnim = new Map();
+
+/** Cells the Lil Guys resolved a bite on this frame (set by tickLilGuys). */
+const bittenThisFrame = new Set();
+
+/** Colors that dispensed agents this frame, from `game.agents_dispensed`.
+ *  A cell of one of these colors that changed was transmuted by a cast, so it
+ *  DISSOLVES rather than dropping — half of every transmutation is destroyed
+ *  outright (balance.neutralize_residue_mult) and refilled in the same tick,
+ *  which would otherwise render as "new slime arrived" instead of "your agent
+ *  vaporized this". */
+const dispensedColorsThisFrame = new Set();
+
+/** flat → idle wobble phase.  Derived from the flat index so a cell always
+ *  breathes on the same beat, and memoised because the draw loop would
+ *  otherwise build a fresh PRNG closure per cell per frame. */
+const bobPhases = [];
+function bobPhase(flat) {
+  let p = bobPhases[flat];
+  if (p === undefined) {
+    p = mulberry32(flat + 1)() * Math.PI * 2;
+    bobPhases[flat] = p;
+  }
+  return p;
+}
+
+/**
+ * Diff `grid` against the previous frame and queue an animation per changed
+ * cell.  Must run AFTER tickLilGuys so `bittenThisFrame` is populated.
+ */
+function updateGridAnims(grid) {
+  for (let flat = 0; flat < grid.length; flat++) {
+    const now = grid[flat];
+    const was = prevGrid[flat];
+    if (was === undefined) continue; // first frame: no animation, just adopt
+    if (now === was) continue;
+
+    if (cellIsSlime(was) && now === `${was}_n`) {
+      // A cast neutralized this unit in place: it survived, so it stays put.
+      cellAnim.set(flat, { kind: "flash", t: FIELD.flashS });
+    } else if (bittenThisFrame.has(flat)) {
+      // A Lil Guy ate it; whatever is here now arrived from the reservoir.
+      cellAnim.set(flat, { kind: "pop", t: FIELD.popS, from: was });
+    } else if (dispensedColorsThisFrame.has(modifiedElement(was))) {
+      // Agents of this color fired this frame and this unit is gone: it was
+      // destroyed by the transmutation, not eaten and not merely replaced.
+      cellAnim.set(flat, { kind: "dissolve", t: FIELD.dissolveS, from: was });
+    } else {
+      // Refilled hole, or any other server-side replacement.
+      cellAnim.set(flat, { kind: "drop", t: FIELD.dropS });
     }
   }
-  octx.putImageData(img, 0, 0);
+  prevGrid = grid.slice();
+  bittenThisFrame.clear();
+  dispensedColorsThisFrame.clear();
+}
+
+/** Advance queued cell animations, dropping the finished ones. */
+function tickGridAnims(dt) {
+  for (const [flat, a] of cellAnim) {
+    a.t -= dt;
+    if (a.t <= 0) cellAnim.delete(flat);
+  }
 }
 
 /**
- * Draw the full ooze carpet for all live zones at time `t` (seconds).
- * Zones bleed into each other horizontally so the carpet reads as one
- * continuous organic layer; per-color particle lists are painted round-robin
- * so no color systematically sits on top where they mix.
- */
-function drawOoze(zones, zoneIndex, t) {
-  const w = oozeCanvas.width, h = oozeCanvas.height;
-  octx.clearRect(0, 0, w, h);
-
-  const colW = w / Math.max(zones.length, 1);
-  const bleed = colW * FIELD.oozeBleed;
-  const zoneArea = colW * h;
-  const lists = [];
-  for (let i = zoneIndex; i < zones.length; i++) {
-    const units = zoneOozeUnits(zones[i]);
-    const total = units.reduce((a, u) => a + u, 0);
-    const coverage = zoneOozeCoverage(i, total);
-    // Footprint budget: full coverage tiles the zone (× overfill so random
-    // gaps close); shrinks with coverage as the zone is eaten down.  The
-    // gamma counteracts the overfill headroom, which would otherwise keep a
-    // half-eaten zone looking fully carpeted.
-    const budget = zoneArea * Math.pow(coverage, FIELD.oozeShrinkGamma) *
-      FIELD.oozeFillFactor;
-    const x0 = i * colW;
-    const x1 = (i + 1) * colW;
-    for (let c = 0; c < units.length; c++) {
-      const footprint = total > 0 ? budget * (units[c] / total) : 0;
-      lists.push(oozeParticles(i, c, units[c], footprint, x0, x1, bleed, t));
-    }
-  }
-  const maxLen = lists.reduce((m, l) => Math.max(m, l.length), 0);
-  for (let k = 0; k < maxLen; k++) {
-    for (const l of lists) if (k < l.length) paintOozeParticle(l[k]);
-  }
-
-  oozeThresholdAndOutline();
-
-  ctx.save();
-  ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(oozeCanvas, FIELD.x0, FIELD.y0, FIELD.x1 - FIELD.x0, FIELD.y1 - FIELD.y0);
-  ctx.restore();
-}
-
-/**
- * Draw the slime field: a continuous organic ooze carpet across the live
- * zones (color = slime type = required agent, grey = neutral/transmuted),
- * with zone columns overlaid.  Consumed zones are dimmed; the active zone is
- * highlighted.
+ * Draw the slime field: recessed sockets, one gel tile per slime unit, and the
+ * reservoir readout — units still queued off-grid, which refill emptied cells
+ * from the top row.
  */
 function drawSlimeField(game) {
-  const zones = game.zones ?? [];
-  const count = zones.length;
-  if (count === 0) return;
-  const zoneIndex = game.zone_index ?? 0;
+  const { rows, cols } = gridDims(game);
+  const grid = game.grid ?? [];
+  const g = gridRect(rows, cols);
+  const t = performance.now() / 1000;
 
-  // Backdrop under the ooze carpet.
   rect(FIELD.x0, FIELD.y0, FIELD.x1 - FIELD.x0, FIELD.y1 - FIELD.y0,
     "rgba(255,255,255,0.03)");
 
-  drawOoze(zones, zoneIndex, performance.now() / 1000);
+  // Cells a live or pending cast would transmute.  Computed once per frame,
+  // and only while something is actually projected.
+  const marks = cohortHighlight(game);
+  const pulse = marks.size > 0
+    ? FIELD.cohortAlphaMin + (FIELD.cohortAlphaMax - FIELD.cohortAlphaMin) *
+      (0.5 + 0.5 * Math.sin(t * Math.PI * 2 * FIELD.cohortPulseHz))
+    : 0;
 
-  // Zone overlays: eaten dimming, borders, and round labels sit on top of
-  // the goo so the round structure stays legible.
-  for (let i = 0; i < count; i++) {
-    const rectZ = zoneColumnRect(i, count);
-    const zw = rectZ.x1 - rectZ.x0;
-    const zh = rectZ.y1 - rectZ.y0;
+  // Walk the grid off `g` directly: cellRect would recompute the same
+  // placement (and allocate a rect) for every one of up to 256 cells.
+  const inset = g.cell * FIELD.tileGap;
+  const body = g.cell - inset * 2;
+  const cellCount = rows * cols;
+  for (let flat = 0; flat < cellCount; flat++) {
+    const x0 = g.x0 + (flat % cols) * g.cell;
+    const y0 = g.y0 + Math.floor(flat / cols) * g.cell;
 
-    if (i < zoneIndex) {
-      // Consumed zone.
-      rect(rectZ.x0, rectZ.y0, zw, zh, FIELD.eatenFill);
+    // Socket: every cell gets one, so holes are visibly waiting to be filled.
+    rect(x0 + inset, y0 + inset, body, body, FIELD.socketFill);
+    rectStroke(x0 + inset, y0 + inset, body, body, 1, FIELD.socketBorder);
+
+    const anim = cellAnim.get(flat);
+
+    // A popping tile bursts outward over its socket; its replacement (below)
+    // drops in behind it.
+    if (anim?.kind === "pop") {
+      const p = 1 - anim.t / FIELD.popS;      // 0 → 1
+      drawTile(anim.from, x0, y0, g.cell, 1 + p * 0.3, 0, 1 - p);
+    }
+
+    // A dissolving tile collapses INWARD as it fades — the opposite of a
+    // pop's outward burst — reading as "vaporized in place" rather than
+    // "bitten off".  Its replacement (below) drops in behind it.
+    if (anim?.kind === "dissolve") {
+      const p = 1 - anim.t / FIELD.dissolveS; // 0 → 1
+      drawTile(anim.from, x0, y0, g.cell, 1 - p * 0.55, 0, 1 - p);
+    }
+
+    const name = grid[flat];
+    if (!cellIsSlime(name)) continue;
+
+    let scale = 1;
+    let dy = 0;
+    if (anim?.kind === "drop" || anim?.kind === "pop" || anim?.kind === "dissolve") {
+      // Slide in from the cell above, easing out, with a landing squash.
+      const dur = anim.kind === "drop" ? FIELD.dropS
+        : anim.kind === "pop" ? FIELD.popS
+          : FIELD.dissolveS;
+      const p = 1 - anim.t / dur;
+      const ease = 1 - (1 - p) * (1 - p);
+      dy = -(1 - ease) * g.cell;
+      scale = 1 + Math.sin(p * Math.PI) * 0.08;
+    } else {
+      // Idle: every cell breathes on its own stable phase.
+      scale = 1 + Math.sin(t * FIELD.bobFreq + bobPhase(flat)) * FIELD.bobAmp;
+    }
+
+    drawTile(name, x0, y0, g.cell, scale, dy, 1);
+
+    // Cohort outline: pulsing, in the projected color, at the socket edge —
+    // outside the tile body, so it is never confused with the static inner
+    // ring that marks an already-neutralized unit.
+    const mark = marks.get(flat);
+    if (mark !== undefined) {
       ctx.save();
-      ctx.fillStyle = "rgba(150,150,160,0.7)";
-      ctx.font = `bold 16px monospace`;
-      ctx.textAlign = "center";
-      ctx.fillText("EATEN", (rectZ.x0 + rectZ.x1) / 2, (rectZ.y0 + rectZ.y1) / 2);
+      ctx.globalAlpha = pulse;
+      rectStroke(x0 + inset, y0 + inset, body, body, FIELD.cohortWidth,
+        ELEMENT_COLOR[mark]);
       ctx.restore();
     }
 
-    const isActive = i === zoneIndex;
-    rectStroke(rectZ.x0, rectZ.y0, zw, zh, isActive ? 3 : 1,
-      isActive ? FIELD.activeBorder : FIELD.border);
-
-    // Round label under the column.
-    ctx.save();
-    ctx.fillStyle = isActive ? "rgba(255,255,120,0.95)" : "rgba(170,180,220,0.7)";
-    ctx.font = `${FIELD.labelFont}px monospace`;
-    ctx.textAlign = "center";
-    ctx.fillText(`round ${i + 1}`, (rectZ.x0 + rectZ.x1) / 2, rectZ.y1 + FIELD.labelDy);
-    ctx.restore();
+    // Neutralize flash: a white bloom over the settled tile.
+    if (anim?.kind === "flash") {
+      const p = 1 - anim.t / FIELD.flashS;
+      ctx.save();
+      ctx.globalAlpha = (1 - p) * 0.8;
+      rect(x0 + inset, y0 + inset, body, body, "rgba(255,255,255,1)");
+      ctx.restore();
+    }
   }
-}
 
-// ---------------------------------------------------------------------------
-// Cosmetic Lil Guys (roam the active zone; purely client-side)
-// ---------------------------------------------------------------------------
+  rectStroke(FIELD.x0, FIELD.y0, FIELD.x1 - FIELD.x0, FIELD.y1 - FIELD.y0, 1,
+    FIELD.border);
+
+  // Reservoir: off-grid slime waiting to drop into the top row.
+  const reservoir = game.reservoir ?? 0;
+  const label = reservoir > 0
+    ? `${reservoir} more slime incoming ↓`
+    : "reservoir empty — last of the slime";
+  text(label, FIELD.x0, FIELD.y1 + FIELD.labelDy, FIELD.reservoirFont,
+    reservoir > 0 ? "rgba(170,180,220,0.8)" : "rgba(255,255,140,0.9)");
+}
 
 /**
- * @typedef {{ x:number, y:number, tx:number, ty:number, chomp:number, id:number }} LilGuy
+ * Blit one cached tile into the cell at (x0, y0), scaled about the cell centre
+ * and offset vertically by `dy` (animation).  `alpha` < 1 fades it out.
  */
-
-/** @type {LilGuy[]} */
-const lilGuys = [];
-
-function randIn(lo, hi) { return lo + Math.random() * (hi - lo); }
-
-function lilGuyTarget(rectZ) {
-  const G = LAYOUT.lilGuys;
-  return {
-    tx: randIn(rectZ.x0, rectZ.x1 - G.size),
-    ty: randIn(rectZ.y0, rectZ.y1 - G.size),
-  };
+function drawTile(name, x0, y0, cell, scale, dy, alpha) {
+  const sprite = tileSprite(name, Math.round(cell));
+  if (!sprite) return;
+  const size = cell * scale;
+  const off = (cell - size) / 2;
+  if (alpha < 1) {
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.drawImage(sprite, x0 + off, y0 + off + dy, size, size);
+    ctx.restore();
+  } else {
+    ctx.drawImage(sprite, x0 + off, y0 + off + dy, size, size);
+  }
 }
 
+// ---------------------------------------------------------------------------
+// Lil Guys (server-driven: each walks to the grid cell the server reserved)
+// ---------------------------------------------------------------------------
+//
+// The server spawns one Lil Guy ECS entity per connected player, reserves a
+// random grid cell for it, and counts down a bite timer.  Frames carry that
+// state as `game.lil_guys[] = { id, target, bite_ms }` — `id` is the server
+// entity id, and `target` is a flat grid index (null when the grid is empty and
+// no cell could be reserved).
+//
+// The client is purely presentational: it interpolates each guy toward its
+// reserved cell and plays the `attack` clip when the server's timer says the
+// bite lands.  Because the reservation is not exclusive, two guys may share a
+// cell and one will miss — that is the server's outcome, and the client shows
+// it faithfully by animating the chomp either way.
+
+/**
+ * @typedef {object} LilGuyView
+ * @property {number} x        - current screen x (top-left of the sprite)
+ * @property {number} y        - current screen y
+ * @property {number|null} target - flat grid index it is walking to
+ * @property {number} lastBiteMs  - previous frame's server bite timer, used
+ *   to detect the wrap that means "the bite just landed"
+ * @property {boolean} facingLeft - sprite mirror, set from the walk direction
+ * @property {string|null} pendingClip - one-shot clip for the next draw
+ *   ("attack" on the frame a bite resolves), consumed by drawLilGuys
+ * @property {number} id      - animator id (offset far above entity ids)
+ */
+
+/** Server entity id → its view state.  Keyed so late joins / disconnects map
+ *  to the right sprite instead of shifting everyone by one. */
+const lilGuys = new Map();
+
+/** Animator ids live far above entity ids so they cannot collide. */
+const LIL_GUY_ANIM_BASE = 1_000_000;
+
+/** Screen position of the most recent chomp — the anchor for score/hunger
+ *  floaters (see updateFeastTracking).  null until the first bite lands. */
+let lastBitePos = null;
+
+/**
+ * Sync the Lil Guy views with the server's horde and advance them one frame.
+ * Spawns/removes views to match `game.lil_guys`, walks each toward its
+ * reserved cell, and fires the chomp (attack clip + floater) on the frame the
+ * server's bite timer wraps.
+ */
 function tickLilGuys(game, dt) {
   const G = LAYOUT.lilGuys;
-  const zones = game.zones ?? [];
-  const count = Math.max(zones.length, 1);
-  const zoneIndex = Math.min(game.zone_index ?? 0, count - 1);
-  const rectZ = zoneColumnRect(zoneIndex, count);
+  const { rows, cols } = gridDims(game);
+  const horde = game.lil_guys ?? [];
 
-  // One Lil Guy per player entity (late joiners get one too).
-  const wanted = (game.entities ?? []).length;
-  while (lilGuys.length < wanted) {
-    const t = lilGuyTarget(rectZ);
-    lilGuys.push({
-      x: randIn(rectZ.x0, rectZ.x1 - G.size),
-      y: randIn(rectZ.y0, rectZ.y1 - G.size),
-      ...t,
-      chomp: randIn(G.chompMin, G.chompMax),
-      id: 1_000_000 + lilGuys.length, // animator ids far above entity ids
-    });
+  // Drop views whose server entity is gone (player disconnected).
+  const live = new Set(horde.map((lg) => lg.id));
+  for (const id of lilGuys.keys()) {
+    if (!live.has(id)) lilGuys.delete(id);
   }
-  if (lilGuys.length > wanted) lilGuys.length = wanted;
 
-  for (const g of lilGuys) {
-    // Retarget if the active zone moved or we arrived.
-    const outside = g.tx < rectZ.x0 || g.tx > rectZ.x1 || g.ty < rectZ.y0 || g.ty > rectZ.y1;
-    const dx = g.tx - g.x, dy = g.ty - g.y;
+  for (const lg of horde) {
+    const target = lg.target ?? null;
+    let g = lilGuys.get(lg.id);
+    if (!g) {
+      // Spawn already standing on its cell: a new guy should not sprint in
+      // from a stale corner of the field.
+      const at = target !== null
+        ? cellCenter(target, rows, cols)
+        : fieldCenter();
+      g = {
+        x: at.x - G.size / 2,
+        y: at.y - G.size / 2,
+        target,
+        lastBiteMs: lg.bite_ms ?? 0,
+        facingLeft: false,
+        pendingClip: null,
+        id: LIL_GUY_ANIM_BASE + lg.id,
+      };
+      lilGuys.set(lg.id, g);
+    }
+
+    // A rising bite timer means the server restarted the countdown, i.e. the
+    // previous bite resolved (landed or missed) — chomp on the cell we were
+    // standing on, then walk to the freshly reserved one.
+    const biteMs = lg.bite_ms ?? 0;
+    if (biteMs > g.lastBiteMs) {
+      const at = g.target !== null
+        ? cellCenter(g.target, rows, cols)
+        : { x: g.x + G.size / 2, y: g.y + G.size / 2 };
+      lastBitePos = at;
+      // Tell the tile layer which cell was eaten: the server refills in the
+      // same tick it bites, so this is the only signal that distinguishes an
+      // eat from a plain refill (see updateGridAnims).
+      if (g.target !== null) bittenThisFrame.add(g.target);
+      // Hand the attack clip to the animator on this frame's draw.
+      g.pendingClip = "attack";
+      spawnFloater("chomp", at.x, at.y - LAYOUT.floater.stack,
+        "rgba(230,230,240,0.85)", 0.8); // cosmetic: exempt from 3s rule
+    }
+    g.lastBiteMs = biteMs;
+    g.target = target;
+
+    // Walk toward the reserved cell (no target → hold position).
+    if (target === null) continue;
+    const at = cellCenter(target, rows, cols);
+    const tx = at.x - G.size / 2;
+    const ty = at.y - G.size / 2;
+    const dx = tx - g.x, dy = ty - g.y;
     const dist = Math.hypot(dx, dy);
-    if (outside || dist < 4) {
-      const t = lilGuyTarget(rectZ);
-      g.tx = t.tx;
-      g.ty = t.ty;
+    if (dist <= G.snap) {
+      g.x = tx;
+      g.y = ty;
       continue;
     }
     const step = Math.min(G.speed * dt, dist);
     g.x += (dx / dist) * step;
     g.y += (dy / dist) * step;
-
-    // Cosmetic chomping while the round is live.
-    g.chomp -= dt;
-    if (g.chomp <= 0) {
-      g.chomp = randIn(G.chompMin, G.chompMax);
-      spawnFloater("chomp", g.x + G.size / 2, g.y, "rgba(230,230,240,0.85)", 0.8); // cosmetic: exempt from 3s rule
-    }
+    g.facingLeft = dx < 0;
   }
 }
 
 function drawLilGuys(dt) {
   const G = LAYOUT.lilGuys;
-  for (const g of lilGuys) {
-    const flip = g.tx < g.x;
-    drawSprite(g.id, LIL_GUY_SPRITE, g.x, g.y, G.size, G.size, null, dt, flip);
+  for (const g of lilGuys.values()) {
+    drawSprite(g.id, LIL_GUY_SPRITE, g.x, g.y, G.size, G.size, g.pendingClip,
+      dt, g.facingLeft);
+    g.pendingClip = null; // one-shot: the animator owns the clip from here
   }
 }
 
@@ -1418,67 +1706,54 @@ function drawActionMenu(game) {
 
   const tbw = mw - M.padX * 2;
 
-  if (roomModeFrom(game) === "realtime") {
-    // Realtime: no round countdown, no shared cast timer.  Every cast fires
-    // at the end of its OWN buffer (entity.cast_ms); casts completing a team
-    // recipe merge and fire together.  The bar tracks the local player's
-    // pending cast.
+  // Every cast fires at the end of its OWN buffer (entity.cast_ms); casts
+  // completing a team recipe merge and fire together.  The bar tracks the
+  // local player's pending cast, and the cooldown after it fires.
+  {
     const bufferS = (game.cast_buffer_ms ?? 0) / 1000;
     const own = (game.entities ?? []).find(e => e.owner === game.player_id);
     const ownCastS = own ? (own.cast_ms ?? 0) / 1000 : 0;
     const lockS = own ? (own.lock_ms ?? 0) / 1000 : 0;
-    const othersPending = (game.entities ?? [])
-      .some(e => e.owner !== game.player_id && (e.cast_ms ?? 0) > 0);
 
     const castFrac = ownCastS > 0 && bufferS > 0
       ? Math.max(0, Math.min(1, ownCastS / bufferS))
       : 0;
-    const barH = M.timerBarDy + M.timerBarH - M.castBarDy; // span both classic bars
-    rect(px, my + M.castBarDy, tbw, barH, "rgba(30,30,30,0.8)");
-    if (ownCastS > 0) {
-      rect(px, my + M.castBarDy, tbw * castFrac, barH, "rgba(120,220,255,0.9)");
-    }
-    rectStroke(px, my + M.castBarDy, tbw, barH, 1, "rgba(255,255,255,0.3)");
-
-    let status;
-    if (ownCastS > 0) {
-      status = `Dispensing: ${ownCastS.toFixed(1)}s`;
-    }
-    if (lockS > 0 && ownCastS <= 0) status = `Cooldown: ${lockS.toFixed(1)}s`;
-    text(status, px, my + M.timerTextDy, M.timerTextFont, C_TEXT);
-  } else {
-    const castsPerRound = game.casts_per_round ?? 1;
-    const castDuration = game.round_duration > 0 ? game.round_duration / castsPerRound : 0;
-    const castFrac = castDuration > 0
-      ? Math.max(0, Math.min(1, (game.cast_timer ?? 0) / castDuration))
-      : 0;
     rect(px, my + M.castBarDy, tbw, M.castBarH, "rgba(30,30,30,0.8)");
-    rect(px, my + M.castBarDy, tbw * castFrac, M.castBarH, "rgba(120,220,255,0.9)");
+    if (ownCastS > 0) {
+      rect(px, my + M.castBarDy, tbw * castFrac, M.castBarH, "rgba(120,220,255,0.9)");
+    }
+    rectStroke(px, my + M.castBarDy, tbw, M.castBarH, 1, "rgba(255,255,255,0.3)");
 
-    // Round timer bar
-    const timerFrac = game.round_duration > 0
-      ? Math.max(0, Math.min(1, game.round_timer / game.round_duration))
-      : 0;
-    rect(px, my + M.timerBarDy, tbw, M.timerBarH, "rgba(30,30,30,0.8)");
-    rect(px, my + M.timerBarDy, tbw * timerFrac, M.timerBarH, "rgba(255,200,50,0.9)");
-
-    const own = (game.entities ?? []).find(e => e.owner === game.player_id);
-    const castsUsed = own ? (own.casts_used ?? 0) : 0;
-    const castText = game.cast_timer !== undefined ? game.cast_timer.toFixed(1) : "?";
-    const roundText = game.round_timer !== undefined ? game.round_timer.toFixed(1) : "?";
-    // "Auto-cast" spells it out: classic commits the pending combo when the
-    // cast bar empties — Enter does nothing in this mode.
-    text(`Auto-cast in: ${castText}s (${castsUsed}/${castsPerRound})  ·  Round: ${roundText}s`,
-      px, my + M.timerTextDy, M.timerTextFont, C_TEXT);
+    let status = "Build a combo, then ENTER to cast";
+    if (ownCastS > 0) status = `Dispensing: ${ownCastS.toFixed(1)}s`;
+    else if (lockS > 0) status = `Cooldown: ${lockS.toFixed(1)}s`;
+    text(status, px, my + M.timerTextDy, M.timerTextFont, C_TEXT);
   }
 
-  const combos = (game.entities ?? []).map(e => e.combo ?? []);
-  const projected = matchRecipes(combos);
+  // Project from committed combos in preference to typed ones, so the preview
+  // survives the cast buffer instead of blanking the instant you press ENTER.
+  const projected = matchRecipes(projectedCombos(game));
 
+  // Per-color reach: `n of cohort`, plus the surplus that will be wasted.
+  // A projected color with NO cohort on the grid is the worst case — every
+  // agent is thrown away — so it is called out in red rather than hidden.
+  const risk = new Map(cohortRisk(game).map(r => [r.color, r]));
   const parts = [];
   for (const name of ELEMENT_NAMES) {
     const n = projected.units[name];
-    if (n) parts.push({ str: `${ELEMENT_CHAR[name]}${n}`, color: ELEMENT_COLOR[name] });
+    if (!n) continue;
+    const r = risk.get(name);
+    if (!r) {
+      parts.push({ str: `${ELEMENT_CHAR[name]}${n}`, color: ELEMENT_COLOR[name] });
+      continue;
+    }
+    parts.push({
+      str: `${ELEMENT_CHAR[name]}${n} → ${r.hit} of ${r.cohort}`,
+      color: r.cohort === 0 ? C_BAD : ELEMENT_COLOR[name],
+    });
+    if (r.wasted > 0) {
+      parts.push({ str: `${r.wasted} wasted`, color: C_BAD });
+    }
   }
   // Medicine is per color: shown in the color of the healable bucket it heals.
   for (const name of ELEMENT_NAMES) {
@@ -1503,14 +1778,39 @@ function drawActionMenu(game) {
   }
 }
 
+/** The `game` object whose transient events have already been consumed.
+ *  Identity, not tick number: each server message is parsed into a fresh
+ *  object, so identity is exact and needs no monotonicity assumption. */
+let lastTransientGame = null;
+
 function drawGame(game, dt) {
-  // Must come first: detects round boundary using previous frame's data.
-  updateRoundTracking(game);
+  // The render loop redraws `latestMsg` every animation frame (~60Hz) while
+  // server frames arrive at ~20Hz, so the same frame is drawn ~3 times.
+  // Transient events (dispense outcomes, recipe fires, casts, fizzles) are
+  // per-frame facts, NOT per-draw, and must be consumed exactly once or they
+  // spawn triplicate floaters.
+  const fresh = game !== lastTransientGame;
+  lastTransientGame = game;
+
   tickFloaters(dt);
+  // Order matters: tickLilGuys resolves this frame's bite (setting lastBitePos)
+  // and updateFeastTracking floats the score/hunger deltas over that cell.
   tickLilGuys(game, dt);
-  spawnCastFloaters(game);
-  spawnRecipeFloaters(game);
-  spawnCastEventFloaters(game);
+  // Dispense outcomes must be read BEFORE the grid diff: they tell
+  // updateGridAnims which colors fired, which is how a cell destroyed by a
+  // transmutation is told apart from one that was merely refilled.
+  if (fresh) spawnDispenseFloaters(game);
+  // Then classify grid changes: updateGridAnims needs both the bite
+  // tickLilGuys just resolved and the dispense colors above to tell an eaten
+  // cell, a vaporized cell and a plain refill apart.
+  tickGridAnims(dt);
+  if (fresh) updateGridAnims(game.grid ?? []);
+  updateFeastTracking(game);
+  if (fresh) {
+    spawnCastFloaters(game);
+    spawnRecipeFloaters(game);
+    spawnCastEventFloaters(game);
+  }
 
   clear();
 
@@ -1536,11 +1836,6 @@ function sumColors(obj) {
   return ELEMENT_NAMES.reduce((t, name) => t + (obj?.[name] ?? 0), 0);
 }
 
-/** Add per-color object `add` into accumulator object `acc`. */
-function addColors(acc, add) {
-  for (const name of ELEMENT_NAMES) acc[name] = (acc[name] ?? 0) + (add?.[name] ?? 0);
-}
-
 /**
  * Draw non-zero per-color values as colored "♦12 ▲5" cells starting at x.
  * Draws a grey dash when everything is zero.
@@ -1561,8 +1856,12 @@ function drawColorCells(x, y, font, obj) {
 }
 
 /**
- * End-of-game tuning report: outcome, round-by-round table, per-player
+ * End-of-game tuning report: outcome, match-wide feast tallies, per-player
  * table, recipe fire counts, derived waste/overheal totals.
+ *
+ * The grid model has no rounds, so the report is a single match-wide summary:
+ * what was dispensed vs. what it actually neutralized (the rest was wasted on
+ * off-grid or wrong-color slime), and what the Lil Guys ended up eating.
  */
 function drawGameOver(msg) {
   clear();
@@ -1582,49 +1881,34 @@ function drawGameOver(msg) {
     return;
   }
 
-  // ---- Round-by-round table ------------------------------------------------
-  const C = L.cols;
-  let y = L.roundsY;
-  text("ROUND", C.round, y, L.sectionFont, C_HEADER);
-  text("CASTS", C.casts, y, L.sectionFont, C_HEADER);
-  text("AGENTS", C.agents, y, L.sectionFont, C_HEADER);
-  text("NEUTRALIZED", C.neutralized, y, L.sectionFont, C_HEADER);
-  text("ESCAPED", C.escaped, y, L.sectionFont, C_HEADER);
-  text("MED (HEALED)", C.healed, y, L.sectionFont, C_HEADER);
-  text("HUNGER", C.hunger, y, L.sectionFont, C_HEADER);
+  // ---- Match-wide feast tallies -------------------------------------------
+  const F = L.fcols;
+  const feast = stats.feast ?? {};
+  let y = L.feastY;
+  text("FEAST", F.label, y, L.sectionFont, C_HEADER);
   y += L.rowH;
 
-  const totals = { agents: {}, medicine: {}, healed: {}, neutralized: {}, escaped: {} };
-  let neutralTotal = 0;
-  for (const [i, r] of (stats.rounds ?? []).entries()) {
-    text(String(i + 1), C.round, y, L.rowFont, C_TEXT);
-    text(String(r.casts), C.casts, y, L.rowFont, C_TEXT);
-    drawColorCells(C.agents, y, L.rowFont, r.agents);
-    drawColorCells(C.neutralized, y, L.rowFont, r.neutralized);
-    drawColorCells(C.escaped, y, L.rowFont, r.escaped);
-    // Medicine: dispensed with healed total in parens.
-    drawColorCells(C.healed, y, L.rowFont, r.medicine);
-    text(`(+${sumColors(r.healed)})`, C.hunger - 60, y, L.rowFont, "rgba(255,80,180,0.9)");
-    text(`${r.hunger_after}`, C.hunger, y, L.rowFont,
-      r.hunger_extra > 0 ? "rgba(255,150,50,0.95)" : "rgba(160,220,160,0.9)");
+  /** One "LABEL  ♦12 ▲5" row. */
+  const feastRow = (label, obj) => {
+    text(label, F.label, y, L.rowFont, "rgba(200,200,210,0.9)");
+    drawColorCells(F.cells, y, L.rowFont, obj);
     y += L.rowH;
+  };
+  feastRow("agents dispensed", feast.agents);
+  feastRow("slime neutralized", feast.neutralized);
+  feastRow("modified slime eaten", feast.escaped);
+  feastRow("medicine dispensed", feast.medicine);
+  feastRow("hunger healed", feast.healed);
 
-    addColors(totals.agents, r.agents);
-    addColors(totals.medicine, r.medicine);
-    addColors(totals.healed, r.healed);
-    addColors(totals.neutralized, r.neutralized);
-    addColors(totals.escaped, r.escaped);
-    neutralTotal += r.neutral ?? 0;
-  }
-
-  // Derived totals: agent waste + medicine overheal.
-  const wasted = sumColors(totals.agents) - sumColors(totals.neutralized);
-  const overheal = sumColors(totals.medicine) - sumColors(totals.healed);
+  // Derived: agents that found no matching on-grid cell, and medicine poured
+  // into hunger that was not there.  Both are the numbers a designer tunes on.
+  const wasted = sumColors(feast.agents) - sumColors(feast.neutralized);
+  const overheal = sumColors(feast.medicine) - sumColors(feast.healed);
   y += 4;
   text(
-    `totals: neutralized ${sumColors(totals.neutralized)}  ·  natural ${neutralTotal}  ·  escaped ${sumColors(totals.escaped)}` +
-    `  ·  agents wasted ${wasted}  ·  medicine overheal ${overheal}`,
-    C.round, y, L.rowFont, "rgba(200,200,210,0.9)",
+    `neutral eaten ${feast.neutral ?? 0}  ·  hunger ${feast.hunger_normal ?? 0} base ` +
+    `+ ${feast.hunger_extra ?? 0} from modified  ·  agents wasted ${wasted}  ·  medicine overheal ${overheal}`,
+    F.label, y, L.rowFont, "rgba(200,200,210,0.9)",
   );
   y += L.rowH + 14;
 
@@ -1663,7 +1947,8 @@ function drawGameOver(msg) {
   text(recipeParts.length > 0 ? recipeParts.join("  ·  ") : "none fired",
     P.name, y, L.rowFont, recipeParts.length > 0 ? "rgba(255,255,140,0.9)" : "rgba(120,120,140,0.7)");
   y += L.rowH;
-  text(`total spells cast: ${stats.casts_total}  ·  zones eaten: ${(stats.rounds ?? []).length}/${stats.zone_count}`,
+  const eaten = (stats.slime_total ?? 0) - (stats.slime_left ?? 0);
+  text(`total spells cast: ${stats.casts_total}  ·  slime eaten: ${eaten}/${stats.slime_total ?? 0}`,
     P.name, y, L.rowFont, "rgba(200,200,210,0.9)");
 
   text("Press any key to return to lobby.", L.x, SH - 40, L.hintFont, C_TEXT);
@@ -1729,8 +2014,6 @@ function connect() {
       // and any stale error text disappears.
       resetPreLobby();
       latestMsg = { phase: "connecting" };
-      // Adopt the room's mode (render frames overwrite this later).
-      roomMode = msg.mode === "realtime" ? "realtime" : "classic";
       // Adopt the lobby's config: a room created from /config/{hash} uses
       // that hash's balance tables; joiners from any page must match.
       const roomConfig = typeof msg.config === "string" ? msg.config : null;
@@ -1799,16 +2082,10 @@ function handlePreLobbyKey(e) {
   e.preventDefault();
 
   if (preLobbyMode === "choose") {
-    const isC = e.key === "c" || e.key === "C";
-    const isR = e.key === "r" || e.key === "R";
-    if (isC || isR) {
-      // Locked config: [C] creates its game type, [R] does nothing.
-      // Otherwise fixed mapping: [C] = classic, [R] = realtime, always.
-      // Creating from /config/{hash} keeps that saved config.
-      if (configLockedMode !== null && isR) return;
+    if (e.key === "c" || e.key === "C") {
+      // Creating from /config/{hash} keeps that saved config's tables.
       preLobbyError = "";
-      const mode = configLockedMode ?? (isR ? "realtime" : "classic");
-      sendPreLobbyAction({ action: "create", mode, config: PAGE_CONFIG_HASH ?? undefined });
+      sendPreLobbyAction({ action: "create", config: PAGE_CONFIG_HASH ?? undefined });
     } else if (e.key === "j" || e.key === "J") {
       preLobbyMode = "entering_code";
       preLobbyCode = "";

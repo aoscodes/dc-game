@@ -135,13 +135,6 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
-  // /realtime — the game shell defaulting lobby creation to realtime mode
-  // (game.js reads location.pathname).
-  if (rawPath === "/realtime") {
-    serveFile(res, WEB_DIR, "/index.html", { "Cache-Control": "no-cache" });
-    return;
-  }
-
   // /config/{hash}[/...] — play (or fetch data for) a saved custom config.
   const cfgMatch = rawPath.match(/^\/config\/([0-9a-f]{16})(\/.*)?$/);
   if (cfgMatch) {
@@ -217,29 +210,11 @@ function validateDataDir(dir) {
 }
 
 /**
- * Intended play mode of a saved config, from custom-configs/<hash>/meta.json.
- * Returns "classic" | "realtime" | null (legacy config saved before modes
- * were recorded — playable in whichever mode the creator requests).
- */
-function configMode(hash) {
-  try {
-    const meta = JSON.parse(
-      fs.readFileSync(path.join(dataDirFor(hash), "meta.json"), "utf8"));
-    return meta.mode === "realtime" || meta.mode === "classic" ? meta.mode : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
  * POST body: { balance: <balance.json object>,
- *              encounter: { hunger_max, zones: [...] },
- *              mode: "classic" | "realtime" }
+ *              encounter: { hunger_max, zones: [...] } }
  * The encounter is saved as the single default encounter labelled "custom".
- * `mode` is the game type the config is designed for: it is part of the
- * content hash and recorded in meta.json — lobbies created from this config
- * always run this mode (see handlePreLobbyAction).  Missing/invalid mode
- * defaults to "classic".
+ * `zones` is a legacy wire name: the Zig loader sums the entries into the one
+ * slime pool this game has, so old saved configs keep working.
  * Responds 200 { url, hash } or 400 { errors: [...] }.
  */
 function handleTuneSave(req, res) {
@@ -278,25 +253,22 @@ function handleTuneSave(req, res) {
         zones: msg.encounter.zones,
       }],
     };
-    const mode = msg.mode === "realtime" ? "realtime" : "classic";
-
-    // Mode is part of the hash: identical tables saved for different game
-    // types are distinct configs (each locked to its own mode).
+    // Content hash over the tables alone.  Historic hashes also folded in a
+    // game mode; those directories still exist and still validate, they simply
+    // are not reproducible from this endpoint any more.
     const hash = require("crypto").createHash("sha256")
-      .update(stableStringify({ balance: balanceDoc, encounters: encountersDoc, mode }))
+      .update(stableStringify({ balance: balanceDoc, encounters: encountersDoc }))
       .digest("hex").slice(0, 16);
     const dir = path.join(CUSTOM_DIR, hash);
     const url = `/config/${hash}`;
 
     // Content-addressed: an existing dir already passed validation.
-    if (fs.existsSync(dir)) { reply(200, { url, hash, mode }); return; }
+    if (fs.existsSync(dir)) { reply(200, { url, hash }); return; }
 
     try {
       fs.mkdirSync(dir, { recursive: true });
       fs.writeFileSync(path.join(dir, "balance.json"), JSON.stringify(balanceDoc, null, 2) + "\n");
       fs.writeFileSync(path.join(dir, "encounters.json"), JSON.stringify(encountersDoc, null, 2) + "\n");
-      // Game-type lock (bridge-only metadata; the Zig loader never reads it).
-      fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify({ mode }, null, 2) + "\n");
     } catch (err) {
       console.error("[tune] save write failed:", err.message);
       fs.rmSync(dir, { recursive: true, force: true });
@@ -311,7 +283,7 @@ function handleTuneSave(req, res) {
       return;
     }
     console.log(`[tune] saved config ${hash}`);
-    reply(200, { url, hash, mode });
+    reply(200, { url, hash });
   });
 }
 
@@ -355,7 +327,6 @@ function findFreePort() {
  *   tabCount:    number,
  *   idleTimer:   ReturnType<typeof setTimeout> | null,
  *   configHash:  string | null,
- *   mode:        "classic" | "realtime",
  * }} LobbyRoom
  */
 
@@ -384,16 +355,14 @@ function uniqueCode() {
  * @param {string} code
  * @param {number} port
  * @param {string | null} configHash - saved /tune config, or null for defaults
- * @param {"classic" | "realtime"} mode - game mode for the spawned server
  * @returns {LobbyRoom}
  */
-function spawnLobbyServer(code, port, configHash, mode) {
+function spawnLobbyServer(code, port, configHash) {
   const dataDir = dataDirFor(configHash);
-  console.log(`[lobby] spawning server for code=${code} port=${port} config=${configHash ?? "default"} mode=${mode}`);
+  console.log(`[lobby] spawning server for code=${code} port=${port} config=${configHash ?? "default"}`);
   usedPorts.add(port);
 
   const args = [String(port), "--join-code", code, "--data-dir", dataDir];
-  if (mode === "realtime") args.push("--mode", "realtime");
   const proc = spawn(SERVER_BIN, args, {
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -424,7 +393,7 @@ function spawnLobbyServer(code, port, configHash, mode) {
   });
 
   /** @type {LobbyRoom} */
-  const room = { code, port, proc, tabCount: 0, idleTimer: null, configHash, mode };
+  const room = { code, port, proc, tabCount: 0, idleTimer: null, configHash };
   lobbyRegistry.set(code, room);
   return room;
 }
@@ -560,12 +529,6 @@ class TabSession extends PlayerSession {
         }
         configHash = msg.config;
       }
-      // Game mode for the new lobby.  A saved config's meta.json LOCKS the
-      // mode (game types are only reachable through configs of that type);
-      // legacy configs without meta.json — and the shipped defaults — honor
-      // the requested mode ("classic" default).
-      const lockedMode = configHash !== null ? configMode(configHash) : null;
-      const mode = lockedMode ?? (msg.mode === "realtime" ? "realtime" : "classic");
       const code = uniqueCode();
       let port;
       try { port = await findFreePort(); } catch (err) {
@@ -573,13 +536,13 @@ class TabSession extends PlayerSession {
         this.sendPreLobbyError("server_error");
         return;
       }
-      const room = spawnLobbyServer(code, port, configHash, mode);
-      console.log(`[lobby] created room code=${code} port=${port} mode=${mode}`);
+      const room = spawnLobbyServer(code, port, configHash);
+      console.log(`[lobby] created room code=${code} port=${port}`);
       // Acknowledge before the Zig client has connected so the browser
       // transitions away from pre_lobby immediately.  `config` lets the tab
-      // load the matching balance tables; `mode` tells it the room's rules.
+      // load the matching balance tables.
       if (this.tabWs.readyState === WebSocket.OPEN) {
-        this.tabWs.send(JSON.stringify({ tag: "joining", config: room.configHash, mode: room.mode }));
+        this.tabWs.send(JSON.stringify({ tag: "joining", config: room.configHash }));
       }
       this.startInRoom(room);
       return;
@@ -601,9 +564,9 @@ class TabSession extends PlayerSession {
       // Acknowledge immediately so the browser clears the pre_lobby screen
       // before the Zig client finishes connecting to the server.  `config`
       // makes joiners adopt the lobby's balance tables (may differ from the
-      // page they joined from); `mode` tells them the room's rules.
+      // page they joined from).
       if (this.tabWs.readyState === WebSocket.OPEN) {
-        this.tabWs.send(JSON.stringify({ tag: "joining", config: room.configHash, mode: room.mode }));
+        this.tabWs.send(JSON.stringify({ tag: "joining", config: room.configHash }));
       }
       this.startInRoom(room);
       return;

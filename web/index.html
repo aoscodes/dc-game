@@ -13,11 +13,14 @@
       justify-content: center;
       min-height: 100vh;
     }
-    canvas { display: block; image-rendering: pixelated; }
+    /* The backing store is 2x the design space (see LAYOUT.screen /
+       LAYOUT.renderScale in game.js): CSS pins the on-screen size to the
+       design space so text and tile art render at 2x device resolution. */
+    canvas { display: block; image-rendering: pixelated; width: 1024px; height: 768px; }
   </style>
 </head>
 <body>
-<canvas id="canvas" width="1024" height="768"></canvas>
+<canvas id="canvas" width="2048" height="1536"></canvas>
 <!-- ?v= is a cache buster: CI rewrites "dev" to the commit SHA on deploy.
      Absolute path: this shell is also served at /config/{hash}. -->
 <script src="/game.js?v=dev"></script>

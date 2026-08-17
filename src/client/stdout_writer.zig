@@ -29,7 +29,9 @@ pub const Writer = struct {
     ) void {
         self.mu.lock();
         defer self.mu.unlock();
-        var frame_buf: [8192]u8 = undefined;
+        // Sized for the largest render frame: a MAX_GRID_CELLS grid of cell
+        // strings plus the full entity/stats payload.
+        var frame_buf: [32768]u8 = undefined;
         var w = std.io.Writer.fixed(&frame_buf);
         write_render_inner(&w, phase, lobby, game) catch return;
         w.writeByte('\n') catch return;
@@ -39,6 +41,7 @@ pub const Writer = struct {
         game.fizzle_count = 0;
         game.recipe_count = 0;
         game.cast_event_count = 0;
+        game.agents_dispensed_count = 0;
     }
 
     pub fn write_send(self: Writer, bytes: []const u8) void {
@@ -60,12 +63,11 @@ pub const LobbyState = struct {
     update: proto.LobbyUpdate = std.mem.zeroes(proto.LobbyUpdate),
     player_id: u8 = 0xFF,
     ready: bool = false,
-    mode: c.GameMode = .classic,
 };
 
 pub const LastActionEntry = struct { entity: u32, anim: c.ActionAnimation };
 
-/// Realtime cast-loop lifecycle event (transient, drained per frame).
+/// Cast-loop lifecycle event (transient, drained per frame).
 /// Trace: committed → (replaced | grouped)* → fired.
 pub const CastEvent = union(enum) {
     grouped: proto.CastGrouped,
@@ -77,13 +79,7 @@ pub const GameState = struct {
     snapshot: proto.GameState = proto.GameState.blank,
     player_id: u8 = 0xFF,
     pending_combo: inp.ComboBuffer = .{},
-    round_timer: f32 = 0.0,
-    round_duration: f32 = 0.0,
-    /// Spells per round, as announced by the server in game_start.
-    casts_per_round: u8 = 0,
-    /// Play mode, as announced by the server in game_start.
-    mode: c.GameMode = .classic,
-    /// Realtime mode: per-cast buffer length in ms (0 in classic mode).
+    /// Per-cast buffer length in ms, as announced by the server in game_start.
     cast_buffer_ms: u32 = 0,
     encounter_label: [32]u8 = [_]u8{0} ** 32,
     encounter_label_len: u8 = 0,
@@ -93,9 +89,6 @@ pub const GameState = struct {
     final_stats: ?proto.MatchStats = null,
     last_action_count: u8 = 0,
     last_actions: [proto.MAX_ENTITIES_WIRE]LastActionEntry = undefined,
-    /// Incremented each time a round_reset message is received.
-    /// JS detects a change in this value to know a round just resolved.
-    round: u32 = 0,
     /// Player ids whose spells fizzled since the last render write
     /// (transient, drained per frame like last_actions).
     fizzles: [proto.MAX_PLAYERS]u8 = undefined,
@@ -103,9 +96,13 @@ pub const GameState = struct {
     /// Recipes fired since the last render write (transient).
     recipes_fired: [16]proto.RecipeFired = undefined,
     recipe_count: u8 = 0,
-    /// Realtime cast-loop events since the last render write (transient).
+    /// Cast-loop events since the last render write (transient).
     cast_events: [16]CastEvent = undefined,
     cast_event_count: u8 = 0,
+    /// Dispense outcomes since the last render write (transient): what each
+    /// converted batch's agents were able to transmute.
+    agents_dispensed: [16]proto.AgentsDispensed = undefined,
+    agents_dispensed_count: u8 = 0,
 };
 
 fn write_render_inner(
@@ -128,8 +125,10 @@ fn write_render_inner(
         };
     }
 
-    // Per-entity slot buffers for JSON serialisation.
+    // Per-entity slot buffers for JSON serialisation.  Typed and submitted
+    // combos are independent (a player may hold both), so each gets a buffer.
     var slot_bufs: [proto.MAX_ENTITIES_WIRE][c.MAX_COMBO_LEN]JsonComboSlot = undefined;
+    var sub_slot_bufs: [proto.MAX_ENTITIES_WIRE][c.MAX_COMBO_LEN]JsonComboSlot = undefined;
     var entities_buf: [proto.MAX_ENTITIES_WIRE]JsonEntity = undefined;
     for (0..game.snapshot.entity_count) |i| {
         const e = &game.snapshot.entities[i];
@@ -143,6 +142,9 @@ fn write_render_inner(
         for (e.combo_slots[0..e.combo_len], 0..) |s, j| {
             slot_bufs[i][j] = .{ .slot = s };
         }
+        for (e.submitted_slots[0..e.submitted_len], 0..) |s, j| {
+            sub_slot_bufs[i][j] = .{ .slot = s };
+        }
         entities_buf[i] = .{
             .id = e.entity,
             .kind = e.kind,
@@ -152,6 +154,7 @@ fn write_render_inner(
             .cast_ms = e.cast_ms,
             .last_action = anim,
             .combo = slot_bufs[i][0..e.combo_len],
+            .submitted = sub_slot_bufs[i][0..e.submitted_len],
         };
     }
 
@@ -159,6 +162,24 @@ fn write_render_inner(
     var recipes_buf: [16]JsonRecipeFired = undefined;
     for (game.recipes_fired[0..game.recipe_count], 0..) |rf, i| {
         recipes_buf[i] = .{ .kind = rf.kind, .index = rf.index };
+    }
+
+    // Convert transient dispense outcomes for JSON.  One entry PER COLOR per
+    // event (colors with no agents are skipped), so the renderer can float a
+    // separate label per element without re-deriving anything.
+    var dispensed_buf: [16 * c.Element.size]JsonAgentsDispensed = undefined;
+    var dispensed_len: usize = 0;
+    for (game.agents_dispensed[0..game.agents_dispensed_count]) |ad| {
+        for (ad.dispensed, ad.transmuted, 0..) |n, t, ci| {
+            if (n == 0) continue;
+            const color: c.Element = @enumFromInt(ci);
+            dispensed_buf[dispensed_len] = .{
+                .color = color,
+                .dispensed = n,
+                .transmuted = t,
+            };
+            dispensed_len += 1;
+        }
     }
 
     // Convert transient cast-loop events for JSON.
@@ -185,39 +206,29 @@ fn write_render_inner(
         pending_slots_buf[i] = .{ .slot = s };
     }
 
-    // Convert zone snapshots for JSON (named per agent color).
-    var zones_buf: [proto.MAX_ZONES_WIRE]JsonZone = undefined;
-    for (game.snapshot.zones[0..game.snapshot.zone_count], 0..) |z, i| {
-        zones_buf[i] = .{
-            .red = z.modified[0],
-            .green = z.modified[1],
-            .yellow = z.modified[2],
-            .blue = z.modified[3],
-            .neutralized = colors(z.neutralized),
-            .neutral = z.neutral,
+    // The slime grid as one compact string per cell (row-major, row 0 = top),
+    // so JS can index it directly as grid[row * cols + col].
+    var grid_buf: [c.MAX_GRID_CELLS][]const u8 = undefined;
+    const grid_len = game.snapshot.grid_len();
+    for (game.snapshot.grid[0..grid_len], 0..) |cell, i| {
+        grid_buf[i] = cell_name(cell);
+    }
+
+    // Lil Guys: which flat cell index each is biting, and how soon.
+    var lil_guys_buf: [proto.MAX_LIL_GUYS_WIRE]JsonLilGuy = undefined;
+    for (game.snapshot.lil_guys[0..game.snapshot.lil_guy_count], 0..) |lg, i| {
+        lil_guys_buf[i] = .{
+            .id = lg.entity,
+            .target = if (lg.target == c.LilGuy.NO_TARGET) null else lg.target,
+            .bite_ms = lg.bite_ms,
         };
     }
 
     // Build the game-over tuning report (per-round + per-player + recipes).
-    var rounds_buf: [proto.MAX_ZONES_WIRE]JsonRoundStats = undefined;
     var pstats_buf: [proto.MAX_PLAYERS]JsonPlayerStats = undefined;
     var json_stats: ?JsonMatchStats = null;
     if (phase == .game_over) {
         if (game.final_stats) |*ms| {
-            for (ms.round_stats[0..ms.rounds], 0..) |rs, i| {
-                rounds_buf[i] = .{
-                    .casts = rs.casts,
-                    .agents = colors(rs.agents_dispensed),
-                    .medicine = colors(rs.medicine_dispensed),
-                    .healed = colors(rs.medicine_healed),
-                    .neutralized = colors(rs.neutralized),
-                    .escaped = colors(rs.modified_escaped),
-                    .neutral = rs.neutral_consumed,
-                    .hunger_normal = rs.hunger_normal,
-                    .hunger_extra = rs.hunger_extra,
-                    .hunger_after = rs.hunger_after,
-                };
-            }
             for (ms.players[0..ms.player_count], 0..) |ps, i| {
                 pstats_buf[i] = .{
                     .name = ps.name[0..ps.name_len],
@@ -230,10 +241,20 @@ fn write_render_inner(
             }
             json_stats = .{
                 .reason = ms.reason,
-                .zone_count = ms.zone_count,
                 .hunger_final = ms.hunger_final,
                 .hunger_max = ms.hunger_max,
-                .rounds = rounds_buf[0..ms.rounds],
+                .slime_total = ms.slime_total,
+                .slime_left = ms.slime_left,
+                .feast = .{
+                    .agents = colors(ms.feast.agents_dispensed),
+                    .medicine = colors(ms.feast.medicine_dispensed),
+                    .healed = colors(ms.feast.medicine_healed),
+                    .neutralized = colors(ms.feast.neutralized),
+                    .escaped = colors(ms.feast.modified_escaped),
+                    .neutral = ms.feast.neutral_consumed,
+                    .hunger_normal = ms.feast.hunger_normal,
+                    .hunger_extra = ms.feast.hunger_extra,
+                },
                 .players = pstats_buf[0..ms.player_count],
                 .player_recipe_hits = ms.player_recipe_hits[0..ms.player_recipe_count],
                 .team_recipe_hits = ms.team_recipe_hits[0..ms.team_recipe_count],
@@ -249,22 +270,15 @@ fn write_render_inner(
             .join_code = lobby.update.join_code[0..jc_end],
             .player_id = lobby.update.player_id,
             .ready = lobby.ready,
-            .mode = lobby.mode,
-            .round_duration = lobby.update.round_duration,
             .players = players_buf[0..lobby.update.player_count],
         } else null,
         .game = if (phase == .game) JsonGame{
             .encounter = game.encounter_label[0..game.encounter_label_len],
             .player_id = game.player_id,
-            .mode = game.mode,
             .cast_buffer_ms = game.cast_buffer_ms,
             .pending_combo = pending_slots_buf[0..game.pending_combo.len],
-            .round_timer = game.round_timer,
-            .round_duration = game.round_duration,
             .cast_timer = game.snapshot.cast_timer,
-            .casts_per_round = game.casts_per_round,
             .tick = game.snapshot.tick,
-            .round = game.round,
             .entities = entities_buf[0..game.snapshot.entity_count],
             .hunger = .{
                 .current = game.snapshot.hunger.current,
@@ -277,17 +291,42 @@ fn write_render_inner(
                 },
             },
             .score = game.snapshot.score,
-            .zone_index = game.snapshot.zone_index,
-            .zones = zones_buf[0..game.snapshot.zone_count],
+            .grid_rows = game.snapshot.grid_rows,
+            .grid_cols = game.snapshot.grid_cols,
+            .grid = grid_buf[0..grid_len],
+            .reservoir = game.snapshot.reservoir,
+            .lil_guys = lil_guys_buf[0..game.snapshot.lil_guy_count],
             .fizzles = game.fizzles[0..game.fizzle_count],
             .recipes_fired = recipes_buf[0..game.recipe_count],
             .cast_events = cast_events_buf[0..game.cast_event_count],
+            .agents_dispensed = dispensed_buf[0..dispensed_len],
         } else null,
         .score = if (phase == .game_over) game.final_score else null,
         .stats = json_stats,
     };
 
     try std.json.Stringify.value(frame, .{ .emit_null_optional_fields = false }, w);
+}
+
+/// One slime cell as a compact renderer-facing name: "empty", "neutral", or
+/// a color suffixed with its state ("red", "red_n" for neutralized red).
+fn cell_name(cell: c.SlimeCell) []const u8 {
+    return switch (cell) {
+        .empty => "empty",
+        .neutral => "neutral",
+        .modified => |e| switch (e) {
+            .red => "red",
+            .green => "green",
+            .yellow => "yellow",
+            .blue => "blue",
+        },
+        .neutralized => |e| switch (e) {
+            .red => "red_n",
+            .green => "green_n",
+            .yellow => "yellow_n",
+            .blue => "blue_n",
+        },
+    };
 }
 
 /// Convert a per-color u16 array into named JSON fields.
@@ -334,8 +373,9 @@ const JsonColors = struct {
     blue: u16,
 };
 
-const JsonRoundStats = struct {
-    casts: u8,
+/// Match-wide feast totals: what was dispensed, healed, neutralized and eaten
+/// over the whole encounter.
+const JsonFeastStats = struct {
     agents: JsonColors,
     medicine: JsonColors,
     healed: JsonColors,
@@ -344,7 +384,6 @@ const JsonRoundStats = struct {
     neutral: u16,
     hunger_normal: u16,
     hunger_extra: u16,
-    hunger_after: u16,
 };
 
 const JsonPlayerStats = struct {
@@ -360,10 +399,12 @@ const JsonPlayerStats = struct {
 /// web/game.js resolves labels by index from the fetched data/balance.json.
 const JsonMatchStats = struct {
     reason: proto.EndReason,
-    zone_count: u8,
     hunger_final: u16,
     hunger_max: u16,
-    rounds: []const JsonRoundStats,
+    /// Slime the encounter started with, and how much was left unneaten.
+    slime_total: u32,
+    slime_left: u32,
+    feast: JsonFeastStats,
     players: []const JsonPlayerStats,
     player_recipe_hits: []const u16,
     team_recipe_hits: []const u16,
@@ -374,9 +415,6 @@ const JsonLobby = struct {
     join_code: []const u8,
     player_id: u8,
     ready: bool,
-    /// Play mode the host selected ("classic" | "realtime").
-    mode: c.GameMode,
-    round_duration: f32,
     players: []const JsonPlayer,
 };
 
@@ -405,47 +443,55 @@ const JsonHunger = struct {
     healable: JsonHealable,
 };
 
-/// One zone's remaining slime: modified units named per agent color, plus
-/// transmuted (`neutralized`, per original color) and naturally-neutral.
-const JsonZone = struct {
-    red: u16,
-    green: u16,
-    yellow: u16,
-    blue: u16,
-    neutralized: JsonColors,
-    neutral: u16,
+/// One Lil Guy: the flat grid index it is biting (null = nothing to bite,
+/// the grid is empty) and how long until the bite lands.
+const JsonLilGuy = struct {
+    id: u32,
+    target: ?u16,
+    bite_ms: u16,
 };
 
 const JsonGame = struct {
     encounter: []const u8,
     player_id: u8,
-    /// Play mode ("classic" | "realtime").
-    mode: c.GameMode,
-    /// Realtime mode: per-cast buffer length in ms (0 in classic mode).
+    /// Per-cast buffer length in ms, from game_start.
     cast_buffer_ms: u32,
     pending_combo: []const JsonComboSlot,
-    round_timer: f32,
-    round_duration: f32,
-    /// Classic: countdown of the current cast window (round_duration /
-    /// casts_per_round).  Realtime: the SOONEST pending cast's remaining
-    /// buffer, or -1 when nothing is pending (idle).
+    /// The SOONEST pending cast's remaining buffer, or -1 when nothing is
+    /// pending (idle).
     cast_timer: f32,
-    casts_per_round: u8,
     tick: u32,
-    round: u32,
     entities: []const JsonEntity,
     hunger: JsonHunger,
     score: u32,
-    zone_index: u8,
-    zones: []const JsonZone,
+    /// The authoritative slime grid: `grid_rows * grid_cols` cell names in
+    /// row-major order, row 0 = TOP.  Index a cell as row * grid_cols + col.
+    grid_rows: u8,
+    grid_cols: u8,
+    grid: []const []const u8,
+    /// Slime still waiting off-grid; it refills emptied cells from the top.
+    reservoir: u32,
+    /// One Lil Guy per connected player, each biting a real grid cell.
+    lil_guys: []const JsonLilGuy,
     /// Player ids whose spells fizzled since the previous frame (transient).
     fizzles: []const u8,
     /// Recipes fired since the previous frame (transient).  `index` refers
     /// to the balance recipe table for `kind` (JS resolves labels from the
     /// fetched data/balance.json, same order).
     recipes_fired: []const JsonRecipeFired,
-    /// Realtime cast-loop events since the previous frame (transient).
+    /// Cast-loop events since the previous frame (transient).
     cast_events: []const JsonCastEvent,
+    /// Dispense outcomes since the previous frame (transient), one per color
+    /// per converted batch.
+    agents_dispensed: []const JsonAgentsDispensed,
+};
+
+/// One color's dispense outcome.  `dispensed - transmuted` is the surplus that
+/// found no on-grid target and was wasted.
+const JsonAgentsDispensed = struct {
+    color: c.Element,
+    dispensed: u16,
+    transmuted: u16,
 };
 
 const JsonRecipeFired = struct {
@@ -453,7 +499,7 @@ const JsonRecipeFired = struct {
     index: u8,
 };
 
-/// One realtime cast-loop event.  `type` is "grouped" | "replaced" |
+/// One cast-loop event.  `type` is "grouped" | "replaced" |
 /// "fired"; unused fields are omitted (emit_null_optional_fields=false).
 const JsonCastEvent = struct {
     type: []const u8,
@@ -467,13 +513,17 @@ const JsonEntity = struct {
     id: u32,
     kind: c.EntityKind,
     owner: u8,
-    /// Spells committed this round (0..casts_per_round).
+    /// 1 if this player has a cast pending, else 0.
     casts_used: u8,
-    /// Realtime: remaining cast-lock cooldown in ms (0 in classic mode).
+    /// Remaining cast-lock cooldown in ms (0 = unlocked).
     lock_ms: u16,
-    /// Realtime: remaining buffer of this player's pending cast in ms
-    /// (0 = no cast pending; 0 in classic mode).
+    /// Remaining buffer of this player's pending cast in ms (0 = none pending).
     cast_ms: u16,
     last_action: ?c.ActionAnimation,
+    /// The combo being typed right now (empty while a cast buffers).
     combo: []const JsonComboSlot,
+    /// The committed combo currently buffering (empty when none pending).
+    /// Clients preview from this in preference to `combo`: it is what will
+    /// actually fire.
+    submitted: []const JsonComboSlot,
 };

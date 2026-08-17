@@ -151,12 +151,10 @@ pub fn main() !void {
     defer ta.report_stderr("server");
 
     var port: u16 = DEFAULT_PORT;
-    var round_duration_override: ?f32 = null;
     var join_code_override: ?[6]u8 = null;
     var data_dir: []const u8 = DEFAULT_DATA_DIR;
     var validate_only = false;
     var tick_ms: u32 = DEFAULT_TICK_MS;
-    var mode: shared.components.GameMode = .classic;
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.next(); // skip argv[0]
@@ -164,14 +162,7 @@ pub fn main() !void {
         port = std.fmt.parseInt(u16, arg, 10) catch DEFAULT_PORT;
     }
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--round-duration")) {
-            if (args.next()) |val| {
-                round_duration_override = std.fmt.parseFloat(f32, val) catch blk: {
-                    std.log.warn("invalid --round-duration value '{s}', using data-file default", .{val});
-                    break :blk null;
-                };
-            }
-        } else if (std.mem.eql(u8, arg, "--join-code")) {
+        if (std.mem.eql(u8, arg, "--join-code")) {
             if (args.next()) |val| {
                 if (val.len == 6) {
                     var code: [6]u8 = undefined;
@@ -192,16 +183,6 @@ pub fn main() !void {
                 if (tick_ms == 0) {
                     std.log.warn("--tick-ms must be >= 1, using default {d}", .{DEFAULT_TICK_MS});
                     tick_ms = DEFAULT_TICK_MS;
-                }
-            }
-        } else if (std.mem.eql(u8, arg, "--mode")) {
-            if (args.next()) |val| {
-                if (std.mem.eql(u8, val, "classic")) {
-                    mode = .classic;
-                } else if (std.mem.eql(u8, val, "realtime")) {
-                    mode = .realtime;
-                } else {
-                    std.log.warn("invalid --mode value '{s}' (classic|realtime), using classic", .{val});
                 }
             }
         } else if (std.mem.eql(u8, arg, "--validate")) {
@@ -226,9 +207,6 @@ pub fn main() !void {
         return;
     }
 
-    const round_duration = round_duration_override orelse
-        g_loaded.config.balance.round_duration_default_s;
-
     var join_code: [6]u8 = undefined;
     if (join_code_override) |override| {
         join_code = override;
@@ -242,12 +220,8 @@ pub fn main() !void {
 
     session = try Session.init(allocator, join_code, &g_loaded.config);
     defer if (session) |*s| s.deinit();
-    session.?.round_duration = round_duration;
-    session.?.round_timer = round_duration;
-    session.?.mode = mode;
 
     std.log.info("Room code: {s}", .{join_code});
-    std.log.info("Mode: {s}", .{@tagName(mode)});
     std.log.info("Listening on port {d}", .{port});
 
     const tick_ns: u64 = @as(u64, tick_ms) * std.time.ns_per_ms;

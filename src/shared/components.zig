@@ -7,12 +7,18 @@
 //!
 //! ## Slime Feast model
 //!
-//! Players support a horde of cosmetic "Lil Guys" that devour a slime field
-//! split into zones.  Each round the current zone is consumed in its
-//! entirety.  Modified Slime (colored, per-Element) costs extra hunger
-//! unless players neutralize it first by dispensing matching-color
-//! Neutralizing Agents.  Medicine heals the hunger bar, but only the
-//! portion attributable to modified-slime consumption.
+//! The slime field is a fixed `rows` × `cols` grid of INDIVIDUAL slime units
+//! (`SlimeGrid` of `SlimeCell`), plus an off-grid `SlimeReservoir` that
+//! refills emptied cells from the top row.  One grid per game.
+//!
+//! Players support a horde of "Lil Guys" (one per connected player, each a
+//! real server ECS entity — see `LilGuy`) that each pick a random occupied
+//! cell, walk to it and bite it empty.  Modified Slime (colored, per-Element)
+//! costs extra hunger unless players neutralize it first by dispensing
+//! matching-color Neutralizing Agents — which convert a random subset of the
+//! matching-color cells CURRENTLY ON THE GRID (agents beyond that cohort are
+//! wasted).  Medicine heals the hunger bar, but only the portion
+//! attributable to un-neutralized modified-slime consumption.
 //!
 //! ## Combo slot model
 //!
@@ -35,25 +41,9 @@ pub const Health = struct {
     max: u16,
 };
 
-/// How the encounter is paced.
-///   classic  — timed rounds split into cast windows; pending combos
-///              auto-commit at window close; the whole zone is consumed at
-///              round end (the original play style).
-///   realtime — Lil Guys eat the current zone at a constant rate
-///              (balance.eat_rate_units_per_s × connected players); spells
-///              are explicitly SUBMITTED (submit_spell): each cast fires at
-///              the end of its own balance.cast_buffer_ms buffer, casts
-///              completing a team recipe merge and fire together, and each
-///              accepted submit starts a balance.cast_lock_ms cooldown;
-///              zones advance when fully eaten.
-pub const GameMode = enum(u8) {
-    classic = 0,
-    realtime = 1,
-};
-
-/// Kind of entity on the wire.  Only players exist server-side; the browser
-/// renders cosmetic Lil Guys/slime itself.  Extend when new server-side
-/// entity kinds appear.
+/// Kind of entity on the wire's PLAYER list.  Lil Guys are server entities
+/// too, but ride their own `GameState.lil_guys` array (they carry a target
+/// cell and bite timer, not a combo), so they are not an EntityKind.
 pub const EntityKind = enum(u8) {
     player = 0,
 };
@@ -126,22 +116,156 @@ pub fn make_combo(slots: []const ComboSlot) ActionCombo {
     return combo;
 }
 
-/// One zone of the slime field.  `modified[e]` = units of Modified Slime of
-/// color `e` (Element ordinal); `neutralized[e]` = modified units transmuted
-/// by Neutralizing Agents (tracked per original color, consumed at normal
-/// cost); `neutral` = units of naturally-neutral slime.  Transmutation
-/// happens per cast window; the entire zone is consumed at the end of its
-/// round.
-pub const ZoneDef = struct {
+/// Upper bounds on the slime grid (wire + array sizing).  The config loader
+/// rejects `slime_grid` dimensions exceeding these.
+pub const MAX_GRID_ROWS: u8 = 16;
+pub const MAX_GRID_COLS: u8 = 16;
+pub const MAX_GRID_CELLS: u16 = @as(u16, MAX_GRID_ROWS) * @as(u16, MAX_GRID_COLS);
+
+/// One cell of the slime grid — exactly one slime unit, or nothing.
+///
+/// This is the whole slime state model: there are no scalar bucket counts.
+/// A cell is:
+///   empty       — eaten (or never filled); refilled from the reservoir
+///   neutral     — naturally-neutral slime, costs hunger_cost_normal
+///   modified    — colored slime; costs the normal + modified-extra hunger,
+///                 and that extra is healable by matching-color medicine
+///   neutralized — was `modified` of this color, transmuted by a matching
+///                 Neutralizing Agent; costs only hunger_cost_normal.  The
+///                 original color is retained for rendering and stats.
+///
+/// Wire encoding (one byte, see protocol.zig):
+///   0x00 = empty, 0x01 = neutral, 0x10|e = modified, 0x20|e = neutralized.
+pub const SlimeCell = union(enum) {
+    empty,
+    neutral,
+    modified: Element,
+    neutralized: Element,
+
+    /// True if this cell holds a slime unit a Lil Guy can bite.
+    pub fn is_slime(self: SlimeCell) bool {
+        return self != .empty;
+    }
+};
+
+/// The slime field: a fixed `rows` × `cols` grid of individual slime units.
+///
+/// Row 0 is the TOP row (the side the reservoir refills from); Lil Guys
+/// approach from below.  `cells` is row-major with a compile-time capacity;
+/// only the first `rows * cols` entries are live — always go through the
+/// accessors, which assert the bounds.
+///
+/// The grid is server-authoritative: the session owns the only instance and
+/// transmits it, so every client renders identical slime.
+pub const SlimeGrid = struct {
+    rows: u8,
+    cols: u8,
+    cells: [MAX_GRID_CELLS]SlimeCell = [_]SlimeCell{.empty} ** MAX_GRID_CELLS,
+
+    /// An all-empty grid of the given dimensions.
+    pub fn init(rows: u8, cols: u8) SlimeGrid {
+        std.debug.assert(rows >= 1 and rows <= MAX_GRID_ROWS);
+        std.debug.assert(cols >= 1 and cols <= MAX_GRID_COLS);
+        return .{ .rows = rows, .cols = cols };
+    }
+
+    /// Number of live cells (`rows * cols`).
+    pub fn len(self: *const SlimeGrid) u16 {
+        return @as(u16, self.rows) * @as(u16, self.cols);
+    }
+
+    /// Row-major flat index of (row, col).
+    pub fn index(self: *const SlimeGrid, row: u8, col: u8) u16 {
+        std.debug.assert(row < self.rows and col < self.cols);
+        return @as(u16, row) * @as(u16, self.cols) + col;
+    }
+
+    pub fn at(self: *const SlimeGrid, row: u8, col: u8) SlimeCell {
+        return self.cells[self.index(row, col)];
+    }
+
+    pub fn set(self: *SlimeGrid, row: u8, col: u8, cell: SlimeCell) void {
+        self.cells[self.index(row, col)] = cell;
+    }
+
+    /// Cell at a flat index (must be < len()).
+    pub fn get(self: *const SlimeGrid, flat: u16) SlimeCell {
+        std.debug.assert(flat < self.len());
+        return self.cells[flat];
+    }
+
+    pub fn put(self: *SlimeGrid, flat: u16, cell: SlimeCell) void {
+        std.debug.assert(flat < self.len());
+        self.cells[flat] = cell;
+    }
+
+    /// Live cells in row-major order — the canonical iteration slice.
+    pub fn live(self: *const SlimeGrid) []const SlimeCell {
+        return self.cells[0..self.len()];
+    }
+
+    /// Count of non-empty cells (slime units currently on the grid).
+    pub fn occupied(self: *const SlimeGrid) u16 {
+        var n: u16 = 0;
+        for (self.live()) |cell| {
+            if (cell.is_slime()) n += 1;
+        }
+        return n;
+    }
+
+    /// Count of `modified` cells of one color — the cohort a dispensed
+    /// Neutralizing Agent of that color may transmute.
+    pub fn modified_count(self: *const SlimeGrid, element: Element) u16 {
+        var n: u16 = 0;
+        for (self.live()) |cell| {
+            if (cell == .modified and cell.modified == element) n += 1;
+        }
+        return n;
+    }
+};
+
+/// Off-grid slime waiting to enter the grid from the top.
+///
+/// The reservoir only ever holds slime in its ORIGINAL state — neutralizing
+/// happens on the grid, so no `neutralized` bucket exists here.  `modified[e]`
+/// is indexed by Element ordinal.
+pub const SlimeReservoir = struct {
     modified: [Element.size]u16 = [_]u16{0} ** Element.size,
-    neutralized: [Element.size]u16 = [_]u16{0} ** Element.size,
     neutral: u16 = 0,
 
-    pub fn total_units(self: ZoneDef) u32 {
-        var total: u32 = self.neutral;
-        for (self.modified) |m| total += m;
-        for (self.neutralized) |n| total += n;
-        return total;
+    pub fn total(self: SlimeReservoir) u32 {
+        var n: u32 = self.neutral;
+        for (self.modified) |m| n += m;
+        return n;
+    }
+
+    pub fn is_empty(self: SlimeReservoir) bool {
+        return self.total() == 0;
+    }
+};
+
+/// A Lil Guy's reserved bite: the grid cell it is walking to, plus the
+/// countdown until the bite lands.
+///
+/// One Lil Guy exists per connected player as a real server ECS entity.  The
+/// target is RESERVED, not exclusive — another Lil Guy may reach the same cell
+/// first, or a neutralizing agent may destroy it, in which case the bite finds
+/// an empty cell and the Lil Guy simply re-targets (see session.bite_tick).
+///
+/// `target` is a flat `SlimeGrid` index; `NO_TARGET` means "none reserved yet"
+/// (the grid was empty when this Lil Guy last looked).
+pub const LilGuy = struct {
+    /// Flat grid index being approached, or NO_TARGET.
+    target: u16 = NO_TARGET,
+    /// Seconds until the bite lands.  Reset on every re-target.
+    bite_timer: f32 = 0,
+
+    /// Sentinel `target` value: no cell reserved.  Out of range for any grid
+    /// since MAX_GRID_CELLS is far below it.
+    pub const NO_TARGET: u16 = std.math.maxInt(u16);
+
+    pub fn has_target(self: LilGuy) bool {
+        return self.target != NO_TARGET;
     }
 };
 
@@ -166,3 +290,98 @@ pub const ActionAnimation = enum(u8) {
     hurt = 1,
     die = 2,
 };
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "SlimeGrid init is all empty with the requested dimensions" {
+    const grid = SlimeGrid.init(3, 4);
+    try testing.expectEqual(@as(u8, 3), grid.rows);
+    try testing.expectEqual(@as(u8, 4), grid.cols);
+    try testing.expectEqual(@as(u16, 12), grid.len());
+    try testing.expectEqual(@as(u16, 12), grid.live().len);
+    try testing.expectEqual(@as(u16, 0), grid.occupied());
+    for (grid.live()) |cell| try testing.expectEqual(SlimeCell.empty, cell);
+}
+
+test "SlimeGrid index is row-major with row 0 as the top row" {
+    const grid = SlimeGrid.init(3, 4);
+    try testing.expectEqual(@as(u16, 0), grid.index(0, 0));
+    try testing.expectEqual(@as(u16, 3), grid.index(0, 3));
+    try testing.expectEqual(@as(u16, 4), grid.index(1, 0));
+    try testing.expectEqual(@as(u16, 11), grid.index(2, 3));
+}
+
+test "SlimeGrid set/at and put/get address the same cell" {
+    var grid = SlimeGrid.init(2, 2);
+    grid.set(1, 0, .{ .modified = .green });
+    try testing.expectEqual(SlimeCell{ .modified = .green }, grid.at(1, 0));
+    try testing.expectEqual(SlimeCell{ .modified = .green }, grid.get(grid.index(1, 0)));
+
+    grid.put(grid.index(0, 1), .neutral);
+    try testing.expectEqual(SlimeCell.neutral, grid.at(0, 1));
+}
+
+test "SlimeGrid occupied counts every non-empty cell kind" {
+    var grid = SlimeGrid.init(2, 3);
+    try testing.expectEqual(@as(u16, 0), grid.occupied());
+    grid.set(0, 0, .neutral);
+    grid.set(0, 1, .{ .modified = .red });
+    grid.set(0, 2, .{ .neutralized = .red });
+    try testing.expectEqual(@as(u16, 3), grid.occupied());
+    grid.set(0, 1, .empty);
+    try testing.expectEqual(@as(u16, 2), grid.occupied());
+}
+
+test "SlimeGrid modified_count is per color and excludes neutralized" {
+    var grid = SlimeGrid.init(2, 3);
+    grid.set(0, 0, .{ .modified = .red });
+    grid.set(0, 1, .{ .modified = .red });
+    grid.set(0, 2, .{ .modified = .blue });
+    // Already-neutralized red is NOT part of the red cohort.
+    grid.set(1, 0, .{ .neutralized = .red });
+    grid.set(1, 1, .neutral);
+
+    try testing.expectEqual(@as(u16, 2), grid.modified_count(.red));
+    try testing.expectEqual(@as(u16, 1), grid.modified_count(.blue));
+    try testing.expectEqual(@as(u16, 0), grid.modified_count(.green));
+    try testing.expectEqual(@as(u16, 0), grid.modified_count(.yellow));
+}
+
+test "SlimeGrid ignores cells beyond the live region" {
+    var grid = SlimeGrid.init(1, 2);
+    // Write past the live region directly; accessors must not see it.
+    grid.cells[50] = .neutral;
+    try testing.expectEqual(@as(u16, 2), grid.len());
+    try testing.expectEqual(@as(u16, 0), grid.occupied());
+    try testing.expectEqual(@as(u16, 0), grid.modified_count(.red));
+}
+
+test "SlimeCell.is_slime is false only for empty" {
+    const empty: SlimeCell = .empty;
+    const neutral: SlimeCell = .neutral;
+    try testing.expect(!empty.is_slime());
+    try testing.expect(neutral.is_slime());
+    try testing.expect((SlimeCell{ .modified = .red }).is_slime());
+    try testing.expect((SlimeCell{ .neutralized = .red }).is_slime());
+}
+
+test "SlimeReservoir totals across colors and neutral" {
+    var res = SlimeReservoir{};
+    try testing.expect(res.is_empty());
+    try testing.expectEqual(@as(u32, 0), res.total());
+
+    res.neutral = 5;
+    res.modified[@intFromEnum(Element.red)] = 2;
+    res.modified[@intFromEnum(Element.blue)] = 3;
+    try testing.expect(!res.is_empty());
+    try testing.expectEqual(@as(u32, 10), res.total());
+}
+
+test "grid capacity bounds agree" {
+    try testing.expectEqual(@as(u16, 256), MAX_GRID_CELLS);
+    try testing.expectEqual(@as(usize, MAX_GRID_CELLS), (SlimeGrid{ .rows = 1, .cols = 1 }).cells.len);
+}

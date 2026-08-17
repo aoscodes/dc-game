@@ -56,12 +56,11 @@ pub const Loaded = struct {
 pub const ConfigError = error{
     InvalidBalanceJson,
     InvalidEncountersJson,
-    InvalidCastsPerRound,
-    InvalidRoundDuration,
     InvalidEatRate,
     InvalidResidueMult,
     InvalidCastBuffer,
     InvalidCastLock,
+    InvalidSlimeGrid,
     TooManyRecipes,
     InvalidTeamPatternCount,
     InvalidComboLength,
@@ -71,6 +70,7 @@ pub const ConfigError = error{
     NoEncounters,
     NoZones,
     TooManyZones,
+    NoSlime,
     InvalidHungerMax,
     UnknownDefaultEncounter,
 };
@@ -155,8 +155,12 @@ const TeamRecipeJson = struct {
     output: OutputJson,
 };
 
+const SlimeGridJson = struct {
+    rows: u8,
+    cols: u8,
+};
+
 const BalanceJson = struct {
-    casts_per_round: u8,
     units_per_slot: u32,
     medicine_per_slot: u32,
     hunger_cost_normal: u32,
@@ -164,20 +168,31 @@ const BalanceJson = struct {
     /// Portion of transmuted slime surviving as neutralized; defaulted so
     /// pre-residue configs keep validating unchanged.
     neutralize_residue_mult: f32 = 1.0,
-    round_duration_default_s: f32,
-    /// Realtime mode fields; defaulted so pre-realtime configs (including
-    /// saved /tune configs) keep validating unchanged.
+    /// Slime grid dimensions; defaulted so pre-grid configs keep validating.
+    slime_grid: SlimeGridJson = .{
+        .rows = balance.DEFAULT_SLIME_GRID.rows,
+        .cols = balance.DEFAULT_SLIME_GRID.cols,
+    },
+    /// Realtime fields; defaulted so pre-realtime configs (including saved
+    /// /tune configs) keep validating unchanged.
     eat_rate_units_per_s: f32 = 2.0,
     cast_buffer_ms: u32 = 500,
     cast_lock_ms: u32 = 500,
-    /// DEPRECATED (ignored): pre-buffer realtime configs carried a repeating
-    /// cast window.  Kept so old saved /tune configs still parse (std.json
-    /// rejects unknown fields).
+    /// DEPRECATED (all ignored): fields from removed features that old saved
+    /// /tune configs still carry.  Kept — and defaulted, for configs written
+    /// before they existed — purely so those files still parse, since
+    /// std.json rejects unknown fields.
     cast_window_ms: u32 = 0,
+    /// DEPRECATED (ignored): the repeating cast window of classic mode.
+    casts_per_round: u8 = 1,
+    /// DEPRECATED (ignored): classic mode's round length.
+    round_duration_default_s: f32 = 5.0,
     player_recipes: []const PlayerRecipeJson,
     team_recipes: []const TeamRecipeJson,
 };
 
+/// One slime bundle.  Historically one per round ("zone"); now purely an
+/// additive slice of the encounter's single slime total.
 const ZoneJson = struct {
     modified: ColorsU16Json = .{},
     neutral: u16 = 0,
@@ -186,6 +201,9 @@ const ZoneJson = struct {
 const EncounterJson = struct {
     label: []const u8,
     hunger_max: u16,
+    /// Slime bundles, SUMMED into the encounter's total slime.  Named `zones`
+    /// for back-compatibility with saved designer configs (std.json rejects
+    /// unknown fields, so the name cannot simply change).
     zones: []const ZoneJson,
 };
 
@@ -207,14 +225,6 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         return ConfigError.InvalidBalanceJson;
     };
 
-    if (raw.casts_per_round == 0) {
-        fail("{s}: casts_per_round must be >= 1", .{BALANCE_FILE});
-        return ConfigError.InvalidCastsPerRound;
-    }
-    if (!(raw.round_duration_default_s > 0)) {
-        fail("{s}: round_duration_default_s must be > 0", .{BALANCE_FILE});
-        return ConfigError.InvalidRoundDuration;
-    }
     if (!(raw.eat_rate_units_per_s > 0)) {
         fail("{s}: eat_rate_units_per_s must be > 0", .{BALANCE_FILE});
         return ConfigError.InvalidEatRate;
@@ -230,6 +240,15 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
     if (raw.cast_lock_ms > 60_000) {
         fail("{s}: cast_lock_ms must be <= 60000", .{BALANCE_FILE});
         return ConfigError.InvalidCastLock;
+    }
+    if (raw.slime_grid.rows < 1 or raw.slime_grid.rows > c.MAX_GRID_ROWS or
+        raw.slime_grid.cols < 1 or raw.slime_grid.cols > c.MAX_GRID_COLS)
+    {
+        fail("{s}: slime_grid {}x{} outside 1..{}x1..{}", .{
+            BALANCE_FILE,        raw.slime_grid.rows, raw.slime_grid.cols,
+            c.MAX_GRID_ROWS, c.MAX_GRID_COLS,
+        });
+        return ConfigError.InvalidSlimeGrid;
     }
     if (raw.player_recipes.len > balance.MAX_PLAYER_RECIPES) {
         fail("{s}: {} player recipes exceeds cap {}", .{ BALANCE_FILE, raw.player_recipes.len, balance.MAX_PLAYER_RECIPES });
@@ -269,13 +288,12 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
     }
 
     return .{
-        .casts_per_round = raw.casts_per_round,
         .units_per_slot = raw.units_per_slot,
         .medicine_per_slot = raw.medicine_per_slot,
         .hunger_cost_normal = raw.hunger_cost_normal,
         .hunger_cost_modified_extra = raw.hunger_cost_modified_extra,
         .neutralize_residue_mult = raw.neutralize_residue_mult,
-        .round_duration_default_s = raw.round_duration_default_s,
+        .slime_grid = .{ .rows = raw.slime_grid.rows, .cols = raw.slime_grid.cols },
         .eat_rate_units_per_s = raw.eat_rate_units_per_s,
         .cast_buffer_ms = raw.cast_buffer_ms,
         .cast_lock_ms = raw.cast_lock_ms,
@@ -317,14 +335,19 @@ fn parse_encounters(a: std.mem.Allocator, bytes: []const u8) !enc.EncounterSet {
             fail("{s}: encounter '{s}' hunger_max must be > 0", .{ ENCOUNTERS_FILE, e.label });
             return ConfigError.InvalidHungerMax;
         }
-        const zones = try a.alloc(c.ZoneDef, e.zones.len);
-        for (e.zones, zones) |z, *zd| {
-            zd.* = .{
-                .modified = .{ z.modified.red, z.modified.green, z.modified.yellow, z.modified.blue },
-                .neutral = z.neutral,
-            };
+        // Sum every bundle into the encounter's single slime total; saturating
+        // so a designer config cannot overflow the u16 buckets.
+        var slime = c.SlimeReservoir{};
+        for (e.zones) |z| {
+            slime.neutral +|= z.neutral;
+            const per_color = [_]u16{ z.modified.red, z.modified.green, z.modified.yellow, z.modified.blue };
+            for (&slime.modified, per_color) |*acc, add| acc.* +|= add;
         }
-        out.* = .{ .label = e.label, .hunger_max = e.hunger_max, .zones = zones };
+        if (slime.is_empty()) {
+            fail("{s}: encounter '{s}' has no slime", .{ ENCOUNTERS_FILE, e.label });
+            return ConfigError.NoSlime;
+        }
+        out.* = .{ .label = e.label, .hunger_max = e.hunger_max, .slime = slime };
     }
 
     const default_index = for (list, 0..) |e, i| {
@@ -402,15 +425,14 @@ test "shipped data files parse and validate" {
     defer loaded.deinit();
 
     const cfg = &loaded.config;
-    try std.testing.expect(cfg.balance.casts_per_round >= 1);
+    try std.testing.expect(cfg.balance.slime_grid.cells() >= 1);
     try std.testing.expect(cfg.balance.player_recipes.len >= 1);
     try std.testing.expect(cfg.encounters.encounters.len >= 1);
-    // Default encounter resolves and every zone count fits the wire bound
+    // Default encounter resolves and every encounter holds slime to eat
     // (guaranteed by validation; assert anyway as a regression tripwire).
     _ = cfg.encounters.default();
     for (cfg.encounters.encounters) |e| {
-        try std.testing.expect(e.zones.len >= 1);
-        try std.testing.expect(e.zones.len <= enc.MAX_ZONES);
+        try std.testing.expect(e.total_units() >= 1);
     }
 }
 
@@ -475,6 +497,49 @@ test "realtime fields default when absent (pre-realtime configs stay valid)" {
     try std.testing.expectEqual(@as(u32, 500), loaded.config.balance.cast_buffer_ms);
     try std.testing.expectEqual(@as(u32, 500), loaded.config.balance.cast_lock_ms);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), loaded.config.balance.neutralize_residue_mult, 0.001);
+}
+
+test "slime_grid defaults when absent (pre-grid configs stay valid)" {
+    var loaded = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expectEqual(balance.DEFAULT_SLIME_GRID, loaded.config.balance.slime_grid);
+}
+
+test "slime_grid is read from the document" {
+    const doc =
+        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
+        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
+        \\ "round_duration_default_s":15,"slime_grid":{"rows":4,"cols":7},
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u8, 4), loaded.config.balance.slime_grid.rows);
+    try std.testing.expectEqual(@as(u8, 7), loaded.config.balance.slime_grid.cols);
+    try std.testing.expectEqual(@as(u16, 28), loaded.config.balance.slime_grid.cells());
+}
+
+test "out-of-range slime_grid dimensions are rejected" {
+    const zero_rows =
+        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
+        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
+        \\ "round_duration_default_s":15,"slime_grid":{"rows":0,"cols":7},
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidSlimeGrid,
+        parse(std.testing.allocator, zero_rows, minimal_encounters),
+    );
+    const too_many_cols =
+        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
+        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
+        \\ "round_duration_default_s":15,"slime_grid":{"rows":4,"cols":17},
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidSlimeGrid,
+        parse(std.testing.allocator, too_many_cols, minimal_encounters),
+    );
 }
 
 test "out-of-range neutralize_residue_mult is rejected" {
@@ -577,17 +642,28 @@ test "zero cast_buffer_ms and cast_lock_ms are valid" {
     try std.testing.expectEqual(@as(u32, 0), loaded.config.balance.cast_lock_ms);
 }
 
-test "zero casts_per_round is rejected" {
-    const bad =
-        \\{"casts_per_round":0,"units_per_slot":5,"medicine_per_slot":3,
+test "a config with no deprecated classic fields at all still loads" {
+    const doc =
+        \\{"units_per_slot":5,"medicine_per_slot":3,
         \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,
         \\ "player_recipes":[],"team_recipes":[]}
     ;
-    try std.testing.expectError(
-        ConfigError.InvalidCastsPerRound,
-        parse(std.testing.allocator, bad, minimal_encounters),
-    );
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u32, 5), loaded.config.balance.units_per_slot);
+}
+
+test "deprecated classic fields are accepted and ignored" {
+    // Every saved designer config carries these; they must not break loading.
+    const doc =
+        \\{"casts_per_round":0,"units_per_slot":5,"medicine_per_slot":3,
+        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
+        \\ "round_duration_default_s":0,"cast_window_ms":3000,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u32, 5), loaded.config.balance.units_per_slot);
 }
 
 test "unknown top-level field is rejected (typo protection)" {
@@ -600,6 +676,35 @@ test "unknown top-level field is rejected (typo protection)" {
     try std.testing.expectError(
         ConfigError.InvalidBalanceJson,
         parse(std.testing.allocator, bad, minimal_encounters),
+    );
+}
+
+test "legacy multi-zone encounters are summed into one slime total" {
+    const doc =
+        \\{"default":"e1","encounters":[{"label":"e1","hunger_max":100,"zones":[
+        \\ {"modified":{"red":10,"green":5},"neutral":15},
+        \\ {"modified":{"red":10,"green":10,"yellow":5},"neutral":10},
+        \\ {"modified":{"red":15,"green":10,"yellow":10,"blue":5},"neutral":5}]}]}
+    ;
+    var loaded = try parse(std.testing.allocator, minimal_balance, doc);
+    defer loaded.deinit();
+    const e = loaded.config.encounters.default();
+    try std.testing.expectEqual(@as(u16, 30), e.slime.neutral);
+    try std.testing.expectEqual(@as(u16, 35), e.slime.modified[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(@as(u16, 25), e.slime.modified[@intFromEnum(c.Element.green)]);
+    try std.testing.expectEqual(@as(u16, 15), e.slime.modified[@intFromEnum(c.Element.yellow)]);
+    try std.testing.expectEqual(@as(u16, 5), e.slime.modified[@intFromEnum(c.Element.blue)]);
+    try std.testing.expectEqual(@as(u32, 110), e.total_units());
+}
+
+test "encounter with no slime at all is rejected" {
+    const bad =
+        \\{"default":"e1","encounters":[
+        \\ {"label":"e1","hunger_max":100,"zones":[{"neutral":0}]}]}
+    ;
+    try std.testing.expectError(
+        ConfigError.NoSlime,
+        parse(std.testing.allocator, minimal_balance, bad),
     );
 }
 

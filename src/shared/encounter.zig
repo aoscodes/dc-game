@@ -1,18 +1,26 @@
-//! Encounter *types*: the slime field layout for one game.
+//! Encounter *types*: the slime supply for one game.
 //!
-//! An encounter is an ordered list of zones.  Round N consumes zone N in its
-//! entirety; the encounter ends when every zone is consumed or the hunger
-//! bar fills.  One encounter per game (no chaining).
+//! An encounter is a hunger budget plus the TOTAL slime the Lil Guys will eat.
+//! That slime starts in the off-grid reservoir; the grid (dimensions come from
+//! balance.slime_grid, a global knob) is filled from it and refilled from the
+//! top as cells are emptied.  The encounter ends when every unit is eaten or
+//! the hunger bar fills.  One encounter per game (no chaining).
+//!
+//! There is exactly ONE slime field per game — the old multi-zone/per-round
+//! split is gone.  `data/encounters.json` still lists slime in `zones` for
+//! back-compatibility with saved designer configs; config.zig SUMS those
+//! entries into the single `slime` total (see parse_encounters).
 //!
 //! The actual encounters live in `data/encounters.json` and are loaded at
-//! server start by `config.zig` — amounts/types of slime per zone and the
-//! hunger budget are the primary difficulty tuning knobs.
+//! server start by `config.zig` — the slime mix and the hunger budget are the
+//! primary difficulty tuning knobs.
 
 const std = @import("std");
 const c = @import("components.zig");
 
-/// Upper bound on zones per encounter (wire + session array sizing).
-/// The config loader rejects encounters exceeding it.
+/// Upper bound on `zones` entries accepted in one encounter document.  The
+/// entries are summed into a single slime total, so this only bounds parsing
+/// of legacy configs.
 pub const MAX_ZONES: u8 = 16;
 
 /// Wire cap on the encounter label (GameStart message field).
@@ -22,7 +30,13 @@ pub const Encounter = struct {
     label: []const u8,
     /// Hunger bar capacity; encounter ends when reached.
     hunger_max: u16,
-    zones: []const c.ZoneDef,
+    /// All the slime in this encounter, as the reservoir starts it.
+    slime: c.SlimeReservoir,
+
+    /// Total slime units in this encounter.
+    pub fn total_units(self: *const Encounter) u32 {
+        return self.slime.total();
+    }
 };
 
 /// The loaded encounter table plus which entry is the default.
@@ -42,3 +56,28 @@ pub const EncounterSet = struct {
         return null;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "Encounter total_units sums every slime bucket" {
+    var slime = c.SlimeReservoir{ .neutral = 5 };
+    slime.modified[@intFromEnum(c.Element.red)] = 10;
+    slime.modified[@intFromEnum(c.Element.blue)] = 3;
+    const e = Encounter{ .label = "t", .hunger_max = 100, .slime = slime };
+    try testing.expectEqual(@as(u32, 18), e.total_units());
+}
+
+test "EncounterSet default and find resolve by label" {
+    const list = [_]Encounter{
+        .{ .label = "a", .hunger_max = 10, .slime = .{ .neutral = 1 } },
+        .{ .label = "b", .hunger_max = 20, .slime = .{ .neutral = 2 } },
+    };
+    const set = EncounterSet{ .encounters = &list, .default_index = 1 };
+    try testing.expectEqualStrings("b", set.default().label);
+    try testing.expectEqualStrings("a", set.find("a").?.label);
+    try testing.expectEqual(@as(?*const Encounter, null), set.find("nope"));
+}

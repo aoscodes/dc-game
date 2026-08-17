@@ -71,30 +71,29 @@ pub const team_recipes = [_]balance.TeamRecipe{
     },
 };
 
-/// 3-zone default fixture encounter.  Totals: 110 units → 110 normal hunger;
-/// fully un-neutralized modified slime adds 160 extra → 270 (fail without
-/// play); full neutralization keeps it at 110 (comfortable clear).
+/// Default fixture encounter.  Totals: 110 units (30 neutral + 80 modified)
+/// → 110 normal hunger; fully un-neutralized modified slime adds 160 extra
+/// → 270 (fail without play); full neutralization keeps it at 110
+/// (comfortable clear).  The 6×10 fixture grid holds 60, so 50 units always
+/// start in the reservoir.
 pub const encounters = [_]enc.Encounter{
     .{
         .label = "slime_feast_01",
         .hunger_max = 200,
-        .zones = &[_]c.ZoneDef{
-            .{ .modified = .{ 10, 5, 0, 0 }, .neutral = 15 },
-            .{ .modified = .{ 10, 10, 5, 0 }, .neutral = 10 },
-            .{ .modified = .{ 15, 10, 10, 5 }, .neutral = 5 },
-        },
+        .slime = .{ .modified = .{ 35, 25, 15, 5 }, .neutral = 30 },
     },
 };
 
 pub const test_config = config.Config{
     .balance = .{
-        .casts_per_round = 3,
         .units_per_slot = 5,
         .medicine_per_slot = 3,
         .hunger_cost_normal = 1,
         .hunger_cost_modified_extra = 2,
         .neutralize_residue_mult = 1.0,
-        .round_duration_default_s = 15.0,
+        // 6×10 = 60 on-grid cells; the fixture encounter's 110 units mean the
+        // reservoir always starts non-empty (exercises refill paths).
+        .slime_grid = .{ .rows = 6, .cols = 10 },
         .eat_rate_units_per_s = 2.0,
         .cast_buffer_ms = 500,
         .cast_lock_ms = 500,

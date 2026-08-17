@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const proto = @import("shared").protocol;
+const c = @import("shared").components;
 
 const MAGIC: [4]u8 = "RPLY".*;
 const VERSION: u32 = 1;
@@ -150,24 +151,26 @@ test "replay: record then play back" {
     // Build two dummy Slime Feast GameState frames.
     var gs1 = proto.GameState.blank;
     gs1.tick = 1;
-    gs1.round_timer = 3.0;
+    gs1.cast_timer = 3.0;
     gs1.entity_count = 1;
     gs1.hunger = .{ .current = 40, .max = 200 };
     gs1.hunger_healable = .{ 10, 0, 0, 0 };
     gs1.score = 25;
-    gs1.zone_index = 1;
-    gs1.zone_count = 3;
-    gs1.zones[1] = .{
-        .modified = .{ 10, 0, 5, 0 },
-        .neutralized = .{ 4, 0, 0, 0 },
-        .neutral = 15,
-    };
+    gs1.grid_rows = 2;
+    gs1.grid_cols = 2;
+    gs1.grid[0] = .neutral;
+    gs1.grid[1] = .{ .modified = .red };
+    gs1.grid[2] = .{ .neutralized = .yellow };
+    gs1.grid[3] = .empty;
+    gs1.reservoir = 15;
     gs1.entities[0] = proto.EntitySnapshot.blank;
     gs1.entities[0].entity = 0;
     gs1.entities[0].kind = .player;
+    gs1.lil_guy_count = 1;
+    gs1.lil_guys[0] = .{ .entity = 9, .target = 2, .bite_ms = 250 };
     var gs2 = gs1;
     gs2.tick = 2;
-    gs2.round_timer = 2.0;
+    gs2.cast_timer = 2.0;
 
     try rec.record(gs1);
     try rec.record(gs2);
@@ -179,16 +182,19 @@ test "replay: record then play back" {
 
     const f1 = (try play.next()) orelse return error.ExpectedFrame;
     try std.testing.expectEqual(@as(u32, 1), f1.tick);
-    try std.testing.expectApproxEqAbs(@as(f32, 3.0), f1.round_timer, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), f1.cast_timer, 0.001);
     try std.testing.expectEqual(@as(u16, 40), f1.hunger.current);
     try std.testing.expectEqual(@as(u16, 10), f1.hunger_healable[0]);
     try std.testing.expectEqual(@as(u32, 25), f1.score);
-    try std.testing.expectEqual(@as(u8, 1), f1.zone_index);
-    try std.testing.expectEqual(@as(u16, 15), f1.zones[1].neutral);
+    try std.testing.expectEqual(@as(u16, 4), f1.grid_len());
+    try std.testing.expectEqual(c.SlimeCell{ .neutralized = .yellow }, f1.grid[2]);
+    try std.testing.expectEqual(@as(u32, 15), f1.reservoir);
+    try std.testing.expectEqual(@as(u16, 2), f1.lil_guys[0].target);
+    try std.testing.expectEqual(@as(u16, 250), f1.lil_guys[0].bite_ms);
 
     const f2 = (try play.next()) orelse return error.ExpectedFrame;
     try std.testing.expectEqual(@as(u32, 2), f2.tick);
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), f2.round_timer, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), f2.cast_timer, 0.001);
 
     try std.testing.expect((try play.next()) == null);
 }
