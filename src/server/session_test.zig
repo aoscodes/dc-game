@@ -2233,6 +2233,49 @@ test "a late joiner gets game_start with the grid dimensions and an entity" {
     try std.testing.expectEqual(@as(usize, 3), s.sess.world.component_arrays.lil_guy.size);
 }
 
+test "a repeated join_lobby does not duplicate the player's entity" {
+    // One player MUST own exactly one player_marker entity: snapshots are built
+    // by walking that array, and both the client's combo projection and the
+    // team-recipe matcher treat one entity as one caster.  A duplicate would
+    // project a player's combo twice and fake a two-player team recipe.
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_mixed);
+
+    var late = TestPlayer{};
+    late.init(allocator);
+    defer late.deinit(allocator);
+    const late_pid = s.sess.join(late.transport(), "Zed") orelse return error.JoinFailed;
+    late.pid = late_pid;
+
+    var name = proto.JoinLobby{ .name = [_]u8{0} ** 16, .name_len = 3 };
+    @memcpy(name.name[0..3], "Zed");
+
+    const before = s.sess.world.component_arrays.player_marker.size;
+    try enqueue_msg(&s.sess, late_pid, .join_lobby, name);
+    try flush(&s.sess);
+    const after_first = s.sess.world.component_arrays.player_marker.size;
+    try std.testing.expectEqual(before + 1, after_first);
+
+    // A client that re-sends its name (reconnect handshake, retry, duplicate
+    // input) must not gain a second body.
+    try enqueue_msg(&s.sess, late_pid, .join_lobby, name);
+    try flush(&s.sess);
+    try std.testing.expectEqual(after_first, s.sess.world.component_arrays.player_marker.size);
+
+    // ...and no two player entities may report the same owner.
+    const pm = &s.sess.world.component_arrays.player_marker;
+    var seen = [_]bool{false} ** session_mod.MAX_PLAYERS;
+    for (pm.index_to_entity[0..pm.size]) |e| {
+        const own = s.sess.world.get_component(e, c.Owner).player_id;
+        try std.testing.expect(!seen[own]);
+        seen[own] = true;
+    }
+}
+
 test "disconnect in the lobby frees the slot" {
     const allocator = std.testing.allocator;
 

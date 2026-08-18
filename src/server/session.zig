@@ -852,10 +852,16 @@ pub const Session = struct {
         try self.broadcast_lobby_update();
     }
 
-    /// Spawn an ECS entity for a player who joined while the game is in progress.
+    /// Spawn an ECS entity for a player who joined while the game is in
+    /// progress.  IDEMPOTENT: a player owns at most one entity, so a repeated
+    /// `join_lobby` (reconnect handshake, retry, duplicated input) is a no-op.
+    /// Snapshots walk the player_marker array and both the client's combo
+    /// projection and the team-recipe matcher treat one entity as one caster,
+    /// so a second body would fake a team recipe from a single player.
     fn spawn_player_midgame(self: *Session, player_id: u8) !void {
         if (player_id >= MAX_PLAYERS) return;
         const slot = &self.players[player_id];
+        if (slot.entity != NO_ENTITY) return;
         const e = self.world.create_entity();
         slot.entity = e;
         self.world.add_component(e, c.Kind{ .tag = .player });

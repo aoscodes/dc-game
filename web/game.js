@@ -860,6 +860,13 @@ function addOutput(sum, output, label) {
  * Mirrors game_logic.match_recipes: team recipes (greedy, repeatable, table
  * order) → player recipes → flat fallback.
  *
+ * CONTRACT: `combos` holds AT MOST ONE COMBO PER PLAYER (see
+ * projectedCombos).  The server additionally requires a team recipe's patterns
+ * to be filled by DISTINCT players; under this contract two distinct indices
+ * are already two distinct players, so matching distinct indices — as the loop
+ * below does via `picked` — enforces that rule.  Passing two combos from one
+ * player would silently break parity and over-project team recipes.
+ *
  * @param {Array<Array<{action?:string, element?:string}>>} combos
  * @returns {{units: Object<string,number>, medicine: number, labels: string[]}}
  */
@@ -916,12 +923,22 @@ function matchRecipes(combos) {
  * may immediately start a new combo), so a player mid-cast who has begun
  * typing again would otherwise flip the preview to a combo that is not the
  * one about to land.
+ *
+ * ONE COMBO PER OWNER, mirroring the server: casts fire out of a pid-indexed
+ * pool, so a player can never contribute two casts to a batch, and team
+ * recipes require DISTINCT players.  Deduplicating by owner here keeps that
+ * rule true of the projection even if a snapshot ever carried two entities for
+ * one player — otherwise a lone player typing half of a team recipe would see
+ * it falsely projected as complete.
  */
 function projectedCombos(game) {
-  return (game.entities ?? []).map(e => {
+  const byOwner = new Map();
+  for (const e of game.entities ?? []) {
+    if (byOwner.has(e.owner)) continue;
     const submitted = e.submitted ?? [];
-    return submitted.length > 0 ? submitted : (e.combo ?? []);
-  });
+    byOwner.set(e.owner, submitted.length > 0 ? submitted : (e.combo ?? []));
+  }
+  return [...byOwner.values()];
 }
 
 /**
