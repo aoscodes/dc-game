@@ -1,9 +1,6 @@
 {
-  "units_per_slot": 5,
-  "medicine_per_slot": 3,
   "hunger_cost_normal": 1,
-  "hunger_cost_modified_extra": 2,
-  "neutralize_residue_mult": 0.5,
+  "hunger_cost_hazard_extra": 2,
   "slime_grid": {
     "rows": 6,
     "cols": 10
@@ -13,136 +10,124 @@
   "cast_lock_ms": 500,
   "player_recipes": [
     {
-      "label": "big_red",
+      "label": "poke",
       "pattern": [
-        "red",
+        "dispense"
+      ],
+      "shape": [
+        "#"
+      ]
+    },
+    {
+      "label": "sweep",
+      "pattern": [
+        "dispense",
+        "dispense"
+      ],
+      "shape": [
+        "###"
+      ]
+    },
+    {
+      "label": "column",
+      "pattern": [
+        "medicine",
+        "medicine",
+        "dispense"
+      ],
+      "shape": [
+        "#",
+        "#",
+        "#"
+      ]
+    },
+    {
+      "label": "block",
+      "pattern": [
         "dispense",
         "dispense",
         "dispense"
       ],
-      "output": {
-        "units": {
-          "red": 20
-        }
-      }
+      "shape": [
+        "###",
+        "###",
+        "###"
+      ]
     },
     {
-      "label": "big_green",
+      "label": "wedge",
       "pattern": [
-        "green",
         "dispense",
-        "dispense",
+        "medicine",
         "dispense"
       ],
-      "output": {
-        "units": {
-          "green": 20
-        }
-      }
+      "shape": [
+        "###",
+        ".#."
+      ]
     },
     {
-      "label": "big_yellow",
+      "label": "tonic",
       "pattern": [
-        "yellow",
-        "dispense",
-        "dispense",
-        "dispense"
-      ],
-      "output": {
-        "units": {
-          "yellow": 20
-        }
-      }
-    },
-    {
-      "label": "big_blue",
-      "pattern": [
-        "blue",
-        "dispense",
-        "dispense",
-        "dispense"
-      ],
-      "output": {
-        "units": {
-          "blue": 20
-        }
-      }
-    },
-    {
-      "label": "prism",
-      "pattern": [
-        "red",
-        "dispense",
-        "blue",
-        "dispense"
-      ],
-      "output": {
-        "units": {
-          "red": 6,
-          "green": 6,
-          "yellow": 6,
-          "blue": 6
-        }
-      }
-    },
-    {
-      "label": "panacea",
-      "pattern": [
-        "blue",
         "medicine",
         "medicine"
       ],
-      "output": {
-        "medicine": {
-          "blue": 10
-        }
+      "shape": [
+        "#"
+      ],
+      "medicine": {
+        "red": 6,
+        "yellow": 6,
+        "green": 6
       }
     }
   ],
   "team_recipes": [
     {
-      "label": "twin_red",
+      "label": "twin_bloom",
       "patterns": [
         [
-          "red",
           "dispense",
-          "dispense"
+          "medicine"
         ],
         [
-          "red",
           "dispense",
-          "dispense"
+          "medicine"
         ]
       ],
-      "output": {
-        "units": {
-          "red": 30
-        },
-        "medicine": {
-          "red": 20
-        }
+      "shape": [
+        "..#..",
+        ".###.",
+        "#####",
+        ".###.",
+        "..#.."
+      ],
+      "medicine": {
+        "red": 4,
+        "yellow": 4,
+        "green": 4
       }
     },
     {
-      "label": "twin_brown",
+      "label": "crossfire",
       "patterns": [
         [
-          "blue",
-          "dispense",
+          "medicine",
           "dispense"
         ],
         [
-          "green",
+          "medicine",
           "dispense",
           "dispense"
         ]
       ],
-      "output": {
-        "units": {
-          "green": 40,
-          "blue": 40
-        }
-      }
+      "shape": [
+        "..#..",
+        "..#..",
+        "#####",
+        "..#..",
+        "..#.."
+      ]
     }
   ]
 }

@@ -9,6 +9,7 @@ pub const MsgTag = enum(u8) {
     choose_combo = 0x07,
     cancel_combo = 0x08,
     submit_spell = 0x09,
+    move_cursor = 0x0a,
     lobby_update = 0x10,
     game_start = 0x11,
     game_state = 0x12,
@@ -20,7 +21,7 @@ pub const MsgTag = enum(u8) {
     cast_grouped = 0x19,
     cast_replaced = 0x1a,
     cast_fired = 0x1b,
-    agents_dispensed = 0x1c,
+    shape_cast = 0x1c,
 };
 
 pub const JoinLobby = struct {
@@ -36,24 +37,47 @@ pub const SubmitSpell = struct {
     combo: components.ActionCombo,
 };
 
+/// One d-pad step of the aiming cursor.  A DIRECTION, not a destination: the
+/// server owns the cursor and clamps it at the field edge, so a client can
+/// never aim off-grid no matter how many steps it sends.
+pub const CursorDir = enum(u8) {
+    up = 0,
+    down = 1,
+    left = 2,
+    right = 3,
+
+    /// Row/column delta of one step in this direction.
+    pub fn delta(self: CursorDir) struct { d_row: i8, d_col: i8 } {
+        return switch (self) {
+            .up => .{ .d_row = -1, .d_col = 0 },
+            .down => .{ .d_row = 1, .d_col = 0 },
+            .left => .{ .d_row = 0, .d_col = -1 },
+            .right => .{ .d_row = 0, .d_col = 1 },
+        };
+    }
+};
+
+pub const MoveCursor = struct {
+    dir: CursorDir,
+};
+
+pub fn decode_move_cursor(reader: anytype) !MoveCursor {
+    const byte = try reader.readByte();
+    const dir = std.meta.intToEnum(CursorDir, byte) catch
+        return DecodeError.InvalidCursorDir;
+    return .{ .dir = dir };
+}
+
 fn encode_combo_slot(w: anytype, slot: components.ComboSlot) !void {
     switch (slot) {
         .action => |a| try w.writeByte(@intFromEnum(a)),
-        .element => |e| try w.writeByte(0x80 | @intFromEnum(e)),
     }
 }
 
 fn decode_combo_slot(byte: u8) !components.ComboSlot {
-    if (byte & 0x80 != 0) {
-        const raw: u8 = byte & 0x7F;
-        const el = std.meta.intToEnum(components.Element, raw) catch
-            return DecodeError.InvalidElement;
-        return .{ .element = el };
-    } else {
-        const ac = std.meta.intToEnum(components.ActionChoice, byte) catch
-            return DecodeError.InvalidActionChoice;
-        return .{ .action = ac };
-    }
+    const ac = std.meta.intToEnum(components.ActionChoice, byte) catch
+        return DecodeError.InvalidActionChoice;
+    return .{ .action = ac };
 }
 
 pub const Reconnect = struct {
@@ -139,24 +163,47 @@ pub fn decode_recipe_fired(reader: anytype) !RecipeFired {
     return .{ .kind = kind, .index = try reader.readByte() };
 }
 
-/// The outcome of one converted batch's dispensed agents, broadcast so
-/// clients can show what a cast actually accomplished.
+/// Wire cap on a broadcast shape footprint.  Matches the authoring cap, so
+/// any loadable recipe fits on the wire.
+pub const MAX_SHAPE_CELLS_WIRE: u16 = balance.MAX_SHAPE_CELLS;
+
+/// One stamped shape, broadcast so every client can draw the same splash on
+/// the same cells and see what the cast actually accomplished.
 ///
-/// `transmuted[e]` counts the color-`e` cells that left the `modified` state
-/// (some became `neutralized`, the rest were destroyed outright).  It is
-/// capped by the ON-GRID cohort, so `dispensed - transmuted` is exactly the
-/// agents that found no target and were WASTED — the headline tuning signal,
-/// which is why both numbers travel together rather than being inferred.
-pub const AgentsDispensed = struct {
-    dispensed: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
-    transmuted: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
+/// The footprint travels as absolute grid cells rather than recipe index +
+/// anchor: clipping at the field edge already happened server-side, so
+/// sending the resolved cells means clients never re-derive placement and
+/// cannot disagree with the server about what was hit.
+///
+/// `downgraded[t]` counts cells that stepped DOWN from tier `t`; `neutralized`
+/// counts how many of those landed on defused.  `off_grid` (clipped by the
+/// edge) and `inert` (hit empty/neutral/neutralized cells) are the two ways
+/// coverage is wasted — the headline aiming signal, which is why they travel
+/// alongside rather than being inferred.
+pub const ShapeCast = struct {
+    /// Player whose cursor anchored this shape (the last joiner, for a team
+    /// recipe).
+    caster: u8 = 0,
+    /// Cells actually covered, as flat grid indices (already clipped).
+    cell_count: u16 = 0,
+    cells: [MAX_SHAPE_CELLS_WIRE]u16 = [_]u16{0} ** MAX_SHAPE_CELLS_WIRE,
+    downgraded: [components.Tier.size]u16 = [_]u16{0} ** components.Tier.size,
+    neutralized: u16 = 0,
+    off_grid: u16 = 0,
+    inert: u16 = 0,
 };
 
-pub fn decode_agents_dispensed(reader: anytype) !AgentsDispensed {
-    return .{
-        .dispensed = try decode_u16_colors(reader),
-        .transmuted = try decode_u16_colors(reader),
-    };
+pub fn decode_shape_cast(reader: anytype) !ShapeCast {
+    var p = ShapeCast{};
+    p.caster = try reader.readByte();
+    p.cell_count = try reader.readInt(u16, .little);
+    if (p.cell_count > MAX_SHAPE_CELLS_WIRE) return DecodeError.TooManyShapeCells;
+    for (p.cells[0..p.cell_count]) |*cell| cell.* = try reader.readInt(u16, .little);
+    p.downgraded = try decode_u16_tiers(reader);
+    p.neutralized = try reader.readInt(u16, .little);
+    p.off_grid = try reader.readInt(u16, .little);
+    p.inert = try reader.readInt(u16, .little);
+    return p;
 }
 
 pub const MAX_PLAYERS: u8 = 6;
@@ -219,6 +266,11 @@ pub const EntitySnapshot = struct {
     /// so both can be non-empty at once.
     submitted_len: u8,
     submitted_slots: [components.MAX_COMBO_LEN]components.ComboSlot,
+    /// Where this player is aiming.  Server-owned and always in bounds, and
+    /// snapshotted for EVERY player (not just the receiver) so teammates can
+    /// see each other's cursors and shape previews.
+    cursor_row: u8,
+    cursor_col: u8,
 
     pub const blank = EntitySnapshot{
         .entity = 0,
@@ -231,6 +283,8 @@ pub const EntitySnapshot = struct {
         .combo_slots = [_]components.ComboSlot{.{ .action = .dispense }} ** components.MAX_COMBO_LEN,
         .submitted_len = 0,
         .submitted_slots = [_]components.ComboSlot{.{ .action = .dispense }} ** components.MAX_COMBO_LEN,
+        .cursor_row = 0,
+        .cursor_col = 0,
     };
 };
 
@@ -268,7 +322,7 @@ pub const GameState = struct {
     entity_count: u8,
     entities: [MAX_ENTITIES_WIRE]EntitySnapshot,
     hunger: BarSummary,
-    hunger_healable: [components.Element.size]u16,
+    hunger_healable: [components.Tier.size]u16,
     score: u32,
     /// The authoritative slime grid.  Cells are sent as one byte each (see
     /// components.SlimeCell), so every client renders identical slime.
@@ -286,7 +340,7 @@ pub const GameState = struct {
         .entity_count = 0,
         .entities = [_]EntitySnapshot{EntitySnapshot.blank} ** MAX_ENTITIES_WIRE,
         .hunger = .{ .current = 0, .max = 0 },
-        .hunger_healable = [_]u16{0} ** components.Element.size,
+        .hunger_healable = [_]u16{0} ** components.Tier.size,
         .score = 0,
         .grid_rows = 0,
         .grid_cols = 0,
@@ -324,13 +378,14 @@ pub const EndReason = enum(u8) {
 /// Match-wide consumption/dispense tallies for the tuning report.  There are
 /// no rounds any more, so this accumulates over the whole encounter.
 pub const FeastStats = struct {
-    agents_dispensed: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
-    medicine_dispensed: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
-    medicine_healed: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
-    /// Cells neutralized by agents, per original color.
-    neutralized: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
-    /// Modified cells eaten WITHOUT being neutralized, per color.
-    modified_escaped: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
+    /// Cells covered by cast shapes, per tier they were standing at.
+    cells_covered: [components.Tier.size]u16 = [_]u16{0} ** components.Tier.size,
+    medicine_dispensed: [components.Tier.size]u16 = [_]u16{0} ** components.Tier.size,
+    medicine_healed: [components.Tier.size]u16 = [_]u16{0} ** components.Tier.size,
+    /// Cells taken all the way to defused, per tier they STARTED at.
+    neutralized: [components.Tier.size]u16 = [_]u16{0} ** components.Tier.size,
+    /// Hazard cells eaten while still a hazard, per tier.
+    hazard_escaped: [components.Tier.size]u16 = [_]u16{0} ** components.Tier.size,
     neutral_consumed: u16 = 0,
     hunger_normal: u16 = 0,
     hunger_extra: u16 = 0,
@@ -340,8 +395,9 @@ pub const PlayerStats = struct {
     name: [16]u8 = [_]u8{0} ** 16,
     name_len: u8 = 0,
     casts: u16 = 0,
-    dispense_slots: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
-    medicine_slots: [components.Element.size]u16 = [_]u16{0} ** components.Element.size,
+    /// Cells this player's shapes covered, and cells taken to defused.
+    cells_covered: u16 = 0,
+    cells_neutralized: u16 = 0,
     recipe_casts: u16 = 0,
     fizzles: u16 = 0,
 };
@@ -400,10 +456,16 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
         .cancel_combo => {},
         .cast_committed => try writer.writeByte(payload.player_id),
         .cast_fizzled => try writer.writeByte(payload.player_id),
-        .agents_dispensed => {
-            const p: AgentsDispensed = payload;
-            try encode_u16_colors(writer, p.dispensed);
-            try encode_u16_colors(writer, p.transmuted);
+        .move_cursor => try writer.writeByte(@intFromEnum(payload.dir)),
+        .shape_cast => {
+            const p: ShapeCast = payload;
+            try writer.writeByte(p.caster);
+            try writer.writeInt(u16, p.cell_count, .little);
+            for (p.cells[0..p.cell_count]) |cell| try writer.writeInt(u16, cell, .little);
+            try encode_u16_tiers(writer, p.downgraded);
+            try writer.writeInt(u16, p.neutralized, .little);
+            try writer.writeInt(u16, p.off_grid, .little);
+            try writer.writeInt(u16, p.inert, .little);
         },
         .recipe_fired => {
             try writer.writeByte(@intFromEnum(payload.kind));
@@ -466,26 +528,28 @@ fn encode_bar_summary(w: anytype, s: BarSummary) !void {
 }
 
 /// One slime cell as a single byte: 0x00 empty, 0x01 neutral,
-/// 0x10|e modified, 0x20|e neutralized (see components.SlimeCell).
+/// 0x02 neutralized, 0x10|t tiered (see components.SlimeCell).
 fn encode_slime_cell(cell: components.SlimeCell) u8 {
     return switch (cell) {
         .empty => 0x00,
         .neutral => 0x01,
-        .modified => |e| 0x10 | @intFromEnum(e),
-        .neutralized => |e| 0x20 | @intFromEnum(e),
+        .neutralized => 0x02,
+        .tiered => |t| 0x10 | @intFromEnum(t),
     };
 }
 
 fn decode_slime_cell(byte: u8) !components.SlimeCell {
-    const el = std.meta.intToEnum(components.Element, byte & 0x0F);
     return switch (byte & 0xF0) {
         0x00 => switch (byte) {
             0x00 => .empty,
             0x01 => .neutral,
+            0x02 => .neutralized,
             else => DecodeError.InvalidSlimeCell,
         },
-        0x10 => .{ .modified = el catch return DecodeError.InvalidElement },
-        0x20 => .{ .neutralized = el catch return DecodeError.InvalidElement },
+        0x10 => .{
+            .tiered = std.meta.intToEnum(components.Tier, byte & 0x0F) catch
+                return DecodeError.InvalidTier,
+        },
         else => DecodeError.InvalidSlimeCell,
     };
 }
@@ -511,6 +575,8 @@ fn encode_game_state(w: anytype, p: GameState) !void {
         var k: u8 = 0;
         while (k < e.submitted_len) : (k += 1)
             try encode_combo_slot(w, e.submitted_slots[k]);
+        try w.writeByte(e.cursor_row);
+        try w.writeByte(e.cursor_col);
     }
     try encode_bar_summary(w, p.hunger);
     for (p.hunger_healable) |h| try w.writeInt(u16, h, .little);
@@ -529,22 +595,22 @@ fn encode_game_state(w: anytype, p: GameState) !void {
     }
 }
 
-fn encode_u16_colors(w: anytype, values: [components.Element.size]u16) !void {
+fn encode_u16_tiers(w: anytype, values: [components.Tier.size]u16) !void {
     for (values) |v| try w.writeInt(u16, v, .little);
 }
 
-fn decode_u16_colors(r: anytype) ![components.Element.size]u16 {
-    var values: [components.Element.size]u16 = undefined;
+fn decode_u16_tiers(r: anytype) ![components.Tier.size]u16 {
+    var values: [components.Tier.size]u16 = undefined;
     for (&values) |*v| v.* = try r.readInt(u16, .little);
     return values;
 }
 
 fn encode_feast_stats(w: anytype, rs: FeastStats) !void {
-    try encode_u16_colors(w, rs.agents_dispensed);
-    try encode_u16_colors(w, rs.medicine_dispensed);
-    try encode_u16_colors(w, rs.medicine_healed);
-    try encode_u16_colors(w, rs.neutralized);
-    try encode_u16_colors(w, rs.modified_escaped);
+    try encode_u16_tiers(w, rs.cells_covered);
+    try encode_u16_tiers(w, rs.medicine_dispensed);
+    try encode_u16_tiers(w, rs.medicine_healed);
+    try encode_u16_tiers(w, rs.neutralized);
+    try encode_u16_tiers(w, rs.hazard_escaped);
     try w.writeInt(u16, rs.neutral_consumed, .little);
     try w.writeInt(u16, rs.hunger_normal, .little);
     try w.writeInt(u16, rs.hunger_extra, .little);
@@ -552,11 +618,11 @@ fn encode_feast_stats(w: anytype, rs: FeastStats) !void {
 
 fn decode_feast_stats(r: anytype) !FeastStats {
     return .{
-        .agents_dispensed = try decode_u16_colors(r),
-        .medicine_dispensed = try decode_u16_colors(r),
-        .medicine_healed = try decode_u16_colors(r),
-        .neutralized = try decode_u16_colors(r),
-        .modified_escaped = try decode_u16_colors(r),
+        .cells_covered = try decode_u16_tiers(r),
+        .medicine_dispensed = try decode_u16_tiers(r),
+        .medicine_healed = try decode_u16_tiers(r),
+        .neutralized = try decode_u16_tiers(r),
+        .hazard_escaped = try decode_u16_tiers(r),
         .neutral_consumed = try r.readInt(u16, .little),
         .hunger_normal = try r.readInt(u16, .little),
         .hunger_extra = try r.readInt(u16, .little),
@@ -567,8 +633,8 @@ fn encode_player_stats(w: anytype, ps: PlayerStats) !void {
     try w.writeByte(ps.name_len);
     try w.writeAll(ps.name[0..ps.name_len]);
     try w.writeInt(u16, ps.casts, .little);
-    try encode_u16_colors(w, ps.dispense_slots);
-    try encode_u16_colors(w, ps.medicine_slots);
+    try w.writeInt(u16, ps.cells_covered, .little);
+    try w.writeInt(u16, ps.cells_neutralized, .little);
     try w.writeInt(u16, ps.recipe_casts, .little);
     try w.writeInt(u16, ps.fizzles, .little);
 }
@@ -579,8 +645,8 @@ fn decode_player_stats(r: anytype) !PlayerStats {
     if (ps.name_len > 16) return DecodeError.NameTooLong;
     _ = try r.readAll(ps.name[0..ps.name_len]);
     ps.casts = try r.readInt(u16, .little);
-    ps.dispense_slots = try decode_u16_colors(r);
-    ps.medicine_slots = try decode_u16_colors(r);
+    ps.cells_covered = try r.readInt(u16, .little);
+    ps.cells_neutralized = try r.readInt(u16, .little);
     ps.recipe_casts = try r.readInt(u16, .little);
     ps.fizzles = try r.readInt(u16, .little);
     return ps;
@@ -641,7 +707,9 @@ pub const DecodeError = error{
     UnknownTag,
     InvalidKind,
     InvalidActionChoice,
-    InvalidElement,
+    InvalidCursorDir,
+    InvalidTier,
+    TooManyShapeCells,
     InvalidActionResultTag,
     NameTooLong,
     TooManyEntities,
@@ -772,6 +840,8 @@ pub fn decode_game_state(reader: anytype) !GameState {
             const sb = try reader.readByte();
             e.submitted_slots[k] = try decode_combo_slot(sb);
         }
+        e.cursor_row = try reader.readByte();
+        e.cursor_col = try reader.readByte();
         p.entities[i] = e;
     }
     p.hunger = try decode_bar_summary(reader);
@@ -835,20 +905,20 @@ test "round-trip: game_over carries score and match stats" {
     go.stats.hunger_final = 199;
     go.stats.hunger_max = 200;
     go.stats.feast = .{
-        .agents_dispensed = .{ 30, 0, 5, 0 },
-        .medicine_dispensed = .{ 2, 0, 0, 10 },
-        .medicine_healed = .{ 2, 0, 0, 3 },
-        .neutralized = .{ 10, 0, 5, 0 },
-        .modified_escaped = .{ 0, 8, 0, 0 },
+        .cells_covered = .{ 30, 0, 5 },
+        .medicine_dispensed = .{ 2, 0, 10 },
+        .medicine_healed = .{ 2, 0, 3 },
+        .neutralized = .{ 10, 0, 5 },
+        .hazard_escaped = .{ 0, 8, 0 },
         .neutral_consumed = 15,
         .hunger_normal = 38,
         .hunger_extra = 16,
     };
     go.stats.player_count = 2;
-    go.stats.players[0] = .{ .casts = 3, .dispense_slots = .{ 6, 0, 0, 0 }, .recipe_casts = 2, .fizzles = 1 };
+    go.stats.players[0] = .{ .casts = 3, .cells_covered = 27, .cells_neutralized = 6, .recipe_casts = 2, .fizzles = 1 };
     @memcpy(go.stats.players[0].name[0..5], "Alice");
     go.stats.players[0].name_len = 5;
-    go.stats.players[1] = .{ .casts = 2, .medicine_slots = .{ 0, 0, 0, 4 } };
+    go.stats.players[1] = .{ .casts = 2, .cells_covered = 4 };
     go.stats.player_recipe_count = 6;
     go.stats.team_recipe_count = 2;
     go.stats.player_recipe_hits[0] = 1;
@@ -866,18 +936,19 @@ test "round-trip: game_over carries score and match stats" {
     try std.testing.expectEqual(@as(u32, 110), d.stats.slime_total);
     try std.testing.expectEqual(@as(u32, 7), d.stats.slime_left);
     try std.testing.expectEqual(@as(u16, 199), d.stats.hunger_final);
-    try std.testing.expectEqual(@as(u16, 30), d.stats.feast.agents_dispensed[0]);
-    try std.testing.expectEqual(@as(u16, 3), d.stats.feast.medicine_healed[3]);
-    try std.testing.expectEqual(@as(u16, 8), d.stats.feast.modified_escaped[1]);
+    try std.testing.expectEqual(@as(u16, 30), d.stats.feast.cells_covered[0]);
+    try std.testing.expectEqual(@as(u16, 3), d.stats.feast.medicine_healed[2]);
+    try std.testing.expectEqual(@as(u16, 8), d.stats.feast.hazard_escaped[1]);
     try std.testing.expectEqual(@as(u16, 15), d.stats.feast.neutral_consumed);
     try std.testing.expectEqual(@as(u16, 16), d.stats.feast.hunger_extra);
     try std.testing.expectEqual(@as(u8, 2), d.stats.player_count);
     try std.testing.expectEqualSlices(u8, "Alice", d.stats.players[0].name[0..d.stats.players[0].name_len]);
     try std.testing.expectEqual(@as(u16, 3), d.stats.players[0].casts);
-    try std.testing.expectEqual(@as(u16, 6), d.stats.players[0].dispense_slots[0]);
+    try std.testing.expectEqual(@as(u16, 27), d.stats.players[0].cells_covered);
+    try std.testing.expectEqual(@as(u16, 6), d.stats.players[0].cells_neutralized);
     try std.testing.expectEqual(@as(u16, 2), d.stats.players[0].recipe_casts);
     try std.testing.expectEqual(@as(u16, 1), d.stats.players[0].fizzles);
-    try std.testing.expectEqual(@as(u16, 4), d.stats.players[1].medicine_slots[3]);
+    try std.testing.expectEqual(@as(u16, 4), d.stats.players[1].cells_covered);
     try std.testing.expectEqual(@as(u8, 6), d.stats.player_recipe_count);
     try std.testing.expectEqual(@as(u8, 2), d.stats.team_recipe_count);
     try std.testing.expectEqual(@as(u16, 1), d.stats.player_recipe_hits[0]);
@@ -910,17 +981,17 @@ test "round-trip: game_state — hunger, score, grid, lil guys, and combo surviv
     gs.cast_timer = 0.6;
     gs.entity_count = 1;
     gs.hunger = .{ .current = 80, .max = 200 };
-    gs.hunger_healable = .{ 30, 0, 6, 0 };
+    gs.hunger_healable = .{ 30, 0, 6 };
     gs.score = 55;
     // A 2x3 grid holding one cell of every kind.
     gs.grid_rows = 2;
     gs.grid_cols = 3;
     gs.grid[0] = .empty;
     gs.grid[1] = .neutral;
-    gs.grid[2] = .{ .modified = .red };
-    gs.grid[3] = .{ .modified = .blue };
-    gs.grid[4] = .{ .neutralized = .yellow };
-    gs.grid[5] = .neutral;
+    gs.grid[2] = .{ .tiered = .red };
+    gs.grid[3] = .{ .tiered = .green };
+    gs.grid[4] = .neutralized;
+    gs.grid[5] = .{ .tiered = .yellow };
     gs.reservoir = 44;
     gs.lil_guy_count = 2;
     gs.lil_guys[0] = .{ .entity = 11, .target = 4, .bite_ms = 750 };
@@ -934,7 +1005,7 @@ test "round-trip: game_state — hunger, score, grid, lil guys, and combo surviv
         .cast_ms = 420,
         .combo_len = 2,
         .combo_slots = [_]components.ComboSlot{
-            .{ .element = .red },
+            .{ .action = .medicine },
             .{ .action = .dispense },
             .{ .action = .dispense },
             .{ .action = .dispense },
@@ -944,12 +1015,14 @@ test "round-trip: game_state — hunger, score, grid, lil guys, and combo surviv
         // must survive the round trip independently.
         .submitted_len = 3,
         .submitted_slots = [_]components.ComboSlot{
-            .{ .element = .blue },
+            .{ .action = .medicine },
             .{ .action = .medicine },
             .{ .action = .dispense },
             .{ .action = .dispense },
             .{ .action = .dispense },
         },
+        .cursor_row = 2,
+        .cursor_col = 5,
     };
 
     try encode(fbs.writer(), .game_state, gs);
@@ -986,13 +1059,16 @@ test "round-trip: game_state — hunger, score, grid, lil guys, and combo surviv
     const idle = components.LilGuy{ .target = decoded.lil_guys[1].target };
     try std.testing.expect(!idle.has_target());
     try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].combo_len);
-    try std.testing.expectEqual(components.Element.red, decoded.entities[0].combo_slots[0].element);
+    try std.testing.expectEqual(components.ActionChoice.medicine, decoded.entities[0].combo_slots[0].action);
     try std.testing.expectEqual(components.ActionChoice.dispense, decoded.entities[0].combo_slots[1].action);
     // The committed pool round-trips separately from the typed one.
     try std.testing.expectEqual(@as(u8, 3), decoded.entities[0].submitted_len);
-    try std.testing.expectEqual(components.Element.blue, decoded.entities[0].submitted_slots[0].element);
+    try std.testing.expectEqual(components.ActionChoice.medicine, decoded.entities[0].submitted_slots[0].action);
     try std.testing.expectEqual(components.ActionChoice.medicine, decoded.entities[0].submitted_slots[1].action);
     try std.testing.expectEqual(components.ActionChoice.dispense, decoded.entities[0].submitted_slots[2].action);
+    // The aiming cursor travels with the rest of the player's state.
+    try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].cursor_row);
+    try std.testing.expectEqual(@as(u8, 5), decoded.entities[0].cursor_col);
 }
 
 test "round-trip: lobby_update — roster survives" {
@@ -1087,25 +1163,24 @@ test "round-trip: choose_combo max-length all dispense" {
         try std.testing.expectEqual(components.ActionChoice.dispense, s.action);
 }
 
-test "round-trip: choose_combo with element slots [red, dispense, blue, dispense]" {
+test "round-trip: a mixed action combo survives in order" {
+    // Order is the whole identity of a combo, so it must survive exactly.
     var buf: [16]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
 
     const combo = components.make_combo(&.{
-        .{ .element = .red },
+        .{ .action = .medicine },
         .{ .action = .dispense },
-        .{ .element = .blue },
-        .{ .action = .dispense },
+        .{ .action = .medicine },
     });
     try encode(fbs.writer(), .choose_combo, ChooseCombo{ .combo = combo });
     fbs.reset();
     _ = try read_tag(fbs.reader());
     const decoded = try decode_choose_combo(fbs.reader());
-    try std.testing.expectEqual(@as(u8, 4), decoded.combo.len);
-    try std.testing.expectEqual(components.Element.red, decoded.combo.slots[0].element);
+    try std.testing.expectEqual(@as(u8, 3), decoded.combo.len);
+    try std.testing.expectEqual(components.ActionChoice.medicine, decoded.combo.slots[0].action);
     try std.testing.expectEqual(components.ActionChoice.dispense, decoded.combo.slots[1].action);
-    try std.testing.expectEqual(components.Element.blue, decoded.combo.slots[2].element);
-    try std.testing.expectEqual(components.ActionChoice.dispense, decoded.combo.slots[3].action);
+    try std.testing.expectEqual(components.ActionChoice.medicine, decoded.combo.slots[2].action);
 }
 
 test "round-trip: submit_spell carries the combo" {
@@ -1113,7 +1188,7 @@ test "round-trip: submit_spell carries the combo" {
     var fbs = std.io.fixedBufferStream(&buf);
 
     const combo = components.make_combo(&.{
-        .{ .element = .red },
+        .{ .action = .medicine },
         .{ .action = .dispense },
         .{ .action = .dispense },
     });
@@ -1123,7 +1198,7 @@ test "round-trip: submit_spell carries the combo" {
     try std.testing.expectEqual(MsgTag.submit_spell, tag);
     const decoded = try decode_submit_spell(fbs.reader());
     try std.testing.expectEqual(@as(u8, 3), decoded.combo.len);
-    try std.testing.expectEqual(components.Element.red, decoded.combo.slots[0].element);
+    try std.testing.expectEqual(components.ActionChoice.medicine, decoded.combo.slots[0].action);
     try std.testing.expectEqual(components.ActionChoice.dispense, decoded.combo.slots[1].action);
 }
 
@@ -1134,13 +1209,14 @@ test "round-trip: a full MAX grid of every cell kind survives" {
     var gs = GameState.blank;
     gs.grid_rows = components.MAX_GRID_ROWS;
     gs.grid_cols = components.MAX_GRID_COLS;
-    // Cycle through all 10 distinct cell values so every encoding is covered.
+    // Cycle through all 6 distinct cell values so every encoding is covered.
     const kinds = [_]components.SlimeCell{
-        .empty,                    .neutral,
-        .{ .modified = .red },     .{ .modified = .green },
-        .{ .modified = .yellow },  .{ .modified = .blue },
-        .{ .neutralized = .red },  .{ .neutralized = .green },
-        .{ .neutralized = .yellow }, .{ .neutralized = .blue },
+        .empty,
+        .neutral,
+        .neutralized,
+        .{ .tiered = .red },
+        .{ .tiered = .yellow },
+        .{ .tiered = .green },
     };
     for (gs.grid[0..gs.grid_len()], 0..) |*cell, i| cell.* = kinds[i % kinds.len];
 
@@ -1217,8 +1293,8 @@ test "decode_game_state: oversized grid dimensions are rejected" {
     try encode(fbs.writer(), .game_state, gs);
     const written = fbs.getWritten();
     // grid_rows sits right after score: tick(4) cast_timer(4) entity_count(1)
-    // hunger(4) healable(8) score(4) = offset 25 after the tag byte.
-    written[1 + 25] = components.MAX_GRID_ROWS + 1;
+    // hunger(4) healable(3 tiers x 2) score(4) = offset 23 after the tag byte.
+    written[1 + 23] = components.MAX_GRID_ROWS + 1;
     fbs.reset();
     _ = try read_tag(fbs.reader());
     try std.testing.expectError(DecodeError.InvalidGridDims, decode_game_state(fbs.reader()));
@@ -1342,26 +1418,98 @@ test "round-trip: action_result heal (medicine) tag" {
     try std.testing.expectEqual(@as(u16, 9), decoded.value);
 }
 
-test "agents_dispensed round-trips dispensed and transmuted counts" {
-    var buf: [64]u8 = undefined;
+test "shape_cast round-trips its footprint and outcome" {
+    var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    var ad = AgentsDispensed{};
-    ad.dispensed[@intFromEnum(components.Element.red)] = 30;
-    ad.transmuted[@intFromEnum(components.Element.red)] = 20;
-    ad.dispensed[@intFromEnum(components.Element.blue)] = 7;
-    ad.transmuted[@intFromEnum(components.Element.blue)] = 7;
-    try encode(fbs.writer(), .agents_dispensed, ad);
+    var sc = ShapeCast{ .caster = 3, .cell_count = 4 };
+    sc.cells = [_]u16{0} ** MAX_SHAPE_CELLS_WIRE;
+    sc.cells[0] = 0;
+    sc.cells[1] = 17;
+    sc.cells[2] = 59;
+    sc.cells[3] = 255;
+    sc.downgraded[@intFromEnum(components.Tier.red)] = 2;
+    sc.downgraded[@intFromEnum(components.Tier.green)] = 1;
+    sc.neutralized = 1;
+    sc.off_grid = 5;
+    sc.inert = 3;
+    try encode(fbs.writer(), .shape_cast, sc);
 
     var rfbs = std.io.fixedBufferStream(fbs.getWritten());
     const r = rfbs.reader();
-    try std.testing.expectEqual(MsgTag.agents_dispensed, try read_tag(r));
-    const got = try decode_agents_dispensed(r);
-    try std.testing.expectEqual(@as(u16, 30), got.dispensed[@intFromEnum(components.Element.red)]);
-    try std.testing.expectEqual(@as(u16, 20), got.transmuted[@intFromEnum(components.Element.red)]);
-    // Overshoot is recoverable: 10 red agents found no target.
-    try std.testing.expectEqual(@as(u16, 10), got.dispensed[@intFromEnum(components.Element.red)] -
-        got.transmuted[@intFromEnum(components.Element.red)]);
-    try std.testing.expectEqual(@as(u16, 7), got.dispensed[@intFromEnum(components.Element.blue)]);
-    try std.testing.expectEqual(@as(u16, 7), got.transmuted[@intFromEnum(components.Element.blue)]);
-    try std.testing.expectEqual(@as(u16, 0), got.dispensed[@intFromEnum(components.Element.green)]);
+    try std.testing.expectEqual(MsgTag.shape_cast, try read_tag(r));
+    const got = try decode_shape_cast(r);
+    try std.testing.expectEqual(@as(u8, 3), got.caster);
+    try std.testing.expectEqual(@as(u16, 4), got.cell_count);
+    try std.testing.expectEqualSlices(u16, sc.cells[0..4], got.cells[0..4]);
+    try std.testing.expectEqual(@as(u16, 2), got.downgraded[@intFromEnum(components.Tier.red)]);
+    try std.testing.expectEqual(@as(u16, 0), got.downgraded[@intFromEnum(components.Tier.yellow)]);
+    try std.testing.expectEqual(@as(u16, 1), got.downgraded[@intFromEnum(components.Tier.green)]);
+    try std.testing.expectEqual(@as(u16, 1), got.neutralized);
+    // Wasted coverage travels explicitly, never inferred.
+    try std.testing.expectEqual(@as(u16, 5), got.off_grid);
+    try std.testing.expectEqual(@as(u16, 3), got.inert);
+}
+
+test "shape_cast: a fully-clipped cast carries no cells" {
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const sc = ShapeCast{ .caster = 1, .cell_count = 0, .off_grid = 9 };
+    try encode(fbs.writer(), .shape_cast, sc);
+
+    var rfbs = std.io.fixedBufferStream(fbs.getWritten());
+    const r = rfbs.reader();
+    _ = try read_tag(r);
+    const got = try decode_shape_cast(r);
+    try std.testing.expectEqual(@as(u16, 0), got.cell_count);
+    try std.testing.expectEqual(@as(u16, 9), got.off_grid);
+}
+
+test "round-trip: move_cursor carries each direction" {
+    for ([_]CursorDir{ .up, .down, .left, .right }) |dir| {
+        var buf: [4]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        try encode(fbs.writer(), .move_cursor, MoveCursor{ .dir = dir });
+        fbs.reset();
+        try std.testing.expectEqual(MsgTag.move_cursor, try read_tag(fbs.reader()));
+        try std.testing.expectEqual(dir, (try decode_move_cursor(fbs.reader())).dir);
+    }
+}
+
+test "decode_move_cursor: an unknown direction is rejected" {
+    var buf = [_]u8{ @intFromEnum(MsgTag.move_cursor), 9 };
+    var fbs = std.io.fixedBufferStream(buf[0..]);
+    _ = try read_tag(fbs.reader());
+    try std.testing.expectError(DecodeError.InvalidCursorDir, decode_move_cursor(fbs.reader()));
+}
+
+test "CursorDir.delta steps exactly one cell" {
+    try std.testing.expectEqual(@as(i8, -1), CursorDir.up.delta().d_row);
+    try std.testing.expectEqual(@as(i8, 0), CursorDir.up.delta().d_col);
+    try std.testing.expectEqual(@as(i8, 1), CursorDir.down.delta().d_row);
+    try std.testing.expectEqual(@as(i8, -1), CursorDir.left.delta().d_col);
+    try std.testing.expectEqual(@as(i8, 1), CursorDir.right.delta().d_col);
+}
+
+test "round-trip: a cursor position survives per entity" {
+    var buf: [1024]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var gs = GameState.blank;
+    gs.entity_count = 2;
+    gs.entities[0] = EntitySnapshot.blank;
+    gs.entities[0].cursor_row = 3;
+    gs.entities[0].cursor_col = 7;
+    gs.entities[1] = EntitySnapshot.blank;
+    gs.entities[1].cursor_row = 0;
+    gs.entities[1].cursor_col = 0;
+    gs.grid_rows = 6;
+    gs.grid_cols = 10;
+
+    try encode(fbs.writer(), .game_state, gs);
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    const decoded = try decode_game_state(fbs.reader());
+    try std.testing.expectEqual(@as(u8, 3), decoded.entities[0].cursor_row);
+    try std.testing.expectEqual(@as(u8, 7), decoded.entities[0].cursor_col);
+    try std.testing.expectEqual(@as(u8, 0), decoded.entities[1].cursor_row);
+    try std.testing.expectEqual(@as(u8, 0), decoded.entities[1].cursor_col);
 }

@@ -65,8 +65,8 @@ const testing = std.testing;
 
 test "Encounter total_units sums every slime bucket" {
     var slime = c.SlimeReservoir{ .neutral = 5 };
-    slime.modified[@intFromEnum(c.Element.red)] = 10;
-    slime.modified[@intFromEnum(c.Element.blue)] = 3;
+    slime.tiered[@intFromEnum(c.Tier.red)] = 10;
+    slime.tiered[@intFromEnum(c.Tier.green)] = 3;
     const e = Encounter{ .label = "t", .hunger_max = 100, .slime = slime };
     try testing.expectEqual(@as(u32, 18), e.total_units());
 }

@@ -6,26 +6,25 @@
       "hunger_max": 200,
       "zones": [
         {
-          "modified": {
+          "tiered": {
             "red": 10,
             "green": 5
           },
           "neutral": 15
         },
         {
-          "modified": {
+          "tiered": {
             "red": 10,
-            "green": 10,
-            "yellow": 5
+            "yellow": 5,
+            "green": 10
           },
           "neutral": 10
         },
         {
-          "modified": {
+          "tiered": {
             "red": 15,
-            "green": 10,
             "yellow": 10,
-            "blue": 5
+            "green": 15
           },
           "neutral": 5
         }
@@ -36,80 +35,73 @@
       "hunger_max": 700,
       "zones": [
         {
-          "modified": {
+          "tiered": {
             "red": 10,
             "green": 5
           },
           "neutral": 15
         },
         {
-          "modified": {
+          "tiered": {
             "red": 10,
-            "green": 10,
-            "yellow": 5
+            "yellow": 5,
+            "green": 10
           },
           "neutral": 10
         },
         {
-          "modified": {
+          "tiered": {
             "red": 15,
-            "green": 10,
             "yellow": 10,
-            "blue": 5
+            "green": 15
           },
           "neutral": 5
         },
         {
-          "modified": {
+          "tiered": {
             "red": 30,
-            "green": 20,
             "yellow": 45,
-            "blue": 50
+            "green": 70
           },
           "neutral": 15
         },
         {
-          "modified": {
+          "tiered": {
             "red": 20,
-            "green": 40,
             "yellow": 15,
-            "blue": 20
+            "green": 60
           },
           "neutral": 10
         },
         {
-          "modified": {
+          "tiered": {
             "red": 15,
-            "green": 10,
             "yellow": 100,
-            "blue": 5
+            "green": 15
           },
           "neutral": 5
         },
         {
-          "modified": {
+          "tiered": {
             "red": 20,
-            "green": 50,
             "yellow": 20,
-            "blue": 10
+            "green": 60
           },
           "neutral": 15
         },
         {
-          "modified": {
+          "tiered": {
             "red": 10,
-            "green": 10,
             "yellow": 15,
-            "blue": 10
+            "green": 20
           },
           "neutral": 10
         },
         {
-          "modified": {
+          "tiered": {
             "red": 15,
-            "green": 10,
             "yellow": 10,
-            "blue": 5
+            "green": 15
           },
           "neutral": 5
         }

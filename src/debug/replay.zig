@@ -154,18 +154,22 @@ test "replay: record then play back" {
     gs1.cast_timer = 3.0;
     gs1.entity_count = 1;
     gs1.hunger = .{ .current = 40, .max = 200 };
-    gs1.hunger_healable = .{ 10, 0, 0, 0 };
+    gs1.hunger_healable = .{ 10, 0, 0 };
     gs1.score = 25;
     gs1.grid_rows = 2;
     gs1.grid_cols = 2;
+    // One of every cell variant, so the round-trip covers the whole encoding.
     gs1.grid[0] = .neutral;
-    gs1.grid[1] = .{ .modified = .red };
-    gs1.grid[2] = .{ .neutralized = .yellow };
+    gs1.grid[1] = .{ .tiered = .red };
+    gs1.grid[2] = .neutralized;
     gs1.grid[3] = .empty;
     gs1.reservoir = 15;
     gs1.entities[0] = proto.EntitySnapshot.blank;
     gs1.entities[0].entity = 0;
     gs1.entities[0].kind = .player;
+    // An off-centre aim cursor, to prove cursors survive the round-trip.
+    gs1.entities[0].cursor_row = 1;
+    gs1.entities[0].cursor_col = 0;
     gs1.lil_guy_count = 1;
     gs1.lil_guys[0] = .{ .entity = 9, .target = 2, .bite_ms = 250 };
     var gs2 = gs1;
@@ -187,7 +191,12 @@ test "replay: record then play back" {
     try std.testing.expectEqual(@as(u16, 10), f1.hunger_healable[0]);
     try std.testing.expectEqual(@as(u32, 25), f1.score);
     try std.testing.expectEqual(@as(u16, 4), f1.grid_len());
-    try std.testing.expectEqual(c.SlimeCell{ .neutralized = .yellow }, f1.grid[2]);
+    try std.testing.expectEqual(c.SlimeCell.neutral, f1.grid[0]);
+    try std.testing.expectEqual(c.SlimeCell{ .tiered = .red }, f1.grid[1]);
+    try std.testing.expectEqual(c.SlimeCell.neutralized, f1.grid[2]);
+    try std.testing.expectEqual(c.SlimeCell.empty, f1.grid[3]);
+    try std.testing.expectEqual(@as(u8, 1), f1.entities[0].cursor_row);
+    try std.testing.expectEqual(@as(u8, 0), f1.entities[0].cursor_col);
     try std.testing.expectEqual(@as(u32, 15), f1.reservoir);
     try std.testing.expectEqual(@as(u16, 2), f1.lil_guys[0].target);
     try std.testing.expectEqual(@as(u16, 250), f1.lil_guys[0].bite_ms);

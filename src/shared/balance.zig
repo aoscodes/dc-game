@@ -9,16 +9,18 @@
 //! ## Recipes
 //!
 //! A recipe is an *exact* combo pattern (same slots, same order, same
-//! length).  When a submitted combo matches a recipe, the recipe's
-//! AgentOutput REPLACES the combo's flat conversion.
+//! length) naming a SHAPE.  Casting stamps that shape on the grid anchored at
+//! the caster's cursor: every covered hazard cell is downgraded one tier.
+//! There is no flat fallback — a combo matching no recipe fizzles, so the
+//! recipe tables are the complete move list.
 //!
 //! Team recipes match sets of combos cast by distinct players in the same
 //! round.  They are checked first, greedily, in table order; each player's
 //! combo can be consumed by at most one recipe per round.  A team recipe may
 //! fire multiple times per round if several disjoint player groups match.
-//! Player recipes are checked next, then any unmatched combo falls back to
-//! flat conversion (see game_logic.flat_convert).
+//! Player recipes are checked next.
 
+const std = @import("std");
 const c = @import("components.zig");
 
 /// Wire cap on the player recipe table (MatchStats hit-array sizing).
@@ -27,17 +29,63 @@ pub const MAX_PLAYER_RECIPES: u8 = 64;
 /// Wire cap on the team recipe table.
 pub const MAX_TEAM_RECIPES: u8 = 64;
 
+/// Bounding-box cap on a single shape.  A shape must fit the grid caps, since
+/// a shape larger than the playfield could never land fully.
+pub const MAX_SHAPE_ROWS: u8 = c.MAX_GRID_ROWS;
+pub const MAX_SHAPE_COLS: u8 = c.MAX_GRID_COLS;
+pub const MAX_SHAPE_CELLS: u16 = @as(u16, MAX_SHAPE_ROWS) * @as(u16, MAX_SHAPE_COLS);
+
+/// One cell of a shape, as a SIGNED offset from the shape's anchor.  Signed
+/// because the anchor is the bounding box's centre, so cells reach up/left of
+/// it; the grid clips whatever falls outside (see slime.apply_shape).
+pub const ShapeOffset = struct {
+    d_row: i8,
+    d_col: i8,
+};
+
+/// The footprint a cast stamps on the grid: the set of cells it covers,
+/// relative to the anchor cell the player aims at.
+///
+/// Orientation is FIXED — rotations and reflections are authored as separate
+/// recipes, so every distinct footprint has its own combo and the move list
+/// stays explicit.
+///
+/// Built by `config.zig` from JSON rows of `#`/`.` characters, e.g.
+/// `[".#.", "###", ".#."]` is a plus.  The anchor is the bounding box centre
+/// (rounded down), so odd-sized shapes centre on the aimed cell.
+pub const Shape = struct {
+    /// Covered cells, in row-major order of the authored rows.  Never empty:
+    /// the loader rejects a shape with no `#`.
+    offsets: []const ShapeOffset,
+    /// Bounding box of the authored rows, for previews and validation.
+    rows: u8,
+    cols: u8,
+
+    /// Number of cells this shape covers when it lands fully on the grid.
+    pub fn size(self: Shape) usize {
+        return self.offsets.len;
+    }
+};
+
 pub const PlayerRecipe = struct {
     label: []const u8,
     pattern: c.ActionCombo,
-    output: c.AgentOutput,
+    /// Footprint downgraded at the caster's cursor.  Every recipe names a
+    /// shape; a pure-heal recipe carries a minimal (1×1) shape and non-zero
+    /// `medicine`.
+    shape: Shape,
+    medicine: c.MedicineOutput = .{},
 };
 
 /// `patterns` — one exact combo per participating player (distinct players).
+///
+/// The combined shape lands at the cursor of the LAST JOINER: the player whose
+/// submit completed the group. They chose to close the circuit, so they aim it.
 pub const TeamRecipe = struct {
     label: []const u8,
     patterns: []const c.ActionCombo,
-    output: c.AgentOutput,
+    shape: Shape,
+    medicine: c.MedicineOutput = .{},
 };
 
 /// Slime grid dimensions — a GLOBAL knob (not per-encounter), so every game
@@ -53,27 +101,17 @@ pub const SlimeGridDims = struct {
     }
 };
 
-/// Default grid used when `slime_grid` is absent from balance.json, so
-/// pre-grid configs (including the saved /tune configs) keep validating.
+/// Default grid used when `slime_grid` is absent from balance.json.
 pub const DEFAULT_SLIME_GRID = SlimeGridDims{ .rows = 6, .cols = 10 };
 
 /// All designer-tunable balance numbers.  Loaded from `data/balance.json`
 /// (see config.zig); tests use the frozen fixture in fixtures.zig.
 pub const Balance = struct {
-    /// Agent units released per elemental dispense slot in a non-recipe combo.
-    units_per_slot: u32,
-    /// Medicine contributed per elemental medicine slot in a non-recipe combo.
-    /// Medicine carries the combo's current element; colorless slots are wasted.
-    medicine_per_slot: u32,
     /// Hunger cost per slime unit consumed (any unit — never healable).
     hunger_cost_normal: u32,
-    /// EXTRA hunger per un-neutralized modified unit consumed (healable portion).
-    hunger_cost_modified_extra: u32,
-    /// Portion (0.0–1.0) of transmuted modified slime that SURVIVES as
-    /// neutralized slime; the rest is destroyed outright (less to eat, less
-    /// hunger, less score).  Rounded down per transmute call per color, so
-    /// e.g. 0.5 on a single unit leaves nothing.  1.0 = everything survives.
-    neutralize_residue_mult: f32,
+    /// EXTRA hunger per un-neutralized hazard unit consumed (healable portion,
+    /// healed by medicine matching the tier that was eaten).
+    hunger_cost_hazard_extra: u32,
     /// Dimensions of the slime grid.  Slime beyond `rows * cols` waits in the
     /// off-grid reservoir and refills emptied cells from the top row.
     slime_grid: SlimeGridDims,

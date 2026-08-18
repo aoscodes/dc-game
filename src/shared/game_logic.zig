@@ -3,14 +3,15 @@
 //!
 //! Cast pipeline (driven by session.fire_expired_casts, once per batch of
 //! casts that expire together):
-//!   1. `match_recipes`   — convert the batch's casts into one AgentOutput
-//!                          (team recipes → player recipes → flat fallback;
-//!                          team recipes need distinct players in the SAME
-//!                          batch).
+//!   1. `match_recipes`   — resolve the batch's casts into the SHAPES to stamp
+//!                          (each with the player whose cursor anchors it) and
+//!                          the medicine brewed.  Team recipes → player
+//!                          recipes; team recipes need distinct players in the
+//!                          SAME batch.  Unmatched casts produce nothing.
 //!   2. `apply_medicine`  — heal the hunger bar immediately, capped by the
-//!                          per-color healable (modified-slime) portions.
-//!   3. dispensed agents are then handed to `slime.SlimeField.neutralize`,
-//!      which owns all slime state and all randomness.
+//!                          per-tier healable (hazard-slime) portions.
+//!   3. each shape is handed to `slime.SlimeField.apply_shape` at its caster's
+//!      aimed cursor, which owns all slime state.
 //!
 //! All functions here are pure/deterministic and unit-testable without a
 //! session.  Slime-field mutation lives in `slime.zig`; hunger/score
@@ -20,41 +21,8 @@ const std = @import("std");
 const c = @import("components.zig");
 const balance = @import("balance.zig");
 
-/// An action slot with its resolved element modifier (null = no element).
-pub const ElementedAction = struct {
-    action: c.ActionChoice,
-    element: ?c.Element,
-};
-
-/// Parse a combo into a flat sequence of ElementedActions.
-///
-/// Rules:
-///   - An element token sets the *current element*; it persists until the
-///     next element token or end of combo.
-///   - An action token consumes the current element (which may be null) and
-///     emits one ElementedAction.
-///   - Trailing element tokens with no following action are silently dropped.
-///
-/// Returns the number of entries written to `out`.  `out` must have capacity
-/// >= combo.len (a combo of all-action slots is the worst case).
-pub fn parse_combo(combo: c.ActionCombo, out: []ElementedAction) usize {
-    var current_element: ?c.Element = null;
-    var count: usize = 0;
-    for (combo.slots[0..combo.len]) |slot| {
-        switch (slot) {
-            .element => |el| current_element = el,
-            .action => |ac| {
-                out[count] = .{ .action = ac, .element = current_element };
-                count += 1;
-                // Element persists — do NOT reset current_element here.
-            },
-        }
-    }
-    return count;
-}
-
 // ---------------------------------------------------------------------------
-// Combo → AgentOutput conversion
+// Combo → shapes + medicine
 // ---------------------------------------------------------------------------
 
 /// Exact structural equality: same length, same slots in the same order.
@@ -66,34 +34,12 @@ pub fn combos_equal(a: c.ActionCombo, b: c.ActionCombo) bool {
     return true;
 }
 
-/// Flat per-slot conversion for combos that match no recipe:
-///   - dispense with an element → bal.units_per_slot agent units of that color
-///   - medicine with an element → bal.medicine_per_slot medicine of that color
-///   - either action with NO element → wasted (both are color-bound)
-pub fn flat_convert(bal: *const balance.Balance, combo: c.ActionCombo) c.AgentOutput {
-    var out = c.AgentOutput{};
-    var ea_buf: [c.MAX_COMBO_LEN]ElementedAction = undefined;
-    const n = parse_combo(combo, &ea_buf);
-    for (ea_buf[0..n]) |ea| {
-        const el = ea.element orelse continue; // colorless actions wasted
-        switch (ea.action) {
-            .dispense => out.units[@intFromEnum(el)] +|= bal.units_per_slot,
-            .medicine => out.medicine[@intFromEnum(el)] +|= bal.medicine_per_slot,
-        }
-    }
-    return out;
-}
-
-/// True if committing this combo could produce ANY output: either its flat
-/// conversion yields agents/medicine, or it exactly matches a recipe pattern
-/// (player recipes, or any single pattern of a team recipe — the partner may
-/// commit in the same window).  Zero-output combos (e.g. a dangling element
-/// token or colorless actions) FIZZLE instead of committing, so they never
-/// waste one of the player's casts.
+/// True if committing this combo could produce ANY effect: it exactly matches
+/// a player recipe, or any single pattern of a team recipe (the partner may
+/// commit in the same window).  Since there is no flat fallback, the recipe
+/// tables are the complete move list, and a combo naming no recipe FIZZLES
+/// instead of committing — so a mistyped sequence never wastes a cast.
 pub fn combo_has_output(bal: *const balance.Balance, combo: c.ActionCombo) bool {
-    const flat = flat_convert(bal, combo);
-    for (flat.units) |u| if (u > 0) return true;
-    for (flat.medicine) |m| if (m > 0) return true;
     for (bal.player_recipes) |pr| {
         if (combos_equal(combo, pr.pattern)) return true;
     }
@@ -140,7 +86,31 @@ pub const MatchReport = struct {
     team_instance: [MAX_CASTS]u8 = [_]u8{NO_TEAM_INSTANCE} ** MAX_CASTS,
 };
 
-/// Convert one round's committed casts into the team's combined AgentOutput.
+/// One shape a batch resolved to, and who aims it.
+pub const ShapeCast = struct {
+    shape: balance.Shape,
+    /// The player whose cursor anchors this stamp.  For a player recipe that
+    /// is the caster; for a team recipe it is the LAST JOINER — the player
+    /// whose submit completed the group, since they chose to close the circuit.
+    anchor_player: u8,
+    /// Index into the table this came from, for the recipe_fired broadcast.
+    recipe_index: u8,
+    is_team: bool,
+};
+
+/// Everything a batch of casts resolves to: the shapes to stamp (in fire
+/// order) and the medicine brewed.
+pub const BatchOutcome = struct {
+    shapes: [MAX_CASTS]ShapeCast = undefined,
+    shape_count: usize = 0,
+    medicine: c.MedicineOutput = .{},
+
+    pub fn stamps(self: *const BatchOutcome) []const ShapeCast {
+        return self.shapes[0..self.shape_count];
+    }
+};
+
+/// Resolve one round's committed casts into shapes to stamp plus medicine.
 /// When `report` is non-null it is filled with recipe fire counts and
 /// per-cast consumption for stats.
 ///
@@ -148,12 +118,24 @@ pub const MatchReport = struct {
 ///   1. Team recipes, greedily in bal.team_recipes order.  Each pattern
 ///      must be matched exactly by a DISTINCT player's cast — one player
 ///      casting both halves does not trigger a team recipe.  A recipe
-///      repeats while disjoint groups keep matching.
-///   2. Player recipes in bal.player_recipes order (exact match).
-///   3. Flat conversion fallback (flat_convert).
-pub fn match_recipes(bal: *const balance.Balance, casts: []const Cast, report: ?*MatchReport) c.AgentOutput {
+///      repeats while disjoint groups keep matching.  The combined shape is
+///      anchored at the last joiner's cursor.
+///   2. Player recipes in bal.player_recipes order (exact match), anchored at
+///      the caster's own cursor.
+/// Casts matching nothing produce no effect (no flat fallback).
+///
+/// `last_joiner` is the player whose submit triggered this batch, used to
+/// anchor team shapes; pass null when no single player closed the group (e.g.
+/// a batch fired purely by buffer expiry), in which case the team shape falls
+/// back to the first contributor's cursor.
+pub fn match_recipes(
+    bal: *const balance.Balance,
+    casts: []const Cast,
+    last_joiner: ?u8,
+    report: ?*MatchReport,
+) BatchOutcome {
     std.debug.assert(casts.len <= MAX_CASTS);
-    var out = c.AgentOutput{};
+    var out = BatchOutcome{};
     var consumed = [_]bool{false} ** MAX_CASTS;
     var instance_counter: u8 = 0;
 
@@ -177,6 +159,17 @@ pub fn match_recipes(bal: *const balance.Balance, casts: []const Cast, report: ?
                 picks[pi] = ci;
                 picked[ci] = true;
             }
+            // The last joiner aims the combined shape — but only if they are
+            // actually in THIS instance; otherwise the first contributor does.
+            var anchor = casts[picks[0]].player_id;
+            if (last_joiner) |lj| {
+                for (tr.patterns, 0..) |_, pi| {
+                    if (casts[picks[pi]].player_id == lj) {
+                        anchor = lj;
+                        break;
+                    }
+                }
+            }
             for (tr.patterns, 0..) |_, pi| {
                 consumed[picks[pi]] = true;
                 if (report) |r| {
@@ -186,16 +179,30 @@ pub fn match_recipes(bal: *const balance.Balance, casts: []const Cast, report: ?
             }
             if (report) |r| r.team_hits[ti] +|= 1;
             instance_counter +|= 1;
-            out.add(tr.output);
+            out.medicine.add(tr.medicine);
+            out.shapes[out.shape_count] = .{
+                .shape = tr.shape,
+                .anchor_player = anchor,
+                .recipe_index = @intCast(ti),
+                .is_team = true,
+            };
+            out.shape_count += 1;
         }
     }
 
-    // 2. Player recipes.
+    // 2. Player recipes — each anchored at its own caster's cursor.
     for (casts, 0..) |cast, ci| {
         if (consumed[ci]) continue;
         for (bal.player_recipes, 0..) |pr, pi| {
             if (combos_equal(cast.combo, pr.pattern)) {
-                out.add(pr.output);
+                out.medicine.add(pr.medicine);
+                out.shapes[out.shape_count] = .{
+                    .shape = pr.shape,
+                    .anchor_player = cast.player_id,
+                    .recipe_index = @intCast(pi),
+                    .is_team = false,
+                };
+                out.shape_count += 1;
                 consumed[ci] = true;
                 if (report) |r| {
                     r.player_hits[pi] +|= 1;
@@ -206,12 +213,6 @@ pub fn match_recipes(bal: *const balance.Balance, casts: []const Cast, report: ?
         }
     }
 
-    // 3. Flat fallback.
-    for (casts, 0..) |cast, ci| {
-        if (consumed[ci]) continue;
-        out.add(flat_convert(bal, cast.combo));
-    }
-
     return out;
 }
 
@@ -219,17 +220,17 @@ pub fn match_recipes(bal: *const balance.Balance, casts: []const Cast, report: ?
 // Hunger + zone consumption
 // ---------------------------------------------------------------------------
 
-/// Heal the hunger bar with per-color medicine pools.  Medicine is
-/// symmetrical: the color-X pool heals only `healable[X]` — the hunger
-/// attributable to eating un-neutralized color-X Modified Slime — and is
+/// Heal the hunger bar with per-tier medicine pools.  Medicine is
+/// symmetrical: the tier-T pool heals only `healable[T]` — the hunger
+/// attributable to eating un-neutralized tier-T hazard slime — and is
 /// further capped by the current hunger level.  Overheal is discarded.
-/// Returns the amount actually healed per color (sum for the total).
+/// Returns the amount actually healed per tier (sum for the total).
 pub fn apply_medicine(
     hunger: *c.Health,
-    healable: *[c.Element.size]u16,
-    pools: [c.Element.size]u32,
-) [c.Element.size]u16 {
-    var healed = [_]u16{0} ** c.Element.size;
+    healable: *[c.Tier.size]u16,
+    pools: [c.Tier.size]u32,
+) [c.Tier.size]u16 {
+    var healed = [_]u16{0} ** c.Tier.size;
     for (pools, 0..) |pool, i| {
         const cap = @min(@as(u32, healable[i]), @as(u32, hunger.current));
         const heal: u16 = @intCast(@min(pool, cap));
@@ -240,15 +241,15 @@ pub fn apply_medicine(
     return healed;
 }
 
-/// Sum a per-color u16 array (convenience for totals).
-pub fn sum_u16(values: [c.Element.size]u16) u32 {
+/// Sum a per-tier u16 array (convenience for totals).
+pub fn sum_u16(values: [c.Tier.size]u16) u32 {
     var total: u32 = 0;
     for (values) |v| total += v;
     return total;
 }
 
-/// Sum a per-color u32 array — e.g. an AgentOutput's units/medicine pools.
-pub fn sum_u32(values: [c.Element.size]u32) u32 {
+/// Sum a per-tier u32 array — e.g. a MedicineOutput's pools.
+pub fn sum_u32(values: [c.Tier.size]u32) u32 {
     var total: u32 = 0;
     for (values) |v| total +|= v;
     return total;
@@ -273,341 +274,322 @@ const fixtures = @import("fixtures.zig");
 /// Frozen fixture balance — designer edits to data/*.json can't break these.
 const test_bal = &fixtures.test_config.balance;
 
-test "parse_combo: action-only — element is null for all" {
-    const combo = mk(&.{
-        .{ .action = .dispense },
-        .{ .action = .medicine },
-    });
-    var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
-    const n = parse_combo(combo, &out);
-    try std.testing.expectEqual(@as(usize, 2), n);
-    try std.testing.expectEqual(c.ActionChoice.dispense, out[0].action);
-    try std.testing.expectEqual(@as(?c.Element, null), out[0].element);
-    try std.testing.expectEqual(c.ActionChoice.medicine, out[1].action);
-    try std.testing.expectEqual(@as(?c.Element, null), out[1].element);
+const D = c.ComboSlot{ .action = .dispense };
+const M = c.ComboSlot{ .action = .medicine };
+
+fn tier_ix(t: c.Tier) usize {
+    return @intFromEnum(t);
 }
 
-test "parse_combo: element persists across following actions" {
-    const combo = mk(&.{
-        .{ .element = .red },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-    });
-    var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
-    const n = parse_combo(combo, &out);
-    try std.testing.expectEqual(@as(usize, 2), n);
-    try std.testing.expectEqual(c.Element.red, out[0].element.?);
-    try std.testing.expectEqual(c.Element.red, out[1].element.?);
-}
-
-test "parse_combo: second element overrides first" {
-    const combo = mk(&.{
-        .{ .element = .red },
-        .{ .action = .dispense },
-        .{ .element = .blue },
-        .{ .action = .dispense },
-    });
-    var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
-    const n = parse_combo(combo, &out);
-    try std.testing.expectEqual(@as(usize, 2), n);
-    try std.testing.expectEqual(c.Element.red, out[0].element.?);
-    try std.testing.expectEqual(c.Element.blue, out[1].element.?);
-}
-
-test "parse_combo: trailing element is silently dropped" {
-    const combo = mk(&.{
-        .{ .action = .dispense },
-        .{ .element = .red },
-    });
-    var out: [c.MAX_COMBO_LEN]ElementedAction = undefined;
-    const n = parse_combo(combo, &out);
-    try std.testing.expectEqual(@as(usize, 1), n);
-    try std.testing.expectEqual(@as(?c.Element, null), out[0].element);
-}
+/// Fixture recipe patterns, by label, so tests read as intent not as keystrokes.
+const POKE = mk(&.{D});
+const SWEEP = mk(&.{ D, D });
+const BLOCK = mk(&.{ D, D, D });
+const TONIC = mk(&.{ M, M });
+const RED_TONIC = mk(&.{ M, M, M });
+const BLOOM_HALF = mk(&.{ D, M });
+const CROSSFIRE_A = mk(&.{ M, D });
+const CROSSFIRE_B = mk(&.{ M, D, D });
 
 test "combos_equal: identical combos match" {
-    const a = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
-    const b = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
-    try std.testing.expect(combos_equal(a, b));
+    try std.testing.expect(combos_equal(SWEEP, mk(&.{ D, D })));
 }
 
 test "combos_equal: different length / slot / order do not match" {
-    const base = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
-    const longer = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
-    const other_el = mk(&.{ .{ .element = .blue }, .{ .action = .dispense } });
-    const reordered = mk(&.{ .{ .action = .dispense }, .{ .element = .red } });
-    try std.testing.expect(!combos_equal(base, longer));
-    try std.testing.expect(!combos_equal(base, other_el));
-    try std.testing.expect(!combos_equal(base, reordered));
+    try std.testing.expect(!combos_equal(SWEEP, BLOCK));
+    try std.testing.expect(!combos_equal(SWEEP, mk(&.{ D, M })));
+    try std.testing.expect(!combos_equal(mk(&.{ D, M }), mk(&.{ M, D })));
 }
 
-test "flat_convert: elemental dispense yields UNITS_PER_SLOT per slot" {
-    const out = flat_convert(test_bal, mk(&.{
-        .{ .element = .green },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-    }));
-    try std.testing.expectEqual(2 * test_bal.units_per_slot, out.units[@intFromEnum(c.Element.green)]);
-    for (out.medicine) |m| try std.testing.expectEqual(@as(u32, 0), m);
+test "match_recipes: a player recipe stamps its shape at its own caster" {
+    const casts = [_]Cast{.{ .player_id = 3, .combo = BLOCK }};
+    const out = match_recipes(test_bal, &casts, null, null);
+
+    try std.testing.expectEqual(@as(usize, 1), out.shape_count);
+    const stamp = out.stamps()[0];
+    try std.testing.expectEqual(@as(u8, 3), stamp.anchor_player);
+    try std.testing.expect(!stamp.is_team);
+    // `block` is the 3x3.
+    try std.testing.expectEqual(@as(usize, 9), stamp.shape.size());
 }
 
-test "flat_convert: colorless dispense is wasted" {
-    const out = flat_convert(test_bal, mk(&.{.{ .action = .dispense }}));
-    for (out.units) |u| try std.testing.expectEqual(@as(u32, 0), u);
+test "match_recipes: an unmatched combo produces nothing" {
+    // No flat fallback: the recipe tables are the whole move list.
+    const nonsense = mk(&.{ M, D, M, D, M });
+    const casts = [_]Cast{.{ .player_id = 0, .combo = nonsense }};
+    const out = match_recipes(test_bal, &casts, null, null);
+    try std.testing.expectEqual(@as(usize, 0), out.shape_count);
+    try std.testing.expectEqual(@as(u32, 0), out.medicine.total());
 }
 
-test "flat_convert: medicine is color-bound; colorless medicine wasted" {
-    const out = flat_convert(test_bal, mk(&.{
-        .{ .action = .medicine }, // colorless — wasted
-        .{ .element = .red },
-        .{ .action = .medicine },
-        .{ .element = .blue },
-        .{ .action = .medicine },
-    }));
-    try std.testing.expectEqual(test_bal.medicine_per_slot, out.medicine[@intFromEnum(c.Element.red)]);
-    try std.testing.expectEqual(test_bal.medicine_per_slot, out.medicine[@intFromEnum(c.Element.blue)]);
-    try std.testing.expectEqual(@as(u32, 0), out.medicine[@intFromEnum(c.Element.green)]);
-    for (out.units) |u| try std.testing.expectEqual(@as(u32, 0), u);
+test "match_recipes: a recipe's medicine is brewed alongside its shape" {
+    const casts = [_]Cast{.{ .player_id = 0, .combo = TONIC }};
+    const out = match_recipes(test_bal, &casts, null, null);
+    try std.testing.expectEqual(@as(usize, 1), out.shape_count);
+    try std.testing.expectEqual(@as(u32, 18), out.medicine.total());
+    for (0..c.Tier.size) |t| {
+        try std.testing.expectEqual(@as(u32, 6), out.medicine.medicine[t]);
+    }
 }
 
-test "match_recipes: player recipe replaces flat conversion" {
-    // crimson_flood: [red, dispense×3] → 20 red units (flat would be 15).
+test "match_recipes: tier-targeted medicine only fills its own pool" {
+    const casts = [_]Cast{.{ .player_id = 0, .combo = RED_TONIC }};
+    const out = match_recipes(test_bal, &casts, null, null);
+    try std.testing.expectEqual(@as(u32, 10), out.medicine.medicine[tier_ix(.red)]);
+    try std.testing.expectEqual(@as(u32, 0), out.medicine.medicine[tier_ix(.yellow)]);
+    try std.testing.expectEqual(@as(u32, 0), out.medicine.medicine[tier_ix(.green)]);
+}
+
+test "match_recipes: team recipe consumes both casts and stamps ONE shape" {
     const casts = [_]Cast{
-        .{ .player_id = 0, .combo = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }) },
+        .{ .player_id = 0, .combo = BLOOM_HALF },
+        .{ .player_id = 1, .combo = BLOOM_HALF },
     };
-    const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(@as(u32, 20), out.units[@intFromEnum(c.Element.red)]);
+    var report = MatchReport{};
+    const out = match_recipes(test_bal, &casts, null, &report);
+
+    // Two casts, one combined shape — not one shape each.
+    try std.testing.expectEqual(@as(usize, 1), out.shape_count);
+    try std.testing.expect(out.stamps()[0].is_team);
+    try std.testing.expectEqual(@as(u16, 1), report.team_hits[0]);
+    try std.testing.expectEqual(ConsumedBy.team_recipe, report.consumed[0]);
+    try std.testing.expectEqual(ConsumedBy.team_recipe, report.consumed[1]);
 }
 
-test "match_recipes: non-recipe combo falls back to flat conversion" {
+test "match_recipes: the last joiner aims the team shape" {
     const casts = [_]Cast{
-        .{ .player_id = 0, .combo = mk(&.{ .{ .element = .yellow }, .{ .action = .dispense } }) },
+        .{ .player_id = 0, .combo = BLOOM_HALF },
+        .{ .player_id = 1, .combo = BLOOM_HALF },
     };
-    const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(test_bal.units_per_slot, out.units[@intFromEnum(c.Element.yellow)]);
+    // Player 1 closed the circuit, so player 1 aims it...
+    const p1 = match_recipes(test_bal, &casts, 1, null);
+    try std.testing.expectEqual(@as(u8, 1), p1.stamps()[0].anchor_player);
+
+    // ...and player 0 aims it when they were the one to complete the group.
+    const p0 = match_recipes(test_bal, &casts, 0, null);
+    try std.testing.expectEqual(@as(u8, 0), p0.stamps()[0].anchor_player);
 }
 
-/// twin_flames (fixtures.team_recipes[0]) output, red channel — tests derive
-/// expectations from the fixture table.
-const twin_flames_units = fixtures.team_recipes[0].output.units[@intFromEnum(c.Element.red)];
-const twin_flames_med = fixtures.team_recipes[0].output.medicine[@intFromEnum(c.Element.red)];
-
-test "match_recipes: team recipe consumes both casts exactly once" {
-    // twin_flames: 2 × [red, dispense, dispense] → one recipe output, once.
-    const pat = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
+test "match_recipes: team shape falls back to the first contributor" {
     const casts = [_]Cast{
-        .{ .player_id = 0, .combo = pat },
-        .{ .player_id = 1, .combo = pat },
+        .{ .player_id = 2, .combo = BLOOM_HALF },
+        .{ .player_id = 5, .combo = BLOOM_HALF },
     };
-    const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(twin_flames_units, out.units[@intFromEnum(c.Element.red)]);
-    try std.testing.expectEqual(twin_flames_med, out.medicine[@intFromEnum(c.Element.red)]);
+    // No joiner (pure buffer expiry): the first contributor aims it.
+    const none = match_recipes(test_bal, &casts, null, null);
+    try std.testing.expectEqual(@as(u8, 2), none.stamps()[0].anchor_player);
+
+    // A joiner who is not in this instance cannot aim it either.
+    const outsider = match_recipes(test_bal, &casts, 7, null);
+    try std.testing.expectEqual(@as(u8, 2), outsider.stamps()[0].anchor_player);
+}
+
+test "match_recipes: an asymmetric team recipe matches either cast order" {
+    const forward = [_]Cast{
+        .{ .player_id = 0, .combo = CROSSFIRE_A },
+        .{ .player_id = 1, .combo = CROSSFIRE_B },
+    };
+    const backward = [_]Cast{
+        .{ .player_id = 0, .combo = CROSSFIRE_B },
+        .{ .player_id = 1, .combo = CROSSFIRE_A },
+    };
+    try std.testing.expectEqual(@as(usize, 1), match_recipes(test_bal, &forward, null, null).shape_count);
+    try std.testing.expectEqual(@as(usize, 1), match_recipes(test_bal, &backward, null, null).shape_count);
 }
 
 test "match_recipes: team recipe fires twice for two disjoint pairs" {
-    const pat = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
     const casts = [_]Cast{
-        .{ .player_id = 0, .combo = pat },
-        .{ .player_id = 1, .combo = pat },
-        .{ .player_id = 2, .combo = pat },
-        .{ .player_id = 3, .combo = pat },
+        .{ .player_id = 0, .combo = BLOOM_HALF },
+        .{ .player_id = 1, .combo = BLOOM_HALF },
+        .{ .player_id = 2, .combo = BLOOM_HALF },
+        .{ .player_id = 3, .combo = BLOOM_HALF },
     };
-    const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(2 * twin_flames_units, out.units[@intFromEnum(c.Element.red)]);
-    try std.testing.expectEqual(2 * twin_flames_med, out.medicine[@intFromEnum(c.Element.red)]);
+    var report = MatchReport{};
+    const out = match_recipes(test_bal, &casts, null, &report);
+    try std.testing.expectEqual(@as(usize, 2), out.shape_count);
+    try std.testing.expectEqual(@as(u16, 2), report.team_hits[0]);
+    // Medicine accrues per instance.
+    try std.testing.expectEqual(@as(u32, 8), out.medicine.medicine[tier_ix(.red)]);
 }
 
 test "match_recipes: team_instance groups each recipe instance's casts" {
-    // Two disjoint twin_flames pairs + one flat cast: instances {0,1} and
-    // {2,3} get distinct shared ids; the flat cast stays unassigned.
-    const pat = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
     const casts = [_]Cast{
-        .{ .player_id = 0, .combo = pat },
-        .{ .player_id = 1, .combo = pat },
-        .{ .player_id = 2, .combo = pat },
-        .{ .player_id = 3, .combo = pat },
-        .{ .player_id = 4, .combo = mk(&.{ .{ .element = .blue }, .{ .action = .dispense } }) },
+        .{ .player_id = 0, .combo = BLOOM_HALF },
+        .{ .player_id = 1, .combo = BLOOM_HALF },
+        .{ .player_id = 2, .combo = BLOOM_HALF },
+        .{ .player_id = 3, .combo = BLOOM_HALF },
     };
     var report = MatchReport{};
-    _ = match_recipes(test_bal, &casts, &report);
-
+    _ = match_recipes(test_bal, &casts, null, &report);
+    // Two instances of two casts each; members share an id, instances differ.
     try std.testing.expectEqual(report.team_instance[0], report.team_instance[1]);
     try std.testing.expectEqual(report.team_instance[2], report.team_instance[3]);
     try std.testing.expect(report.team_instance[0] != report.team_instance[2]);
-    try std.testing.expect(report.team_instance[0] != NO_TEAM_INSTANCE);
-    try std.testing.expect(report.team_instance[2] != NO_TEAM_INSTANCE);
-    try std.testing.expectEqual(NO_TEAM_INSTANCE, report.team_instance[4]);
 }
 
 test "match_recipes: same player casting both halves does NOT fire team recipe" {
-    // Team recipes require distinct players; one player's two twin_flames
-    // halves fall back to flat conversion (2 × 2 × UNITS_PER_SLOT red).
-    const pat = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
+    // A team recipe is a COOPERATION requirement, not a combo length.
     const casts = [_]Cast{
-        .{ .player_id = 0, .combo = pat },
-        .{ .player_id = 0, .combo = pat },
+        .{ .player_id = 0, .combo = BLOOM_HALF },
+        .{ .player_id = 0, .combo = BLOOM_HALF },
     };
-    const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(4 * test_bal.units_per_slot, out.units[@intFromEnum(c.Element.red)]);
-    for (out.medicine) |m| try std.testing.expectEqual(@as(u32, 0), m);
+    const out = match_recipes(test_bal, &casts, null, null);
+    // No team shape fired; `[D,M]` matches no player recipe either.
+    try std.testing.expectEqual(@as(usize, 0), out.shape_count);
 }
 
-test "match_recipes: distinct-player pair still fires alongside same-player extras" {
-    // Players 0 and 1 form one twin_flames pair; player 0's second half has
-    // no distinct partner left and converts flat.
-    const pat = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
+test "match_recipes: distinct-player pair still fires alongside a duplicate" {
     const casts = [_]Cast{
-        .{ .player_id = 0, .combo = pat },
-        .{ .player_id = 0, .combo = pat },
-        .{ .player_id = 1, .combo = pat },
+        .{ .player_id = 0, .combo = BLOOM_HALF },
+        .{ .player_id = 0, .combo = BLOOM_HALF },
+        .{ .player_id = 1, .combo = BLOOM_HALF },
     };
-    const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(twin_flames_units + 2 * test_bal.units_per_slot, out.units[@intFromEnum(c.Element.red)]);
-    try std.testing.expectEqual(twin_flames_med, out.medicine[@intFromEnum(c.Element.red)]);
+    var report = MatchReport{};
+    const out = match_recipes(test_bal, &casts, null, &report);
+    // Exactly one pair can be formed across distinct players.
+    try std.testing.expectEqual(@as(usize, 1), out.shape_count);
+    try std.testing.expectEqual(@as(u16, 1), report.team_hits[0]);
 }
 
-test "match_recipes: lone half of a team recipe falls back to flat" {
-    // One [red, dispense, dispense] alone: no team match, no player recipe
-    // (crimson_flood needs 3 dispenses) → flat 2 × UNITS_PER_SLOT.
-    const casts = [_]Cast{
-        .{ .player_id = 0, .combo = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } }) },
-    };
-    const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(2 * test_bal.units_per_slot, out.units[@intFromEnum(c.Element.red)]);
-    for (out.medicine) |m| try std.testing.expectEqual(@as(u32, 0), m);
+test "match_recipes: a lone half of a team recipe does nothing" {
+    const casts = [_]Cast{.{ .player_id = 0, .combo = BLOOM_HALF }};
+    const out = match_recipes(test_bal, &casts, null, null);
+    try std.testing.expectEqual(@as(usize, 0), out.shape_count);
 }
 
-test "match_recipes: mixed — team pair + independent flat combo" {
-    const pat = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
-    const flat = mk(&.{ .{ .element = .blue }, .{ .action = .dispense } });
+test "match_recipes: team pair plus an independent player recipe" {
     const casts = [_]Cast{
-        .{ .player_id = 0, .combo = pat },
-        .{ .player_id = 1, .combo = flat },
-        .{ .player_id = 2, .combo = pat },
+        .{ .player_id = 0, .combo = BLOOM_HALF },
+        .{ .player_id = 1, .combo = BLOOM_HALF },
+        .{ .player_id = 2, .combo = POKE },
     };
-    const out = match_recipes(test_bal, &casts, null);
-    try std.testing.expectEqual(twin_flames_units, out.units[@intFromEnum(c.Element.red)]);
-    try std.testing.expectEqual(test_bal.units_per_slot, out.units[@intFromEnum(c.Element.blue)]);
+    const out = match_recipes(test_bal, &casts, 1, null);
+    try std.testing.expectEqual(@as(usize, 2), out.shape_count);
+    // Team shape first (table order), then the player recipe.
+    try std.testing.expect(out.stamps()[0].is_team);
+    try std.testing.expectEqual(@as(u8, 1), out.stamps()[0].anchor_player);
+    try std.testing.expect(!out.stamps()[1].is_team);
+    try std.testing.expectEqual(@as(u8, 2), out.stamps()[1].anchor_player);
+    try std.testing.expectEqual(@as(usize, 1), out.stamps()[1].shape.size());
 }
 
-test "apply_medicine: capped by matching-color healable portion" {
+test "match_recipes: every cast in a batch gets its own anchor" {
+    const casts = [_]Cast{
+        .{ .player_id = 4, .combo = POKE },
+        .{ .player_id = 7, .combo = SWEEP },
+    };
+    const out = match_recipes(test_bal, &casts, null, null);
+    try std.testing.expectEqual(@as(usize, 2), out.shape_count);
+    try std.testing.expectEqual(@as(u8, 4), out.stamps()[0].anchor_player);
+    try std.testing.expectEqual(@as(u8, 7), out.stamps()[1].anchor_player);
+}
+
+test "match_recipes: report records fire counts and per-cast consumption" {
+    const casts = [_]Cast{
+        .{ .player_id = 0, .combo = BLOCK },
+        .{ .player_id = 1, .combo = mk(&.{ M, D, M, D, M }) }, // matches nothing
+    };
+    var report = MatchReport{};
+    _ = match_recipes(test_bal, &casts, null, &report);
+    // `block` is index 2 in the fixture player table.
+    try std.testing.expectEqual(@as(u16, 1), report.player_hits[2]);
+    try std.testing.expectEqual(ConsumedBy.player_recipe, report.consumed[0]);
+    try std.testing.expectEqual(ConsumedBy.none, report.consumed[1]);
+    try std.testing.expectEqual(NO_TEAM_INSTANCE, report.team_instance[0]);
+}
+
+test "combo_has_output: a combo naming no recipe fizzles" {
+    try std.testing.expect(!combo_has_output(test_bal, mk(&.{ M, D, M, D, M })));
+    try std.testing.expect(!combo_has_output(test_bal, mk(&.{ M, M, M, M })));
+}
+
+test "combo_has_output: player and team patterns both count" {
+    try std.testing.expect(combo_has_output(test_bal, BLOCK));
+    try std.testing.expect(combo_has_output(test_bal, TONIC));
+    // A team half commits: the partner may still complete it this window.
+    try std.testing.expect(combo_has_output(test_bal, BLOOM_HALF));
+    try std.testing.expect(combo_has_output(test_bal, CROSSFIRE_B));
+}
+
+test "apply_medicine: capped by the matching tier's healable portion" {
     var hunger = c.Health{ .current = 50, .max = 100 };
-    var healable = [_]u16{0} ** c.Element.size;
-    healable[@intFromEnum(c.Element.red)] = 10;
-    var pools = [_]u32{0} ** c.Element.size;
-    pools[@intFromEnum(c.Element.red)] = 25;
+    var healable = [_]u16{0} ** c.Tier.size;
+    healable[tier_ix(.red)] = 8;
+
+    var pools = [_]u32{0} ** c.Tier.size;
+    pools[tier_ix(.red)] = 20;
     const healed = apply_medicine(&hunger, &healable, pools);
-    try std.testing.expectEqual(@as(u16, 10), healed[@intFromEnum(c.Element.red)]);
-    try std.testing.expectEqual(@as(u32, 10), sum_u16(healed));
-    try std.testing.expectEqual(@as(u16, 40), hunger.current);
-    try std.testing.expectEqual(@as(u16, 0), healable[@intFromEnum(c.Element.red)]);
+
+    // Only the 8 healable points were red's doing; the other 12 are wasted.
+    try std.testing.expectEqual(@as(u16, 8), healed[tier_ix(.red)]);
+    try std.testing.expectEqual(@as(u16, 42), hunger.current);
+    try std.testing.expectEqual(@as(u16, 0), healable[tier_ix(.red)]);
 }
 
 test "apply_medicine: asymmetric medicine heals nothing" {
-    // Blue medicine vs red healable hunger: no effect.
+    // Green medicine cannot undo what red slime did.
     var hunger = c.Health{ .current = 50, .max = 100 };
-    var healable = [_]u16{0} ** c.Element.size;
-    healable[@intFromEnum(c.Element.red)] = 20;
-    var pools = [_]u32{0} ** c.Element.size;
-    pools[@intFromEnum(c.Element.blue)] = 99;
+    var healable = [_]u16{0} ** c.Tier.size;
+    healable[tier_ix(.red)] = 10;
+
+    var pools = [_]u32{0} ** c.Tier.size;
+    pools[tier_ix(.green)] = 30;
     const healed = apply_medicine(&hunger, &healable, pools);
+
     try std.testing.expectEqual(@as(u32, 0), sum_u16(healed));
     try std.testing.expectEqual(@as(u16, 50), hunger.current);
-    try std.testing.expectEqual(@as(u16, 20), healable[@intFromEnum(c.Element.red)]);
+    try std.testing.expectEqual(@as(u16, 10), healable[tier_ix(.red)]);
 }
 
-test "apply_medicine: multiple colors heal independently" {
-    var hunger = c.Health{ .current = 50, .max = 100 };
-    var healable = [_]u16{ 10, 0, 4, 8 };
-    const pools = [_]u32{ 3, 99, 99, 8 };
+test "apply_medicine: tiers heal independently" {
+    var hunger = c.Health{ .current = 30, .max = 100 };
+    var healable = [_]u16{0} ** c.Tier.size;
+    healable[tier_ix(.red)] = 5;
+    healable[tier_ix(.yellow)] = 7;
+    healable[tier_ix(.green)] = 2;
+
+    var pools = [_]u32{0} ** c.Tier.size;
+    pools[tier_ix(.red)] = 5;
+    pools[tier_ix(.yellow)] = 3;
     const healed = apply_medicine(&hunger, &healable, pools);
-    // red 3 + green 0 + yellow 4 + blue 8 = 15.
-    try std.testing.expectEqual(@as(u32, 15), sum_u16(healed));
-    try std.testing.expectEqual(@as(u16, 3), healed[0]);
-    try std.testing.expectEqual(@as(u16, 8), healed[3]);
-    try std.testing.expectEqual(@as(u16, 35), hunger.current);
-    try std.testing.expectEqual(@as(u16, 7), healable[0]);
-    try std.testing.expectEqual(@as(u16, 0), healable[2]);
-    try std.testing.expectEqual(@as(u16, 0), healable[3]);
+
+    try std.testing.expectEqual(@as(u16, 5), healed[tier_ix(.red)]);
+    try std.testing.expectEqual(@as(u16, 3), healed[tier_ix(.yellow)]);
+    try std.testing.expectEqual(@as(u16, 0), healed[tier_ix(.green)]);
+    try std.testing.expectEqual(@as(u16, 22), hunger.current);
+    // Yellow keeps the 4 points the pool could not reach.
+    try std.testing.expectEqual(@as(u16, 4), healable[tier_ix(.yellow)]);
 }
 
 test "apply_medicine: capped by current hunger" {
     var hunger = c.Health{ .current = 3, .max = 100 };
-    var healable = [_]u16{0} ** c.Element.size;
-    healable[@intFromEnum(c.Element.red)] = 50;
-    var pools = [_]u32{0} ** c.Element.size;
-    pools[@intFromEnum(c.Element.red)] = 25;
+    var healable = [_]u16{0} ** c.Tier.size;
+    healable[tier_ix(.red)] = 50;
+
+    var pools = [_]u32{0} ** c.Tier.size;
+    pools[tier_ix(.red)] = 50;
     const healed = apply_medicine(&hunger, &healable, pools);
-    try std.testing.expectEqual(@as(u32, 3), sum_u16(healed));
+
+    try std.testing.expectEqual(@as(u16, 3), healed[tier_ix(.red)]);
     try std.testing.expectEqual(@as(u16, 0), hunger.current);
-    try std.testing.expectEqual(@as(u16, 47), healable[@intFromEnum(c.Element.red)]);
 }
 
-test "apply_medicine: zero healable — neutral consumption not healable" {
-    var hunger = c.Health{ .current = 80, .max = 100 };
-    var healable = [_]u16{0} ** c.Element.size;
-    const pools = [_]u32{99} ** c.Element.size;
+test "apply_medicine: zero healable — eating clean slime is not healable" {
+    var hunger = c.Health{ .current = 40, .max = 100 };
+    var healable = [_]u16{0} ** c.Tier.size;
+    var pools = [_]u32{0} ** c.Tier.size;
+    pools[tier_ix(.red)] = 25;
     const healed = apply_medicine(&hunger, &healable, pools);
     try std.testing.expectEqual(@as(u32, 0), sum_u16(healed));
-    try std.testing.expectEqual(@as(u16, 80), hunger.current);
+    try std.testing.expectEqual(@as(u16, 40), hunger.current);
 }
 
 test "add_hunger: clamps at max" {
-    var hunger = c.Health{ .current = 190, .max = 200 };
-    add_hunger(&hunger, 50);
-    try std.testing.expectEqual(@as(u16, 200), hunger.current);
+    var hunger = c.Health{ .current = 95, .max = 100 };
+    add_hunger(&hunger, 3);
+    try std.testing.expectEqual(@as(u16, 98), hunger.current);
+    try std.testing.expect(!hunger_full(hunger));
+    add_hunger(&hunger, 999);
+    try std.testing.expectEqual(@as(u16, 100), hunger.current);
     try std.testing.expect(hunger_full(hunger));
-}
-
-test "match_recipes: report records fire counts and per-cast consumption" {
-    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
-    const flood = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } });
-    const plain = mk(&.{ .{ .element = .blue }, .{ .action = .dispense } });
-    const casts = [_]Cast{
-        .{ .player_id = 0, .combo = half }, // team pair w/ p1
-        .{ .player_id = 1, .combo = half },
-        .{ .player_id = 2, .combo = flood }, // crimson_flood (player recipe 0)
-        .{ .player_id = 3, .combo = plain }, // flat
-    };
-    var report = MatchReport{};
-    _ = match_recipes(test_bal, &casts, &report);
-
-    try std.testing.expectEqual(@as(u16, 1), report.team_hits[0]); // twin_flames
-    try std.testing.expectEqual(@as(u16, 1), report.player_hits[0]); // crimson_flood
-    try std.testing.expectEqual(ConsumedBy.team_recipe, report.consumed[0]);
-    try std.testing.expectEqual(ConsumedBy.team_recipe, report.consumed[1]);
-    try std.testing.expectEqual(ConsumedBy.player_recipe, report.consumed[2]);
-    try std.testing.expectEqual(ConsumedBy.none, report.consumed[3]);
-}
-
-test "combo_has_output: dangling element token fizzles" {
-    try std.testing.expect(!combo_has_output(test_bal, mk(&.{.{ .element = .red }})));
-}
-
-test "combo_has_output: colorless actions fizzle" {
-    try std.testing.expect(!combo_has_output(test_bal, mk(&.{
-        .{ .action = .dispense },
-        .{ .action = .medicine },
-    })));
-}
-
-test "combo_has_output: colored dispense has output" {
-    try std.testing.expect(combo_has_output(test_bal, mk(&.{
-        .{ .element = .red },
-        .{ .action = .dispense },
-    })));
-}
-
-test "combo_has_output: recipe patterns have output" {
-    // twin_flames half (team pattern) and panacea (player recipe).
-    try std.testing.expect(combo_has_output(test_bal, mk(&.{
-        .{ .element = .red },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-    })));
-    try std.testing.expect(combo_has_output(test_bal, mk(&.{
-        .{ .element = .blue },
-        .{ .action = .medicine },
-        .{ .action = .medicine },
-    })));
 }

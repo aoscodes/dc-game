@@ -181,6 +181,12 @@ fn send_submit_spell(combo: *const inp.ComboBuffer) void {
     emit_send(fbs.getWritten());
 }
 
+fn send_move_cursor(dir: proto.CursorDir) void {
+    var fbs = std.io.fixedBufferStream(&g_state.send_buf);
+    proto.encode(fbs.writer(), .move_cursor, proto.MoveCursor{ .dir = dir }) catch return;
+    emit_send(fbs.getWritten());
+}
+
 fn send_cancel_combo() void {
     var fbs = std.io.fixedBufferStream(&g_state.send_buf);
     proto.encode(fbs.writer(), .cancel_combo, {}) catch return;
@@ -291,13 +297,13 @@ fn process_recv() void {
                     g_state.game.recipe_count += 1;
                 }
             },
-            .agents_dispensed => {
-                const p = proto.decode_agents_dispensed(r) catch continue;
+            .shape_cast => {
+                const p = proto.decode_shape_cast(r) catch continue;
                 // Record for the renderer (transient, drained per frame).
                 const gs = &g_state.game;
-                if (gs.agents_dispensed_count < gs.agents_dispensed.len) {
-                    gs.agents_dispensed[gs.agents_dispensed_count] = p;
-                    gs.agents_dispensed_count += 1;
+                if (gs.shape_cast_count < gs.shape_casts.len) {
+                    gs.shape_casts[gs.shape_cast_count] = p;
+                    gs.shape_cast_count += 1;
                 }
             },
             .cast_grouped => {
@@ -346,8 +352,11 @@ fn update_lobby() void {
 
 fn update_game() void {
     const gs = &g_state.game;
-    const result = inp.drain_into_combo(&g_key_queue, &gs.pending_combo);
-    switch (result) {
+    const drained = inp.drain(&g_key_queue, &gs.pending_combo);
+    // Aim first: a step pressed before a submit must reach the server before
+    // the cast it was aiming, or the shape lands at the stale cursor.
+    for (drained.cursor_steps()) |dir| send_move_cursor(dir);
+    switch (drained.combo) {
         .unchanged => {},
         .appended => send_combo(&gs.pending_combo),
         .cancelled => {

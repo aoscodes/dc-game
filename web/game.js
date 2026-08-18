@@ -28,31 +28,49 @@ const LAYOUT = {
     tileGap: 0.18,      // inset per side as a fraction of the cell: large, so
     // units read as discrete candies rather than a contiguous mass
     tileRadius: 0.28,   // body corner radius as a fraction of the body size
-    symbolAlpha: 0.42,  // element glyph opacity stamped on the body
+    symbolAlpha: 0.55,  // tier glyph opacity stamped on the body
     // Per-cell animation durations (seconds) and idle wobble.
     dropS: 0.15,        // refill slide-in from above
     popS: 0.22,         // eaten-tile burst
-    flashS: 0.25,       // neutralized white bloom
-    dissolveS: 0.3,     // agent-destroyed tile: shrink + fade in place
+    flashS: 0.25,       // downgraded-tile white bloom
     bobAmp: 0.02,       // idle breathing: ±fraction of tile size
     bobFreq: 1.6,       // idle breathing rate (rad/s)
 
-    // --- Transmute cohort highlight (see cohortHighlight) -----------------
+    // --- Aim cursor + projected shape footprint (see shapePreview) --------
     //
-    // Drawn at the SOCKET edge, outside the tile body, so it can never be
-    // read as the static inner ring that marks an already-neutralized unit.
-    cohortWidth: 2.5,     // outline stroke width (design px)
-    cohortPulseHz: 2.4,   // pulse rate
-    cohortAlphaMin: 0.35, // pulse trough
-    cohortAlphaMax: 0.95, // pulse crest
+    // Both are drawn at the SOCKET edge, outside the tile body, so neither can
+    // be read as part of a tile's own art.
+    cursorWidth: 3,       // the local player's cursor: thick, unmissable
+    cursorMateWidth: 2,   // teammates' cursors: present but subordinate
+    cursorCornerFrac: 0.3, // crosshair arm length, as a fraction of the cell
+    previewWidth: 3.5,    // projected-footprint outline stroke width
+    previewPulseHz: 2.4,  // pulse rate
+    previewAlphaMin: 0.35,// pulse trough
+    previewAlphaMax: 0.95,// pulse crest
+    // Under-socket tint on a covered cell, and the wash laid OVER its tile.
+    // Both are drawn in the color the cell will BECOME, so a committed cast
+    // reads as an outcome rather than as a generic highlight.
+    previewFillAlpha: 0.16,
+    previewWashAlpha: 0.3, // scaled by the pulse, so the wash breathes too
+
+    // --- Candidate ghosts (see candidateShapes) ---------------------------
+    //
+    // Deliberately quieter than the committed preview and drawn UNDER it:
+    // ghosts are "this is where it would land IF you keep typing", and must
+    // never be mistaken for the cast that is actually about to fire.  Neutral
+    // (not outcome-colored) for the same reason.
+    ghostWidth: 1,
+    ghostAlpha: 0.22,      // per covering candidate — overlap is ADDITIVE, so
+    ghostAlphaCap: 0.66,   // cells several candidates share read strongest
+    ghostFillAlpha: 0.05,  // ditto, also scaled by the overlap count
   },
 
   hungerBar: {
     x0: 40, x1: 984, y: 150, h: 18,
     labelFont: 14, labelDy: -8,
     bg: "rgba(30,10,10,0.78)",
-    // Grey, matching neutral/neutralized slime: this portion is not healable,
-    // and element colors are reserved for the healable segments.
+    // Grey, matching neutral/defused slime: this portion is not healable,
+    // and tier colors are reserved for the healable segments.
     fill: "rgba(150,150,162,0.9)",
     dangerBorder: "rgba(255,60,60,0.95)",
     textFont: 13,
@@ -71,14 +89,19 @@ const LAYOUT = {
   lilGuys: { size: 48, speed: 220, snap: 3 },
 
   actionMenu: {
-    w: 340, h: 108, marginBottom: 128,
+    w: 340, h: 126, marginBottom: 128,
     padX: 10, padTopY: 14,
     actionRowDy: 16, actionFont: 16, actionCols: [0, 150],
-    elementRowDy: 34, elementFont: 13, elementCols: [0, 80, 160, 240],
+    aimRowDy: 34, aimFont: 13,
     cancelRowDy: 48, cancelFont: 12,
     castBarDy: 56, castBarH: 16,
     timerTextDy: 86, timerTextFont: 13,
     previewDy: 102, previewFont: 13,
+    candidateDy: 120, candidateFont: 12,
+    // Cap the candidate hint: the panel is a fixed width, and a config may
+    // author far more recipes than share a prefix legibly.  Overflow is
+    // summarised as "+N more" rather than clipped.
+    candidateMax: 3,
   },
 
   // Default floater lifetime ≥ 3s so feedback is readable; cosmetic chomps
@@ -111,7 +134,7 @@ const LAYOUT = {
     feastY: 150,
     // Match-wide feast tallies (one row per measure, label + colored cells).
     fcols: { label: 40, cells: 260 },
-    pcols: { name: 40, casts: 200, dispense: 260, medicine: 460, recipes: 660, fizzles: 790 },
+    pcols: { name: 40, casts: 190, covered: 250, defused: 420, recipes: 590, fizzles: 760 },
     hintFont: 14,
   },
 };
@@ -128,10 +151,10 @@ const C_SLIME_HDR = "rgba(160,255,140,1)";
 const C_OWN_ROW = "rgba(255,255,60,0.9)";
 const C_MENU_BG = "rgba(20,20,40,0.86)";
 const C_MENU_BORDER = C_HEADER;
-/** Warning red: wasted agents, and a projected color with no cohort to hit. */
+/** Warning red: a stamp aimed off the grid or at cells with nothing to hit. */
 const C_BAD = "rgba(255,110,110,1)";
-/** Muted tint for the "wasted" tail of a dispense floater — present but not
- *  competing with the transmute count that actually accomplished something. */
+/** Muted tint for the wasted tail of a stamp floater — present but not
+ *  competing with the count that actually accomplished something. */
 const C_MUTED = "rgba(190,150,150,0.85)";
 
 /** Sprite used for the cosmetic Lil Guys roaming the slime field. */
@@ -161,11 +184,36 @@ async function loadAssets() {
   ]);
 }
 
-/** Combo slot from its data-file name: actions vs element modifiers. */
+/**
+ * Combo slot from its data-file name.  Combos are ACTION KEYS ONLY — a recipe
+ * is identified by the sequence of keys pressed, and what it does is carried by
+ * its shape, not by any color token in the pattern.
+ */
 function slotFromName(name) {
-  return (name === "dispense" || name === "medicine")
-    ? { action: name }
-    : { element: name };
+  return { action: name };
+}
+
+/**
+ * Parse an authored shape (rows of "#" / ".") into anchor-relative offsets.
+ * MIRRORS config.shape_from_rows: the anchor is the bounding box centre
+ * (`len / 2`, floored), so offsets reach up and left of it.  Both sides derive
+ * offsets from the same data file with the same rule, so a preview covers
+ * exactly the cells the server will stamp.
+ *
+ * @param {string[]} rows
+ * @returns {Array<{dRow: number, dCol: number}>}
+ */
+function shapeOffsets(rows) {
+  const anchorR = Math.floor(rows.length / 2);
+  const anchorC = Math.floor((rows[0]?.length ?? 0) / 2);
+  const offsets = [];
+  rows.forEach((line, r) => {
+    for (let cl = 0; cl < line.length; cl++) {
+      if (line[cl] !== "#") continue;
+      offsets.push({ dRow: r - anchorR, dCol: cl - anchorC });
+    }
+  });
+  return offsets;
 }
 
 /**
@@ -193,20 +241,21 @@ async function loadBalanceData(hash = PAGE_CONFIG_HASH) {
   const res = await fetch(balanceUrl(hash));
   if (!res.ok) throw new Error(`fetch ${balanceUrl(hash)}: HTTP ${res.status}`);
   const bal = await res.json();
-  const output = (o) => ({ units: o.units ?? {}, medicine: o.medicine ?? {} });
-  UNITS_PER_SLOT = bal.units_per_slot;
-  MEDICINE_PER_SLOT = bal.medicine_per_slot;
   CAST_BUFFER_MS = bal.cast_buffer_ms ?? 500;
   CAST_LOCK_MS = bal.cast_lock_ms ?? 500;
   PLAYER_RECIPES = bal.player_recipes.map((r) => ({
     label: r.label,
     pattern: r.pattern.map(slotFromName),
-    output: output(r.output),
+    rows: r.shape,
+    offsets: shapeOffsets(r.shape),
+    medicine: r.medicine ?? {},
   }));
   TEAM_RECIPES = bal.team_recipes.map((r) => ({
     label: r.label,
     patterns: r.patterns.map((p) => p.map(slotFromName)),
-    output: output(r.output),
+    rows: r.shape,
+    offsets: shapeOffsets(r.shape),
+    medicine: r.medicine ?? {},
   }));
   loadedConfigHash = hash;
 }
@@ -284,7 +333,7 @@ function clearEntityState() {
   prevGrid = [];
   cellAnim.clear();
   bittenThisFrame.clear();
-  dispensedColorsThisFrame.clear();
+  stampedThisFrame.clear();
   lastTransientGame = null;
 }
 
@@ -403,18 +452,11 @@ function drawLobby(lobby) {
   drawRecipeGuide();
 }
 
-/** Key bindings per element / action — mirrors src/client/input.zig. */
-const ELEMENT_KEY = { red: "Q", green: "W", yellow: "E", blue: "R" };
+/** Key binding per action — mirrors src/client/input.zig. */
 const ACTION_KEY = { dispense: "1", medicine: "2" };
 
-/** Render one combo slot as key+symbol (e.g. "Q♦", "1d") in its parity color. */
+/** Render one combo slot as key+symbol (e.g. "1d") in its action color. */
 function slotKeySymbol(slot) {
-  if (slot.element !== undefined) {
-    return {
-      str: `${ELEMENT_KEY[slot.element] ?? "?"}${ELEMENT_CHAR[slot.element] ?? "?"}`,
-      color: ELEMENT_COLOR[slot.element] ?? C_TEXT,
-    };
-  }
   return {
     str: `${ACTION_KEY[slot.action] ?? "?"}${ACTION_CHAR[slot.action] ?? "?"}`,
     color: ACTION_COLOR[slot.action] ?? C_TEXT,
@@ -433,18 +475,45 @@ function drawParts(x, y, font, parts, gap) {
   return dx;
 }
 
-/** Colored output parts for a recipe's AgentOutput ({units, medicine} maps). */
-function outputParts(output) {
+/** Colored parts for a recipe's medicine output (per healable tier). */
+function medicineParts(medicine) {
   const parts = [];
-  for (const name of ELEMENT_NAMES) {
-    const n = output.units?.[name];
-    if (n) parts.push({ str: `${ELEMENT_CHAR[name]}${n}`, color: ELEMENT_COLOR[name] });
-  }
-  for (const name of ELEMENT_NAMES) {
-    const n = output.medicine?.[name];
-    if (n) parts.push({ str: `med${ELEMENT_CHAR[name]}${n}`, color: ELEMENT_COLOR[name] });
+  for (const name of TIER_NAMES) {
+    const n = medicine?.[name];
+    if (n) parts.push({ str: `med${TIER_CHAR[name]}${n}`, color: TIER_COLOR[name] });
   }
   return parts;
+}
+
+/**
+ * Draw a recipe's shape as a small glyph grid ("###" / ".#."), with the anchor
+ * cell marked — that is the cell you aim at, and every other cell is placed
+ * relative to it.
+ *
+ * @returns {number} x after the drawn glyph.
+ */
+function drawShapeGlyph(x, y, font, rows) {
+  const G = LAYOUT.lobby;
+  const anchorR = Math.floor(rows.length / 2);
+  const anchorC = Math.floor((rows[0]?.length ?? 0) / 2);
+  ctx.font = `${font}px monospace`;
+  const cw = ctx.measureText("#").width;
+  const ch = font * 0.82;
+  // Top-align the block on the row baseline so tall shapes grow downward and
+  // never collide with the row above.
+  const y0 = y - ch * anchorR;
+  rows.forEach((line, r) => {
+    for (let cl = 0; cl < line.length; cl++) {
+      const on = line[cl] === "#";
+      const isAnchor = r === anchorR && cl === anchorC;
+      const glyph = on ? (isAnchor ? "◉" : "■") : "·";
+      const color = on
+        ? (isAnchor ? C_OWN_ROW : SHAPE_COLOR)
+        : "rgba(110,110,130,0.5)";
+      text(glyph, x + cl * cw, y0 + r * ch, font, color);
+    }
+  });
+  return x + (rows[0]?.length ?? 0) * cw;
 }
 
 /**
@@ -470,21 +539,24 @@ function drawRecipeGuide() {
   ];
   const descLines = [
     [
-      { str: "Pick an agent color —", color: descColor },
-      { str: "Q♦", color: ELEMENT_COLOR.red },
-      { str: "W▲", color: ELEMENT_COLOR.green },
-      { str: "E≋", color: ELEMENT_COLOR.yellow },
-      { str: "R~", color: ELEMENT_COLOR.blue },
-      { str: "— then actions:", color: descColor },
+      { str: "AIM with the arrow keys, then type a combo:", color: descColor },
       { str: "1d dispense", color: ACTION_COLOR.dispense },
       { str: "2m medicine", color: ACTION_COLOR.medicine },
     ],
     [
-      { str: "Dispensed agents neutralize matching-color slime ON THE GRID;", color: ACTION_COLOR.dispense },
-      { str: "medicine heals matching-color hunger.", color: ACTION_COLOR.medicine },
+      { str: "Each combo below stamps its SHAPE on the grid, centred on your cursor.", color: descColor },
     ],
     [
-      { str: "Agents are split across the cells of that color — extras are wasted, so time your casts.", color: descColor },
+      { str: "Every covered cell steps down one tier:", color: descColor },
+      { str: `${TIER_CHAR.red}red`, color: TIER_COLOR.red },
+      { str: "→", color: descColor },
+      { str: `${TIER_CHAR.yellow}yellow`, color: TIER_COLOR.yellow },
+      { str: "→", color: descColor },
+      { str: `${TIER_CHAR.green}green`, color: TIER_COLOR.green },
+      { str: "→ defused (harmless to eat).", color: descColor },
+    ],
+    [
+      { str: "Aim is captured when you press ENTER — re-aiming will not move a cast already in flight.", color: descColor },
     ],
     castingLine,
   ];
@@ -497,8 +569,8 @@ function drawRecipeGuide() {
   text("RECIPES", L.guideX, y, L.guideFont + 2, C_HEADER);
   y += L.guideLineH;
 
-  const drawRecipeRow = (label, labelColor, patterns, output, suffix) => {
-    text(label, L.guideX, y, L.recipeFont, labelColor);
+  const drawRecipeRow = (r, labelColor, patterns, suffix) => {
+    text(r.label, L.guideX, y, L.recipeFont, labelColor);
     let x = L.guideX + L.recipeLabelW;
     patterns.forEach((pattern, pi) => {
       if (pi > 0) {
@@ -510,16 +582,19 @@ function drawRecipeGuide() {
     });
     text("→", x, y, L.recipeFont, descColor);
     x += L.recipeArrowGap;
-    x = drawParts(x, y, L.recipeFont, outputParts(output), L.recipeSlotGap);
+    x = drawShapeGlyph(x, y, L.recipeFont, r.rows ?? ["#"]) + L.recipeSlotGap;
+    x = drawParts(x, y, L.recipeFont, medicineParts(r.medicine), L.recipeSlotGap);
     if (suffix) text(suffix, x + 4, y, L.guideFont, RECIPE_COLOR_TEAM);
-    y += L.recipeRowH;
+    // Tall shapes render below the baseline, so advance past the whole block.
+    const shapeH = (r.rows?.length ?? 1) * L.recipeFont * 0.82;
+    y += Math.max(L.recipeRowH, shapeH + 4);
   };
 
   for (const r of PLAYER_RECIPES) {
-    drawRecipeRow(r.label, RECIPE_COLOR_PLAYER, [r.pattern], r.output, null);
+    drawRecipeRow(r, RECIPE_COLOR_PLAYER, [r.pattern], null);
   }
   for (const r of TEAM_RECIPES) {
-    drawRecipeRow(r.label, RECIPE_COLOR_TEAM, r.patterns, r.output, `(team ×${r.patterns.length})`);
+    drawRecipeRow(r, RECIPE_COLOR_TEAM, r.patterns, `(team ×${r.patterns.length})`);
   }
 }
 
@@ -626,32 +701,43 @@ function spawnRecipeFloaters(game) {
 }
 
 /**
- * Dispense-outcome floaters (`game.agents_dispensed`, transient): what a cast's
- * agents actually accomplished, one label per color per converted batch.
+ * Stamp-outcome floaters (`game.shape_casts`, transient): what each landed
+ * shape actually accomplished, floated over the cells it covered.
  *
- * Also records which colors fired, so updateGridAnims can tell a cell that was
- * DESTROYED by the transmutation from one that was merely refilled.  That set
- * is consumed and cleared by updateGridAnims on the same frame.
+ * Also records every covered cell, so updateGridAnims can tell a cell a stamp
+ * DOWNGRADED from one that was merely refilled.  That set is consumed and
+ * cleared by updateGridAnims on the same frame.
  */
-function spawnDispenseFloaters(game) {
-  const events = game.agents_dispensed ?? [];
+function spawnStampFloaters(game) {
+  const events = game.shape_casts ?? [];
   if (events.length === 0) return;
 
-  const { x: cx, y: cy } = fieldCenter();
+  const { rows, cols } = gridDims(game);
   const STACK = LAYOUT.floater.stack;
 
   events.forEach((ev, i) => {
-    dispensedColorsThisFrame.add(ev.color);
-    const wasted = ev.dispensed - ev.transmuted;
-    const glyph = ELEMENT_CHAR[ev.color] ?? "";
-    const head = `${glyph}${ev.dispensed} → ${ev.transmuted} transmuted`;
-    const y = cy + i * STACK;
-    spawnFloater(head, cx, y, ELEMENT_COLOR[ev.color] ?? C_TEXT,
+    for (const flat of ev.cells ?? []) stampedThisFrame.add(flat);
+
+    // Anchor the readout on the footprint itself — the whole point of aiming
+    // is that the outcome is local, so a field-centre label would hide it.
+    const at = (ev.cells ?? []).length > 0
+      ? cellCenter(ev.cells[0], rows, cols)
+      : fieldCenter();
+    const y = at.y + i * STACK;
+
+    const hits = sumTiers(ev.downgraded);
+    const head = hits > 0
+      ? `${hits} downgraded${ev.neutralized > 0 ? `, ${ev.neutralized} defused` : ""}`
+      : "no effect";
+    spawnFloater(head, at.x, y, hits > 0 ? C_SLIME_HDR : C_BAD,
       LAYOUT.floater.lifetime, LAYOUT.floater.font);
-    // Overshoot gets its own muted label: the count that matters is the one
-    // that landed, but a player tuning combo size needs to see the surplus.
+
+    // Nothing is destroyed by a stamp, so the only waste is coverage thrown
+    // away: cells clipped off the grid edge, or in-bounds cells with nothing
+    // left to downgrade.  Both are aiming feedback.
+    const wasted = (ev.off_grid ?? 0) + (ev.inert ?? 0);
     if (wasted > 0) {
-      spawnFloater(`(${wasted} wasted)`, cx, y + LAYOUT.floater.stack * 0.7,
+      spawnFloater(`(${wasted} wasted)`, at.x, y + STACK * 0.7,
         C_MUTED, LAYOUT.floater.lifetime, LAYOUT.floater.font);
     }
   });
@@ -721,9 +807,6 @@ function drawComboPanel(game) {
       if (slot && slot.action !== undefined) {
         text(ACTION_CHAR[slot.action] ?? "?", slotX, y, CP.font,
           ACTION_COLOR[slot.action] ?? C_TEXT);
-      } else if (slot && slot.element !== undefined) {
-        text(ELEMENT_CHAR[slot.element] ?? "?", slotX, y, CP.font,
-          ELEMENT_COLOR[slot.element] ?? C_TEXT);
       } else {
         text("·", slotX, y, CP.font, "rgba(120,120,140,0.5)");
       }
@@ -735,6 +818,11 @@ function drawComboPanel(game) {
     if (castS > 0) {
       text(`⌛${castS.toFixed(1)}`, usedX, y, CP.font, CAST_EVENT_COLOR);
     }
+    // Where this player is aiming.  While a cast buffers the server sends the
+    // captured ANCHOR here, so the row shows where the spell will actually
+    // land rather than where the player has since wandered.
+    text(`@${e.cursor_row ?? 0},${e.cursor_col ?? 0}`, usedX + 44, y, CP.font,
+      own ? C_OWN_ROW : "rgba(180,200,255,0.6)");
   });
 }
 
@@ -784,81 +872,60 @@ function drawFloaters() {
 // Combo parsing + recipe preview (mirrors game_logic.zig / balance.zig)
 // ---------------------------------------------------------------------------
 
-/**
- * Parse a combo's slots into elemented actions using the same rules as
- * game_logic.parse_combo on the server:
- *   - element token sets the current element (persists until next element)
- *   - action token emits { action, element } and keeps the current element
- *   - trailing element tokens are dropped
- *
- * @param {Array<{action?:string, element?:string}>} slots
- * @returns {Array<{action:string, element:string|null}>}
- */
-function parseComboSlots(slots) {
-  let currentElement = null;
-  const out = [];
-  for (const slot of slots) {
-    if (slot.element !== undefined) {
-      currentElement = slot.element;
-    } else if (slot.action !== undefined) {
-      out.push({ action: slot.action, element: currentElement });
-      // Element persists — do NOT reset here.
-    }
-  }
-  return out;
-}
+// Recipe tables are loaded from data/balance.json (loadBalanceData) — the same
+// file the Zig server reads, so there is no hand-mirrored copy to drift.  A
+// recipe's `medicine` output is per TIER: tier-X medicine heals only the
+// tier-X healable bucket (symmetrical healing).
+//
+// There is NO flat fallback: an unmatched combo fizzles.  These tables are the
+// complete move list, both here and on the server.
 
-// Flat conversion rates + recipe tables are loaded from data/balance.json
-// (loadBalanceData) — the same file the Zig server reads, so there is no
-// hand-mirrored copy to drift.  `medicine` outputs are per color: color-X
-// medicine heals only color-X healable hunger (symmetrical healing).
-let UNITS_PER_SLOT = 0;
-let MEDICINE_PER_SLOT = 0;
 /** Group-cast buffer / per-cast cooldown (ms) from balance.json. */
 let CAST_BUFFER_MS = 500;
 let CAST_LOCK_MS = 500;
-/** @type {Array<{label: string, pattern: Array<object>, output: object}>} */
+/** @typedef {{dRow: number, dCol: number}} ShapeOffset */
+/** @type {Array<{label: string, pattern: Array<object>, rows: string[],
+ *   offsets: ShapeOffset[], medicine: Object<string,number>}>} */
 let PLAYER_RECIPES = [];
-/** @type {Array<{label: string, patterns: Array<Array<object>>, output: object}>} */
+/** @type {Array<{label: string, patterns: Array<Array<object>>, rows: string[],
+ *   offsets: ShapeOffset[], medicine: Object<string,number>}>} */
 let TEAM_RECIPES = [];
 
+/** Two combos are the same move iff they are the same action-key sequence. */
 function slotsEqual(a, b) {
   if (a.length !== b.length) return false;
   for (let i = 0; i < a.length; i++) {
-    if (a[i].action !== b[i].action || a[i].element !== b[i].element) return false;
+    if (a[i].action !== b[i].action) return false;
   }
   return true;
 }
 
-/** Flat per-slot conversion (mirrors game_logic.flat_convert).
- *  Both actions are color-bound; colorless slots are wasted. */
-function flatConvert(slots) {
-  const out = { units: {}, medicine: {}, labels: [] };
-  for (const { action, element } of parseComboSlots(slots)) {
-    if (element === null) continue; // colorless actions wasted
-    if (action === "dispense") {
-      out.units[element] = (out.units[element] ?? 0) + UNITS_PER_SLOT;
-    } else if (action === "medicine") {
-      out.medicine[element] = (out.medicine[element] ?? 0) + MEDICINE_PER_SLOT;
-    }
+/**
+ * Accumulate one matched recipe into the projected batch: its shape (as a
+ * separate stamp, since each stamp lands at its own anchor) and its medicine.
+ *
+ * @param {{stamps: Array<object>, medicine: Object<string,number>,
+ *   labels: string[]}} sum
+ * @param {object} recipe   - the matched recipe (carries offsets + medicine)
+ * @param {number} anchorIndex - index into `combos` of the player whose cursor
+ *   anchors this stamp; -1 when unknown.
+ */
+function addOutput(sum, recipe, anchorIndex) {
+  sum.stamps.push({
+    offsets: recipe.offsets ?? [],
+    label: recipe.label,
+    anchorIndex,
+  });
+  for (const [t, n] of Object.entries(recipe.medicine ?? {})) {
+    sum.medicine[t] = (sum.medicine[t] ?? 0) + n;
   }
-  return out;
-}
-
-function addOutput(sum, output, label) {
-  for (const [e, n] of Object.entries(output.units ?? {})) {
-    sum.units[e] = (sum.units[e] ?? 0) + n;
-  }
-  for (const [e, n] of Object.entries(output.medicine ?? {})) {
-    sum.medicine[e] = (sum.medicine[e] ?? 0) + n;
-  }
-  if (label) sum.labels.push(label);
+  sum.labels.push(recipe.label);
 }
 
 /**
- * Convert all players' pending combos into the projected team AgentOutput.
+ * Match all players' pending combos into the projected batch of stamps.
  * Mirrors game_logic.match_recipes: team recipes (greedy, repeatable, table
- * order) → player recipes → flat fallback.
+ * order) → player recipes → unmatched combos fizzle.
  *
  * CONTRACT: `combos` holds AT MOST ONE COMBO PER PLAYER (see
  * projectedCombos).  The server additionally requires a team recipe's patterns
@@ -867,11 +934,18 @@ function addOutput(sum, output, label) {
  * below does via `picked` — enforces that rule.  Passing two combos from one
  * player would silently break parity and over-project team recipes.
  *
- * @param {Array<Array<{action?:string, element?:string}>>} combos
- * @returns {{units: Object<string,number>, medicine: number, labels: string[]}}
+ * A team stamp is anchored at the LAST JOINER's cursor (the player whose combo
+ * completed the group), falling back to the first contributor.  `lastJoiner`
+ * is the server's `session.last_joiner`, which the client cannot observe, so
+ * the projection uses the first contributor — the preview may therefore move
+ * to the true anchor once the group actually fires.
+ *
+ * @param {Array<Array<{action?:string}>>} combos
+ * @returns {{stamps: Array<{offsets: ShapeOffset[], label: string,
+ *   anchorIndex: number}>, medicine: Object<string,number>, labels: string[]}}
  */
 function matchRecipes(combos) {
-  const sum = { units: {}, medicine: {}, labels: [] };
+  const sum = { stamps: [], medicine: {}, labels: [] };
   const consumed = combos.map(() => false);
 
   for (const tr of TEAM_RECIPES) {
@@ -891,7 +965,7 @@ function matchRecipes(combos) {
       }
       if (!ok) break;
       for (const ci of picks) consumed[ci] = true;
-      addOutput(sum, tr.output, tr.label);
+      addOutput(sum, tr, picks[0] ?? -1);
     }
   }
 
@@ -899,16 +973,11 @@ function matchRecipes(combos) {
     if (consumed[ci] || combos[ci].length === 0) continue;
     for (const pr of PLAYER_RECIPES) {
       if (slotsEqual(combos[ci], pr.pattern)) {
-        addOutput(sum, pr.output, pr.label);
+        addOutput(sum, pr, ci);
         consumed[ci] = true;
         break;
       }
     }
-  }
-
-  for (let ci = 0; ci < combos.length; ci++) {
-    if (consumed[ci] || combos[ci].length === 0) continue;
-    addOutput(sum, flatConvert(combos[ci]), null);
   }
 
   return sum;
@@ -930,71 +999,134 @@ function matchRecipes(combos) {
  * rule true of the projection even if a snapshot ever carried two entities for
  * one player — otherwise a lone player typing half of a team recipe would see
  * it falsely projected as complete.
+ *
+ * Each entry carries its owner's aim, because a stamp lands at the anchoring
+ * player's cursor, not the local player's.
+ *
+ * @returns {{combos: Array<Array<object>>, aims: Array<{row: number,
+ *   col: number}>}}
  */
 function projectedCombos(game) {
   const byOwner = new Map();
   for (const e of game.entities ?? []) {
     if (byOwner.has(e.owner)) continue;
     const submitted = e.submitted ?? [];
-    byOwner.set(e.owner, submitted.length > 0 ? submitted : (e.combo ?? []));
+    byOwner.set(e.owner, {
+      combo: submitted.length > 0 ? submitted : (e.combo ?? []),
+      aim: { row: e.cursor_row ?? 0, col: e.cursor_col ?? 0 },
+    });
   }
-  return [...byOwner.values()];
+  const entries = [...byOwner.values()];
+  return {
+    combos: entries.map((v) => v.combo),
+    aims: entries.map((v) => v.aim),
+  };
 }
 
 /**
- * Per-color risk readout for the projected agents: how many of the on-grid
- * cohort they can transmute, and how many overshoot into nothing.
+ * Resolve a projected batch into the cells it would cover, with each cell's
+ * projected outcome.
  *
- * Reach is the on-grid cohort ONLY — surplus agents are wasted, never banked
- * against the off-grid reservoir — so `wasted` is the tuning signal that tells
- * a player their combo is too big for the board.
+ * Placement is EXACT, not a guess: a stamp's footprint is a pure function of
+ * (shape offsets, anchor cursor), all of which the client already has, so the
+ * preview is exactly the set of cells the server will hit.  Off-grid offsets
+ * are clipped away, matching slime.apply_shape.
  *
- * @returns {Array<{color: string, agents: number, hit: number, cohort: number,
- *   wasted: number}>} one entry per projected color, in ELEMENT_NAMES order.
+ * @returns {{cells: Map<number, string>, offGrid: number, inert: number,
+ *   hits: number, defused: number}} `cells` maps flat index → the tier name it
+ *   will become ("defused" when it bottoms out).
  */
-function cohortRisk(game) {
-  const projected = matchRecipes(projectedCombos(game));
+function shapePreview(game) {
+  const { rows, cols } = gridDims(game);
   const grid = game.grid ?? [];
-  const cohorts = {};
-  for (const name of grid) {
-    const el = modifiedElement(name);
-    if (el !== null) cohorts[el] = (cohorts[el] ?? 0) + 1;
-  }
+  const { combos, aims } = projectedCombos(game);
+  const projected = matchRecipes(combos);
 
-  const out = [];
-  for (const color of ELEMENT_NAMES) {
-    const agents = projected.units[color] ?? 0;
-    if (agents === 0) continue;
-    const cohort = cohorts[color] ?? 0;
-    const hit = Math.min(agents, cohort);
-    out.push({ color, agents, hit, cohort, wasted: agents - hit });
+  const cells = new Map();
+  let offGrid = 0;
+  let inert = 0;
+  let hits = 0;
+  let defused = 0;
+
+  for (const stamp of projected.stamps) {
+    const aim = aims[stamp.anchorIndex];
+    if (aim === undefined) continue;
+    for (const { dRow, dCol } of stamp.offsets) {
+      const r = aim.row + dRow;
+      const cl = aim.col + dCol;
+      if (r < 0 || r >= rows || cl < 0 || cl >= cols) { offGrid++; continue; }
+      const flat = r * cols + cl;
+      // Chain multiple stamps over the same cell: each one steps it down
+      // again, exactly as the server applies them in sequence.
+      const current = cells.get(flat) ?? grid[flat];
+      const next = downgradeName(current);
+      if (next === null) { inert++; continue; }
+      cells.set(flat, next);
+      hits++;
+      if (next === "defused") defused++;
+    }
   }
-  return out;
+  return { cells, offGrid, inert, hits, defused, projected };
 }
 
 /**
- * Flat indices of every cell a projected cast could transmute, with the color
- * driving each highlight.
+ * Resolve the shapes the local player is currently typing TOWARD, so the field
+ * projects the intended footprint before the combo is complete.
  *
- * Deliberately the WHOLE eligible cohort, never a predicted subset: the server
- * picks its victims with a seeded random shuffle (slime.zig neutralize), so
- * marking specific cells would be a guess the client cannot honour.  The count
- * in the action-menu readout carries the precision instead.
+ * A candidate is any player recipe whose pattern STARTS WITH the typed buffer.
+ * That includes recipes longer than an already-exact match (typing `1` both
+ * casts `poke` and is en route to `sweep`), so the ghosts answer "what else is
+ * still reachable from here" rather than "what is complete".  The exact match
+ * itself is excluded: it is drawn as the committed preview, and drawing it
+ * twice would make a complete combo look identical to an incomplete one.
  *
- * @returns {Map<number, string>} flat index → element color
+ * Uses the TYPED buffer (`entity.combo`), never the submitted one: this is a
+ * projection of keys not yet pressed, and a buffering cast has no keys left to
+ * press.  An empty buffer yields nothing — every recipe would be a candidate,
+ * which is noise, not aim.
+ *
+ * Team recipes are excluded: a team stamp lands at the server's `last_joiner`
+ * cursor, which the client cannot observe, so ghosting a team half at the LOCAL
+ * cursor would confidently point at the wrong cells.
+ *
+ * Overlap is ADDITIVE, mirroring the mechanic: cells that several candidates
+ * cover are the cells that pay off across the most continuations, so `cells`
+ * counts coverage rather than merely flagging it.
+ *
+ * @returns {{cells: Map<number, number>, labels: Array<{label: string,
+ *   remaining: number}>}} `cells` maps flat index → how many candidates cover
+ *   it; `labels` is ordered by fewest keys remaining, then recipe-table order.
  */
-function cohortHighlight(game) {
-  const marks = new Map();
-  const risk = cohortRisk(game);
-  if (risk.length === 0) return marks;
+function candidateShapes(game) {
+  const own = (game.entities ?? []).find((e) => e.owner === game.player_id);
+  const typed = own?.combo ?? [];
+  const cells = new Map();
+  const labels = [];
+  if (typed.length === 0) return { cells, labels };
 
-  const colors = new Set(risk.map(r => r.color));
-  const grid = game.grid ?? [];
-  for (let flat = 0; flat < grid.length; flat++) {
-    const el = modifiedElement(grid[flat]);
-    if (el !== null && colors.has(el)) marks.set(flat, el);
+  const { rows, cols } = gridDims(game);
+  const aimRow = own?.cursor_row ?? 0;
+  const aimCol = own?.cursor_col ?? 0;
+
+  for (const pr of PLAYER_RECIPES) {
+    // Strictly longer, so the exact match is excluded by construction.
+    if (pr.pattern.length <= typed.length) continue;
+    if (!slotsEqual(typed, pr.pattern.slice(0, typed.length))) continue;
+
+    labels.push({ label: pr.label, remaining: pr.pattern.length - typed.length });
+    for (const { dRow, dCol } of pr.offsets) {
+      const r = aimRow + dRow;
+      const cl = aimCol + dCol;
+      // Clipped exactly as slime.apply_shape would: a ghost must not imply
+      // coverage the server could never deliver.
+      if (r < 0 || r >= rows || cl < 0 || cl >= cols) continue;
+      const flat = r * cols + cl;
+      cells.set(flat, (cells.get(flat) ?? 0) + 1);
+    }
   }
-  return marks;
+  // Nearest continuations first: those are the ones one keypress away.
+  labels.sort((a, b) => a.remaining - b.remaining);
+  return { cells, labels };
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,30 +1178,70 @@ const ACTION_COLOR = {
   medicine: "rgba(255,80,180,1)",
 };
 
-/** Element ordinal → name string; matches protocol Element ordinal order. */
-const ELEMENT_NAMES = ["red", "green", "yellow", "blue"];
+/** Tier ordinal → name string; matches protocol Tier ordinal order, hardest
+ *  first.  A cell's color is its DIFFICULTY, not its type: red needs three
+ *  stamps to defuse, yellow two, green one. */
+const TIER_NAMES = ["red", "yellow", "green"];
 
-/** Map Element (agent color) enum string → display character. */
-const ELEMENT_CHAR = { red: "♦", green: "▲", yellow: "≋", blue: "~" };
+/** Map Tier → display character.  Pip count = stamps still needed, so the
+ *  glyph carries the difficulty without relying on color. */
+const TIER_CHAR = { red: "≡", yellow: "=", green: "-" };
 
-/** Map Element (agent color / slime type) → colour.  Matches the whiteboard:
- *  red / yellow / green / blue scribbles.
+/** Map Tier → colour: a hot-to-cool ramp, so difficulty reads at a glance.
  *
- *  SINGLE SOURCE OF COLOR TRUTH: slime blobs, agent key labels (QWER),
- *  combo slot chars, team output preview, hunger-bar healable segments, and
- *  the game-over stats tables all read from this map so a slime color always
- *  matches its agent, its medicine, and its hunger block. */
-const ELEMENT_COLOR = {
+ *  SINGLE SOURCE OF COLOR TRUTH: slime blobs, combo/recipe readouts,
+ *  hunger-bar healable segments, and the game-over stats tables all read from
+ *  this map, so a tier always looks the same wherever it appears. */
+const TIER_COLOR = {
   red: "rgba(255,90,90,1)",
-  green: "rgba(130,230,130,1)",
   yellow: "rgba(250,210,80,1)",
-  blue: "rgba(110,160,255,1)",
+  green: "rgba(130,230,130,1)",
 };
 
-/** Neutral slime: needs no agent, so it must not read as any element color.
- *  Grey is the "safe / inert" color — shared by neutral and neutralized
- *  tiles, and by the non-healable portion of the hunger bar. */
+/** Shape footprints in the recipe guide and the on-grid preview: deliberately
+ *  NOT a tier color, since a shape is tier-agnostic. */
+const SHAPE_COLOR = "rgba(160,220,255,1)";
+
+/** Neutral and defused slime: harmless, so it must not read as any tier color.
+ *  Grey is the "safe / inert" color — shared by both tiles and by the
+ *  non-healable portion of the hunger bar. */
 const NEUTRAL_COLOR = "rgba(150,150,162,1)";
+
+/**
+ * Restate an `rgba(r,g,b,a)` color at a new alpha.
+ *
+ * Every palette constant in this file is written in that one form, so a literal
+ * rewrite is exact and avoids a canvas globalAlpha save/restore per cell (the
+ * field draws up to 256 of them per frame).  Alpha is clamped, since callers
+ * scale it by pulse and overlap counts.  Anything not in `rgba(...)` form is
+ * returned untouched rather than silently mangled.
+ */
+function withAlpha(color, alpha) {
+  const a = Math.max(0, Math.min(1, alpha));
+  const m = /^rgba?\(([^,]+),([^,]+),([^,)]+)/.exec(color);
+  if (m === null) return color;
+  return `rgba(${m[1].trim()},${m[2].trim()},${m[3].trim()},${a})`;
+}
+
+/** Sum a per-tier {red, yellow, green} object. */
+function sumTiers(obj) {
+  return TIER_NAMES.reduce((t, name) => t + (obj?.[name] ?? 0), 0);
+}
+
+/**
+ * One stamp applied to a cell: the name it becomes, or null when there is
+ * nothing to downgrade (empty / neutral / already defused).
+ *
+ * MIRRORS components.Tier.downgrade + slime.apply_shape: red → yellow → green
+ * → defused.  Nothing is ever destroyed, so every downgrade REWRITES the cell
+ * and a Lil Guy's reserved bite still lands.
+ */
+function downgradeName(name) {
+  if (name === "red") return "yellow";
+  if (name === "yellow") return "green";
+  if (name === "green") return "defused";
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Hunger bar + score
@@ -1077,9 +1249,9 @@ const NEUTRAL_COLOR = "rgba(150,150,162,1)";
 
 /**
  * Draw the Total Hunger bar.  Fills left→right as slime is consumed; the
- * healable (modified-slime) portion sits at the right end of the fill as
- * color-coded segments — one per slime color — since only matching-color
- * medicine can heal each segment.
+ * healable (hazard-slime) portion sits at the right end of the fill as
+ * color-coded segments — one per TIER — since only same-tier medicine can heal
+ * each segment.
  */
 function drawHungerBar(game) {
   const H = LAYOUT.hungerBar;
@@ -1088,7 +1260,7 @@ function drawHungerBar(game) {
   const w = H.x1 - H.x0;
   const frac = hunger.max > 0 ? Math.min(1, hunger.current / hunger.max) : 0;
 
-  const healableTotal = ELEMENT_NAMES.reduce((t, name) => t + (healable[name] ?? 0), 0);
+  const healableTotal = sumTiers(healable);
   const healFracTotal = hunger.max > 0 ? Math.min(frac, healableTotal / hunger.max) : 0;
 
   text("TOTAL HUNGER", H.x0, H.y + H.labelDy, H.labelFont, C_HEADER);
@@ -1096,17 +1268,17 @@ function drawHungerBar(game) {
   rect(H.x0, H.y, w, H.h, H.bg);
   if (frac > 0) rect(H.x0, H.y, w * frac, H.h, H.fill);
 
-  // Healable segments: right end of the current fill, one per slime color
-  // (only these use element colors — dim-purple fill = unhealable hunger).
-  // Scale segments proportionally if the fill clamped at the bar edge.
+  // Healable segments: right end of the current fill, one per tier (only these
+  // use tier colors — grey fill = unhealable hunger).  Scale segments
+  // proportionally if the fill clamped at the bar edge.
   if (healFracTotal > 0 && healableTotal > 0) {
     const scale = (w * healFracTotal) / healableTotal;
     let x = H.x0 + w * (frac - healFracTotal);
-    for (const name of ELEMENT_NAMES) {
+    for (const name of TIER_NAMES) {
       const units = healable[name] ?? 0;
       if (units === 0) continue;
       const segW = units * scale;
-      rect(x, H.y, segW, H.h, ELEMENT_COLOR[name]);
+      rect(x, H.y, segW, H.h, TIER_COLOR[name]);
       x += segW;
     }
   }
@@ -1133,7 +1305,7 @@ function drawScore(game) {
 // the whole grid (`game.grid`, row-major, row 0 = top) with its dimensions, so
 // every client draws exactly the same field.
 //
-// Each unit is drawn as its own tile — a gel blob stamped with its element
+// Each unit is drawn as its own tile — a gel blob stamped with its tier
 // glyph — so the field reads as a board of discrete pieces rather than a
 // blanket of goo.  A cell's flat index is its identity: the server refills
 // holes in place and never slides existing units around, so tiles never move
@@ -1192,7 +1364,7 @@ function fieldCenter() {
 //
 // A tile is pure function of (cell state, cell size), so each distinct tile is
 // rendered ONCE into an offscreen canvas and thereafter blitted.  There are
-// only 9 states (4 modified + 4 neutralized + neutral), and a 16×16 grid draws
+// only 5 states (3 tiers + defused + neutral), and a 16×16 grid draws
 // 256 cells per frame — drawing gel bodies with live gradients at that rate
 // would mean thousands of gradient allocations per second, so the cache is
 // what makes the look affordable.  Animation varies only the destination rect.
@@ -1215,34 +1387,29 @@ function parseRgb(str) {
   return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : [255, 255, 255];
 }
 
-/** Tile body colors by element name, plus neutral's grey.  Derived from
- *  ELEMENT_COLOR/NEUTRAL_COLOR (single source of color truth). */
+/** Tile body colors by tier name, plus neutral's grey.  Derived from
+ *  TIER_COLOR/NEUTRAL_COLOR (single source of color truth). */
 const TILE_RGB = {
-  ...Object.fromEntries(ELEMENT_NAMES.map((n) => [n, parseRgb(ELEMENT_COLOR[n])])),
+  ...Object.fromEntries(TIER_NAMES.map((n) => [n, parseRgb(TIER_COLOR[n])])),
   neutral: parseRgb(NEUTRAL_COLOR),
 };
 
 /**
  * Decode a wire cell name into what to draw.
- *   "empty"   → null (no tile; the socket shows through)
- *   "neutral" → grey body, no glyph
- *   "red"     → red body + ♦ glyph            (threat: needs a red agent)
- *   "red_n"   → grey body + red ring          (defused, and by which agent)
- * Neutralized slime is safe to eat, so its BODY is grey like neutral; the ring
- * preserves which color was spent neutralizing it.
+ *   "empty"    → null (no tile; the socket shows through)
+ *   "neutral"  → grey body, no glyph        (harmless filler)
+ *   "red"      → red body + ≡ glyph         (hazard, 3 stamps from harmless)
+ *   "defused"  → grey body + a dim ring     (was a hazard, now harmless)
+ * A defused cell is safe to eat, so its BODY is grey like neutral; the ring
+ * distinguishes "someone defused this" from "this was never a threat".
  */
 function cellStyle(name) {
   if (!name || name === "empty") return null;
-  if (name === "neutral") return { body: "neutral", glyph: null, ring: null };
-  if (name.endsWith("_n")) {
-    const el = name.slice(0, -2);
-    return ELEMENT_NAMES.includes(el)
-      ? { body: "neutral", glyph: null, ring: el }
-      : { body: "neutral", glyph: null, ring: null };
-  }
-  return ELEMENT_NAMES.includes(name)
-    ? { body: name, glyph: ELEMENT_CHAR[name], ring: null }
-    : { body: "neutral", glyph: null, ring: null };
+  if (name === "neutral") return { body: "neutral", glyph: null, ring: false };
+  if (name === "defused") return { body: "neutral", glyph: null, ring: true };
+  return TIER_NAMES.includes(name)
+    ? { body: name, glyph: TIER_CHAR[name], ring: false }
+    : { body: "neutral", glyph: null, ring: false };
 }
 
 /** True when the cell name denotes slime a Lil Guy could bite. */
@@ -1250,16 +1417,11 @@ function cellIsSlime(name) {
   return cellStyle(name) !== null;
 }
 
-/**
- * The element of a cell that is still MODIFIED, or null for anything else
- * (empty, neutral, or already-neutralized `x_n`).
- *
- * This is exactly the set agents can transmute, so it drives both the cohort
- * highlight and the dissolve classification.  Neutralized units keep their
- * element in the name for the ring color, hence the explicit `_n` rejection.
- */
-function modifiedElement(name) {
-  return ELEMENT_NAMES.includes(name) ? name : null;
+/** The tier of a cell that is still a HAZARD, or null for anything else
+ *  (empty, neutral, or already defused).  Exactly the set a stamp can
+ *  downgrade. */
+function hazardTier(name) {
+  return TIER_NAMES.includes(name) ? name : null;
 }
 
 /** state|size → rendered tile canvas.  Cleared when the cell size changes. */
@@ -1335,17 +1497,18 @@ function tileSprite(name, size) {
   c.fill();
   c.restore();
 
-  // Ring: which agent color neutralized this unit.
+  // Ring: this unit was a hazard that somebody defused, as opposed to neutral
+  // filler that never threatened anything.
   if (style.ring) {
-    const [rr_, rg, rb] = TILE_RGB[style.ring];
-    c.strokeStyle = `rgba(${rr_},${rg},${rb},0.85)`;
+    c.strokeStyle = "rgba(255,255,255,0.55)";
     c.lineWidth = Math.max(1.5, size * 0.055);
     roundRectPath(c, inset + bw * 0.16, inset + bw * 0.16, bw * 0.68, bw * 0.68,
       radius * 0.68);
     c.stroke();
   }
 
-  // Element glyph: colorblind parity with the action menu and combo panel.
+  // Tier glyph: pip count = stamps still needed, so difficulty survives
+  // colorblindness.
   if (style.glyph) {
     c.fillStyle = `rgba(20,16,32,${FIELD.symbolAlpha})`;
     c.font = `bold ${Math.round(bw * 0.5)}px monospace`;
@@ -1381,13 +1544,11 @@ const cellAnim = new Map();
 /** Cells the Lil Guys resolved a bite on this frame (set by tickLilGuys). */
 const bittenThisFrame = new Set();
 
-/** Colors that dispensed agents this frame, from `game.agents_dispensed`.
- *  A cell of one of these colors that changed was transmuted by a cast, so it
- *  DISSOLVES rather than dropping — half of every transmutation is destroyed
- *  outright (balance.neutralize_residue_mult) and refilled in the same tick,
- *  which would otherwise render as "new slime arrived" instead of "your agent
- *  vaporized this". */
-const dispensedColorsThisFrame = new Set();
+/** Cells a stamp covered this frame, from `game.shape_casts`.  A covered cell
+ *  that changed was DOWNGRADED by a cast, so it flashes in place rather than
+ *  dropping in as new slime — a downgrade rewrites the cell, it never destroys
+ *  it, and the two must not look the same. */
+const stampedThisFrame = new Set();
 
 /** flat → idle wobble phase.  Derived from the flat index so a cell always
  *  breathes on the same beat, and memoised because the draw loop would
@@ -1413,16 +1574,13 @@ function updateGridAnims(grid) {
     if (was === undefined) continue; // first frame: no animation, just adopt
     if (now === was) continue;
 
-    if (cellIsSlime(was) && now === `${was}_n`) {
-      // A cast neutralized this unit in place: it survived, so it stays put.
+    if (stampedThisFrame.has(flat) && now === downgradeName(was)) {
+      // A stamp stepped this unit down a tier in place: it survived, so it
+      // stays put and blooms.
       cellAnim.set(flat, { kind: "flash", t: FIELD.flashS });
     } else if (bittenThisFrame.has(flat)) {
       // A Lil Guy ate it; whatever is here now arrived from the reservoir.
       cellAnim.set(flat, { kind: "pop", t: FIELD.popS, from: was });
-    } else if (dispensedColorsThisFrame.has(modifiedElement(was))) {
-      // Agents of this color fired this frame and this unit is gone: it was
-      // destroyed by the transmutation, not eaten and not merely replaced.
-      cellAnim.set(flat, { kind: "dissolve", t: FIELD.dissolveS, from: was });
     } else {
       // Refilled hole, or any other server-side replacement.
       cellAnim.set(flat, { kind: "drop", t: FIELD.dropS });
@@ -1430,7 +1588,7 @@ function updateGridAnims(grid) {
   }
   prevGrid = grid.slice();
   bittenThisFrame.clear();
-  dispensedColorsThisFrame.clear();
+  stampedThisFrame.clear();
 }
 
 /** Advance queued cell animations, dropping the finished ones. */
@@ -1455,13 +1613,18 @@ function drawSlimeField(game) {
   rect(FIELD.x0, FIELD.y0, FIELD.x1 - FIELD.x0, FIELD.y1 - FIELD.y0,
     "rgba(255,255,255,0.03)");
 
-  // Cells a live or pending cast would transmute.  Computed once per frame,
-  // and only while something is actually projected.
-  const marks = cohortHighlight(game);
-  const pulse = marks.size > 0
-    ? FIELD.cohortAlphaMin + (FIELD.cohortAlphaMax - FIELD.cohortAlphaMin) *
-      (0.5 + 0.5 * Math.sin(t * Math.PI * 2 * FIELD.cohortPulseHz))
+  // Cells a live or pending cast would cover, and what each becomes.  Exact,
+  // not a guess: placement is a pure function of (shape, cursor).  Computed
+  // once per frame, and only while something is actually projected.
+  const preview = shapePreview(game).cells;
+  const pulse = preview.size > 0
+    ? FIELD.previewAlphaMin + (FIELD.previewAlphaMax - FIELD.previewAlphaMin) *
+      (0.5 + 0.5 * Math.sin(t * Math.PI * 2 * FIELD.previewPulseHz))
     : 0;
+
+  // Cells the combo being TYPED is heading toward.  Static (no pulse) and
+  // neutral, so the eye separates "would land" from the pulsing "will land".
+  const ghosts = candidateShapes(game).cells;
 
   // Walk the grid off `g` directly: cellRect would recompute the same
   // placement (and allocate a rect) for every one of up to 256 cells.
@@ -1485,24 +1648,34 @@ function drawSlimeField(game) {
       drawTile(anim.from, x0, y0, g.cell, 1 + p * 0.3, 0, 1 - p);
     }
 
-    // A dissolving tile collapses INWARD as it fades — the opposite of a
-    // pop's outward burst — reading as "vaporized in place" rather than
-    // "bitten off".  Its replacement (below) drops in behind it.
-    if (anim?.kind === "dissolve") {
-      const p = 1 - anim.t / FIELD.dissolveS; // 0 → 1
-      drawTile(anim.from, x0, y0, g.cell, 1 - p * 0.55, 0, 1 - p);
+    // Candidate ghost, UNDER everything else: a committed cast covering the
+    // same cell must visually win, so this only ever shows through where
+    // nothing firmer is drawn.
+    const ghostCount = ghosts.get(flat);
+    if (ghostCount !== undefined) drawGhostMark(x0, y0, inset, body, ghostCount);
+
+    // Projected footprint: a socket tinted in the OUTCOME color plus a pulsing
+    // outline, on every cell a pending cast will cover.  Drawn UNDER the tile
+    // so it reads as ground being targeted, and covering an empty cell still
+    // shows (that is exactly the aiming mistake worth seeing).
+    const becomes = preview.get(flat);
+    if (becomes !== undefined) {
+      rect(x0 + inset, y0 + inset, body, body,
+        withAlpha(becomesColor(becomes), FIELD.previewFillAlpha));
     }
 
     const name = grid[flat];
-    if (!cellIsSlime(name)) continue;
+    if (!cellIsSlime(name)) {
+      // Empty cell: the footprint outline is all there is to draw.
+      if (becomes !== undefined) drawPreviewMark(x0, y0, inset, body, becomes, pulse);
+      continue;
+    }
 
     let scale = 1;
     let dy = 0;
-    if (anim?.kind === "drop" || anim?.kind === "pop" || anim?.kind === "dissolve") {
+    if (anim?.kind === "drop" || anim?.kind === "pop") {
       // Slide in from the cell above, easing out, with a landing squash.
-      const dur = anim.kind === "drop" ? FIELD.dropS
-        : anim.kind === "pop" ? FIELD.popS
-          : FIELD.dissolveS;
+      const dur = anim.kind === "drop" ? FIELD.dropS : FIELD.popS;
       const p = 1 - anim.t / dur;
       const ease = 1 - (1 - p) * (1 - p);
       dy = -(1 - ease) * g.cell;
@@ -1514,19 +1687,20 @@ function drawSlimeField(game) {
 
     drawTile(name, x0, y0, g.cell, scale, dy, 1);
 
-    // Cohort outline: pulsing, in the projected color, at the socket edge —
-    // outside the tile body, so it is never confused with the static inner
-    // ring that marks an already-neutralized unit.
-    const mark = marks.get(flat);
-    if (mark !== undefined) {
-      ctx.save();
-      ctx.globalAlpha = pulse;
-      rectStroke(x0 + inset, y0 + inset, body, body, FIELD.cohortWidth,
-        ELEMENT_COLOR[mark]);
-      ctx.restore();
+    // Outcome wash OVER the tile.  The socket tint above is hidden behind an
+    // occupied tile, which is precisely where the preview matters most, so the
+    // covered tile is also washed in the color it will become.
+    if (becomes !== undefined) {
+      rect(x0 + inset, y0 + inset, body, body,
+        withAlpha(becomesColor(becomes), FIELD.previewWashAlpha * pulse));
     }
 
-    // Neutralize flash: a white bloom over the settled tile.
+    // Footprint outline: pulsing, in the color the cell will BECOME, at the
+    // socket edge — outside the tile body, so it is never confused with the
+    // static inner ring that marks an already-defused unit.
+    if (becomes !== undefined) drawPreviewMark(x0, y0, inset, body, becomes, pulse);
+
+    // Downgrade flash: a white bloom over the settled tile.
     if (anim?.kind === "flash") {
       const p = 1 - anim.t / FIELD.flashS;
       ctx.save();
@@ -1535,6 +1709,9 @@ function drawSlimeField(game) {
       ctx.restore();
     }
   }
+
+  // Cursors last, so aim is never buried under a tile.
+  drawCursors(game, g, cols);
 
   rectStroke(FIELD.x0, FIELD.y0, FIELD.x1 - FIELD.x0, FIELD.y1 - FIELD.y0, 1,
     FIELD.border);
@@ -1546,6 +1723,83 @@ function drawSlimeField(game) {
     : "reservoir empty — last of the slime";
   text(label, FIELD.x0, FIELD.y1 + FIELD.labelDy, FIELD.reservoirFont,
     reservoir > 0 ? "rgba(170,180,220,0.8)" : "rgba(255,255,140,0.9)");
+}
+
+/** The color standing for a projected outcome tier ("defused" has no tier). */
+function becomesColor(becomes) {
+  return becomes === "defused" ? SHAPE_COLOR : (TIER_COLOR[becomes] ?? SHAPE_COLOR);
+}
+
+/**
+ * Outline one previewed cell in the color it will BECOME after the stamp —
+ * so the preview shows the outcome, not merely "this will be hit".
+ */
+function drawPreviewMark(x0, y0, inset, body, becomes, pulse) {
+  ctx.save();
+  ctx.globalAlpha = pulse;
+  rectStroke(x0 + inset, y0 + inset, body, body, FIELD.previewWidth,
+    becomesColor(becomes));
+  ctx.restore();
+}
+
+/**
+ * Mark one cell a still-being-typed combo could reach.  `count` is how many
+ * candidate recipes cover it, and brightness scales with it (capped) so the
+ * cells that pay off across the most continuations stand out.
+ */
+function drawGhostMark(x0, y0, inset, body, count) {
+  const strength = Math.min(count, FIELD.ghostAlphaCap / FIELD.ghostAlpha);
+  ctx.save();
+  rect(x0 + inset, y0 + inset, body, body,
+    withAlpha(SHAPE_COLOR, FIELD.ghostFillAlpha * strength));
+  ctx.globalAlpha = FIELD.ghostAlpha * strength;
+  rectStroke(x0 + inset, y0 + inset, body, body, FIELD.ghostWidth, SHAPE_COLOR);
+  ctx.restore();
+}
+
+/**
+ * Draw every player's aim cursor as a corner crosshair on their cell.
+ *
+ * The server sends a cursor for EVERY player (and, while a cast buffers, the
+ * captured anchor instead of the live cursor), so teammates can see where each
+ * other are aiming and coordinate a team shape.  The local player's is thicker
+ * and yellow; teammates' are thinner and blue.
+ *
+ * A crosshair rather than a full box: a box at the socket edge would compete
+ * with the footprint outline drawn there, and the corner arms stay legible even
+ * when both land on the same cell.
+ */
+function drawCursors(game, g, cols) {
+  const own = [];
+  for (const e of game.entities ?? []) {
+    const r = e.cursor_row ?? 0;
+    const cl = e.cursor_col ?? 0;
+    const x0 = g.x0 + cl * g.cell;
+    const y0 = g.y0 + r * g.cell;
+    const isOwn = e.owner === game.player_id;
+    // Own cursor drawn last, on top of any teammate sharing the cell.
+    if (isOwn) { own.push({ x0, y0 }); continue; }
+    drawCrosshair(x0, y0, g.cell, FIELD.cursorMateWidth, C_HEADER);
+  }
+  for (const o of own) {
+    drawCrosshair(o.x0, o.y0, g.cell, FIELD.cursorWidth, C_OWN_ROW);
+  }
+}
+
+/** Four corner arms bracketing one cell. */
+function drawCrosshair(x0, y0, cell, lineW, color) {
+  const arm = cell * FIELD.cursorCornerFrac;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lineW;
+  ctx.beginPath();
+  // Top-left, top-right, bottom-left, bottom-right.
+  ctx.moveTo(x0, y0 + arm); ctx.lineTo(x0, y0); ctx.lineTo(x0 + arm, y0);
+  ctx.moveTo(x0 + cell - arm, y0); ctx.lineTo(x0 + cell, y0); ctx.lineTo(x0 + cell, y0 + arm);
+  ctx.moveTo(x0, y0 + cell - arm); ctx.lineTo(x0, y0 + cell); ctx.lineTo(x0 + arm, y0 + cell);
+  ctx.moveTo(x0 + cell - arm, y0 + cell); ctx.lineTo(x0 + cell, y0 + cell); ctx.lineTo(x0 + cell, y0 + cell - arm);
+  ctx.stroke();
+  ctx.restore();
 }
 
 /**
@@ -1695,7 +1949,7 @@ function drawLilGuys(dt) {
 }
 
 // ---------------------------------------------------------------------------
-// Action menu + projected agent preview
+// Action menu + projected stamp preview
 // ---------------------------------------------------------------------------
 
 function drawActionMenu(game) {
@@ -1713,11 +1967,11 @@ function drawActionMenu(game) {
   text("[1] Dispense", px + M.actionCols[0], aRowY, M.actionFont, ACTION_COLOR.dispense);
   text("[2] Medicine", px + M.actionCols[1], aRowY, M.actionFont, ACTION_COLOR.medicine);
 
-  const eRowY = my + M.padTopY + M.elementRowDy;
-  text("[Q]♦", px + M.elementCols[0], eRowY, M.elementFont, ELEMENT_COLOR.red);
-  text("[W]▲", px + M.elementCols[1], eRowY, M.elementFont, ELEMENT_COLOR.green);
-  text("[E]≋", px + M.elementCols[2], eRowY, M.elementFont, ELEMENT_COLOR.yellow);
-  text("[R]~", px + M.elementCols[3], eRowY, M.elementFont, ELEMENT_COLOR.blue);
+  // Aim row: the arrow keys move the cursor the shape is stamped on.
+  const own0 = (game.entities ?? []).find(e => e.owner === game.player_id);
+  const aimY = my + M.padTopY + M.aimRowDy;
+  text(`[← ↑ ↓ →] Aim  @${own0?.cursor_row ?? 0},${own0?.cursor_col ?? 0}`,
+    px, aimY, M.aimFont, C_OWN_ROW);
 
   text("[Esc] Cancel", px, my + M.padTopY + M.cancelRowDy, M.cancelFont, "rgba(180,180,180,0.8)");
 
@@ -1749,33 +2003,27 @@ function drawActionMenu(game) {
 
   // Project from committed combos in preference to typed ones, so the preview
   // survives the cast buffer instead of blanking the instant you press ENTER.
-  const projected = matchRecipes(projectedCombos(game));
+  // The same resolution the field preview draws, so the numbers and the
+  // highlighted cells can never disagree.
+  const pv = shapePreview(game);
+  const projected = pv.projected;
 
-  // Per-color reach: `n of cohort`, plus the surplus that will be wasted.
-  // A projected color with NO cohort on the grid is the worst case — every
-  // agent is thrown away — so it is called out in red rather than hidden.
-  const risk = new Map(cohortRisk(game).map(r => [r.color, r]));
   const parts = [];
-  for (const name of ELEMENT_NAMES) {
-    const n = projected.units[name];
-    if (!n) continue;
-    const r = risk.get(name);
-    if (!r) {
-      parts.push({ str: `${ELEMENT_CHAR[name]}${n}`, color: ELEMENT_COLOR[name] });
-      continue;
-    }
-    parts.push({
-      str: `${ELEMENT_CHAR[name]}${n} → ${r.hit} of ${r.cohort}`,
-      color: r.cohort === 0 ? C_BAD : ELEMENT_COLOR[name],
-    });
-    if (r.wasted > 0) {
-      parts.push({ str: `${r.wasted} wasted`, color: C_BAD });
+  if (pv.hits > 0) {
+    parts.push({ str: `${pv.hits} cells`, color: C_SLIME_HDR });
+    if (pv.defused > 0) {
+      parts.push({ str: `${pv.defused} defused`, color: SHAPE_COLOR });
     }
   }
-  // Medicine is per color: shown in the color of the healable bucket it heals.
-  for (const name of ELEMENT_NAMES) {
+  // Coverage thrown away: clipped off the grid edge, or landing on cells with
+  // nothing left to downgrade.  This is the aiming signal, so it is called out
+  // in red rather than hidden.
+  const wasted = pv.offGrid + pv.inert;
+  if (wasted > 0) parts.push({ str: `${wasted} wasted`, color: C_BAD });
+  // Medicine is per tier: shown in the color of the healable bucket it heals.
+  for (const name of TIER_NAMES) {
     const n = projected.medicine[name];
-    if (n) parts.push({ str: `med${ELEMENT_CHAR[name]}${n}`, color: ELEMENT_COLOR[name] });
+    if (n) parts.push({ str: `med${TIER_CHAR[name]}${n}`, color: TIER_COLOR[name] });
   }
 
   let dx = px;
@@ -1792,6 +2040,21 @@ function drawActionMenu(game) {
   }
   if (projected.labels.length > 0) {
     text(projected.labels.join(", "), dx + 8, pvY, M.previewFont, "rgba(255,255,140,0.9)");
+  }
+
+  // Where the typed combo could still go: the names behind the ghost cells on
+  // the field, each with the number of keys still to press.  Dim, because this
+  // is an invitation rather than a commitment.
+  const cand = candidateShapes(game);
+  if (cand.labels.length > 0) {
+    // Already sorted nearest-first, so a truncated list keeps the most
+    // actionable continuations.
+    const shown = cand.labels.slice(0, M.candidateMax);
+    const parts = shown.map((c) => `${c.label} +${c.remaining}`);
+    const hidden = cand.labels.length - shown.length;
+    if (hidden > 0) parts.push(`+${hidden} more`);
+    text(`\u2192 ${parts.join(" \u00b7 ")}`, px, my + M.candidateDy,
+      M.candidateFont, withAlpha(SHAPE_COLOR, 0.65));
   }
 }
 
@@ -1813,13 +2076,13 @@ function drawGame(game, dt) {
   // Order matters: tickLilGuys resolves this frame's bite (setting lastBitePos)
   // and updateFeastTracking floats the score/hunger deltas over that cell.
   tickLilGuys(game, dt);
-  // Dispense outcomes must be read BEFORE the grid diff: they tell
-  // updateGridAnims which colors fired, which is how a cell destroyed by a
-  // transmutation is told apart from one that was merely refilled.
-  if (fresh) spawnDispenseFloaters(game);
+  // Stamp outcomes must be read BEFORE the grid diff: they tell updateGridAnims
+  // which cells were covered, which is how a downgraded cell is told apart from
+  // one that was merely refilled.
+  if (fresh) spawnStampFloaters(game);
   // Then classify grid changes: updateGridAnims needs both the bite
-  // tickLilGuys just resolved and the dispense colors above to tell an eaten
-  // cell, a vaporized cell and a plain refill apart.
+  // tickLilGuys just resolved and the covered cells above to tell an eaten
+  // cell, a downgraded cell and a plain refill apart.
   tickGridAnims(dt);
   if (fresh) updateGridAnims(game.grid ?? []);
   updateFeastTracking(game);
@@ -1848,24 +2111,19 @@ function drawGame(game, dt) {
   drawFloaters();
 }
 
-/** Sum a per-color {red, green, yellow, blue} object. */
-function sumColors(obj) {
-  return ELEMENT_NAMES.reduce((t, name) => t + (obj?.[name] ?? 0), 0);
-}
-
 /**
- * Draw non-zero per-color values as colored "♦12 ▲5" cells starting at x.
+ * Draw non-zero per-tier values as colored "≡12 -5" cells starting at x.
  * Draws a grey dash when everything is zero.
  */
-function drawColorCells(x, y, font, obj) {
+function drawTierCells(x, y, font, obj) {
   let dx = x;
   let any = false;
-  for (const name of ELEMENT_NAMES) {
+  for (const name of TIER_NAMES) {
     const v = obj?.[name] ?? 0;
     if (!v) continue;
     any = true;
-    const str = `${ELEMENT_CHAR[name]}${v}`;
-    text(str, dx, y, font, ELEMENT_COLOR[name]);
+    const str = `${TIER_CHAR[name]}${v}`;
+    text(str, dx, y, font, TIER_COLOR[name]);
     ctx.font = `${font}px monospace`;
     dx += ctx.measureText(str).width + 8;
   }
@@ -1877,8 +2135,8 @@ function drawColorCells(x, y, font, obj) {
  * table, recipe fire counts, derived waste/overheal totals.
  *
  * The grid model has no rounds, so the report is a single match-wide summary:
- * what was dispensed vs. what it actually neutralized (the rest was wasted on
- * off-grid or wrong-color slime), and what the Lil Guys ended up eating.
+ * how much of the field the team's stamps covered and defused, and what the Lil
+ * Guys ended up eating before they could.
  */
 function drawGameOver(msg) {
   clear();
@@ -1905,26 +2163,27 @@ function drawGameOver(msg) {
   text("FEAST", F.label, y, L.sectionFont, C_HEADER);
   y += L.rowH;
 
-  /** One "LABEL  ♦12 ▲5" row. */
+  /** One "LABEL  ≡12 -5" row, bucketed by tier. */
   const feastRow = (label, obj) => {
     text(label, F.label, y, L.rowFont, "rgba(200,200,210,0.9)");
-    drawColorCells(F.cells, y, L.rowFont, obj);
+    drawTierCells(F.cells, y, L.rowFont, obj);
     y += L.rowH;
   };
-  feastRow("agents dispensed", feast.agents);
-  feastRow("slime neutralized", feast.neutralized);
-  feastRow("modified slime eaten", feast.escaped);
+  // `covered` and `neutralized` are bucketed by the tier each cell was BEFORE
+  // the stamp, so the rows read as "what did we hit", not "what is left".
+  feastRow("cells downgraded", feast.covered);
+  feastRow("cells defused", feast.neutralized);
+  feastRow("hazard slime eaten", feast.escaped);
   feastRow("medicine dispensed", feast.medicine);
   feastRow("hunger healed", feast.healed);
 
-  // Derived: agents that found no matching on-grid cell, and medicine poured
-  // into hunger that was not there.  Both are the numbers a designer tunes on.
-  const wasted = sumColors(feast.agents) - sumColors(feast.neutralized);
-  const overheal = sumColors(feast.medicine) - sumColors(feast.healed);
+  // Derived: medicine poured into hunger that was not there — the number a
+  // designer tunes medicine pools on.
+  const overheal = sumTiers(feast.medicine) - sumTiers(feast.healed);
   y += 4;
   text(
     `neutral eaten ${feast.neutral ?? 0}  ·  hunger ${feast.hunger_normal ?? 0} base ` +
-    `+ ${feast.hunger_extra ?? 0} from modified  ·  agents wasted ${wasted}  ·  medicine overheal ${overheal}`,
+    `+ ${feast.hunger_extra ?? 0} from hazards  ·  medicine overheal ${overheal}`,
     F.label, y, L.rowFont, "rgba(200,200,210,0.9)",
   );
   y += L.rowH + 14;
@@ -1933,16 +2192,16 @@ function drawGameOver(msg) {
   const P = L.pcols;
   text("PLAYER", P.name, y, L.sectionFont, C_HEADER);
   text("CASTS", P.casts, y, L.sectionFont, C_HEADER);
-  text("DISPENSE SLOTS", P.dispense, y, L.sectionFont, C_HEADER);
-  text("MEDICINE SLOTS", P.medicine, y, L.sectionFont, C_HEADER);
+  text("CELLS HIT", P.covered, y, L.sectionFont, C_HEADER);
+  text("DEFUSED", P.defused, y, L.sectionFont, C_HEADER);
   text("RECIPES", P.recipes, y, L.sectionFont, C_HEADER);
   text("FIZZLES", P.fizzles, y, L.sectionFont, C_HEADER);
   y += L.rowH;
   for (const p of stats.players ?? []) {
     text(p.name || "(anon)", P.name, y, L.rowFont, C_TEXT);
     text(String(p.casts), P.casts, y, L.rowFont, C_TEXT);
-    drawColorCells(P.dispense, y, L.rowFont, p.dispense);
-    drawColorCells(P.medicine, y, L.rowFont, p.medicine);
+    text(String(p.cells_covered ?? 0), P.covered, y, L.rowFont, C_SLIME_HDR);
+    text(String(p.cells_neutralized ?? 0), P.defused, y, L.rowFont, SHAPE_COLOR);
     text(`${p.recipe_casts}/${p.casts}`, P.recipes, y, L.rowFont, "rgba(255,255,140,0.9)");
     text(String(p.fizzles ?? 0), P.fizzles, y, L.rowFont,
       (p.fizzles ?? 0) > 0 ? "rgba(255,120,120,0.9)" : "rgba(120,120,140,0.7)");
@@ -2061,7 +2320,10 @@ function connect() {
 const FORWARDED_KEYS = new Set([
   "Enter", "Escape",
   "1", "2",
-  "q", "w", "e", "r",
+  // Aim: the arrow keys walk the server-authoritative cursor the shape is
+  // stamped on.  Clamped server-side, so holding a direction at an edge is
+  // harmless.
+  "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
 ]);
 
 /** Forward one key to the Zig client via the tab WebSocket. */

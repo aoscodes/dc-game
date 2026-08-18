@@ -18,6 +18,7 @@ const c = @import("components.zig");
 const balance = @import("balance.zig");
 const enc = @import("encounter.zig");
 const protocol = @import("protocol.zig");
+const game_logic = @import("game_logic.zig");
 
 const log = std.log.scoped(.config);
 
@@ -57,7 +58,6 @@ pub const ConfigError = error{
     InvalidBalanceJson,
     InvalidEncountersJson,
     InvalidEatRate,
-    InvalidResidueMult,
     InvalidCastBuffer,
     InvalidCastLock,
     InvalidSlimeGrid,
@@ -65,6 +65,10 @@ pub const ConfigError = error{
     InvalidTeamPatternCount,
     InvalidComboLength,
     InvalidComboSlot,
+    InvalidShapeSize,
+    RaggedShape,
+    EmptyShape,
+    DuplicatePattern,
     EmptyLabel,
     LabelTooLong,
     NoEncounters,
@@ -127,32 +131,33 @@ pub fn parse(
 
 // The Colors* structs map named fields onto Element-ordinal arrays; guard
 // the assumed ordering at compile time.
+// The tier JSON field order must match the Tier ordinals, since the loader
+// converts named fields into ordinal-indexed arrays.
 comptime {
-    std.debug.assert(@intFromEnum(c.Element.red) == 0);
-    std.debug.assert(@intFromEnum(c.Element.green) == 1);
-    std.debug.assert(@intFromEnum(c.Element.yellow) == 2);
-    std.debug.assert(@intFromEnum(c.Element.blue) == 3);
+    std.debug.assert(@intFromEnum(c.Tier.red) == 0);
+    std.debug.assert(@intFromEnum(c.Tier.yellow) == 1);
+    std.debug.assert(@intFromEnum(c.Tier.green) == 2);
 }
 
-const ColorsU32Json = struct { red: u32 = 0, green: u32 = 0, yellow: u32 = 0, blue: u32 = 0 };
-const ColorsU16Json = struct { red: u16 = 0, green: u16 = 0, yellow: u16 = 0, blue: u16 = 0 };
-
-const OutputJson = struct {
-    units: ColorsU32Json = .{},
-    medicine: ColorsU32Json = .{},
-};
+const TiersU32Json = struct { red: u32 = 0, yellow: u32 = 0, green: u32 = 0 };
+const TiersU16Json = struct { red: u16 = 0, yellow: u16 = 0, green: u16 = 0 };
 
 const PlayerRecipeJson = struct {
     label: []const u8,
-    /// Combo slots as strings: "dispense" | "medicine" | element name.
+    /// Combo slots as strings: "dispense" | "medicine".
     pattern: []const []const u8,
-    output: OutputJson,
+    /// Footprint rows of `#` (covered) and any other char (not covered),
+    /// e.g. ["###","###","###"] for a 3x3 block.
+    shape: []const []const u8,
+    /// Medicine brewed per tier.  Absent = a pure-neutralizing recipe.
+    medicine: TiersU32Json = .{},
 };
 
 const TeamRecipeJson = struct {
     label: []const u8,
     patterns: []const []const []const u8,
-    output: OutputJson,
+    shape: []const []const u8,
+    medicine: TiersU32Json = .{},
 };
 
 const SlimeGridJson = struct {
@@ -161,32 +166,16 @@ const SlimeGridJson = struct {
 };
 
 const BalanceJson = struct {
-    units_per_slot: u32,
-    medicine_per_slot: u32,
     hunger_cost_normal: u32,
-    hunger_cost_modified_extra: u32,
-    /// Portion of transmuted slime surviving as neutralized; defaulted so
-    /// pre-residue configs keep validating unchanged.
-    neutralize_residue_mult: f32 = 1.0,
+    hunger_cost_hazard_extra: u32,
     /// Slime grid dimensions; defaulted so pre-grid configs keep validating.
     slime_grid: SlimeGridJson = .{
         .rows = balance.DEFAULT_SLIME_GRID.rows,
         .cols = balance.DEFAULT_SLIME_GRID.cols,
     },
-    /// Realtime fields; defaulted so pre-realtime configs (including saved
-    /// /tune configs) keep validating unchanged.
     eat_rate_units_per_s: f32 = 2.0,
     cast_buffer_ms: u32 = 500,
     cast_lock_ms: u32 = 500,
-    /// DEPRECATED (all ignored): fields from removed features that old saved
-    /// /tune configs still carry.  Kept — and defaulted, for configs written
-    /// before they existed — purely so those files still parse, since
-    /// std.json rejects unknown fields.
-    cast_window_ms: u32 = 0,
-    /// DEPRECATED (ignored): the repeating cast window of classic mode.
-    casts_per_round: u8 = 1,
-    /// DEPRECATED (ignored): classic mode's round length.
-    round_duration_default_s: f32 = 5.0,
     player_recipes: []const PlayerRecipeJson,
     team_recipes: []const TeamRecipeJson,
 };
@@ -194,7 +183,8 @@ const BalanceJson = struct {
 /// One slime bundle.  Historically one per round ("zone"); now purely an
 /// additive slice of the encounter's single slime total.
 const ZoneJson = struct {
-    modified: ColorsU16Json = .{},
+    /// Hazard slime per difficulty tier.
+    tiered: TiersU16Json = .{},
     neutral: u16 = 0,
 };
 
@@ -229,10 +219,6 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         fail("{s}: eat_rate_units_per_s must be > 0", .{BALANCE_FILE});
         return ConfigError.InvalidEatRate;
     }
-    if (!(raw.neutralize_residue_mult >= 0.0 and raw.neutralize_residue_mult <= 1.0)) {
-        fail("{s}: neutralize_residue_mult must be within 0.0..1.0", .{BALANCE_FILE});
-        return ConfigError.InvalidResidueMult;
-    }
     if (raw.cast_buffer_ms > 60_000) {
         fail("{s}: cast_buffer_ms must be <= 60000", .{BALANCE_FILE});
         return ConfigError.InvalidCastBuffer;
@@ -265,9 +251,13 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         out.* = .{
             .label = pr.label,
             .pattern = try combo_from_names(pr.label, pr.pattern),
-            .output = output_from_json(pr.output),
+            .shape = try shape_from_rows(a, pr.label, pr.shape),
+            .medicine = medicine_from_json(pr.medicine),
         };
     }
+    // Two recipes sharing a combo would make the move ambiguous: the first
+    // would always win and the second would be dead data.
+    try reject_duplicate_patterns(players);
 
     const teams = try a.alloc(balance.TeamRecipe, raw.team_recipes.len);
     for (raw.team_recipes, teams) |tr, *out| {
@@ -283,16 +273,14 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         out.* = .{
             .label = tr.label,
             .patterns = pats,
-            .output = output_from_json(tr.output),
+            .shape = try shape_from_rows(a, tr.label, tr.shape),
+            .medicine = medicine_from_json(tr.medicine),
         };
     }
 
     return .{
-        .units_per_slot = raw.units_per_slot,
-        .medicine_per_slot = raw.medicine_per_slot,
         .hunger_cost_normal = raw.hunger_cost_normal,
-        .hunger_cost_modified_extra = raw.hunger_cost_modified_extra,
-        .neutralize_residue_mult = raw.neutralize_residue_mult,
+        .hunger_cost_hazard_extra = raw.hunger_cost_hazard_extra,
         .slime_grid = .{ .rows = raw.slime_grid.rows, .cols = raw.slime_grid.cols },
         .eat_rate_units_per_s = raw.eat_rate_units_per_s,
         .cast_buffer_ms = raw.cast_buffer_ms,
@@ -340,8 +328,8 @@ fn parse_encounters(a: std.mem.Allocator, bytes: []const u8) !enc.EncounterSet {
         var slime = c.SlimeReservoir{};
         for (e.zones) |z| {
             slime.neutral +|= z.neutral;
-            const per_color = [_]u16{ z.modified.red, z.modified.green, z.modified.yellow, z.modified.blue };
-            for (&slime.modified, per_color) |*acc, add| acc.* +|= add;
+            const per_tier = [_]u16{ z.tiered.red, z.tiered.yellow, z.tiered.green };
+            for (&slime.tiered, per_tier) |*acc, add| acc.* +|= add;
         }
         if (slime.is_empty()) {
             fail("{s}: encounter '{s}' has no slime", .{ ENCOUNTERS_FILE, e.label });
@@ -367,17 +355,77 @@ fn validate_recipe_label(label: []const u8) !void {
     }
 }
 
-fn output_from_json(o: OutputJson) c.AgentOutput {
-    return .{
-        .units = .{ o.units.red, o.units.green, o.units.yellow, o.units.blue },
-        .medicine = .{ o.medicine.red, o.medicine.green, o.medicine.yellow, o.medicine.blue },
-    };
+fn medicine_from_json(m: TiersU32Json) c.MedicineOutput {
+    return .{ .medicine = .{ m.red, m.yellow, m.green } };
 }
 
 fn slot_from_name(name: []const u8) ?c.ComboSlot {
     if (std.meta.stringToEnum(c.ActionChoice, name)) |action| return .{ .action = action };
-    if (std.meta.stringToEnum(c.Element, name)) |element| return .{ .element = element };
     return null;
+}
+
+/// Turn authored rows of `#` into a Shape.  The anchor — the cell the caster
+/// is aiming at — is the bounding box centre rounded down, so odd-sized
+/// shapes centre exactly on the cursor.  Orientation is taken literally:
+/// rotations and reflections are separate authored recipes.
+fn shape_from_rows(
+    a: std.mem.Allocator,
+    recipe_label: []const u8,
+    rows: []const []const u8,
+) !balance.Shape {
+    if (rows.len < 1 or rows.len > balance.MAX_SHAPE_ROWS) {
+        fail("{s}: recipe '{s}' shape has {} rows (want 1..{})", .{ BALANCE_FILE, recipe_label, rows.len, balance.MAX_SHAPE_ROWS });
+        return ConfigError.InvalidShapeSize;
+    }
+    const cols = rows[0].len;
+    if (cols < 1 or cols > balance.MAX_SHAPE_COLS) {
+        fail("{s}: recipe '{s}' shape has {} cols (want 1..{})", .{ BALANCE_FILE, recipe_label, cols, balance.MAX_SHAPE_COLS });
+        return ConfigError.InvalidShapeSize;
+    }
+    // A ragged grid has no well-defined anchor, so demand a rectangle.
+    for (rows) |line| {
+        if (line.len != cols) {
+            fail("{s}: recipe '{s}' shape rows are ragged ({} vs {})", .{ BALANCE_FILE, recipe_label, line.len, cols });
+            return ConfigError.RaggedShape;
+        }
+    }
+
+    var offsets: [balance.MAX_SHAPE_CELLS]balance.ShapeOffset = undefined;
+    var n: usize = 0;
+    const anchor_r: i8 = @intCast(rows.len / 2);
+    const anchor_c: i8 = @intCast(cols / 2);
+    for (rows, 0..) |line, r| {
+        for (line, 0..) |ch, cl| {
+            if (ch != '#') continue;
+            offsets[n] = .{
+                .d_row = @as(i8, @intCast(r)) - anchor_r,
+                .d_col = @as(i8, @intCast(cl)) - anchor_c,
+            };
+            n += 1;
+        }
+    }
+    // An empty shape is a recipe that does nothing — always a typo.
+    if (n == 0) {
+        fail("{s}: recipe '{s}' shape covers no cells (need at least one '#')", .{ BALANCE_FILE, recipe_label });
+        return ConfigError.EmptyShape;
+    }
+
+    const owned = try a.alloc(balance.ShapeOffset, n);
+    @memcpy(owned, offsets[0..n]);
+    return .{ .offsets = owned, .rows = @intCast(rows.len), .cols = @intCast(cols) };
+}
+
+/// Player combos are matched first-hit, so a repeated pattern silently
+/// shadows the later recipe.  Reject it at load rather than ship dead data.
+fn reject_duplicate_patterns(recipes: []const balance.PlayerRecipe) !void {
+    for (recipes, 0..) |a_rec, i| {
+        for (recipes[i + 1 ..]) |b_rec| {
+            if (game_logic.combos_equal(a_rec.pattern, b_rec.pattern)) {
+                fail("{s}: recipes '{s}' and '{s}' share the same pattern", .{ BALANCE_FILE, a_rec.label, b_rec.label });
+                return ConfigError.DuplicatePattern;
+            }
+        }
+    }
 }
 
 fn combo_from_names(recipe_label: []const u8, names: []const []const u8) !c.ActionCombo {
@@ -391,7 +439,7 @@ fn combo_from_names(recipe_label: []const u8, names: []const []const u8) !c.Acti
     };
     for (names, 0..) |name, i| {
         combo.slots[i] = slot_from_name(name) orelse {
-            fail("{s}: recipe '{s}' has unknown slot '{s}' (want dispense|medicine|red|green|yellow|blue)", .{ BALANCE_FILE, recipe_label, name });
+            fail("{s}: recipe '{s}' has unknown slot '{s}' (want dispense|medicine)", .{ BALANCE_FILE, recipe_label, name });
             return ConfigError.InvalidComboSlot;
         };
     }
@@ -404,9 +452,7 @@ fn combo_from_names(recipe_label: []const u8, names: []const []const u8) !c.Acti
 
 /// Minimal valid balance document for rejection tests.
 const minimal_balance =
-    \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-    \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-    \\ "round_duration_default_s":15,
+    \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
     \\ "player_recipes":[],"team_recipes":[]}
 ;
 
@@ -415,6 +461,13 @@ const minimal_encounters =
     \\{"default":"e1","encounters":[
     \\ {"label":"e1","hunger_max":100,"zones":[{"neutral":5}]}]}
 ;
+
+/// A one-recipe balance document, `{...}`-interpolated at the recipe body so
+/// each rejection test states only the field it is exercising.
+fn one_recipe(comptime body: []const u8) []const u8 {
+    return "{\"hunger_cost_normal\":1,\"hunger_cost_hazard_extra\":2," ++
+        "\"player_recipes\":[" ++ body ++ "],\"team_recipes\":[]}";
+}
 
 test "shipped data files parse and validate" {
     var loaded = try parse(
@@ -436,19 +489,41 @@ test "shipped data files parse and validate" {
     }
 }
 
-test "shipped balance parses to the expected shapes" {
+test "every shipped recipe has a legal combo and a real footprint" {
     var loaded = try parse(
         std.testing.allocator,
         @embedFile("balance_data"),
         @embedFile("encounters_data"),
     );
     defer loaded.deinit();
-    for (loaded.config.balance.player_recipes) |pr| {
+    const bal = &loaded.config.balance;
+    for (bal.player_recipes) |pr| {
         try std.testing.expect(pr.pattern.len >= 1);
         try std.testing.expect(pr.pattern.len <= c.MAX_COMBO_LEN);
+        try std.testing.expect(pr.shape.size() >= 1);
     }
-    for (loaded.config.balance.team_recipes) |tr| {
+    for (bal.team_recipes) |tr| {
         try std.testing.expect(tr.patterns.len >= 1);
+        try std.testing.expect(tr.shape.size() >= 1);
+    }
+}
+
+test "every shipped shape fits inside the grid it is cast on" {
+    // A shape wider than the field could never be fully placed.
+    var loaded = try parse(
+        std.testing.allocator,
+        @embedFile("balance_data"),
+        @embedFile("encounters_data"),
+    );
+    defer loaded.deinit();
+    const bal = &loaded.config.balance;
+    for (bal.player_recipes) |pr| {
+        try std.testing.expect(pr.shape.rows <= bal.slime_grid.rows);
+        try std.testing.expect(pr.shape.cols <= bal.slime_grid.cols);
+    }
+    for (bal.team_recipes) |tr| {
+        try std.testing.expect(tr.shape.rows <= bal.slime_grid.rows);
+        try std.testing.expect(tr.shape.cols <= bal.slime_grid.cols);
     }
 }
 
@@ -459,142 +534,241 @@ test "minimal documents parse" {
     try std.testing.expectEqualStrings("e1", loaded.config.encounters.default().label);
 }
 
-test "unknown combo slot name is rejected" {
-    const bad =
-        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,
-        \\ "player_recipes":[{"label":"x","pattern":["lava","dispense"],
-        \\   "output":{"units":{"red":1}}}],
-        \\ "team_recipes":[]}
-    ;
-    try std.testing.expectError(
-        ConfigError.InvalidComboSlot,
-        parse(std.testing.allocator, bad, minimal_encounters),
+test "a shape's anchor centres an odd footprint on the aimed cell" {
+    var loaded = try parse(
+        std.testing.allocator,
+        one_recipe(
+            \\{"label":"x","pattern":["dispense"],"shape":["###","###","###"]}
+        ),
+        minimal_encounters,
     );
+    defer loaded.deinit();
+    const shape = loaded.config.balance.player_recipes[0].shape;
+    try std.testing.expectEqual(@as(usize, 9), shape.size());
+    // Offsets span -1..+1 on both axes, so the centre cell is (0,0).
+    var has_centre = false;
+    for (shape.offsets) |o| {
+        try std.testing.expect(o.d_row >= -1 and o.d_row <= 1);
+        try std.testing.expect(o.d_col >= -1 and o.d_col <= 1);
+        if (o.d_row == 0 and o.d_col == 0) has_centre = true;
+    }
+    try std.testing.expect(has_centre);
+}
+
+test "a shape reads only '#' as covered" {
+    var loaded = try parse(
+        std.testing.allocator,
+        one_recipe(
+            \\{"label":"x","pattern":["dispense"],"shape":["#.#",".#.","#.#"]}
+        ),
+        minimal_encounters,
+    );
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 5), loaded.config.balance.player_recipes[0].shape.size());
+}
+
+test "a 1x1 shape sits exactly on the cursor" {
+    var loaded = try parse(
+        std.testing.allocator,
+        one_recipe(
+            \\{"label":"x","pattern":["dispense"],"shape":["#"]}
+        ),
+        minimal_encounters,
+    );
+    defer loaded.deinit();
+    const shape = loaded.config.balance.player_recipes[0].shape;
+    try std.testing.expectEqual(@as(usize, 1), shape.size());
+    try std.testing.expectEqual(@as(i8, 0), shape.offsets[0].d_row);
+    try std.testing.expectEqual(@as(i8, 0), shape.offsets[0].d_col);
+}
+
+test "a shape covering no cells is rejected" {
+    try std.testing.expectError(ConfigError.EmptyShape, parse(
+        std.testing.allocator,
+        one_recipe(
+            \\{"label":"x","pattern":["dispense"],"shape":["...","..."]}
+        ),
+        minimal_encounters,
+    ));
+}
+
+test "a shape with no rows is rejected" {
+    try std.testing.expectError(ConfigError.InvalidShapeSize, parse(
+        std.testing.allocator,
+        one_recipe(
+            \\{"label":"x","pattern":["dispense"],"shape":[]}
+        ),
+        minimal_encounters,
+    ));
+}
+
+test "a ragged shape is rejected" {
+    try std.testing.expectError(ConfigError.RaggedShape, parse(
+        std.testing.allocator,
+        one_recipe(
+            \\{"label":"x","pattern":["dispense"],"shape":["###","#"]}
+        ),
+        minimal_encounters,
+    ));
+}
+
+test "an over-tall shape is rejected" {
+    // MAX_SHAPE_ROWS + 1 rows of a single cell.
+    const rows = "[" ++ "\"#\"," ** balance.MAX_SHAPE_ROWS ++ "\"#\"]";
+    try std.testing.expectError(ConfigError.InvalidShapeSize, parse(
+        std.testing.allocator,
+        one_recipe("{\"label\":\"x\",\"pattern\":[\"dispense\"],\"shape\":" ++ rows ++ "}"),
+        minimal_encounters,
+    ));
+}
+
+test "an over-wide shape is rejected" {
+    const wide = "\"" ++ "#" ** (balance.MAX_SHAPE_COLS + 1) ++ "\"";
+    try std.testing.expectError(ConfigError.InvalidShapeSize, parse(
+        std.testing.allocator,
+        one_recipe("{\"label\":\"x\",\"pattern\":[\"dispense\"],\"shape\":[" ++ wide ++ "]}"),
+        minimal_encounters,
+    ));
+}
+
+test "two recipes sharing a pattern are rejected" {
+    // The second would be unreachable: first-hit matching shadows it.
+    try std.testing.expectError(ConfigError.DuplicatePattern, parse(
+        std.testing.allocator,
+        one_recipe(
+            \\{"label":"a","pattern":["dispense","medicine"],"shape":["#"]},
+            \\{"label":"b","pattern":["dispense","medicine"],"shape":["##"]}
+        ),
+        minimal_encounters,
+    ));
+}
+
+test "recipes differing only in order are distinct patterns" {
+    var loaded = try parse(
+        std.testing.allocator,
+        one_recipe(
+            \\{"label":"a","pattern":["dispense","medicine"],"shape":["#"]},
+            \\{"label":"b","pattern":["medicine","dispense"],"shape":["##"]}
+        ),
+        minimal_encounters,
+    );
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loaded.config.balance.player_recipes.len);
+}
+
+test "medicine is keyed by tier and defaults to none" {
+    var loaded = try parse(
+        std.testing.allocator,
+        one_recipe(
+            \\{"label":"plain","pattern":["dispense"],"shape":["#"]},
+            \\{"label":"tonic","pattern":["medicine"],"shape":["#"],
+            \\ "medicine":{"red":7,"green":2}}
+        ),
+        minimal_encounters,
+    );
+    defer loaded.deinit();
+    const recipes = loaded.config.balance.player_recipes;
+    try std.testing.expectEqual(@as(u32, 0), recipes[0].medicine.total());
+    try std.testing.expectEqual(@as(u32, 7), recipes[1].medicine.medicine[@intFromEnum(c.Tier.red)]);
+    try std.testing.expectEqual(@as(u32, 0), recipes[1].medicine.medicine[@intFromEnum(c.Tier.yellow)]);
+    try std.testing.expectEqual(@as(u32, 2), recipes[1].medicine.medicine[@intFromEnum(c.Tier.green)]);
+}
+
+test "an element name is no longer a valid combo slot" {
+    // Colors are difficulty tiers now; they were never castable input.
+    try std.testing.expectError(ConfigError.InvalidComboSlot, parse(
+        std.testing.allocator,
+        one_recipe(
+            \\{"label":"x","pattern":["red","dispense"],"shape":["#"]}
+        ),
+        minimal_encounters,
+    ));
+}
+
+test "unknown combo slot name is rejected" {
+    try std.testing.expectError(ConfigError.InvalidComboSlot, parse(
+        std.testing.allocator,
+        one_recipe(
+            \\{"label":"x","pattern":["lava","dispense"],"shape":["#"]}
+        ),
+        minimal_encounters,
+    ));
 }
 
 test "over-long combo pattern is rejected" {
-    const bad =
-        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,
-        \\ "player_recipes":[{"label":"x",
-        \\   "pattern":["red","dispense","dispense","dispense","dispense","dispense"],
-        \\   "output":{"units":{"red":1}}}],
-        \\ "team_recipes":[]}
-    ;
-    try std.testing.expectError(
-        ConfigError.InvalidComboLength,
-        parse(std.testing.allocator, bad, minimal_encounters),
-    );
+    try std.testing.expectError(ConfigError.InvalidComboLength, parse(
+        std.testing.allocator,
+        one_recipe(
+            \\{"label":"x","shape":["#"],
+            \\ "pattern":["dispense","dispense","dispense","dispense","dispense","dispense"]}
+        ),
+        minimal_encounters,
+    ));
 }
 
-test "realtime fields default when absent (pre-realtime configs stay valid)" {
+test "empty combo pattern is rejected" {
+    try std.testing.expectError(ConfigError.InvalidComboLength, parse(
+        std.testing.allocator,
+        one_recipe(
+            \\{"label":"x","pattern":[],"shape":["#"]}
+        ),
+        minimal_encounters,
+    ));
+}
+
+test "realtime fields default when absent" {
     var loaded = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
     defer loaded.deinit();
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), loaded.config.balance.eat_rate_units_per_s, 0.001);
     try std.testing.expectEqual(@as(u32, 500), loaded.config.balance.cast_buffer_ms);
     try std.testing.expectEqual(@as(u32, 500), loaded.config.balance.cast_lock_ms);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), loaded.config.balance.neutralize_residue_mult, 0.001);
 }
 
-test "slime_grid defaults when absent (pre-grid configs stay valid)" {
+test "slime_grid defaults when absent" {
     var loaded = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
     defer loaded.deinit();
-    try std.testing.expectEqual(balance.DEFAULT_SLIME_GRID, loaded.config.balance.slime_grid);
+    try std.testing.expectEqual(balance.DEFAULT_SLIME_GRID.rows, loaded.config.balance.slime_grid.rows);
+    try std.testing.expectEqual(balance.DEFAULT_SLIME_GRID.cols, loaded.config.balance.slime_grid.cols);
 }
 
 test "slime_grid is read from the document" {
     const doc =
-        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,"slime_grid":{"rows":4,"cols":7},
+        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\ "slime_grid":{"rows":4,"cols":12},
         \\ "player_recipes":[],"team_recipes":[]}
     ;
     var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
     defer loaded.deinit();
     try std.testing.expectEqual(@as(u8, 4), loaded.config.balance.slime_grid.rows);
-    try std.testing.expectEqual(@as(u8, 7), loaded.config.balance.slime_grid.cols);
-    try std.testing.expectEqual(@as(u16, 28), loaded.config.balance.slime_grid.cells());
+    try std.testing.expectEqual(@as(u8, 12), loaded.config.balance.slime_grid.cols);
+    try std.testing.expectEqual(@as(usize, 48), loaded.config.balance.slime_grid.cells());
 }
 
 test "out-of-range slime_grid dimensions are rejected" {
-    const zero_rows =
-        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,"slime_grid":{"rows":0,"cols":7},
+    const zero =
+        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\ "slime_grid":{"rows":0,"cols":8},
         \\ "player_recipes":[],"team_recipes":[]}
     ;
     try std.testing.expectError(
         ConfigError.InvalidSlimeGrid,
-        parse(std.testing.allocator, zero_rows, minimal_encounters),
+        parse(std.testing.allocator, zero, minimal_encounters),
     );
-    const too_many_cols =
-        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,"slime_grid":{"rows":4,"cols":17},
+    const too_big =
+        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\ "slime_grid":{"rows":8,"cols":99},
         \\ "player_recipes":[],"team_recipes":[]}
     ;
     try std.testing.expectError(
         ConfigError.InvalidSlimeGrid,
-        parse(std.testing.allocator, too_many_cols, minimal_encounters),
+        parse(std.testing.allocator, too_big, minimal_encounters),
     );
-}
-
-test "out-of-range neutralize_residue_mult is rejected" {
-    const over =
-        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,"neutralize_residue_mult":1.5,
-        \\ "player_recipes":[],"team_recipes":[]}
-    ;
-    try std.testing.expectError(
-        ConfigError.InvalidResidueMult,
-        parse(std.testing.allocator, over, minimal_encounters),
-    );
-    const negative =
-        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,"neutralize_residue_mult":-0.1,
-        \\ "player_recipes":[],"team_recipes":[]}
-    ;
-    try std.testing.expectError(
-        ConfigError.InvalidResidueMult,
-        parse(std.testing.allocator, negative, minimal_encounters),
-    );
-}
-
-test "zero neutralize_residue_mult is valid" {
-    const doc =
-        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,"neutralize_residue_mult":0,
-        \\ "player_recipes":[],"team_recipes":[]}
-    ;
-    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
-    defer loaded.deinit();
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), loaded.config.balance.neutralize_residue_mult, 0.001);
-}
-
-test "deprecated cast_window_ms is accepted and ignored" {
-    const old =
-        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,"cast_window_ms":3000,
-        \\ "player_recipes":[],"team_recipes":[]}
-    ;
-    var loaded = try parse(std.testing.allocator, old, minimal_encounters);
-    defer loaded.deinit();
-    try std.testing.expectEqual(@as(u32, 500), loaded.config.balance.cast_buffer_ms);
-    try std.testing.expectEqual(@as(u32, 500), loaded.config.balance.cast_lock_ms);
 }
 
 test "zero eat_rate_units_per_s is rejected" {
     const bad =
-        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,"eat_rate_units_per_s":0,
+        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\ "eat_rate_units_per_s":0,
         \\ "player_recipes":[],"team_recipes":[]}
     ;
     try std.testing.expectError(
@@ -605,9 +779,8 @@ test "zero eat_rate_units_per_s is rejected" {
 
 test "over-cap cast_buffer_ms is rejected" {
     const bad =
-        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,"cast_buffer_ms":60001,
+        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\ "cast_buffer_ms":60001,
         \\ "player_recipes":[],"team_recipes":[]}
     ;
     try std.testing.expectError(
@@ -618,9 +791,8 @@ test "over-cap cast_buffer_ms is rejected" {
 
 test "over-cap cast_lock_ms is rejected" {
     const bad =
-        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,"cast_lock_ms":60001,
+        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\ "cast_lock_ms":60001,
         \\ "player_recipes":[],"team_recipes":[]}
     ;
     try std.testing.expectError(
@@ -630,10 +802,10 @@ test "over-cap cast_lock_ms is rejected" {
 }
 
 test "zero cast_buffer_ms and cast_lock_ms are valid" {
+    // Zero means "fire immediately" / "no lock", both legitimate tunings.
     const doc =
-        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,"cast_buffer_ms":0,"cast_lock_ms":0,
+        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\ "cast_buffer_ms":0,"cast_lock_ms":0,
         \\ "player_recipes":[],"team_recipes":[]}
     ;
     var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
@@ -642,35 +814,10 @@ test "zero cast_buffer_ms and cast_lock_ms are valid" {
     try std.testing.expectEqual(@as(u32, 0), loaded.config.balance.cast_lock_ms);
 }
 
-test "a config with no deprecated classic fields at all still loads" {
-    const doc =
-        \\{"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "player_recipes":[],"team_recipes":[]}
-    ;
-    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
-    defer loaded.deinit();
-    try std.testing.expectEqual(@as(u32, 5), loaded.config.balance.units_per_slot);
-}
-
-test "deprecated classic fields are accepted and ignored" {
-    // Every saved designer config carries these; they must not break loading.
-    const doc =
-        \\{"casts_per_round":0,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":0,"cast_window_ms":3000,
-        \\ "player_recipes":[],"team_recipes":[]}
-    ;
-    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
-    defer loaded.deinit();
-    try std.testing.expectEqual(@as(u32, 5), loaded.config.balance.units_per_slot);
-}
-
 test "unknown top-level field is rejected (typo protection)" {
     const bad =
-        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,"units_per_sloot":9,
+        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\ "unnits_per_slot":5,
         \\ "player_recipes":[],"team_recipes":[]}
     ;
     try std.testing.expectError(
@@ -679,22 +826,72 @@ test "unknown top-level field is rejected (typo protection)" {
     );
 }
 
+test "a removed pre-shape balance field is rejected, not ignored" {
+    // Old configs are incompatible on purpose: their recipes have no shapes.
+    const stale =
+        \\{"units_per_slot":5,"medicine_per_slot":3,
+        \\ "hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidBalanceJson,
+        parse(std.testing.allocator, stale, minimal_encounters),
+    );
+}
+
+test "a recipe without a shape is rejected" {
+    const bad =
+        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\ "player_recipes":[{"label":"x","pattern":["dispense"]}],
+        \\ "team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidBalanceJson,
+        parse(std.testing.allocator, bad, minimal_encounters),
+    );
+}
+
+test "team recipes carry one shared shape" {
+    const doc =
+        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\ "player_recipes":[],
+        \\ "team_recipes":[{"label":"t","patterns":[["dispense"],["medicine"]],
+        \\   "shape":["#####"],"medicine":{"yellow":3}}]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    const tr = loaded.config.balance.team_recipes[0];
+    try std.testing.expectEqual(@as(usize, 2), tr.patterns.len);
+    try std.testing.expectEqual(@as(usize, 5), tr.shape.size());
+    try std.testing.expectEqual(@as(u32, 3), tr.medicine.medicine[@intFromEnum(c.Tier.yellow)]);
+}
+
+test "team recipe with zero patterns is rejected" {
+    const bad =
+        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\ "player_recipes":[],
+        \\ "team_recipes":[{"label":"t","patterns":[],"shape":["#"]}]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidTeamPatternCount,
+        parse(std.testing.allocator, bad, minimal_encounters),
+    );
+}
+
 test "legacy multi-zone encounters are summed into one slime total" {
     const doc =
-        \\{"default":"e1","encounters":[{"label":"e1","hunger_max":100,"zones":[
-        \\ {"modified":{"red":10,"green":5},"neutral":15},
-        \\ {"modified":{"red":10,"green":10,"yellow":5},"neutral":10},
-        \\ {"modified":{"red":15,"green":10,"yellow":10,"blue":5},"neutral":5}]}]}
+        \\{"default":"e1","encounters":[
+        \\ {"label":"e1","hunger_max":100,"zones":[
+        \\   {"tiered":{"red":3},"neutral":1},
+        \\   {"tiered":{"red":2,"green":4},"neutral":5}]}]}
     ;
     var loaded = try parse(std.testing.allocator, minimal_balance, doc);
     defer loaded.deinit();
     const e = loaded.config.encounters.default();
-    try std.testing.expectEqual(@as(u16, 30), e.slime.neutral);
-    try std.testing.expectEqual(@as(u16, 35), e.slime.modified[@intFromEnum(c.Element.red)]);
-    try std.testing.expectEqual(@as(u16, 25), e.slime.modified[@intFromEnum(c.Element.green)]);
-    try std.testing.expectEqual(@as(u16, 15), e.slime.modified[@intFromEnum(c.Element.yellow)]);
-    try std.testing.expectEqual(@as(u16, 5), e.slime.modified[@intFromEnum(c.Element.blue)]);
-    try std.testing.expectEqual(@as(u32, 110), e.total_units());
+    try std.testing.expectEqual(@as(u16, 5), e.slime.tiered[@intFromEnum(c.Tier.red)]);
+    try std.testing.expectEqual(@as(u16, 4), e.slime.tiered[@intFromEnum(c.Tier.green)]);
+    try std.testing.expectEqual(@as(u16, 6), e.slime.neutral);
+    try std.testing.expectEqual(@as(u32, 15), e.total_units());
 }
 
 test "encounter with no slime at all is rejected" {
@@ -720,34 +917,12 @@ test "unknown default encounter is rejected" {
 }
 
 test "too many zones is rejected" {
-    var buf: [4096]u8 = undefined;
-    var w = std.io.fixedBufferStream(&buf);
-    try w.writer().writeAll(
-        \\{"default":"e1","encounters":[{"label":"e1","hunger_max":100,"zones":[
-    );
-    for (0..enc.MAX_ZONES + 1) |i| {
-        if (i > 0) try w.writer().writeAll(",");
-        try w.writer().writeAll(
-            \\{"neutral":1}
-        );
-    }
-    try w.writer().writeAll("]}]}");
+    const zone = "{\"neutral\":1},";
+    const bad = "{\"default\":\"e1\",\"encounters\":[{\"label\":\"e1\"," ++
+        "\"hunger_max\":100,\"zones\":[" ++
+        zone ** (enc.MAX_ZONES) ++ "{\"neutral\":1}]}]}";
     try std.testing.expectError(
         ConfigError.TooManyZones,
-        parse(std.testing.allocator, minimal_balance, w.getWritten()),
-    );
-}
-
-test "team recipe with zero patterns is rejected" {
-    const bad =
-        \\{"casts_per_round":3,"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_modified_extra":2,
-        \\ "round_duration_default_s":15,
-        \\ "player_recipes":[],
-        \\ "team_recipes":[{"label":"t","patterns":[],"output":{}}]}
-    ;
-    try std.testing.expectError(
-        ConfigError.InvalidTeamPatternCount,
-        parse(std.testing.allocator, bad, minimal_encounters),
+        parse(std.testing.allocator, minimal_balance, bad),
     );
 }

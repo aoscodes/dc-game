@@ -1,8 +1,9 @@
 //! Bot test harness: injects bots into PlayerSlots in place of real clients.
 //!
-//! Each bot is driven by a `Profile` (a repeating combo sequence from
-//! bots.zig). On every cast cycle the harness encodes the bot's next combo as
-//! a `submit_spell` protocol message and enqueues it into the session, exactly
+//! Each bot is driven by a `Profile` (a repeating combo sequence, plus an
+//! optional repeating aim sequence, from bots.zig). On every cast cycle the
+//! harness encodes the bot's cursor steps as `move_cursor` messages and its
+//! next combo as a `submit_spell`, enqueueing both into the session — exactly
 //! replicating what a real WebSocket client would send.
 //!
 //! A "cycle" is one submit + one tick past the cast buffer, which is also long
@@ -151,6 +152,20 @@ pub const BotHarness = struct {
         try self.inject_tag(.choose_combo);
     }
 
+    /// Enqueue this cycle's cursor steps for every bot, so their next cast
+    /// lands somewhere new.  Aiming is a separate input axis from the combo,
+    /// so this is separable from inject_actions.
+    pub fn inject_aim(self: *BotHarness) !void {
+        for (self.bot_states) |*bs| {
+            for (bs.profile.aim_for(self.cycle)) |dir| {
+                var buf: [4]u8 = undefined;
+                var fbs = std.io.fixedBufferStream(&buf);
+                try proto.encode(fbs.writer(), .move_cursor, proto.MoveCursor{ .dir = dir });
+                self.session.enqueue_message(bs.player_id, fbs.getWritten());
+            }
+        }
+    }
+
     fn inject_tag(self: *BotHarness, tag: proto.MsgTag) !void {
         for (self.bot_states) |*bs| {
             const combo = bs.profile.combos[self.cycle % bs.profile.combos.len];
@@ -174,13 +189,15 @@ pub const BotHarness = struct {
     }
 
     /// Advance the session by exactly one cast cycle:
-    ///   1. inject_actions() for every bot
+    ///   1. inject_aim() then inject_actions() for every bot — aim first, so
+    ///      the cast is anchored at this cycle's new cursor
     ///   2. tick(0) so the queue drains and every cast is accepted together
     ///   3. tick past the cast buffer: the batch fires (team recipes group),
     ///      then each Lil Guy takes one bite
     ///
     /// Increments self.cycle afterwards.
     pub fn step(self: *BotHarness) !void {
+        try self.inject_aim();
         try self.inject_actions();
         try self.session.tick(0.0);
         try self.session.tick(self.cycle_dt());
@@ -199,8 +216,8 @@ pub const BotHarness = struct {
     }
 };
 
-/// Sum a per-color stats array.
-fn color_total(values: [c.Element.size]u16) u32 {
+/// Sum a per-tier stats array.
+fn tier_total(values: [c.Tier.size]u16) u32 {
     var t: u32 = 0;
     for (values) |v| t += v;
     return t;
@@ -210,56 +227,59 @@ fn color_total(values: [c.Element.size]u16) u32 {
 // Test encounters
 // ---------------------------------------------------------------------------
 
-/// Red-only field, exactly the size of the 6x10 fixture grid, so every unit is
-/// on-grid (in agent reach) from the first tick.
-const enc_red_field = enc.Encounter{
-    .label = "bot_red_field",
+/// Green-only field, exactly the size of the 6x10 fixture grid, so every unit
+/// is on-grid (in cursor reach) from the first tick.  Green is one downgrade
+/// from defused, so a single stamp per cell suffices.
+const enc_green_field = enc.Encounter{
+    .label = "bot_green_field",
     .hunger_max = 1000,
-    .slime = .{ .modified = .{ 60, 0, 0, 0 } },
+    .slime = .{ .tiered = .{ 0, 0, 60 } },
 };
 
-/// Un-winnable hunger budget when idle; survivable when neutralized:
-/// idle: 20 normal + 40 extra = 60 >= 50.  Neutralized: 20 < 50.
+/// Un-winnable hunger budget when idle; survivable when defused.  Exactly
+/// fills the 6x10 fixture grid, so every stamp is guaranteed to land on slime
+/// (a sparse field would make the comparison a coin flip).
+///
+/// Idle: each of the 60 units costs 1 normal + 2 extra, so the bar fills after
+/// 34 units.  Defused first: 1 each, so 60 total fits inside the budget.
 const enc_survival = enc.Encounter{
     .label = "bot_survival",
-    .hunger_max = 50,
-    .slime = .{ .modified = .{ 20, 0, 0, 0 } },
+    .hunger_max = 100,
+    .slime = .{ .tiered = .{ 0, 0, 60 } },
 };
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-test "twin_flames pair clears the red field" {
+test "sweeping bots make progress against a full hazard field" {
     const allocator = std.testing.allocator;
-    var h = try BotHarness.init(allocator, &bots.team_red_pair, &enc_red_field, "BOTKEY".*, .{});
+    var h = try BotHarness.init(allocator, &bots.team_mixed, &enc_green_field, "BOTKEY".*, .{});
     defer h.deinit();
 
-    _ = try h.run_to_completion(200);
+    _ = try h.run_to_completion(400);
 
     try std.testing.expectEqual(session_mod.SessionPhase.lobby, h.session.phase);
-    try std.testing.expectEqual(proto.EndReason.field_cleared, h.session.stats.reason);
     try std.testing.expectEqual(@as(u32, 60), h.session.stats.slime_total);
-    try std.testing.expectEqual(@as(u32, 0), h.session.stats.slime_left);
 
-    // Every unit was either scored (neutralized before its bite) or escaped as
-    // still-modified slime; nothing else can consume a unit.
-    const escaped = color_total(h.session.stats.feast.modified_escaped);
+    // Every unit was either scored (defused before its bite) or escaped as a
+    // live hazard; nothing else can consume a unit.
+    const escaped = tier_total(h.session.stats.feast.hazard_escaped);
     try std.testing.expectEqual(@as(u32, 60), h.session.score + escaped);
-    // The pair out-paces the horde by a wide margin: 30 agents per cycle vs
-    // two bites, so escapes are the rare exception.
-    try std.testing.expect(escaped < 10);
+    // Stamps landed on real hazards, so defusals happened.
+    try std.testing.expect(h.session.score > 0);
+    try std.testing.expect(tier_total(h.session.stats.feast.cells_covered) > 0);
 }
 
-test "neutralizing bots survive a hunger budget that idle play fails" {
+test "idle play loses a hunger budget that defusing bots can survive" {
     const allocator = std.testing.allocator;
 
-    // Idle team: joined but never casts, so all 20 modified units are eaten
-    // raw (1 normal + 2 extra each = 60 hunger) against a 50 budget.
+    // Idle team: joined but never casts, so every hazard unit is eaten live
+    // (1 normal + 2 extra each) and the bar fills long before the field does.
     var idle_sess = try Session.init_seeded(allocator, "BOTK01".*, TEST_CFG, 0xB07_5EED);
     defer idle_sess.deinit();
     var idle_bot: BotState = undefined;
-    idle_bot.init(allocator, 0xFF, &bots.profile_red_dispenser);
+    idle_bot.init(allocator, 0xFF, &bots.profile_sweeper);
     defer idle_bot.deinit(allocator);
     idle_bot.player_id = idle_sess.join(idle_bot.transport(), "Idle") orelse
         return error.JoinFailed;
@@ -272,24 +292,23 @@ test "neutralizing bots survive a hunger budget that idle play fails" {
     try std.testing.expectEqual(session_mod.SessionPhase.lobby, idle_sess.phase);
     try std.testing.expectEqual(proto.EndReason.hunger_full, idle_sess.stats.reason);
     try std.testing.expect(idle_sess.hunger.current >= idle_sess.hunger.max);
-    // Raw modified slime scores nothing.
+    // Live hazard slime scores nothing.
     try std.testing.expectEqual(@as(u32, 0), idle_sess.score);
     try std.testing.expect(idle_sess.stats.slime_left > 0);
 
-    // Active pair: twin_flames neutralizes the whole field on the first cast,
-    // so every unit is eaten at the normal hunger cost only.
-    var h = try BotHarness.init(allocator, &bots.team_red_pair, &enc_survival, "BOTK02".*, .{});
+    // Active team: stamping defuses cells before the horde reaches them, so
+    // those units cost the normal hunger only and the budget holds.
+    var h = try BotHarness.init(allocator, &bots.team_mixed, &enc_survival, "BOTK02".*, .{});
     defer h.deinit();
     _ = try h.run_to_completion(200);
 
     try std.testing.expectEqual(session_mod.SessionPhase.lobby, h.session.phase);
+    // Defusing outpaces the horde by a wide margin (3 bites/cycle vs a dozen
+    // cells stamped), so the field is cleared inside the budget.
     try std.testing.expectEqual(proto.EndReason.field_cleared, h.session.stats.reason);
-    try std.testing.expectEqual(@as(u32, 20), h.session.score);
-    try std.testing.expectEqual(@as(u16, 20), h.session.hunger.current);
+    try std.testing.expect(h.session.score > idle_sess.score);
     try std.testing.expect(h.session.hunger.current < h.session.hunger.max);
-    // Nothing escaped, so no healable hunger accrued.
-    for (h.session.hunger_healable) |healable|
-        try std.testing.expectEqual(@as(u16, 0), healable);
+    try std.testing.expect(tier_total(h.session.stats.feast.cells_covered) > 0);
 }
 
 test "mixed team finishes the default encounter with a positive score" {
@@ -308,7 +327,7 @@ test "mixed team finishes the default encounter with a positive score" {
 }
 
 test "profile cycles correctly across cast cycles" {
-    // Verify the rainbow profile cycles through its combos cycle by cycle.
+    // Verify a multi-combo profile cycles through its combos cycle by cycle.
     //
     // Injection flow: enqueue_message() places bytes in the slot's msg_queue.
     // The session only drains msg_queue during tick() via drain_queues(), so
@@ -317,11 +336,11 @@ test "profile cycles correctly across cast cycles" {
     // the previews stay observable.
     const allocator = std.testing.allocator;
 
-    const rainbow_team = bots.BotTeam{
-        .label = "rainbow_cycle",
+    const snake_team = bots.BotTeam{
+        .label = "snake_cycle",
         .bots = &[_]bots.BotEntry{.{
-            .name = "RainBot",
-            .profile = &bots.profile_rainbow,
+            .name = "SnakeBot",
+            .profile = &bots.profile_snake,
         }},
     };
 
@@ -331,11 +350,11 @@ test "profile cycles correctly across cast cycles" {
         .slime = .{ .neutral = 6 },
     };
 
-    var h = try BotHarness.init(allocator, &rainbow_team, &big_field, "BOTKEY".*, .{});
+    var h = try BotHarness.init(allocator, &snake_team, &big_field, "BOTKEY".*, .{});
     defer h.deinit();
 
     for (0..5) |i| {
-        const expected = bots.profile_rainbow.combos[i % bots.profile_rainbow.combos.len];
+        const expected = bots.profile_snake.combos[i % bots.profile_snake.combos.len];
         try h.inject_previews();
         try h.session.tick(0.0);
         const pid = h.bot_states[0].player_id;
@@ -346,4 +365,87 @@ test "profile cycles correctly across cast cycles" {
     // No cast ever committed and no bite timer advanced: the field is intact.
     try std.testing.expectEqual(session_mod.SessionPhase.playing, h.session.phase);
     try std.testing.expectEqual(@as(u32, 6), h.session.field.remaining());
+}
+
+test "aim injection walks the cursor and anchors casts where the bot aimed" {
+    // profile_sweeper steps right three times per cycle; the cursor starts at
+    // the grid centre and clamps at the right edge.
+    const allocator = std.testing.allocator;
+
+    const solo = bots.BotTeam{
+        .label = "solo_sweeper",
+        .bots = &[_]bots.BotEntry{.{ .name = "Sweep", .profile = &bots.profile_sweeper }},
+    };
+    const big_field = enc.Encounter{
+        .label = "bot_aim_field",
+        .hunger_max = 60000,
+        .slime = .{ .neutral = 60 },
+    };
+
+    var h = try BotHarness.init(allocator, &solo, &big_field, "BOTKEY".*, .{});
+    defer h.deinit();
+    const pid = h.bot_states[0].player_id;
+    const grid = &h.session.field.grid;
+
+    const start = h.session.cursors[pid];
+    try std.testing.expectEqual(@as(u8, 5), grid.col_of(start));
+
+    try h.inject_aim();
+    try h.session.tick(0.0);
+    const moved = h.session.cursors[pid];
+    // Three right steps, same row.
+    try std.testing.expectEqual(grid.row_of(start), grid.row_of(moved));
+    try std.testing.expectEqual(@as(u8, 8), grid.col_of(moved));
+
+    // Aiming past the edge parks against it rather than wrapping.
+    for (0..3) |_| {
+        try h.inject_aim();
+        try h.session.tick(0.0);
+    }
+    const parked = h.session.cursors[pid];
+    try std.testing.expectEqual(grid.cols - 1, grid.col_of(parked));
+    try std.testing.expectEqual(grid.row_of(start), grid.row_of(parked));
+}
+
+test "a submitted cast keeps its anchor when the bot re-aims mid-buffer" {
+    // The cast_anchors snapshot exists so an in-flight spell cannot be
+    // retargeted by moving after commit.
+    const allocator = std.testing.allocator;
+
+    const solo = bots.BotTeam{
+        .label = "solo_poker",
+        .bots = &[_]bots.BotEntry{.{ .name = "Poke", .profile = &bots.profile_poker }},
+    };
+    const big_field = enc.Encounter{
+        .label = "bot_anchor_field",
+        .hunger_max = 60000,
+        .slime = .{ .tiered = .{ 0, 0, 60 } },
+    };
+
+    var h = try BotHarness.init(allocator, &solo, &big_field, "BOTKEY".*, .{});
+    defer h.deinit();
+    const pid = h.bot_states[0].player_id;
+
+    try h.inject_actions();
+    try h.session.tick(0.0);
+    const anchor = h.session.cast_anchors[pid];
+    try std.testing.expectEqual(h.session.cursors[pid], anchor);
+
+    // Walk away while the cast is still buffering.
+    for (0..3) |_| {
+        var buf: [4]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        try proto.encode(fbs.writer(), .move_cursor, proto.MoveCursor{ .dir = .up });
+        h.session.enqueue_message(pid, fbs.getWritten());
+    }
+    try h.session.tick(0.0);
+    try std.testing.expect(h.session.cursors[pid] != anchor);
+    try std.testing.expectEqual(anchor, h.session.cast_anchors[pid]);
+
+    // `poke` is 1x1 and the field is all-green, so the stamp downgrades
+    // exactly one green cell — at the anchor, not the moved-to cursor.
+    try h.session.tick(h.cycle_dt());
+    const covered = h.session.stats.feast.cells_covered;
+    try std.testing.expectEqual(@as(u16, 1), covered[@intFromEnum(c.Tier.green)]);
+    try std.testing.expectEqual(@as(u16, 1), h.session.stats.players[pid].cells_covered);
 }

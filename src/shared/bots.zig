@@ -7,8 +7,9 @@
 //!
 //! ## Concepts
 //!
-//! `Profile`   — a repeating combo sequence; on round r the bot submits
-//!               combos[r % combos.len].  Profiles are shared across bots.
+//! `Profile`   — a repeating combo sequence plus an optional repeating aim
+//!               sequence; on cycle r the bot steps aim[r % aim.len] then
+//!               submits combos[r % combos.len].  Shared across bots.
 //!
 //! `BotEntry`  — one slot in a BotTeam: profile + display name.
 //!
@@ -20,12 +21,27 @@
 //! No other file needs to change.
 
 const c = @import("components.zig");
+const protocol = @import("protocol.zig");
 
 const mk = c.make_combo;
+
+const D = c.ComboSlot{ .action = .dispense };
+const M = c.ComboSlot{ .action = .medicine };
 
 pub const Profile = struct {
     label: []const u8,
     combos: []const c.ActionCombo,
+    /// Cursor steps taken BEFORE each cast, cycled the same way as `combos`.
+    /// A bot that never aims stays wherever it spawned, which is a legitimate
+    /// (if bad) strategy — so this defaults to empty rather than being
+    /// required.
+    aim: []const []const protocol.CursorDir = &.{},
+
+    /// Cursor steps for cycle `n`, or none if this profile never aims.
+    pub fn aim_for(self: *const Profile, n: usize) []const protocol.CursorDir {
+        if (self.aim.len == 0) return &.{};
+        return self.aim[n % self.aim.len];
+    }
 };
 
 pub const BotEntry = struct {
@@ -38,54 +54,58 @@ pub const BotTeam = struct {
     bots: []const BotEntry,
 };
 
-/// Dispenses red agents every round (flat conversion: 2 slots).
-pub const profile_red_dispenser = Profile{
-    .label = "red_dispenser",
+/// Pokes a single cell, never moving: the minimum viable player.
+pub const profile_poker = Profile{
+    .label = "poker",
+    .combos = &[_]c.ActionCombo{mk(&.{D})},
+};
+
+/// Walks right one cell per cast, stamping 3x3 blocks — the field-clearing
+/// workhorse.  Clamping means it eventually parks on the right edge.
+pub const profile_sweeper = Profile{
+    .label = "sweeper",
+    .combos = &[_]c.ActionCombo{mk(&.{ D, D, D })},
+    .aim = &.{&.{ .right, .right, .right }},
+};
+
+/// Alternates a wide sweep and a downward step, snaking across the field.
+pub const profile_snake = Profile{
+    .label = "snake",
     .combos = &[_]c.ActionCombo{
-        mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } }),
+        mk(&.{ D, D }),
+        mk(&.{ D, D, D }),
+    },
+    .aim = &.{
+        &.{ .right, .right, .right },
+        &.{ .down, .left, .left },
     },
 };
 
-/// Rotates through all four agent colors, one flood recipe per round.
-pub const profile_rainbow = Profile{
-    .label = "rainbow",
-    .combos = &[_]c.ActionCombo{
-        mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        mk(&.{ .{ .element = .green }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        mk(&.{ .{ .element = .yellow }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        mk(&.{ .{ .element = .blue }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
-    },
-};
-
-/// Casts medicine every round (panacea recipe).
+/// Brews medicine instead of clearing: exercises the healing path.
 pub const profile_medic = Profile{
     .label = "medic",
-    .combos = &[_]c.ActionCombo{
-        mk(&.{ .{ .element = .blue }, .{ .action = .medicine }, .{ .action = .medicine } }),
-    },
+    .combos = &[_]c.ActionCombo{mk(&.{ M, M })},
 };
 
-/// One half of the twin_flames team recipe, every round.
-pub const profile_twin_flame = Profile{
-    .label = "twin_flame",
-    .combos = &[_]c.ActionCombo{
-        mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } }),
-    },
+/// One half of the twin_bloom team recipe, every cycle.
+pub const profile_twin_bloom = Profile{
+    .label = "twin_bloom",
+    .combos = &[_]c.ActionCombo{mk(&.{ D, M })},
 };
 
-pub const team_red_pair = BotTeam{
-    .label = "team_red_pair",
+pub const team_bloom_pair = BotTeam{
+    .label = "team_bloom_pair",
     .bots = &[_]BotEntry{
-        .{ .name = "FlameBotA", .profile = &profile_twin_flame },
-        .{ .name = "FlameBotB", .profile = &profile_twin_flame },
+        .{ .name = "BloomBotA", .profile = &profile_twin_bloom },
+        .{ .name = "BloomBotB", .profile = &profile_twin_bloom },
     },
 };
 
 pub const team_mixed = BotTeam{
     .label = "team_mixed",
     .bots = &[_]BotEntry{
-        .{ .name = "Rainbow", .profile = &profile_rainbow },
+        .{ .name = "Snake", .profile = &profile_snake },
         .{ .name = "Medic", .profile = &profile_medic },
-        .{ .name = "Sprayer", .profile = &profile_red_dispenser },
+        .{ .name = "Sweeper", .profile = &profile_sweeper },
     },
 };

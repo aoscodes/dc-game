@@ -4,24 +4,27 @@
 //! BufferTransport that accumulates outgoing bytes.
 //!
 //! Every session here is created with `Session.init_seeded` and a PINNED seed,
-//! so cell placement, Lil Guy targeting and neutralize subsets are all
-//! reproducible.  Where a test needs a specific grid layout it writes the
+//! so cell placement and Lil Guy targeting are both reproducible.  Where a test needs a specific grid layout it writes the
 //! cells directly (`sess.field.grid.put`) after start, which is the only way
 //! to assert exact per-cell outcomes without depending on the PRNG stream.
 //!
 //! Mechanics under test:
 //!   - combo intake (latest preview wins, cancel clears)
+//!   - aiming: server-authoritative per-player cursor, clamped at the edges;
+//!     a cast is anchored where the player aimed at SUBMIT time
 //!   - realtime casting: per-cast buffer, cast lock, replacement, team-recipe
 //!     grouping, batch conversion
-//!   - neutralization: on-grid cohort only, random subset, residue multiplier
+//!   - shape stamping: a matched recipe's footprint downgrades every covered
+//!     hazard cell by exactly one tier (red→yellow→green→defused); cells off
+//!     the grid edge are clipped, non-hazard cells are inert
 //!   - eating: one Lil Guy per connected player, bite timers, misses, refill
 //!     from the reservoir
 //!   - hunger accounting: normal (unhealable) vs extra (healable) portions
-//!   - symmetrical medicine: color-X medicine heals only color-X healable
+//!   - symmetrical medicine: tier-X medicine heals only tier-X healable
 //!     hunger; asymmetric medicine and overheal are discarded
-//!   - score = neutral + neutralized units eaten
+//!   - score = neutral + defused units eaten
 //!   - end conditions: field cleared / hunger bar full
-//!   - wire contents: grid, reservoir, lil guys, cast countdowns
+//!   - wire contents: grid, reservoir, lil guys, cursors, cast countdowns
 
 const std = @import("std");
 const shared = @import("shared");
@@ -45,9 +48,31 @@ const DEFAULT_ENC = fixtures.test_config.encounters.default();
 /// grid placement and target selection replay identically run to run.
 const SEED: u64 = 0x5EED_FEA57;
 
-const RED: usize = @intFromEnum(c.Element.red);
-const GREEN: usize = @intFromEnum(c.Element.green);
-const BLUE: usize = @intFromEnum(c.Element.blue);
+const RED: usize = @intFromEnum(c.Tier.red);
+const YELLOW: usize = @intFromEnum(c.Tier.yellow);
+const GREEN: usize = @intFromEnum(c.Tier.green);
+
+/// Fixture recipe combos, by the shape they stamp.  Kept as named consts so a
+/// test reads as an intent ("stamp a 3x3 block") rather than a slot soup.
+const POKE = mk(&.{D}); // "#"
+const SWEEP = mk(&.{ D, D }); // "###"
+const BLOCK = mk(&.{ D, D, D }); // 3x3
+const TONIC = mk(&.{ M, M }); // "#" + medicine 6/6/6
+const RED_TONIC = mk(&.{ M, M, M }); // "#" + medicine 10/0/0
+const BLOOM_HALF = mk(&.{ D, M }); // half of team twin_bloom (5x5 diamond)
+const CROSSFIRE_A = mk(&.{ M, D });
+const CROSSFIRE_B = mk(&.{ M, D, D });
+/// Matches nothing in the fixture tables.  There is NO flat fallback, so this
+/// always fizzles — the recipe list is the complete move list.
+const UNMATCHED = mk(&.{ D, D, D, D, D });
+
+const D = c.ComboSlot{ .action = .dispense };
+const M = c.ComboSlot{ .action = .medicine };
+
+/// A live hazard cell of the given tier — the thing casts downgrade.
+fn tiered(tier: c.Tier) c.SlimeCell {
+    return .{ .tiered = tier };
+}
 
 // ---------------------------------------------------------------------------
 // Minimal test encounters
@@ -57,40 +82,45 @@ const BLUE: usize = @intFromEnum(c.Element.blue);
 // encounters fit entirely on the grid and large ones exercise refill.
 // ---------------------------------------------------------------------------
 
-/// 20 red-modified units, roomy hunger budget.  Fits on the grid.
+/// 20 green hazard units, roomy hunger budget.  Fits on the grid.  Green is
+/// one downgrade from defused, so a single stamp finishes a cell.
+const enc_twenty_green = enc.Encounter{
+    .label = "test_twenty_green",
+    .hunger_max = 1000,
+    .slime = .{ .tiered = .{ 0, 0, 20 } },
+};
+
+/// 20 red hazard units: red needs THREE stamps per cell to defuse.
 const enc_twenty_red = enc.Encounter{
     .label = "test_twenty_red",
     .hunger_max = 1000,
-    .slime = .{ .modified = .{ 20, 0, 0, 0 } },
+    .slime = .{ .tiered = .{ 20, 0, 0 } },
 };
 
-/// 30 red-modified units — exactly one twin_flames output.
-const enc_thirty_red = enc.Encounter{
-    .label = "test_thirty_red",
+/// 50 green units — more than any single shape covers, so casts only ever
+/// clear part of the field.
+const enc_fifty_green = enc.Encounter{
+    .label = "test_fifty_green",
     .hunger_max = 1000,
-    .slime = .{ .modified = .{ 30, 0, 0, 0 } },
+    .slime = .{ .tiered = .{ 0, 0, 50 } },
 };
 
-/// 50 red-modified units (the partial-neutralization case).  Fits on the grid.
-const enc_fifty_red = enc.Encounter{
-    .label = "test_fifty_red",
-    .hunger_max = 1000,
-    .slime = .{ .modified = .{ 50, 0, 0, 0 } },
-};
-
-/// Mixed colors + neutral: 10 red + 8 green + 7 neutral = 25 units.
+/// Mixed tiers + neutral: 10 red + 8 green + 7 neutral = 25 units.
 const enc_mixed = enc.Encounter{
     .label = "test_mixed",
     .hunger_max = 1000,
-    .slime = .{ .modified = .{ 10, 8, 0, 0 }, .neutral = 7 },
+    .slime = .{ .tiered = .{ 10, 0, 8 }, .neutral = 7 },
 };
 
-/// Tiny hunger budget: eating the 10 red units un-neutralized costs
-/// 10 normal + 20 extra = 30 ≥ 25, so idle play loses.
+/// Tiny hunger budget, and exactly as many units as one `block` stamp covers
+/// (3x3 = 9).  Eating them live costs 3 each, so the bar fills on the 8th unit
+/// — BEFORE the field empties, which is what makes the loss unambiguous (a
+/// simultaneous clear would win the tie).  Defusing them first costs 9 total,
+/// a comfortable clear.
 const enc_tight_budget = enc.Encounter{
     .label = "test_tight_budget",
-    .hunger_max = 25,
-    .slime = .{ .modified = .{ 10, 0, 0, 0 } },
+    .hunger_max = 20,
+    .slime = .{ .tiered = .{ 0, 0, 9 } },
 };
 
 /// Neutral-only: hunger from these units is never healable, and every unit
@@ -106,7 +136,7 @@ const enc_neutral_only = enc.Encounter{
 const enc_overflow = enc.Encounter{
     .label = "test_overflow",
     .hunger_max = 1000,
-    .slime = .{ .modified = .{ 40, 0, 0, 0 }, .neutral = 40 },
+    .slime = .{ .tiered = .{ 0, 0, 40 }, .neutral = 40 },
 };
 
 // ---------------------------------------------------------------------------
@@ -183,7 +213,8 @@ fn consume_payload(tag: proto.MsgTag, r: anytype) bool {
         .cast_committed => if (proto.decode_cast_committed(r)) |_| true else |_| false,
         .cast_fizzled => if (proto.decode_cast_fizzled(r)) |_| true else |_| false,
         .recipe_fired => if (proto.decode_recipe_fired(r)) |_| true else |_| false,
-        .agents_dispensed => if (proto.decode_agents_dispensed(r)) |_| true else |_| false,
+        .shape_cast => if (proto.decode_shape_cast(r)) |_| true else |_| false,
+        .move_cursor => if (proto.decode_move_cursor(r)) |_| true else |_| false,
         .cast_grouped => if (proto.decode_cast_grouped(r)) |_| true else |_| false,
         .cast_replaced => if (proto.decode_cast_replaced(r)) |_| true else |_| false,
         .cast_fired => if (proto.decode_cast_fired(r)) |_| true else |_| false,
@@ -246,7 +277,7 @@ fn flush(sess: *Session) !void {
     try sess.tick(0.0);
 }
 
-/// Sum of all per-color healable hunger buckets.
+/// Sum of all per-tier healable hunger buckets.
 fn total_healable(sess: *const Session) u32 {
     var t: u32 = 0;
     for (sess.hunger_healable) |h| t += h;
@@ -338,6 +369,20 @@ fn set_field(sess: *Session, cell: c.SlimeCell, count: u16) void {
     paint_grid(sess, .empty);
     var flat: u16 = 0;
     while (flat < count) : (flat += 1) sess.field.grid.put(flat, cell);
+    sess.field.reservoir = .{};
+}
+
+/// Replace the whole field with a 3x3 patch of `cell` centred on (row, col)
+/// and nothing else — exactly the footprint of the fixture `block` recipe, so
+/// ONE stamp covers the entire remaining field.  The reservoir is emptied so
+/// no refill can reintroduce slime mid-test.
+fn set_block_field(sess: *Session, cell: c.SlimeCell, row: u8, col: u8) void {
+    paint_grid(sess, .empty);
+    for (0..3) |dr| {
+        for (0..3) |dc| {
+            sess.field.grid.set(row - 1 + @as(u8, @intCast(dr)), col - 1 + @as(u8, @intCast(dc)), cell);
+        }
+    }
     sess.field.reservoir = .{};
 }
 
@@ -481,7 +526,7 @@ test "one Lil Guy per connected player, each with a reservation" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_fifty_red);
+    try start(&s, &enc_fifty_green);
 
     try std.testing.expectEqual(@as(usize, 2), s.sess.world.component_arrays.lil_guy.size);
     for (&s.sess.players) |*slot| {
@@ -499,7 +544,7 @@ test "disconnect retires the Lil Guy; reconnect brings it back" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_fifty_red);
+    try start(&s, &enc_fifty_green);
 
     s.sess.disconnect(s.p[1].pid);
     try flush(&s.sess); // sync_lil_guys runs inside the feast phase
@@ -522,10 +567,10 @@ test "choose_combo stores the latest preview; cancel clears it" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_fifty_red);
+    try start(&s, &enc_fifty_green);
 
-    const combo_a = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
-    const combo_b = mk(&.{ .{ .element = .blue }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const combo_a = POKE;
+    const combo_b = SWEEP;
 
     try enqueue_combo(&s.sess, s.p[0].pid, combo_a);
     try flush(&s.sess);
@@ -547,9 +592,9 @@ test "submitting clears the live preview" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_fifty_red);
+    try start(&s, &enc_fifty_green);
 
-    const combo = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
+    const combo = BLOOM_HALF; // [dispense, medicine] — two distinguishable slots
     try enqueue_combo(&s.sess, s.p[0].pid, combo);
     try flush(&s.sess);
     try enqueue_submit(&s.sess, s.p[0].pid, combo);
@@ -560,20 +605,38 @@ test "submitting clears the live preview" {
 }
 
 // ---------------------------------------------------------------------------
-// Neutralization (agents act on the ON-GRID cohort only)
+// Shape stamping
 //
-// These tests pin the grid with `set_field` and fire casts with a zero buffer
-// so the conversion is fully deterministic: the only randomness left is WHICH
-// cells of the cohort are picked, which the assertions do not depend on.
+// A matched recipe stamps its shape at the caster's cast anchor, downgrading
+// every covered HAZARD cell by exactly one tier.  These tests pin the grid
+// with `set_field`/`paint_grid` and fire casts with a zero cast buffer, so a
+// stamp is fully deterministic: shape placement is arithmetic, not PRNG.
 // ---------------------------------------------------------------------------
 
-/// Number of `neutralized` cells of one color on the grid.
-fn count_neutralized(sess: *const Session, color: c.Element) u16 {
+/// Number of live hazard cells of one tier on the grid.
+fn count_tier(sess: *const Session, tier: c.Tier) u16 {
+    return sess.field.grid.tier_count(tier);
+}
+
+/// Number of defused (`neutralized`) cells on the grid.
+fn count_defused(sess: *const Session) u16 {
     var n: u16 = 0;
     for (sess.field.grid.live()) |cell| {
-        if (cell == .neutralized and cell.neutralized == color) n += 1;
+        if (cell == .neutralized) n += 1;
     }
     return n;
+}
+
+/// Park a player's cursor on an exact cell, bypassing the d-pad.  Cursors are
+/// server-owned, so tests set them the same way the server does.
+fn aim_at(sess: *Session, pid: u8, row: u8, col: u8) void {
+    sess.cursors[pid] = sess.field.grid.index(row, col);
+}
+
+/// Seconds that expire a cast buffer under `cfg` (plus nothing — callers add
+/// their own epsilon).
+fn cast_buffer_s(cfg: *const shared.config.Config) f32 {
+    return @as(f32, @floatFromInt(cfg.balance.cast_buffer_ms)) / 1000.0;
 }
 
 /// A fixture config with an immediate cast buffer, so a submit converts in the
@@ -584,7 +647,7 @@ fn cfg_instant_cast() shared.config.Config {
     return cfg;
 }
 
-test "dispensed agents neutralize matching-color cells in place" {
+test "a stamp downgrades exactly the cells its shape covers" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -592,30 +655,33 @@ test "dispensed agents neutralize matching-color cells in place" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_fifty_red);
-    set_field(&s.sess, .{ .modified = .red }, 50);
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
 
-    // crimson_flood: 20 red agents, residue 1.0 → 20 cells become neutralized.
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .red },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-    }));
+    // `block` is 3x3 = 9 cells, centred on the anchor and fully in-bounds here.
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
 
-    try std.testing.expectEqual(@as(u16, 30), s.sess.field.grid.modified_count(.red));
-    try std.testing.expectEqual(@as(u16, 20), count_neutralized(&s.sess, .red));
-    // Nothing eaten yet: hunger and score untouched, no slime destroyed.
+    // Green is one step from defused, so all 9 covered cells defuse and the
+    // rest of the grid is untouched.
+    try std.testing.expectEqual(@as(u16, 9), count_defused(&s.sess));
+    try std.testing.expectEqual(@as(u16, 60 - 9), count_tier(&s.sess, .green));
+    // Nothing is destroyed: a downgrade rewrites a cell, it never empties it.
+    try std.testing.expectEqual(@as(u16, 60), s.sess.field.grid.occupied());
+    try std.testing.expectEqual(@as(u32, 60), s.sess.field.remaining());
+    // Nothing eaten yet.
     try std.testing.expectEqual(@as(u16, 0), s.sess.hunger.current);
     try std.testing.expectEqual(@as(u32, 0), s.sess.score);
-    try std.testing.expectEqual(@as(u32, 50), s.sess.field.remaining());
-    // Stats record the dispensed agents and the cells transmuted.
-    try std.testing.expectEqual(@as(u16, 20), s.sess.stats.feast.agents_dispensed[RED]);
-    try std.testing.expectEqual(@as(u16, 20), s.sess.stats.feast.neutralized[RED]);
+    // Stats see the coverage and the defusals.
+    try std.testing.expectEqual(@as(u16, 9), s.sess.stats.feast.cells_covered[GREEN]);
+    try std.testing.expectEqual(@as(u16, 9), s.sess.stats.feast.neutralized[GREEN]);
+    try std.testing.expectEqual(@as(u16, 9), s.sess.stats.players[s.p[0].pid].cells_covered);
+    try std.testing.expectEqual(@as(u16, 9), s.sess.stats.players[s.p[0].pid].cells_neutralized);
 }
 
-test "wrong-color agents neutralize nothing" {
+test "a stamp lands at the caster's cursor, not at a fixed spot" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -623,25 +689,20 @@ test "wrong-color agents neutralize nothing" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_fifty_red);
-    set_field(&s.sess, .{ .modified = .red }, 50);
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
 
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .blue },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-    }));
+    // `poke` is a single cell, so the anchor IS the footprint.
+    aim_at(&s.sess, s.p[0].pid, 4, 7);
+    try enqueue_submit(&s.sess, s.p[0].pid, POKE);
     try flush(&s.sess);
 
-    try std.testing.expectEqual(@as(u16, 50), s.sess.field.grid.modified_count(.red));
-    try std.testing.expectEqual(@as(u16, 0), count_neutralized(&s.sess, .red));
-    // The agents were dispensed (and wasted) — the stats show both facts.
-    try std.testing.expectEqual(@as(u16, 20), s.sess.stats.feast.agents_dispensed[BLUE]);
-    for (s.sess.stats.feast.neutralized) |n| try std.testing.expectEqual(@as(u16, 0), n);
+    try std.testing.expect(s.sess.field.grid.at(4, 7) == .neutralized);
+    try std.testing.expectEqual(@as(u16, 1), count_defused(&s.sess));
 }
 
-test "agents beyond the on-grid cohort are wasted, not applied to the reservoir" {
+test "a shape hanging off the edge is clipped, and the surplus is reported" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -649,28 +710,122 @@ test "agents beyond the on-grid cohort are wasted, not applied to the reservoir"
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    // 80 red units: 60 on the grid, 20 waiting off-grid.
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
+
+    // 3x3 anchored in the top-left corner: only the bottom-right 2x2 quadrant
+    // is on the grid.  Clipping must not wrap to the far edge.
+    aim_at(&s.sess, s.p[0].pid, 0, 0);
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
+    try flush(&s.sess);
+
+    try std.testing.expectEqual(@as(u16, 4), count_defused(&s.sess));
+    try std.testing.expect(s.sess.field.grid.at(0, 0) == .neutralized);
+    try std.testing.expect(s.sess.field.grid.at(1, 1) == .neutralized);
+    // The opposite corner is untouched — nothing wrapped around.
+    try std.testing.expect(s.sess.field.grid.at(5, 9) == .tiered);
+}
+
+test "a stamp steps a red cell down one tier at a time, taking three casts" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    const cfg = cfg_instant_cast();
+    s.sess.cfg = &cfg;
+    try start(&s, &enc_twenty_red);
+    paint_grid(&s.sess, tiered(.red));
+    s.sess.field.reservoir = .{};
+    freeze_bites(&s.sess);
+
+    const pid = s.p[0].pid;
+    aim_at(&s.sess, pid, 3, 4);
+
+    // Cast 1: red → yellow.
+    try enqueue_submit(&s.sess, pid, POKE);
+    try flush(&s.sess);
+    try std.testing.expectEqual(c.Tier.yellow, s.sess.field.grid.at(3, 4).tiered);
+
+    // Cast 2: yellow → green.
+    try s.sess.tick(1.0); // clear the cast lock
+    aim_at(&s.sess, pid, 3, 4);
+    try enqueue_submit(&s.sess, pid, POKE);
+    try flush(&s.sess);
+    try std.testing.expectEqual(c.Tier.green, s.sess.field.grid.at(3, 4).tiered);
+
+    // Cast 3: green → defused, and no further.
+    try s.sess.tick(1.0);
+    aim_at(&s.sess, pid, 3, 4);
+    try enqueue_submit(&s.sess, pid, POKE);
+    try flush(&s.sess);
+    try std.testing.expect(s.sess.field.grid.at(3, 4) == .neutralized);
+
+    // A fourth cast is inert: a defused cell cannot be downgraded further.
+    try s.sess.tick(1.0);
+    aim_at(&s.sess, pid, 3, 4);
+    try enqueue_submit(&s.sess, pid, POKE);
+    try flush(&s.sess);
+    try std.testing.expect(s.sess.field.grid.at(3, 4) == .neutralized);
+    // Three tiers covered, one per tier — the fourth cast covered nothing.
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.feast.cells_covered[RED]);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.feast.cells_covered[YELLOW]);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.feast.cells_covered[GREEN]);
+}
+
+test "empty and neutral cells under a shape are inert" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    const cfg = cfg_instant_cast();
+    s.sess.cfg = &cfg;
+    try start(&s, &enc_neutral_only);
+    // Half neutral, half empty: neither is a hazard, so neither can downgrade.
+    paint_grid(&s.sess, .empty);
+    var flat: u16 = 0;
+    while (flat < 30) : (flat += 1) s.sess.field.grid.put(flat, .neutral);
+    s.sess.field.reservoir = .{};
+
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
+    try flush(&s.sess);
+
+    try std.testing.expectEqual(@as(u16, 0), count_defused(&s.sess));
+    try std.testing.expectEqual(@as(u16, 30), s.sess.field.grid.occupied());
+    for (s.sess.stats.feast.cells_covered) |n|
+        try std.testing.expectEqual(@as(u16, 0), n);
+}
+
+test "a stamp only reaches the grid; the reservoir is out of range" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    const cfg = cfg_instant_cast();
+    s.sess.cfg = &cfg;
+    // 80 green units: 60 on the grid, 20 waiting off-grid.
     const encounter = enc.Encounter{
-        .label = "test_red_overflow",
+        .label = "test_green_overflow",
         .hunger_max = 1000,
-        .slime = .{ .modified = .{ 80, 0, 0, 0 } },
+        .slime = .{ .tiered = .{ 0, 0, 80 } },
     };
     try start(&s, &encounter);
-    try std.testing.expectEqual(@as(u16, 60), s.sess.field.grid.modified_count(.red));
+    try std.testing.expectEqual(@as(u16, 60), count_tier(&s.sess, .green));
 
-    // twin_flames from both players: 30 agents — under the 60-cell cohort.
-    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
-    try enqueue_submit(&s.sess, s.p[0].pid, half);
-    try enqueue_submit(&s.sess, s.p[1].pid, half);
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
 
-    try std.testing.expectEqual(@as(u16, 30), count_neutralized(&s.sess, .red));
-    try std.testing.expectEqual(@as(u16, 30), s.sess.field.grid.modified_count(.red));
-    // The off-grid 20 are out of reach and untouched.
-    try std.testing.expectEqual(@as(u16, 20), s.sess.field.reservoir.modified[RED]);
+    try std.testing.expectEqual(@as(u16, 9), count_defused(&s.sess));
+    // The off-grid 20 are untouched: shapes address cells, not the pool.
+    try std.testing.expectEqual(@as(u16, 20), s.sess.field.reservoir.tiered[GREEN]);
 }
 
-test "agents_dispensed reports the dispensed total and what it transmuted" {
+test "shape_cast reports the resolved footprint and the tiers it downgraded" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -681,41 +836,37 @@ test "agents_dispensed reports the dispensed total and what it transmuted" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    // Cohort of 20 red on the grid.
-    try start(&s, &enc_thirty_red);
-    set_field(&s.sess, .{ .modified = .red }, 20);
-    const cohort = s.sess.field.grid.modified_count(.red);
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
 
     s.p[0].clear();
     s.p[1].clear();
-    // big_red: 3 dispense slots at 5 units, plus the recipe bonus -> 20
-    // agents, exactly covering the 20-cell cohort.
-    const combo = mk(&.{
-        .{ .element = .red },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-    });
-    try enqueue_submit(&s.sess, s.p[0].pid, combo);
+    // `sweep` is a horizontal run of three, centred on the anchor.
+    aim_at(&s.sess, s.p[0].pid, 3, 5);
+    try enqueue_submit(&s.sess, s.p[0].pid, SWEEP);
     try flush(&s.sess);
 
+    // Broadcast to everyone, so teammates can animate the hit.
     const msgs = try drain(s.p[1].buf.items, arena);
-    const msg = find_tag(msgs, .agents_dispensed) orelse
-        return error.MissingAgentsDispensed;
+    const msg = find_tag(msgs, .shape_cast) orelse return error.MissingShapeCast;
     var fbs = std.io.fixedBufferStream(msg.payload);
-    const ad = try proto.decode_agents_dispensed(fbs.reader());
+    const sc = try proto.decode_shape_cast(fbs.reader());
 
-    // Dispensed matches the recipe; transmuted matches what left `modified`.
-    try std.testing.expectEqual(@as(u16, 20), ad.dispensed[RED]);
-    const left = cohort - s.sess.field.grid.modified_count(.red);
-    try std.testing.expectEqual(left, ad.transmuted[RED]);
-    try std.testing.expectEqual(@as(u16, 20), ad.transmuted[RED]);
-    // Under capacity: nothing wasted, and no other color is touched.
-    try std.testing.expectEqual(ad.dispensed[RED], ad.transmuted[RED]);
-    try std.testing.expectEqual(@as(u16, 0), ad.dispensed[BLUE]);
+    try std.testing.expectEqual(s.p[0].pid, sc.caster);
+    try std.testing.expectEqual(@as(u16, 3), sc.cell_count);
+    // Absolute flat indices, already clipped: the client never re-derives them.
+    const grid = &s.sess.field.grid;
+    try std.testing.expectEqual(grid.index(3, 4), sc.cells[0]);
+    try std.testing.expectEqual(grid.index(3, 5), sc.cells[1]);
+    try std.testing.expectEqual(grid.index(3, 6), sc.cells[2]);
+    try std.testing.expectEqual(@as(u16, 3), sc.downgraded[GREEN]);
+    try std.testing.expectEqual(@as(u16, 3), sc.neutralized);
+    try std.testing.expectEqual(@as(u16, 0), sc.off_grid);
+    try std.testing.expectEqual(@as(u16, 0), sc.inert);
 }
 
-test "agents_dispensed exposes the wasted surplus when a cast overshoots" {
+test "shape_cast counts clipped cells as off_grid and dead cells as inert" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -726,36 +877,32 @@ test "agents_dispensed exposes the wasted surplus when a cast overshoots" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_thirty_red);
-    // Only 4 red cells for big_red's 20 agents to hit.
-    set_field(&s.sess, .{ .modified = .red }, 4);
+    try start(&s, &enc_fifty_green);
+    // Only the anchor row carries slime; everything else is empty.
+    paint_grid(&s.sess, .empty);
+    s.sess.field.grid.set(0, 0, tiered(.green));
+    s.sess.field.reservoir = .{};
 
     s.p[0].clear();
     s.p[1].clear();
-    const combo = mk(&.{
-        .{ .element = .red },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-    });
-    try enqueue_submit(&s.sess, s.p[0].pid, combo);
+    // 3x3 in the corner: 5 of 9 cells fall off the grid, 3 of the remaining 4
+    // are empty, and only (0,0) is a hazard.
+    aim_at(&s.sess, s.p[0].pid, 0, 0);
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
 
     const msgs = try drain(s.p[1].buf.items, arena);
-    const msg = find_tag(msgs, .agents_dispensed) orelse
-        return error.MissingAgentsDispensed;
+    const msg = find_tag(msgs, .shape_cast) orelse return error.MissingShapeCast;
     var fbs = std.io.fixedBufferStream(msg.payload);
-    const ad = try proto.decode_agents_dispensed(fbs.reader());
+    const sc = try proto.decode_shape_cast(fbs.reader());
 
-    // Transmuted is capped by the cohort, so the surplus is recoverable as
-    // dispensed - transmuted: 16 red agents found nothing to convert.
-    try std.testing.expectEqual(@as(u16, 20), ad.dispensed[RED]);
-    try std.testing.expectEqual(@as(u16, 4), ad.transmuted[RED]);
-    try std.testing.expectEqual(@as(u16, 16), ad.dispensed[RED] - ad.transmuted[RED]);
-    try std.testing.expectEqual(@as(u16, 0), s.sess.field.grid.modified_count(.red));
+    try std.testing.expectEqual(@as(u16, 4), sc.cell_count); // only in-bounds cells
+    try std.testing.expectEqual(@as(u16, 5), sc.off_grid);
+    try std.testing.expectEqual(@as(u16, 3), sc.inert);
+    try std.testing.expectEqual(@as(u16, 1), sc.downgraded[GREEN]);
 }
 
-test "a fizzled cast broadcasts no agents_dispensed" {
+test "a fizzled cast broadcasts no shape_cast" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -766,77 +913,92 @@ test "a fizzled cast broadcasts no agents_dispensed" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_thirty_red);
+    try start(&s, &enc_twenty_green);
 
     s.p[0].clear();
     s.p[1].clear();
-    // Element only, no actions: zero output, so nothing to report.
-    const empty_combo = mk(&.{.{ .element = .red }});
-    try enqueue_submit(&s.sess, s.p[0].pid, empty_combo);
+    // No recipe table entry matches this combo, and there is no flat
+    // fallback — the recipe list IS the move list, so this is a no-op.
+    const unmatched = mk(&.{ D, D, D, D, D });
+    try enqueue_submit(&s.sess, s.p[0].pid, unmatched);
     try flush(&s.sess);
 
     const msgs = try drain(s.p[1].buf.items, arena);
-    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .agents_dispensed));
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .shape_cast));
+    try std.testing.expect(find_tag(msgs, .cast_fizzled) != null);
 }
 
-test "neutralize_residue_mult destroys the non-surviving portion" {
+test "a team recipe stamps one big shape, out-covering the halves fired apart" {
     const allocator = std.testing.allocator;
 
-    var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
-    defer s.deinit();
-    var cfg = cfg_instant_cast();
-    cfg.balance.neutralize_residue_mult = 0.5;
-    s.sess.cfg = &cfg;
-    try start(&s, &enc_thirty_red);
-    set_field(&s.sess, .{ .modified = .red }, 30);
-
-    // twin_flames: 30 agents transmute all 30 cells; only 15 survive.
-    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
-    try enqueue_submit(&s.sess, s.p[0].pid, half);
-    try enqueue_submit(&s.sess, s.p[1].pid, half);
-    try flush(&s.sess);
-
-    try std.testing.expectEqual(@as(u16, 0), s.sess.field.grid.modified_count(.red));
-    try std.testing.expectEqual(@as(u16, 15), count_neutralized(&s.sess, .red));
-    try std.testing.expectEqual(@as(u16, 15), s.sess.field.grid.occupied());
-    // Destroyed slime is gone from the match entirely.
-    try std.testing.expectEqual(@as(u32, 15), s.sess.field.remaining());
-}
-
-test "team recipe out-neutralizes the same two casts fired apart" {
-    const allocator = std.testing.allocator;
-    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
-
-    // Together (grouped): twin_flames → 30 agents.
+    // Together (grouped): twin_bloom's 5x5 diamond = 13 cells, one stamp.
     var together: TwoPlayerSession = undefined;
     try init_two_player_session(&together, allocator);
     defer together.deinit();
     const cfg = cfg_instant_cast();
     together.sess.cfg = &cfg;
-    try start(&together, &enc_fifty_red);
-    set_field(&together.sess, .{ .modified = .red }, 50);
-    try enqueue_submit(&together.sess, together.p[0].pid, half);
-    try enqueue_submit(&together.sess, together.p[1].pid, half);
+    try start(&together, &enc_fifty_green);
+    paint_grid(&together.sess, tiered(.green));
+    together.sess.field.reservoir = .{};
+    aim_at(&together.sess, together.p[0].pid, 2, 5);
+    aim_at(&together.sess, together.p[1].pid, 2, 5);
+    try enqueue_submit(&together.sess, together.p[0].pid, BLOOM_HALF);
+    try enqueue_submit(&together.sess, together.p[1].pid, BLOOM_HALF);
     try flush(&together.sess);
-    try std.testing.expectEqual(@as(u16, 30), count_neutralized(&together.sess, .red));
+
+    try std.testing.expectEqual(@as(u16, 13), count_defused(&together.sess));
     try std.testing.expectEqual(@as(u16, 1), together.sess.stats.team_recipe_hits[0]);
 
-    // Apart: two flat conversions → 2 × 10 = 20 agents.
+    // Apart: neither half matches a PLAYER recipe on its own, so both fizzle.
     var apart: TwoPlayerSession = undefined;
     try init_two_player_session(&apart, allocator);
     defer apart.deinit();
     apart.sess.cfg = &cfg;
-    try start(&apart, &enc_fifty_red);
-    set_field(&apart.sess, .{ .modified = .red }, 50);
+    try start(&apart, &enc_fifty_green);
+    paint_grid(&apart.sess, tiered(.green));
+    apart.sess.field.reservoir = .{};
     // With a zero buffer p0's cast fires in the drain that accepted it, so
     // p1's later submit can never share the batch.
-    try enqueue_submit(&apart.sess, apart.p[0].pid, half);
+    try enqueue_submit(&apart.sess, apart.p[0].pid, BLOOM_HALF);
     try flush(&apart.sess);
-    try enqueue_submit(&apart.sess, apart.p[1].pid, half);
+    try enqueue_submit(&apart.sess, apart.p[1].pid, BLOOM_HALF);
     try flush(&apart.sess);
-    try std.testing.expectEqual(@as(u16, 20), count_neutralized(&apart.sess, .red));
+
+    try std.testing.expectEqual(@as(u16, 0), count_defused(&apart.sess));
     try std.testing.expectEqual(@as(u16, 0), apart.sess.stats.team_recipe_hits[0]);
+}
+
+test "the team shape is anchored at the joiner's cursor" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    var cfg = TEST_CFG.*;
+    s.sess.cfg = &cfg;
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
+    freeze_bites(&s.sess);
+
+    // The two halves aim at opposite ends of the field.  p1 submits second, so
+    // p1 completes the group and p1's cursor places the combined shape.
+    aim_at(&s.sess, s.p[0].pid, 1, 1);
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOOM_HALF);
+    try flush(&s.sess);
+    aim_at(&s.sess, s.p[1].pid, 3, 7);
+    try enqueue_submit(&s.sess, s.p[1].pid, BLOOM_HALF);
+    try flush(&s.sess);
+
+    // Grouping fires them together at the joiner's expiry.
+    try s.sess.tick(cast_buffer_s(&cfg) + 0.001);
+
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[0]);
+    try std.testing.expectEqual(@as(u16, 13), count_defused(&s.sess));
+    // The diamond's tip is two rows above the joiner's anchor...
+    try std.testing.expect(s.sess.field.grid.at(1, 7) == .neutralized);
+    // ...and nothing landed at the OTHER caster's cursor.
+    try std.testing.expect(s.sess.field.grid.at(1, 1) == .tiered);
 }
 
 test "same player's own recipe halves never fire the team recipe" {
@@ -847,21 +1009,118 @@ test "same player's own recipe halves never fire the team recipe" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_fifty_red);
-    set_field(&s.sess, .{ .modified = .red }, 50);
-
-    // The same player casts the twin_flames half twice: distinct players are
-    // required, so both fire as flat conversions (10 agents each).
-    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
-    try enqueue_submit(&s.sess, s.p[0].pid, half);
-    try flush(&s.sess);
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
     freeze_bites(&s.sess);
+
+    // The same player casts the twin_bloom half twice.  Team recipes need
+    // DISTINCT players, so neither cast can complete the group — and the half
+    // is not a player recipe, so both fizzle.
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOOM_HALF);
+    try flush(&s.sess);
     try s.sess.tick(1.0); // lock expires
-    try enqueue_submit(&s.sess, s.p[0].pid, half);
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOOM_HALF);
     try flush(&s.sess);
 
-    try std.testing.expectEqual(@as(u16, 20), count_neutralized(&s.sess, .red));
+    try std.testing.expectEqual(@as(u16, 0), count_defused(&s.sess));
     try std.testing.expectEqual(@as(u16, 0), s.sess.stats.team_recipe_hits[0]);
+}
+
+// ---------------------------------------------------------------------------
+// Aiming (the cursor)
+// ---------------------------------------------------------------------------
+
+test "the cursor starts at the middle of the field for every player" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_twenty_green);
+
+    const grid = &s.sess.field.grid;
+    for ([_]u8{ s.p[0].pid, s.p[1].pid }) |pid| {
+        try std.testing.expectEqual(@as(u8, 3), grid.row_of(s.sess.cursors[pid]));
+        try std.testing.expectEqual(@as(u8, 5), grid.col_of(s.sess.cursors[pid]));
+    }
+}
+
+test "move_cursor steps one cell per message and clamps at the edges" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_twenty_green);
+    const pid = s.p[0].pid;
+    const grid = &s.sess.field.grid;
+
+    try enqueue_msg(&s.sess, pid, .move_cursor, proto.MoveCursor{ .dir = .up });
+    try enqueue_msg(&s.sess, pid, .move_cursor, proto.MoveCursor{ .dir = .left });
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u8, 2), grid.row_of(s.sess.cursors[pid]));
+    try std.testing.expectEqual(@as(u8, 4), grid.col_of(s.sess.cursors[pid]));
+
+    // Walk hard into the top-left corner: clamping parks the cursor rather
+    // than wrapping (which would make the d-pad unusable).
+    for (0..20) |_| {
+        try enqueue_msg(&s.sess, pid, .move_cursor, proto.MoveCursor{ .dir = .up });
+        try enqueue_msg(&s.sess, pid, .move_cursor, proto.MoveCursor{ .dir = .left });
+    }
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.cursors[pid]);
+
+    // And into the opposite corner.
+    for (0..20) |_| {
+        try enqueue_msg(&s.sess, pid, .move_cursor, proto.MoveCursor{ .dir = .down });
+        try enqueue_msg(&s.sess, pid, .move_cursor, proto.MoveCursor{ .dir = .right });
+    }
+    try flush(&s.sess);
+    try std.testing.expectEqual(grid.len() - 1, s.sess.cursors[pid]);
+}
+
+test "each player aims their own cursor independently" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_twenty_green);
+
+    const before = s.sess.cursors[s.p[1].pid];
+    try enqueue_msg(&s.sess, s.p[0].pid, .move_cursor, proto.MoveCursor{ .dir = .right });
+    try flush(&s.sess);
+
+    try std.testing.expect(s.sess.cursors[s.p[0].pid] != before);
+    try std.testing.expectEqual(before, s.sess.cursors[s.p[1].pid]);
+}
+
+test "a committed cast keeps its anchor when the caster re-aims mid-buffer" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    var cfg = TEST_CFG.*;
+    s.sess.cfg = &cfg;
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
+    freeze_bites(&s.sess);
+    const pid = s.p[0].pid;
+
+    aim_at(&s.sess, pid, 4, 8);
+    try enqueue_submit(&s.sess, pid, POKE);
+    try flush(&s.sess);
+
+    // Re-aim while the cast is still buffering: the pending spell must not
+    // follow the cursor.
+    aim_at(&s.sess, pid, 0, 0);
+    try s.sess.tick(cast_buffer_s(&cfg) + 0.001);
+
+    try std.testing.expect(s.sess.field.grid.at(4, 8) == .neutralized);
+    try std.testing.expect(s.sess.field.grid.at(0, 0) == .tiered);
 }
 
 // ---------------------------------------------------------------------------
@@ -921,7 +1180,43 @@ test "no bite lands before the interval elapses" {
     try std.testing.expectEqual(@as(u16, 38), s.sess.field.grid.occupied());
 }
 
-test "eating modified slime adds healable extra hunger; neutralized does not" {
+test "eating live hazard slime adds healable extra hunger; defused does not" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_twenty_green);
+
+    // A grid of live green: both bites cost normal + extra, and score nothing.
+    set_field(&s.sess, tiered(.green), 20);
+    try s.sess.tick(BITE_S);
+    const expected = 2 * (BAL.hunger_cost_normal + BAL.hunger_cost_hazard_extra);
+    try std.testing.expectEqual(@as(u16, @intCast(expected)), s.sess.hunger.current);
+    // Healable hunger is bucketed by the TIER that caused it, so only green
+    // medicine can undo this.
+    try std.testing.expectEqual(
+        @as(u16, @intCast(2 * BAL.hunger_cost_hazard_extra)),
+        s.sess.hunger_healable[GREEN],
+    );
+    try std.testing.expectEqual(@as(u16, 0), s.sess.hunger_healable[RED]);
+    try std.testing.expectEqual(@as(u32, 0), s.sess.score);
+    try std.testing.expectEqual(@as(u16, 2), s.sess.stats.feast.hazard_escaped[GREEN]);
+
+    // A grid of defused slime: normal hunger only, and it scores.
+    set_field(&s.sess, .neutralized, 20);
+    const hunger_before = s.sess.hunger.current;
+    const healable_before = s.sess.hunger_healable[GREEN];
+    try s.sess.tick(BITE_S);
+    try std.testing.expectEqual(
+        hunger_before + @as(u16, @intCast(2 * BAL.hunger_cost_normal)),
+        s.sess.hunger.current,
+    );
+    try std.testing.expectEqual(healable_before, s.sess.hunger_healable[GREEN]);
+    try std.testing.expectEqual(@as(u32, 2), s.sess.score);
+}
+
+test "healable hunger is bucketed by the tier that was eaten" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -929,29 +1224,18 @@ test "eating modified slime adds healable extra hunger; neutralized does not" {
     defer s.deinit();
     try start(&s, &enc_twenty_red);
 
-    // A grid of un-neutralized red: both bites cost normal + extra, no score.
-    set_field(&s.sess, .{ .modified = .red }, 20);
+    // Red slime fills the red bucket; green slime fills the green one.  They
+    // never mix, which is what makes tier-targeted medicine meaningful.
+    set_field(&s.sess, tiered(.red), 20);
     try s.sess.tick(BITE_S);
-    const expected = 2 * (BAL.hunger_cost_normal + BAL.hunger_cost_modified_extra);
-    try std.testing.expectEqual(@as(u16, @intCast(expected)), s.sess.hunger.current);
-    try std.testing.expectEqual(
-        @as(u16, @intCast(2 * BAL.hunger_cost_modified_extra)),
-        s.sess.hunger_healable[RED],
-    );
-    try std.testing.expectEqual(@as(u32, 0), s.sess.score);
-    try std.testing.expectEqual(@as(u16, 2), s.sess.stats.feast.modified_escaped[RED]);
+    try std.testing.expect(s.sess.hunger_healable[RED] > 0);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.hunger_healable[GREEN]);
 
-    // A grid of neutralized red: normal hunger only, and it scores.
-    set_field(&s.sess, .{ .neutralized = .red }, 20);
-    const hunger_before = s.sess.hunger.current;
-    const healable_before = s.sess.hunger_healable[RED];
+    const red_before = s.sess.hunger_healable[RED];
+    set_field(&s.sess, tiered(.green), 20);
     try s.sess.tick(BITE_S);
-    try std.testing.expectEqual(
-        hunger_before + @as(u16, @intCast(2 * BAL.hunger_cost_normal)),
-        s.sess.hunger.current,
-    );
-    try std.testing.expectEqual(healable_before, s.sess.hunger_healable[RED]);
-    try std.testing.expectEqual(@as(u32, 2), s.sess.score);
+    try std.testing.expectEqual(red_before, s.sess.hunger_healable[RED]);
+    try std.testing.expect(s.sess.hunger_healable[GREEN] > 0);
 }
 
 test "neutral slime scores but is never healable" {
@@ -995,33 +1279,32 @@ test "a reservation is not exclusive: the loser's bite misses" {
     }
 }
 
-test "a bite whose cell was neutralized away misses" {
+test "a stamp never destroys a cell, so a reserved bite still lands" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    var cfg = cfg_instant_cast();
-    cfg.balance.neutralize_residue_mult = 0.0; // transmuted cells are destroyed
+    const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_twenty_red);
-    set_field(&s.sess, .{ .modified = .red }, 20);
+    try start(&s, &enc_twenty_green);
+    set_field(&s.sess, tiered(.green), 20);
 
-    // Aim both Lil Guys at cell 0, then destroy the whole red cohort with a
-    // cast in the same tick: the bites land on emptiness.
+    // Aim both Lil Guys at cell 0 and stamp over it in the same tick.  A
+    // downgrade REWRITES the cell, so the bite still finds slime there —
+    // it just eats a defused unit (score, no extra hunger) instead of a
+    // hazard.
     aim_all_at(&s.sess, 0);
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .red },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-    })); // crimson_flood: 20 agents ≥ the 20-cell cohort
+    aim_at(&s.sess, s.p[0].pid, 0, 0);
+    try enqueue_submit(&s.sess, s.p[0].pid, POKE);
     try s.sess.tick(0.002);
 
-    try std.testing.expectEqual(@as(u16, 0), s.sess.field.grid.occupied());
-    try std.testing.expectEqual(@as(u16, 0), s.sess.hunger.current);
-    try std.testing.expectEqual(@as(u32, 0), s.sess.score);
-    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.feast.hunger_normal);
+    try std.testing.expectEqual(@as(u32, 1), s.sess.score);
+    try std.testing.expectEqual(@as(u16, @intCast(BAL.hunger_cost_normal)), s.sess.hunger.current);
+    // No healable hunger: the cell was defused before the bite landed.
+    try std.testing.expectEqual(@as(u32, 0), total_healable(&s.sess));
+    // 20 painted, 1 eaten: the stamp itself removed nothing.
+    try std.testing.expectEqual(@as(u16, 19), s.sess.field.grid.occupied());
 }
 
 test "emptied cells refill from the reservoir, keeping the grid full" {
@@ -1067,7 +1350,7 @@ test "refills enter from the top row" {
     }
 }
 
-test "neutralizing before the bite lands removes the healable hunger" {
+test "defusing before the bite lands removes the healable hunger" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -1075,26 +1358,23 @@ test "neutralizing before the bite lands removes the healable hunger" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_twenty_red);
-    set_field(&s.sess, .{ .modified = .red }, 20);
+    try start(&s, &enc_twenty_green);
+    // A 3x3 patch of green — exactly what one `block` stamp covers.
+    set_block_field(&s.sess, tiered(.green), 2, 5);
 
-    // crimson_flood neutralizes all 20 cells (residue 1.0), then everything is
-    // eaten: normal hunger only, and every unit scores.
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .red },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-    }));
+    // One stamp defuses all 9 cells, then everything is eaten: normal hunger
+    // only, no healable portion at all, and every unit scores.
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
-    try std.testing.expectEqual(@as(u16, 20), count_neutralized(&s.sess, .red));
+    try std.testing.expectEqual(@as(u16, 9), count_defused(&s.sess));
 
     var guard: usize = 0;
     while (s.sess.phase == .playing and guard < 40) : (guard += 1) try s.sess.tick(BITE_S);
 
-    try std.testing.expectEqual(@as(u32, 20), s.sess.score);
+    try std.testing.expectEqual(@as(u32, 9), s.sess.score);
     try std.testing.expectEqual(@as(u32, 0), total_healable(&s.sess));
-    try std.testing.expectEqual(@as(u16, @intCast(20 * BAL.hunger_cost_normal)), s.sess.hunger.current);
+    try std.testing.expectEqual(@as(u16, @intCast(9 * BAL.hunger_cost_normal)), s.sess.hunger.current);
 }
 
 // ---------------------------------------------------------------------------
@@ -1114,14 +1394,14 @@ test "accepted cast starts its buffer and lock; a locked resubmit is ignored" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_fifty_red);
+    try start(&s, &enc_fifty_green);
     freeze_bites(&s.sess);
 
     // No submits yet: nothing counting down.
     try std.testing.expectEqual(@as(?f32, null), s.sess.cast_fire_timers[s.p[0].pid]);
 
-    const combo = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
-    const combo_b = mk(&.{ .{ .element = .blue }, .{ .action = .dispense } });
+    const combo = POKE;
+    const combo_b = POKE;
 
     s.p[1].clear();
     try enqueue_submit(&s.sess, s.p[0].pid, combo);
@@ -1171,22 +1451,24 @@ test "a solo cast fires at its own expiry only" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_fifty_red);
-    set_field(&s.sess, .{ .modified = .red }, 50);
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
     freeze_bites(&s.sess);
 
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .red }, .{ .action = .dispense } }));
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
 
-    // Before expiry (buffer 0.5s): nothing fires, nothing transmutes.
+    // Before expiry (buffer 0.5s): nothing fires, nothing stamps.
     s.p[1].clear();
     try s.sess.tick(0.3);
     var msgs = try drain(s.p[1].buf.items, arena);
     try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_fired));
     try std.testing.expect(s.sess.submitted_pool[s.p[0].pid] != null);
-    try std.testing.expectEqual(@as(u16, 0), count_neutralized(&s.sess, .red));
+    try std.testing.expectEqual(@as(u16, 0), count_defused(&s.sess));
 
-    // At expiry: fires solo (5 red agents), everything clears.
+    // At expiry: fires solo, stamping the 3x3 block.
     s.p[1].clear();
     try s.sess.tick(0.3);
     msgs = try drain(s.p[1].buf.items, arena);
@@ -1198,7 +1480,7 @@ test "a solo cast fires at its own expiry only" {
     try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.submitted_pool[s.p[0].pid]);
     try std.testing.expectEqual(@as(?f32, null), s.sess.cast_fire_timers[s.p[0].pid]);
     try std.testing.expectEqual(@as(u8, 0), s.sess.casts_used[s.p[0].pid]);
-    try std.testing.expectEqual(@as(u16, 5), count_neutralized(&s.sess, .red));
+    try std.testing.expectEqual(@as(u16, 9), count_defused(&s.sess));
 }
 
 test "nothing pending means ticks never fire a cast" {
@@ -1210,7 +1492,7 @@ test "nothing pending means ticks never fire a cast" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_fifty_red);
+    try start(&s, &enc_fifty_green);
     freeze_bites(&s.sess);
 
     s.p[1].clear();
@@ -1231,12 +1513,12 @@ test "a zero-output submit fizzles: no buffer, no lock" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_fifty_red);
+    try start(&s, &enc_fifty_green);
     freeze_bites(&s.sess);
 
-    // Dangling element token: no output → fizzle, nothing else happens.
+    // No recipe covers this combo, so it fizzles: no buffer, no lock.
     s.p[1].clear();
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{.{ .element = .red }}));
+    try enqueue_submit(&s.sess, s.p[0].pid, UNMATCHED);
     try flush(&s.sess);
 
     try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.submitted_pool[s.p[0].pid]);
@@ -1251,7 +1533,7 @@ test "a zero-output submit fizzles: no buffer, no lock" {
 
     // A valid submit right after is accepted and starts its buffer.
     s.p[1].clear();
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .red }, .{ .action = .dispense } }));
+    try enqueue_submit(&s.sess, s.p[0].pid, POKE);
     try flush(&s.sess);
 
     try std.testing.expect(s.sess.submitted_pool[s.p[0].pid] != null);
@@ -1269,13 +1551,16 @@ test "a team-recipe match groups the casts; they fire together at the joiner's e
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_thirty_red);
-    set_field(&s.sess, .{ .modified = .red }, 30);
+    try start(&s, &enc_twenty_green);
+    // The whole grid, so the 5x5 diamond has a hazard under every cell.
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
     freeze_bites(&s.sess);
 
-    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
+    // Each half is [dispense, medicine] — the twin_bloom team recipe.
+    const half = BLOOM_HALF;
 
-    // p0 casts; 0.3s later (inside p0's 0.5s buffer) p1 completes twin_flames.
+    // p0 casts; 0.3s later (inside p0's 0.5s buffer) p1 completes twin_bloom.
     try enqueue_submit(&s.sess, s.p[0].pid, half);
     try flush(&s.sess);
     try s.sess.tick(0.3);
@@ -1301,14 +1586,14 @@ test "a team-recipe match groups the casts; they fire together at the joiner's e
     try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_fired));
     try std.testing.expect(s.sess.submitted_pool[s.p[0].pid] != null);
 
-    // Joiner's expiry (0.5s after grouping): both fire as ONE batch, so
-    // twin_flames' 30 agents cover the whole 30-cell cohort (flat conversion
-    // would only reach 20).
+    // Joiner's expiry (0.5s after grouping): both fire as ONE batch, so the
+    // team's 5x5 diamond (13 cells) is stamped once.  Fired apart, neither
+    // half matches anything at all.
     s.p[1].clear();
     try s.sess.tick(0.25);
 
-    try std.testing.expectEqual(@as(u16, 0), s.sess.field.grid.modified_count(.red));
-    try std.testing.expectEqual(@as(u16, 30), count_neutralized(&s.sess, .red));
+    try std.testing.expectEqual(@as(u16, 13), count_defused(&s.sess));
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[0]);
     try std.testing.expectEqual(session_mod.SessionPhase.playing, s.sess.phase);
 
     // Fired: pools + timers + markers reset, stats recorded once per spell.
@@ -1352,16 +1637,16 @@ test "non-matching overlapping casts fire separately, with no group" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_fifty_red);
+    try start(&s, &enc_fifty_green);
     freeze_bites(&s.sess);
 
     // p0 red flat cast; p1 blue flat cast 0.3s later — no team recipe.
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .red }, .{ .action = .dispense } }));
+    try enqueue_submit(&s.sess, s.p[0].pid, POKE);
     try flush(&s.sess);
     try s.sess.tick(0.3);
 
     s.p[1].clear();
-    try enqueue_submit(&s.sess, s.p[1].pid, mk(&.{ .{ .element = .blue }, .{ .action = .dispense } }));
+    try enqueue_submit(&s.sess, s.p[1].pid, POKE);
     try flush(&s.sess);
     var msgs = try drain(s.p[1].buf.items, arena);
     try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_grouped));
@@ -1397,13 +1682,14 @@ test "a matching cast arriving after the first fired does not group" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_thirty_red);
+    try start(&s, &enc_twenty_green);
     freeze_bites(&s.sess);
 
-    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
+    // A team half, so the ONLY way it can produce anything is by grouping.
+    const half = BLOOM_HALF;
     try enqueue_submit(&s.sess, s.p[0].pid, half);
     try flush(&s.sess);
-    try s.sess.tick(0.55); // p0 fires alone (flat: 2 slots × 5 = 10 red agents)
+    try s.sess.tick(0.55); // p0's buffer expires and it fires alone, matching nothing
 
     s.p[1].clear();
     try enqueue_submit(&s.sess, s.p[1].pid, half);
@@ -1431,12 +1717,15 @@ test "an unlocked resubmit replaces the pending cast and restarts its buffer" {
     var custom_cfg = TEST_CFG.*;
     custom_cfg.balance.cast_lock_ms = 100;
     s.sess.cfg = &custom_cfg;
-    try start(&s, &enc_fifty_red);
-    set_field(&s.sess, .{ .modified = .red }, 50);
+    try start(&s, &enc_fifty_green);
+    set_field(&s.sess, tiered(.green), 50);
     freeze_bites(&s.sess);
 
-    const combo_a = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
-    const combo_b = mk(&.{ .{ .element = .blue }, .{ .action = .dispense } });
+    // A stamps a single cell; B stamps a 3x3 block.  Different footprints, so
+    // the grid itself shows WHICH cast actually fired.
+    const combo_a = POKE;
+    const combo_b = BLOCK;
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
 
     try enqueue_submit(&s.sess, s.p[0].pid, combo_a);
     try flush(&s.sess);
@@ -1466,12 +1755,11 @@ test "an unlocked resubmit replaces the pending cast and restarts its buffer" {
     s.p[1].clear();
     try s.sess.tick(0.2); // the restarted buffer expires → fires the REPLACEMENT
 
-    // Stats counted once (at fire time), and the batch used B (blue dispense),
-    // not A: flat blue agents cannot neutralize red slime.
+    // Stats counted once (at fire time), and B's 9-cell block landed — not
+    // A's single cell.  Only one spell ever converted.
     try std.testing.expectEqual(@as(u16, 1), s.sess.stats.players[s.p[0].pid].casts);
-    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.players[s.p[0].pid].dispense_slots[BLUE]);
-    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.players[s.p[0].pid].dispense_slots[RED]);
-    try std.testing.expectEqual(@as(u16, 0), count_neutralized(&s.sess, .red));
+    try std.testing.expectEqual(@as(u16, 9), count_defused(&s.sess));
+    try std.testing.expectEqual(@as(u16, 9), s.sess.stats.players[s.p[0].pid].cells_covered);
 
     msgs = try drain(s.p[1].buf.items, arena);
     const cf_msg = find_tag(msgs, .cast_fired) orelse return error.MissingCastFired;
@@ -1491,15 +1779,15 @@ test "zero cast_buffer_ms fires the cast in the same tick" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_fifty_red);
-    set_field(&s.sess, .{ .modified = .red }, 50);
+    try start(&s, &enc_fifty_green);
+    set_field(&s.sess, tiered(.green), 50);
 
     s.p[1].clear();
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .red }, .{ .action = .dispense } }));
+    try enqueue_submit(&s.sess, s.p[0].pid, POKE);
     try flush(&s.sess);
 
-    // Accepted AND fired within one tick: 5 red cells neutralized.
-    try std.testing.expectEqual(@as(u16, 5), count_neutralized(&s.sess, .red));
+    // Accepted AND fired within one tick: `poke`'s single cell is defused.
+    try std.testing.expectEqual(@as(u16, 1), count_defused(&s.sess));
     try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.submitted_pool[s.p[0].pid]);
     try std.testing.expectEqual(@as(?f32, null), s.sess.cast_fire_timers[s.p[0].pid]);
     const msgs = try drain(s.p[1].buf.items, arena);
@@ -1518,19 +1806,20 @@ test "zero cast_buffer_ms: a same-drain pair still fires the team recipe" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_thirty_red);
-    set_field(&s.sess, .{ .modified = .red }, 30);
+    try start(&s, &enc_twenty_green);
+    // The whole grid, so the 5x5 diamond has a hazard under every cell.
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
 
-    // Both twin_flames halves land in ONE drain: both timers hit 0 in the same
+    // Both twin_bloom halves land in ONE drain: both timers hit 0 in the same
     // tick, so they convert as one batch and the recipe fires.
-    const half = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } });
+    const half = BLOOM_HALF;
     s.p[1].clear();
     try enqueue_submit(&s.sess, s.p[0].pid, half);
     try enqueue_submit(&s.sess, s.p[1].pid, half);
     try flush(&s.sess);
 
-    try std.testing.expectEqual(@as(u16, 0), s.sess.field.grid.modified_count(.red));
-    try std.testing.expectEqual(@as(u16, 30), count_neutralized(&s.sess, .red));
+    try std.testing.expectEqual(@as(u16, 13), count_defused(&s.sess));
     try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[0]);
     const msgs = try drain(s.p[1].buf.items, arena);
     try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_fired));
@@ -1549,10 +1838,10 @@ test "cast_lock_ms above the buffer throttles the next cast" {
     custom_cfg.balance.cast_buffer_ms = 100;
     custom_cfg.balance.cast_lock_ms = 1000;
     s.sess.cfg = &custom_cfg;
-    try start(&s, &enc_fifty_red);
+    try start(&s, &enc_fifty_green);
     freeze_bites(&s.sess);
 
-    const combo = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
+    const combo = POKE;
     try enqueue_submit(&s.sess, s.p[0].pid, combo);
     try flush(&s.sess);
     try s.sess.tick(0.2); // cast fired; the lock has 0.8s left
@@ -1586,16 +1875,11 @@ test "player recipe fires are broadcast when the cast converts" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_fifty_red);
-    set_field(&s.sess, .{ .modified = .red }, 50);
+    try start(&s, &enc_fifty_green);
+    set_field(&s.sess, tiered(.green), 50);
 
     s.p[1].clear();
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .red },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-    })); // crimson_flood = player_recipes[0]
+    try enqueue_submit(&s.sess, s.p[0].pid, POKE); // `poke` = player_recipes[0]
     try flush(&s.sess);
 
     const msgs = try drain(s.p[1].buf.items, arena);
@@ -1617,16 +1901,17 @@ test "player recipe fires are broadcast when the cast converts" {
 // Medicine (symmetrical healing)
 // ---------------------------------------------------------------------------
 
-/// Accrue healable hunger of one color by letting the Lil Guys eat that color
-/// un-neutralized, then freeze them.  Returns the healable amount accrued.
-fn accrue_healable(sess: *Session, color: c.Element, bites: usize) !u16 {
-    set_field(sess, .{ .modified = color }, @intCast(sess.field.grid.len()));
+/// Accrue healable hunger of one tier by letting the Lil Guys eat that tier
+/// while it is still a live hazard, then freeze them.  Returns the healable
+/// amount accrued.
+fn accrue_healable(sess: *Session, tier: c.Tier, bites: usize) !u16 {
+    set_field(sess, tiered(tier), @intCast(sess.field.grid.len()));
     for (0..bites) |_| try sess.tick(BITE_S);
     freeze_bites(sess);
-    return sess.hunger_healable[@intFromEnum(color)];
+    return sess.hunger_healable[@intFromEnum(tier)];
 }
 
-test "symmetrical medicine heals matching-color healable hunger" {
+test "symmetrical medicine heals matching-tier healable hunger" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1637,23 +1922,19 @@ test "symmetrical medicine heals matching-color healable hunger" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_fifty_red);
+    try start(&s, &enc_fifty_green);
 
-    // 3 intervals × 2 Lil Guys = 6 red units eaten un-neutralized.
+    // 3 intervals x 2 Lil Guys = 6 red units eaten as live hazards.
     const red_healable = try accrue_healable(&s.sess, .red, 3);
-    try std.testing.expectEqual(@as(u16, @intCast(6 * BAL.hunger_cost_modified_extra)), red_healable);
+    try std.testing.expectEqual(@as(u16, @intCast(6 * BAL.hunger_cost_hazard_extra)), red_healable);
     const hunger_before = s.sess.hunger.current;
 
-    // RED medicine, flat: 2 slots × medicine_per_slot.
+    // `tonic` brews 6 medicine for EVERY tier, so the red bucket is served.
     s.p[0].clear();
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .red },
-        .{ .action = .medicine },
-        .{ .action = .medicine },
-    }));
+    try enqueue_submit(&s.sess, s.p[0].pid, TONIC);
     try flush(&s.sess);
 
-    const expected_heal: u16 = @intCast(@min(2 * BAL.medicine_per_slot, red_healable));
+    const expected_heal: u16 = @min(6, red_healable);
     try std.testing.expectEqual(hunger_before - expected_heal, s.sess.hunger.current);
     try std.testing.expectEqual(red_healable - expected_heal, s.sess.hunger_healable[RED]);
     try std.testing.expectEqual(expected_heal, s.sess.stats.feast.medicine_healed[RED]);
@@ -1681,25 +1962,24 @@ test "asymmetric medicine heals nothing" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_fifty_red);
+    try start(&s, &enc_fifty_green);
 
-    const red_healable = try accrue_healable(&s.sess, .red, 3);
-    try std.testing.expect(red_healable > 0);
+    // Green hunger accrued...
+    const green_healable = try accrue_healable(&s.sess, .green, 3);
+    try std.testing.expect(green_healable > 0);
     const hunger_before = s.sess.hunger.current;
 
-    // panacea is BLUE medicine — wrong color for red hunger, fully wasted.
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .blue },
-        .{ .action = .medicine },
-        .{ .action = .medicine },
-    }));
+    // ...but `red_tonic` brews 10 RED medicine and nothing else, so it is
+    // entirely wasted: healing is symmetrical by tier.
+    try enqueue_submit(&s.sess, s.p[0].pid, RED_TONIC);
     try flush(&s.sess);
 
     try std.testing.expectEqual(hunger_before, s.sess.hunger.current);
-    try std.testing.expectEqual(red_healable, s.sess.hunger_healable[RED]);
-    // Dispensed but healed nothing — the overheal is visible in the stats.
-    try std.testing.expectEqual(@as(u16, 10), s.sess.stats.feast.medicine_dispensed[BLUE]);
-    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.feast.medicine_healed[BLUE]);
+    try std.testing.expectEqual(green_healable, s.sess.hunger_healable[GREEN]);
+    // Brewed but healed nothing — the waste is visible in the stats.
+    try std.testing.expectEqual(@as(u16, 10), s.sess.stats.feast.medicine_dispensed[RED]);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.feast.medicine_healed[RED]);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.feast.medicine_healed[GREEN]);
 }
 
 test "medicine cannot heal neutral-slime hunger" {
@@ -1719,10 +1999,10 @@ test "medicine cannot heal neutral-slime hunger" {
     try std.testing.expect(hunger_before > 0);
     try std.testing.expectEqual(@as(u32, 0), total_healable(&s.sess));
 
-    // Heavy medicine from both players: nothing is healable, all discarded.
-    const medicine = mk(&.{ .{ .element = .blue }, .{ .action = .medicine }, .{ .action = .medicine } });
-    try enqueue_submit(&s.sess, s.p[0].pid, medicine);
-    try enqueue_submit(&s.sess, s.p[1].pid, medicine);
+    // Medicine from both players: neutral slime's hunger is not healable by
+    // ANY tier, so all of it is discarded.
+    try enqueue_submit(&s.sess, s.p[0].pid, TONIC);
+    try enqueue_submit(&s.sess, s.p[1].pid, TONIC);
     try flush(&s.sess);
 
     try std.testing.expectEqual(hunger_before, s.sess.hunger.current);
@@ -1736,28 +2016,47 @@ test "medicine heals only up to the healable bucket (overheal discarded)" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_fifty_red);
+    try start(&s, &enc_fifty_green);
 
-    // One interval: 2 red units eaten → 4 healable.
+    // One interval: 2 red units eaten → 4 healable, less than red_tonic's 10.
     const red_healable = try accrue_healable(&s.sess, .red, 1);
-    try std.testing.expectEqual(@as(u16, @intCast(2 * BAL.hunger_cost_modified_extra)), red_healable);
+    try std.testing.expectEqual(@as(u16, @intCast(2 * BAL.hunger_cost_hazard_extra)), red_healable);
     const hunger_before = s.sess.hunger.current;
 
-    // 4 red medicine slots = 12 medicine against 4 healable.
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .red },
-        .{ .action = .medicine },
-        .{ .action = .medicine },
-        .{ .action = .medicine },
-        .{ .action = .medicine },
-    }));
+    try enqueue_submit(&s.sess, s.p[0].pid, RED_TONIC);
     try flush(&s.sess);
 
     try std.testing.expectEqual(@as(u16, 0), s.sess.hunger_healable[RED]);
     try std.testing.expectEqual(hunger_before - red_healable, s.sess.hunger.current);
-    try std.testing.expectEqual(@as(u16, 12), s.sess.stats.feast.medicine_dispensed[RED]);
+    try std.testing.expectEqual(@as(u16, 10), s.sess.stats.feast.medicine_dispensed[RED]);
+    // The surplus 6 is discarded, not banked against future hunger.
     try std.testing.expectEqual(red_healable, s.sess.stats.feast.medicine_healed[RED]);
-    try std.testing.expectEqual(@as(u16, 4), s.sess.stats.players[s.p[0].pid].medicine_slots[RED]);
+}
+
+test "a medicine recipe both heals and stamps its shape" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    const cfg = cfg_instant_cast();
+    s.sess.cfg = &cfg;
+    try start(&s, &enc_fifty_green);
+
+    const red_healable = try accrue_healable(&s.sess, .red, 1);
+    try std.testing.expect(red_healable > 0);
+    // Repaint as green so the stamp has something to defuse.
+    set_field(&s.sess, tiered(.green), 50);
+    freeze_bites(&s.sess);
+
+    // `tonic` is a 1x1 shape AND 6/6/6 medicine: every recipe stamps, even the
+    // healing ones.
+    aim_at(&s.sess, s.p[0].pid, 0, 3);
+    try enqueue_submit(&s.sess, s.p[0].pid, TONIC);
+    try flush(&s.sess);
+
+    try std.testing.expect(s.sess.field.grid.at(0, 3) == .neutralized);
+    try std.testing.expect(s.sess.hunger_healable[RED] < red_healable);
 }
 
 // ---------------------------------------------------------------------------
@@ -1799,7 +2098,7 @@ test "a full hunger bar ends the game with slime left over" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    // 10 red units un-neutralized = 30 hunger ≥ max 25.
+    // 9 live green units = 27 hunger, and the bar (20) fills on the 8th.
     try start(&s, &enc_tight_budget);
 
     s.p[0].clear();
@@ -1807,18 +2106,18 @@ test "a full hunger bar ends the game with slime left over" {
     while (s.sess.phase == .playing and guard < 20) : (guard += 1) try s.sess.tick(BITE_S);
 
     try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
-    try std.testing.expectEqual(@as(u16, 25), s.sess.hunger.current); // clamped at max
+    try std.testing.expectEqual(@as(u16, 20), s.sess.hunger.current); // clamped at max
 
     const go = try game_over_msg(try drain(s.p[0].buf.items, arena));
     try std.testing.expectEqual(proto.EndReason.hunger_full, go.stats.reason);
-    try std.testing.expectEqual(@as(u16, 25), go.stats.hunger_final);
-    try std.testing.expectEqual(@as(u16, 25), go.stats.hunger_max);
-    try std.testing.expectEqual(@as(u32, 10), go.stats.slime_total);
+    try std.testing.expectEqual(@as(u16, 20), go.stats.hunger_final);
+    try std.testing.expectEqual(@as(u16, 20), go.stats.hunger_max);
+    try std.testing.expectEqual(@as(u32, 9), go.stats.slime_total);
     // The bar filled before the field was cleared, so slime survives.
     try std.testing.expect(go.stats.slime_left > 0);
 }
 
-test "neutralizing the tight budget survives what idle play loses" {
+test "defusing the tight budget survives what idle play loses" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -1826,23 +2125,21 @@ test "neutralizing the tight budget survives what idle play loses" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_tight_budget); // 10 red, hunger_max 25
+    try start(&s, &enc_tight_budget); // 9 green, hunger_max 20
+    set_block_field(&s.sess, tiered(.green), 2, 5);
 
-    // 10 red agents (2 flat dispense slots) neutralize the whole cohort, so
-    // the field costs 10 normal hunger only and every unit scores.
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .red },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-    }));
+    // One `block` stamp defuses the whole field, so it costs 9 normal hunger
+    // and every unit scores — where idle play would spend 27 and lose.
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
-    try std.testing.expectEqual(@as(u16, 10), count_neutralized(&s.sess, .red));
+    try std.testing.expectEqual(@as(u16, 9), count_defused(&s.sess));
 
     var guard: usize = 0;
     while (s.sess.phase == .playing and guard < 20) : (guard += 1) try s.sess.tick(BITE_S);
 
-    try std.testing.expectEqual(@as(u32, 10), s.sess.score);
-    try std.testing.expectEqual(@as(u16, 10), s.sess.hunger.current);
+    try std.testing.expectEqual(@as(u32, 9), s.sess.score);
+    try std.testing.expectEqual(@as(u16, 9), s.sess.hunger.current);
     try std.testing.expect(!logic.hunger_full(s.sess.hunger));
 }
 
@@ -1906,20 +2203,22 @@ test "match stats: feast tallies, players and recipes are reported" {
     s.sess.cfg = &cfg;
     try start(&s, &enc_mixed); // 10 red + 8 green + 7 neutral = 25 units
 
+    // Pin a layout the stamps can address exactly: the green run sits in the
+    // top-left corner, the red run beside it, neutral after that.
+    paint_grid(&s.sess, .empty);
+    var flat: u16 = 0;
+    while (flat < 8) : (flat += 1) s.sess.field.grid.put(flat, tiered(.green));
+    while (flat < 18) : (flat += 1) s.sess.field.grid.put(flat, tiered(.red));
+    while (flat < 25) : (flat += 1) s.sess.field.grid.put(flat, .neutral);
+    s.sess.field.reservoir = .{};
+
     s.p[0].clear();
 
-    // Alice: crimson_flood (player recipe → 20 red agents) covers all 10 red.
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .red },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-    }));
-    // Bob: a flat blue dispense — wrong color for everything here, wasted.
-    try enqueue_submit(&s.sess, s.p[1].pid, mk(&.{
-        .{ .element = .blue },
-        .{ .action = .dispense },
-    }));
+    // Alice pokes one green cell (defusing it); Bob sweeps three more.
+    aim_at(&s.sess, s.p[0].pid, 0, 0);
+    aim_at(&s.sess, s.p[1].pid, 0, 4);
+    try enqueue_submit(&s.sess, s.p[0].pid, POKE);
+    try enqueue_submit(&s.sess, s.p[1].pid, SWEEP);
     try flush(&s.sess);
 
     var guard: usize = 0;
@@ -1933,34 +2232,37 @@ test "match stats: feast tallies, players and recipes are reported" {
     try std.testing.expectEqual(@as(u32, 0), st.slime_left);
     try std.testing.expectEqual(@as(u16, 2), st.casts_total);
 
-    // Feast tallies: agents dispensed (including the wasted blue), the red
-    // cohort neutralized, the green slime that escaped, neutral consumed.
-    try std.testing.expectEqual(@as(u16, 20), st.feast.agents_dispensed[RED]);
-    try std.testing.expectEqual(@as(u16, 5), st.feast.agents_dispensed[BLUE]);
-    try std.testing.expectEqual(@as(u16, 10), st.feast.neutralized[RED]);
-    try std.testing.expectEqual(@as(u16, 0), st.feast.modified_escaped[RED]);
-    try std.testing.expectEqual(@as(u16, 8), st.feast.modified_escaped[GREEN]);
+    // Coverage: 4 green cells covered (1 poke + 3 sweep), all defused since
+    // green is one step from harmless.  No red was ever covered.
+    try std.testing.expectEqual(@as(u16, 4), st.feast.cells_covered[GREEN]);
+    try std.testing.expectEqual(@as(u16, 0), st.feast.cells_covered[RED]);
+    try std.testing.expectEqual(@as(u16, 4), st.feast.neutralized[GREEN]);
+    // Escapes: the 4 untouched green plus all 10 red were eaten live.
+    try std.testing.expectEqual(@as(u16, 4), st.feast.hazard_escaped[GREEN]);
+    try std.testing.expectEqual(@as(u16, 10), st.feast.hazard_escaped[RED]);
     try std.testing.expectEqual(@as(u16, 7), st.feast.neutral_consumed);
     try std.testing.expectEqual(@as(u16, @intCast(25 * BAL.hunger_cost_normal)), st.feast.hunger_normal);
     try std.testing.expectEqual(
-        @as(u16, @intCast(8 * BAL.hunger_cost_modified_extra)),
+        @as(u16, @intCast(14 * BAL.hunger_cost_hazard_extra)),
         st.feast.hunger_extra,
     );
-    // Score = neutralized red + neutral units.
-    try std.testing.expectEqual(@as(u32, 17), go.score);
+    // Score = defused units + neutral units.
+    try std.testing.expectEqual(@as(u32, 11), go.score);
 
-    // Players: dense, named, raw slot attribution + recipe participation.
+    // Players: dense, named, coverage attribution + recipe participation.
     try std.testing.expectEqual(@as(u8, 2), st.player_count);
     try std.testing.expectEqualSlices(u8, "Alice", st.players[0].name[0..st.players[0].name_len]);
     try std.testing.expectEqual(@as(u16, 1), st.players[0].casts);
-    try std.testing.expectEqual(@as(u16, 3), st.players[0].dispense_slots[RED]);
+    try std.testing.expectEqual(@as(u16, 1), st.players[0].cells_covered);
+    try std.testing.expectEqual(@as(u16, 1), st.players[0].cells_neutralized);
     try std.testing.expectEqual(@as(u16, 1), st.players[0].recipe_casts);
     try std.testing.expectEqualSlices(u8, "Bob", st.players[1].name[0..st.players[1].name_len]);
-    try std.testing.expectEqual(@as(u16, 1), st.players[1].dispense_slots[BLUE]);
-    try std.testing.expectEqual(@as(u16, 0), st.players[1].recipe_casts);
+    try std.testing.expectEqual(@as(u16, 3), st.players[1].cells_covered);
+    try std.testing.expectEqual(@as(u16, 1), st.players[1].recipe_casts);
 
-    // crimson_flood is player_recipes[0]; no team recipes fired.
+    // `poke` is player_recipes[0] and `sweep` is [1]; no team recipes fired.
     try std.testing.expectEqual(@as(u16, 1), st.player_recipe_hits[0]);
+    try std.testing.expectEqual(@as(u16, 1), st.player_recipe_hits[1]);
     for (st.team_recipe_hits) |h| try std.testing.expectEqual(@as(u16, 0), h);
     // Table sizes travel with the report so the browser can resolve labels.
     try std.testing.expectEqual(@as(u8, fixtures.player_recipes.len), st.player_recipe_count);
@@ -1987,8 +2289,8 @@ test "game_state carries the whole grid, the reservoir and the hunger bar" {
     // hole to fill and the reservoir keeps its 20 held-back units.
     paint_grid(&s.sess, .neutral);
     s.sess.field.grid.put(0, .neutral);
-    s.sess.field.grid.put(1, .{ .modified = .green });
-    s.sess.field.grid.put(2, .{ .neutralized = .blue });
+    s.sess.field.grid.put(1, tiered(.green));
+    s.sess.field.grid.put(2, .neutralized);
 
     s.p[0].clear();
     try flush(&s.sess);
@@ -1998,8 +2300,8 @@ test "game_state carries the whole grid, the reservoir and the hunger bar" {
     try std.testing.expectEqual(BAL.slime_grid.cols, gs.grid_cols);
     try std.testing.expectEqual(@as(u16, 60), gs.grid_len());
     try std.testing.expectEqual(c.SlimeCell.neutral, gs.grid[0]);
-    try std.testing.expectEqual(c.SlimeCell{ .modified = .green }, gs.grid[1]);
-    try std.testing.expectEqual(c.SlimeCell{ .neutralized = .blue }, gs.grid[2]);
+    try std.testing.expectEqual(c.SlimeCell{ .tiered = .green }, gs.grid[1]);
+    try std.testing.expectEqual(c.SlimeCell.neutralized, gs.grid[2]);
     for (gs.grid[3..gs.grid_len()]) |cell| try std.testing.expectEqual(c.SlimeCell.neutral, cell);
 
     // The off-grid remainder drives the client's "incoming" indicator.
@@ -2018,7 +2320,7 @@ test "game_state carries one lil guy per player with target and bite countdown" 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_fifty_red);
+    try start(&s, &enc_fifty_green);
 
     s.p[0].clear();
     try flush(&s.sess);
@@ -2053,30 +2355,26 @@ test "game_state reflects neutralization and bites as they happen" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_fifty_red);
-    set_field(&s.sess, .{ .modified = .red }, 50);
+    try start(&s, &enc_fifty_green);
+    set_field(&s.sess, tiered(.green), 50);
 
     s.p[0].clear();
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .red },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-    })); // 20 agents, residue 1.0
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK); // 3x3 = 9 cells defused
     try s.sess.tick(BITE_S); // convert, then both Lil Guys bite
 
     const gs = try last_game_state(try drain(s.p[0].buf.items, arena));
     var neutralized: u16 = 0;
-    var modified: u16 = 0;
+    var hazard: u16 = 0;
     var occupied: u16 = 0;
     for (gs.grid[0..gs.grid_len()]) |cell| {
         if (cell.is_slime()) occupied += 1;
         if (cell == .neutralized) neutralized += 1;
-        if (cell == .modified) modified += 1;
+        if (cell.is_hazard()) hazard += 1;
     }
-    // 50 cells, 20 transmuted, 2 eaten (nothing left to refill with).
+    // 50 cells, 9 defused (not destroyed), 2 eaten (nothing left to refill).
     try std.testing.expectEqual(@as(u16, 48), occupied);
-    try std.testing.expectEqual(neutralized + modified, occupied);
+    try std.testing.expectEqual(neutralized + hazard, occupied);
     try std.testing.expectEqual(s.sess.field.grid.occupied(), occupied);
     try std.testing.expectEqual(s.sess.hunger.current, gs.hunger.current);
     try std.testing.expectEqual(s.sess.score, gs.score);
@@ -2092,9 +2390,9 @@ test "game_state carries the live combo preview on the owner's entity" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_fifty_red);
+    try start(&s, &enc_fifty_green);
 
-    const combo = mk(&.{ .{ .element = .red }, .{ .action = .dispense } });
+    const combo = BLOOM_HALF; // [dispense, medicine] — two distinguishable slots
     try enqueue_combo(&s.sess, s.p[0].pid, combo);
 
     s.p[0].clear();
@@ -2109,8 +2407,8 @@ test "game_state carries the live combo preview on the owner's entity" {
         }
         found = true;
         try std.testing.expectEqual(combo.len, e.combo_len);
-        try std.testing.expectEqual(c.Element.red, e.combo_slots[0].element);
-        try std.testing.expectEqual(c.ActionChoice.dispense, e.combo_slots[1].action);
+        try std.testing.expectEqual(c.ActionChoice.dispense, e.combo_slots[0].action);
+        try std.testing.expectEqual(c.ActionChoice.medicine, e.combo_slots[1].action);
     }
     try std.testing.expect(found);
 }
@@ -2124,7 +2422,7 @@ test "game_state carries the soonest cast countdown (idle = -1), lock_ms and cas
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_fifty_red);
+    try start(&s, &enc_fifty_green);
     freeze_bites(&s.sess);
 
     // Idle: cast_timer sentinel -1, no locks, no pending casts.
@@ -2141,7 +2439,7 @@ test "game_state carries the soonest cast countdown (idle = -1), lock_ms and cas
     // Cast pending: the soonest countdown is positive; the submitter's lock_ms
     // and cast_ms count down, everyone else's stay 0.
     s.p[1].clear();
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{ .{ .element = .red }, .{ .action = .dispense } }));
+    try enqueue_submit(&s.sess, s.p[0].pid, POKE);
     try flush(&s.sess);
     gs = try last_game_state(try drain(s.p[1].buf.items, arena));
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), gs.cast_timer, 0.001);
@@ -2160,9 +2458,9 @@ test "game_state carries the soonest cast countdown (idle = -1), lock_ms and cas
     try std.testing.expect(found_submitter);
 }
 
-test "an all-neutralized grid broadcasts zero healable hunger in every color" {
-    // Wire-level regression for "modified slime showing in the hunger bar
-    // after neutralizing everything".
+test "a fully defused grid broadcasts zero healable hunger in every tier" {
+    // Wire-level regression for "hazard slime showing in the hunger bar after
+    // defusing everything".
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -2173,16 +2471,12 @@ test "an all-neutralized grid broadcasts zero healable hunger in every color" {
     defer s.deinit();
     const cfg = cfg_instant_cast();
     s.sess.cfg = &cfg;
-    try start(&s, &enc_twenty_red);
-    set_field(&s.sess, .{ .modified = .red }, 20);
+    try start(&s, &enc_twenty_green);
+    set_block_field(&s.sess, tiered(.green), 2, 5);
 
-    // crimson_flood covers the 20-cell cohort exactly, then everything is eaten.
-    try enqueue_submit(&s.sess, s.p[0].pid, mk(&.{
-        .{ .element = .red },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-    }));
+    // One `block` stamp covers the whole 9-cell field, then it is all eaten.
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
     s.p[0].clear();
     var guard: usize = 0;

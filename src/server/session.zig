@@ -19,11 +19,11 @@
 //! EATING.  One "Lil Guy" ECS entity exists per connected player.  Each
 //! reserves a RANDOM occupied cell and counts down a bite timer (derived from
 //! `balance.eat_rate_units_per_s`); when it expires the Lil Guy bites that
-//! cell empty, adding hunger (normal, plus healable extra for un-neutralized
-//! modified slime) and score (neutral + neutralized slime), then re-targets.
-//! A reservation is not exclusive: if the cell emptied first (another Lil Guy
-//! got there, or an agent destroyed it) the bite is a miss and the Lil Guy
-//! simply re-targets.
+//! cell empty, adding hunger (normal, plus healable extra for still-hazardous
+//! slime) and score (neutral + defused slime), then re-targets.  A reservation
+//! is not exclusive: if the cell emptied first (another Lil Guy got there) the
+//! bite is a miss and the Lil Guy simply re-targets.  A cast can never steal a
+//! reserved bite: downgrading REWRITES a cell, it never empties one.
 //!
 //! CASTING.  Casts are explicitly SUBMITTED (`submit_spell`).  Each accepted
 //! cast gets its OWN `cast_buffer_ms` countdown and fires solo at its expiry
@@ -31,9 +31,11 @@
 //! that recipe instance's members then share the joiner's expiry
 //! (`cast_grouped`) and fire together.  Expired casts convert as one batch
 //! (`cast_fired`): recipes match within the batch, medicine heals the hunger
-//! bar immediately, and dispensed agents neutralize a random subset of the
-//! matching-color modified cells CURRENTLY ON THE GRID (agents beyond that
-//! on-grid cohort are wasted).  Each accepted submit also starts a per-player
+//! bar immediately, and each matched recipe STAMPS its shape on the grid,
+//! anchored at the caster's captured cursor.  Every covered hazard cell steps
+//! down one tier (red -> yellow -> green -> defused); coverage that falls off
+//! the grid edge, or lands on a cell with nothing left to downgrade, is wasted.
+//! Each accepted submit also starts a per-player
 //! `cast_lock_ms` cooldown: locked submits are silently ignored, and an
 //! unlocked resubmit REPLACES the player's pending cast, restarting its
 //! buffer (`cast_replaced`).
@@ -110,10 +112,10 @@ pub const Session = struct {
     current_encounter: ?*const enc.Encounter = null,
     /// Total Hunger bar.  Fills as slime is consumed; full = encounter over.
     hunger: c.Health = .{ .current = 0, .max = 0 },
-    /// Portion of `hunger.current` attributable to un-neutralized modified
-    /// slime, tracked per slime color (Element ordinal).  Only matching-color
-    /// (symmetrical) Medicine can heal each bucket.
-    hunger_healable: [c.Element.size]u16 = [_]u16{0} ** c.Element.size,
+    /// Portion of `hunger.current` attributable to hazard slime eaten while
+    /// still a hazard, tracked per difficulty tier (Tier ordinal).  Only
+    /// matching-tier (symmetrical) Medicine can heal each bucket.
+    hunger_healable: [c.Tier.size]u16 = [_]u16{0} ** c.Tier.size,
     /// The authoritative slime field: grid + off-grid reservoir.  Empty until
     /// start_game_encounter sizes it from balance.slime_grid.
     field: slime.SlimeField,
@@ -133,6 +135,17 @@ pub const Session = struct {
     cast_fire_timers: [MAX_PLAYERS]?f32 = [_]?f32{null} ** MAX_PLAYERS,
     /// Per-player cast-lock cooldowns (seconds remaining).
     cast_locks: [MAX_PLAYERS]f32 = [_]f32{0} ** MAX_PLAYERS,
+    /// Each player's aiming cursor, as a flat grid index.  SERVER-OWNED: the
+    /// client sends directions and this clamps, so a cursor is always a valid
+    /// cell of the current grid and no client can aim out of bounds.
+    cursors: [MAX_PLAYERS]u16 = [_]u16{0} ** MAX_PLAYERS,
+    /// Where each pending cast was aimed, captured at SUBMIT time.  A cast
+    /// lands where the player was aiming when they committed it, so moving
+    /// during the buffer cannot retarget an already-committed spell.
+    cast_anchors: [MAX_PLAYERS]u16 = [_]u16{0} ** MAX_PLAYERS,
+    /// The player whose submit most recently COMPLETED a team-recipe group.
+    /// That player aims the combined shape; cleared once the group fires.
+    last_joiner: ?u8 = null,
     /// Whether each player has a cast pending, as sent on the wire (drives
     /// the client's "cast used" indicator).
     casts_used: [MAX_PLAYERS]u8 = [_]u8{0} ** MAX_PLAYERS,
@@ -277,9 +290,11 @@ pub const Session = struct {
         self.cast_fire_timers = [_]?f32{null} ** MAX_PLAYERS;
         self.cast_locks = [_]f32{0} ** MAX_PLAYERS;
         for (&self.submitted_pool) |*sp| sp.* = null;
+        self.cast_anchors = [_]u16{0} ** MAX_PLAYERS;
+        self.last_joiner = null;
 
         self.hunger = .{ .current = 0, .max = encounter.hunger_max };
-        self.hunger_healable = [_]u16{0} ** c.Element.size;
+        self.hunger_healable = [_]u16{0} ** c.Tier.size;
         self.score = 0;
         self.slime_total = encounter.total_units();
         self.field = slime.SlimeField.init(
@@ -287,6 +302,13 @@ pub const Session = struct {
             encounter.slime,
             self.rand(),
         );
+        // Everyone starts aiming at the middle of the field: the least
+        // arbitrary opening position, and always a valid cell.
+        const centre = self.field.grid.index(
+            self.cfg.balance.slime_grid.rows / 2,
+            self.cfg.balance.slime_grid.cols / 2,
+        );
+        self.cursors = [_]u16{centre} ** MAX_PLAYERS;
 
         std.log.info("game start — encounter: {s} slime={} grid={}x{} hunger_max={}", .{
             encounter.label,
@@ -404,7 +426,7 @@ pub const Session = struct {
             batch[batch_len] = .{ .player_id = @intCast(pid), .combo = combo };
             batch_len += 1;
             player_mask |= @as(u8, 1) << @intCast(pid);
-            self.record_cast_stats(pid, combo);
+            self.record_cast_stats(pid);
         }
         if (batch_len == 0) return;
 
@@ -416,7 +438,11 @@ pub const Session = struct {
         });
         try self.broadcast_raw(fbs.getWritten());
 
-        try self.convert_batch(batch[0..batch_len]);
+        // The joiner only aims the group it completed; once that group has
+        // fired the claim is spent.
+        const joiner = self.last_joiner;
+        self.last_joiner = null;
+        try self.convert_batch(batch[0..batch_len], joiner);
     }
 
     /// After accepting `player_id`'s cast, check whether it
@@ -438,9 +464,13 @@ pub const Session = struct {
         const ji = joiner_index orelse return;
 
         var report = logic.MatchReport{};
-        _ = logic.match_recipes(&self.cfg.balance, pending[0..pending_len], &report);
+        _ = logic.match_recipes(&self.cfg.balance, pending[0..pending_len], null, &report);
         const instance = report.team_instance[ji];
         if (instance == logic.NO_TEAM_INSTANCE) return;
+
+        // This player closed the circuit, so their cursor aims the combined
+        // shape when the group fires.
+        self.last_joiner = player_id;
 
         var player_mask: u8 = 0;
         for (pending[0..pending_len], 0..) |cast, ci| {
@@ -460,14 +490,18 @@ pub const Session = struct {
 
     /// CONVERT one batch of fired spells: recipes match within the batch
     /// (team recipes = same batch only), medicine heals right away
-    /// (broadcasting a .heal action_result), and dispensed agents neutralize
-    /// a random subset of the matching-color modified cells ON THE GRID.
-    /// Each recipe fire is broadcast.
-    fn convert_batch(self: *Session, batch: []const logic.Cast) !void {
+    /// (broadcasting a .heal action_result), and each matched recipe STAMPS
+    /// its shape on the grid at the anchoring player's cursor — downgrading
+    /// every covered hazard cell by one tier.  Each recipe fire and each
+    /// stamp is broadcast.
+    ///
+    /// `joiner` is the player whose submit completed a team group, if any;
+    /// they aim the combined team shape (see match_recipes).
+    fn convert_batch(self: *Session, batch: []const logic.Cast, joiner: ?u8) !void {
         if (batch.len == 0) return;
 
         var report = logic.MatchReport{};
-        const output = logic.match_recipes(&self.cfg.balance, batch, &report);
+        const outcome = logic.match_recipes(&self.cfg.balance, batch, joiner, &report);
 
         // Recipe stats: fire counts + per-player participation.  Each fire is
         // also broadcast so clients can show recipe floaters live.  Only the
@@ -488,8 +522,8 @@ pub const Session = struct {
             }
         }
 
-        // Medicine heals immediately (already-accrued modified-slime hunger).
-        const healed = logic.apply_medicine(&self.hunger, &self.hunger_healable, output.medicine);
+        // Medicine heals immediately (already-accrued hazard-slime hunger).
+        const healed = logic.apply_medicine(&self.hunger, &self.hunger_healable, outcome.medicine.medicine);
         const healed_total = logic.sum_u16(healed);
         if (healed_total > 0) {
             try self.broadcast_action_result(.{
@@ -500,33 +534,61 @@ pub const Session = struct {
             });
         }
 
-        // Agents neutralize on-grid modified cells in place (visible live).
-        // Reach is the on-grid cohort only: agents beyond it are wasted.
-        const neutralized = self.field.neutralize(
-            output.units,
-            self.cfg.balance.neutralize_residue_mult,
-            self.rand(),
-        );
-
-        // Tell clients what the agents accomplished: how many were dispensed
-        // versus how many cells they actually transmuted.  The difference is
-        // the wasted surplus (reach is the on-grid cohort only), which is
-        // otherwise invisible live.
-        if (logic.sum_u32(output.units) > 0) {
-            var dbuf: [4 + 4 * c.Element.size]u8 = undefined;
-            var dfbs = std.io.fixedBufferStream(&dbuf);
-            var ad = proto.AgentsDispensed{};
-            for (&ad.dispensed, output.units) |*d, u| d.* = stat_u16(u);
-            ad.transmuted = neutralized;
-            try proto.encode(dfbs.writer(), .agents_dispensed, ad);
-            try self.broadcast_raw(dfbs.getWritten());
+        // Stamp each shape where its caster was aiming when they committed.
+        for (outcome.stamps()) |stamp| {
+            try self.stamp_shape(stamp);
         }
 
         const fs = &self.stats.feast;
-        for (&fs.agents_dispensed, output.units) |*d, u| d.* +|= stat_u16(u);
-        for (&fs.medicine_dispensed, output.medicine) |*d, m| d.* +|= stat_u16(m);
+        for (&fs.medicine_dispensed, outcome.medicine.medicine) |*d, m| d.* +|= stat_u16(m);
         for (&fs.medicine_healed, healed) |*d, h| d.* +|= h;
-        for (&fs.neutralized, neutralized) |*d, n| d.* +|= n;
+    }
+
+    /// Apply one matched shape to the grid at its anchoring player's cast
+    /// cursor, then broadcast the resolved footprint and outcome.
+    ///
+    /// Anchoring uses `cast_anchors` (where the player aimed at SUBMIT time),
+    /// not the live cursor: a cast that is already in flight must not follow
+    /// the player as they re-aim for their next one.
+    fn stamp_shape(self: *Session, stamp: logic.ShapeCast) !void {
+        const anchor = self.cast_anchors[stamp.anchor_player];
+        const grid = &self.field.grid;
+        const row = grid.row_of(anchor);
+        const col = grid.col_of(anchor);
+
+        const outcome = self.field.apply_shape(stamp.shape, row, col);
+
+        var msg = proto.ShapeCast{
+            .caster = stamp.anchor_player,
+            .downgraded = outcome.downgraded,
+            .neutralized = outcome.neutralized,
+            .off_grid = outcome.off_grid,
+            .inert = outcome.inert,
+        };
+        // Send the RESOLVED cells so clients never re-derive placement and
+        // cannot disagree with the server about what was hit.
+        for (stamp.shape.offsets) |off| {
+            const r = @as(i16, row) + off.d_row;
+            const cl = @as(i16, col) + off.d_col;
+            if (r < 0 or cl < 0 or r >= grid.rows or cl >= grid.cols) continue;
+            if (msg.cell_count >= proto.MAX_SHAPE_CELLS_WIRE) break;
+            msg.cells[msg.cell_count] = grid.index(@intCast(r), @intCast(cl));
+            msg.cell_count += 1;
+        }
+
+        const fs = &self.stats.feast;
+        for (&fs.cells_covered, outcome.downgraded) |*d, n| d.* +|= n;
+        // Only a green cell can step all the way to defused, so every
+        // neutralization is attributable to the green bucket.
+        fs.neutralized[@intFromEnum(c.Tier.green)] +|= outcome.neutralized;
+        const ps = &self.stats.players[stamp.anchor_player];
+        ps.cells_covered +|= stat_u16(outcome.total_downgraded());
+        ps.cells_neutralized +|= outcome.neutralized;
+
+        var buf: [8 + 2 * proto.MAX_SHAPE_CELLS_WIRE + 4 * c.Tier.size + 8]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        try proto.encode(fbs.writer(), .shape_cast, msg);
+        try self.broadcast_raw(fbs.getWritten());
     }
 
     /// Seconds one Lil Guy takes to eat one slime unit — the inverse of
@@ -540,10 +602,12 @@ pub const Session = struct {
     /// bite the reserved cell.
     ///
     /// A reservation is NOT exclusive.  If the cell emptied first (another Lil
-    /// Guy beat it there, or an agent destroyed it) the bite is a MISS: no
-    /// hunger, no score, and the Lil Guy re-targets immediately.  A landed
-    /// bite adds normal hunger, healable extra hunger for un-neutralized
-    /// modified slime, and score for neutral/neutralized slime.
+    /// Guy beat it there) the bite is a MISS: no hunger, no score, and the Lil
+    /// Guy re-targets immediately.  A cast can never cause a miss — a downgrade
+    /// rewrites the cell rather than emptying it — so a reserved bite always
+    /// lands, possibly on a cheaper tier than when it was reserved.  A landed
+    /// bite adds normal hunger, healable extra hunger for still-hazardous
+    /// slime, and score for neutral/defused slime.
     ///
     /// After the bites, emptied cells are refilled from the reservoir (top row
     /// first) so the grid stays as full as the remaining slime allows.
@@ -568,8 +632,8 @@ pub const Session = struct {
             if (self.field.bite(&self.cfg.balance, lg.target)) |out| {
                 hunger_added += out.hunger_normal + out.hunger_extra;
                 logic.add_hunger(&self.hunger, out.hunger_normal + out.hunger_extra);
-                if (out.healable_color()) |color| {
-                    const i = @intFromEnum(color);
+                if (out.healable_tier()) |tier| {
+                    const i = @intFromEnum(tier);
                     const grown = @as(u32, self.hunger_healable[i]) + out.hunger_extra;
                     self.hunger_healable[i] = @intCast(@min(grown, @as(u32, std.math.maxInt(u16))));
                 }
@@ -611,8 +675,8 @@ pub const Session = struct {
         switch (out.eaten) {
             .empty => unreachable, // a landed bite always ate something
             .neutral => fs.neutral_consumed +|= 1,
-            .neutralized => {}, // counted when the agent neutralized it
-            .modified => |color| fs.modified_escaped[@intFromEnum(color)] +|= 1,
+            .neutralized => {}, // counted when the cast defused it
+            .tiered => |tier| fs.hazard_escaped[@intFromEnum(tier)] +|= 1,
         }
         fs.hunger_normal +|= stat_u16(out.hunger_normal);
         fs.hunger_extra +|= stat_u16(out.hunger_extra);
@@ -632,21 +696,12 @@ pub const Session = struct {
         }
     }
 
-    /// Record a committed cast into the tuning stats: total + per-player
-    /// counts and RAW per-color slot tallies (pre-recipe attribution).
-    fn record_cast_stats(self: *Session, pid: usize, combo: c.ActionCombo) void {
+    /// Record a committed cast into the tuning stats.  Coverage is credited
+    /// later, when the shape actually lands (see stamp_shape) — a combo is
+    /// just a name until then.
+    fn record_cast_stats(self: *Session, pid: usize) void {
         self.stats.casts_total +|= 1;
-        const ps = &self.stats.players[pid];
-        ps.casts +|= 1;
-        var ea_buf: [c.MAX_COMBO_LEN]logic.ElementedAction = undefined;
-        const n = logic.parse_combo(combo, &ea_buf);
-        for (ea_buf[0..n]) |ea| {
-            const el = ea.element orelse continue; // colorless slots are wasted
-            switch (ea.action) {
-                .dispense => ps.dispense_slots[@intFromEnum(el)] +|= 1,
-                .medicine => ps.medicine_slots[@intFromEnum(el)] +|= 1,
-            }
-        }
+        self.stats.players[pid].casts +|= 1;
     }
 
     fn drain_queues(self: *Session) !void {
@@ -721,6 +776,17 @@ pub const Session = struct {
                     std.log.debug("player {} cancelled combo", .{player_id});
                 }
             },
+            .move_cursor => {
+                // Always decode so the stream stays in sync for messages
+                // queued after this one.
+                const p = try proto.decode_move_cursor(fbs.reader());
+                if (self.phase != .playing or player_id >= MAX_PLAYERS) return;
+                const d = p.dir.delta();
+                // Clamped, so any number of steps in any direction leaves the
+                // cursor on a real cell.
+                self.cursors[player_id] =
+                    self.field.grid.step(self.cursors[player_id], d.d_row, d.d_col);
+            },
             .submit_spell => {
                 // Always decode so the stream stays in sync for any
                 // messages queued after this one.
@@ -744,6 +810,9 @@ pub const Session = struct {
 
                 const replacing = self.submitted_pool[player_id] != null;
                 self.submitted_pool[player_id] = p.combo;
+                // Freeze the aim now: this cast lands where the player was
+                // pointing when they committed it, however they move next.
+                self.cast_anchors[player_id] = self.cursors[player_id];
                 self.action_pool[player_id] = null; // clears the live preview
                 self.cast_locks[player_id] = self.cast_lock_s();
                 // The cast's own buffer: fires at expiry unless a later
@@ -987,6 +1056,10 @@ pub const Session = struct {
                 combo.slots
             else
                 blank_slots;
+            const cursor = if (self.submitted_pool[own] != null)
+                self.cast_anchors[own]
+            else
+                self.cursors[own];
 
             snap.entities[snap.entity_count] = .{
                 .entity = e,
@@ -999,6 +1072,11 @@ pub const Session = struct {
                 .combo_slots = combo_slots,
                 .submitted_len = sub_len,
                 .submitted_slots = sub_slots,
+                // A cast in flight shows where it will LAND (its captured
+                // anchor); an idle player shows their live aim.  Snapshotted
+                // for every player so teammates see each other's previews.
+                .cursor_row = self.field.grid.row_of(cursor),
+                .cursor_col = self.field.grid.col_of(cursor),
             };
             snap.entity_count += 1;
         }

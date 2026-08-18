@@ -18,15 +18,15 @@
 //!   fill        — move reservoir slime into empty cells, TOP ROW FIRST
 //!                 (row 0 down), each unit's type drawn from the reservoir in
 //!                 proportion to what remains.
-//!   neutralize  — a dispensed color's agents transmute a RANDOM SUBSET of
-//!                 the matching-color `modified` cells CURRENTLY ON THE GRID.
-//!                 Agents beyond that on-grid cohort are wasted, and the
-//!                 residue multiplier destroys a portion outright.
+//!   apply_shape — stamp a cast's footprint at an aimed anchor, DOWNGRADING
+//!                 every covered hazard one tier.  Deterministic: the player
+//!                 chose the cells, so nothing is random and nothing is
+//!                 destroyed — only made safer.
 //!   bite        — empty one cell, reporting the hunger/score it produced.
 //!
-//! Neither the reservoir nor an off-grid unit can be neutralized: transmuting
-//! is a grid-only operation by construction (`SlimeReservoir` has no
-//! neutralized bucket).
+//! Neither the reservoir nor an off-grid unit can be neutralized: casting is a
+//! grid-only operation by construction (`SlimeReservoir` has no neutralized
+//! bucket), so slime waiting off-grid always arrives at full difficulty.
 
 const std = @import("std");
 const c = @import("components.zig");
@@ -92,76 +92,63 @@ pub const SlimeField = struct {
             return .neutral;
         }
         pick -= self.reservoir.neutral;
-        for (&self.reservoir.modified, 0..) |*count, i| {
+        for (&self.reservoir.tiered, 0..) |*count, i| {
             if (pick < count.*) {
                 count.* -= 1;
-                return .{ .modified = @enumFromInt(i) };
+                return .{ .tiered = @enumFromInt(i) };
             }
             pick -= count.*;
         }
         unreachable; // `total` is the sum of the buckets just walked.
     }
 
-    /// Flat indices of every `modified` cell of `color` — the cohort a
-    /// dispensed agent of that color may transmute.  Returns the slice of
-    /// `out` written; `out` must have capacity for the whole grid.
-    fn modified_cells(
-        self: *const SlimeField,
-        color: c.Element,
-        out: *[c.MAX_GRID_CELLS]u16,
-    ) []u16 {
-        var n: u16 = 0;
-        for (self.grid.live(), 0..) |cell, i| {
-            if (cell == .modified and cell.modified == color) {
-                out[n] = @intCast(i);
-                n += 1;
-            }
-        }
-        return out[0..n];
-    }
-
-    /// Transmute matching-color modified slime with one cast's agent units.
+    /// Stamp one cast's shape on the grid, anchored at (`row`, `col`).
     ///
-    /// `agents[e]` units of color `e` act on the color-`e` modified cells
-    /// CURRENTLY ON THE GRID: `t = min(agents, cohort)` cells are picked at
-    /// random and leave the modified state.  Of those, `floor(residue_mult *
-    /// t)` become `neutralized` (still edible, no extra hunger, still score);
-    /// the rest are destroyed outright, emptying the cell.  Agents beyond the
-    /// on-grid cohort, and wrong-color agents, are wasted.
+    /// Every covered cell holding a hazard is DOWNGRADED one tier
+    /// (red -> yellow -> green -> neutralized).  Nothing is destroyed: a
+    /// neutralized unit stays on the grid, edible, scoring, and costing only
+    /// normal hunger — clearing the field is the Lil Guys' job, not the cast's.
     ///
-    /// Returns cells transmuted (i.e. removed from `modified`) per color.
-    pub fn neutralize(
+    /// Cells the shape covers that cannot be downgraded are WASTED, and the
+    /// distinction is the player's aiming feedback:
+    ///   - `off_grid`  — the offset fell outside the playfield (clipped)
+    ///   - `inert`     — a real cell with nothing to neutralize (empty,
+    ///                   neutral, or already neutralized)
+    ///
+    /// Deterministic: no randomness, because the player chose the cells.
+    pub fn apply_shape(
         self: *SlimeField,
-        agents: [c.Element.size]u32,
-        residue_mult: f32,
-        rand: std.Random,
-    ) [c.Element.size]u16 {
-        var transmuted = [_]u16{0} ** c.Element.size;
-        var buf: [c.MAX_GRID_CELLS]u16 = undefined;
+        shape: balance.Shape,
+        row: u8,
+        col: u8,
+    ) ShapeOutcome {
+        std.debug.assert(row < self.grid.rows and col < self.grid.cols);
+        var out = ShapeOutcome{};
 
-        for (agents, 0..) |pool, i| {
-            if (pool == 0) continue;
-            const color: c.Element = @enumFromInt(i);
-            const cohort = self.modified_cells(color, &buf);
-            if (cohort.len == 0) continue;
-
-            const n: u16 = @intCast(@min(pool, cohort.len));
-            // Random subset of size n: partial Fisher-Yates over the cohort.
-            for (0..n) |k| {
-                const j = k + rand.uintLessThan(usize, cohort.len - k);
-                std.mem.swap(u16, &cohort[k], &cohort[j]);
+        for (shape.offsets) |off| {
+            const r = @as(i32, row) + off.d_row;
+            const cl = @as(i32, col) + off.d_col;
+            if (r < 0 or r >= self.grid.rows or cl < 0 or cl >= self.grid.cols) {
+                out.off_grid += 1;
+                continue;
             }
-            const survivors: u16 =
-                @intFromFloat(@floor(residue_mult * @as(f32, @floatFromInt(n))));
-            for (cohort[0..n], 0..) |flat, k| {
-                self.grid.put(flat, if (k < survivors)
-                    .{ .neutralized = color }
-                else
-                    .empty);
+            const flat = self.grid.index(@intCast(r), @intCast(cl));
+            const cell = self.grid.get(flat);
+            if (cell != .tiered) {
+                out.inert += 1;
+                continue;
             }
-            transmuted[i] = n;
+            const tier = cell.tiered;
+            if (tier.downgrade()) |next| {
+                self.grid.put(flat, .{ .tiered = next });
+                out.downgraded[@intFromEnum(tier)] += 1;
+            } else {
+                self.grid.put(flat, .neutralized);
+                out.downgraded[@intFromEnum(tier)] += 1;
+                out.neutralized += 1;
+            }
         }
-        return transmuted;
+        return out;
     }
 
     /// Pick a random occupied cell — what a Lil Guy targets.  Returns its
@@ -195,40 +182,62 @@ pub const SlimeField = struct {
         var out = BiteOutcome{ .hunger_normal = bal.hunger_cost_normal };
         switch (cell) {
             .empty => unreachable, // guarded above
-            .neutral => {
-                out.eaten = .neutral;
+            .neutral, .neutralized => {
+                out.eaten = cell;
                 out.score = 1;
             },
-            .neutralized => |color| {
-                out.eaten = .{ .neutralized = color };
-                out.score = 1;
-            },
-            .modified => |color| {
-                out.eaten = .{ .modified = color };
-                out.hunger_extra = bal.hunger_cost_modified_extra;
+            .tiered => {
+                out.eaten = cell;
+                out.hunger_extra = bal.hunger_cost_hazard_extra;
             },
         }
         return out;
     }
 };
 
+/// What stamping one shape did.  The three wasted-cell kinds are kept apart
+/// because they mean different things to the player: `off_grid` says "you
+/// aimed off the edge", `inert` says "you hit clean slime".
+pub const ShapeOutcome = struct {
+    /// Cells downgraded, indexed by the tier they were AT before the cast.
+    downgraded: [c.Tier.size]u16 = [_]u16{0} ** c.Tier.size,
+    /// Of those, how many were fully defused (green -> neutralized).
+    neutralized: u16 = 0,
+    /// Covered offsets that fell outside the grid.
+    off_grid: u16 = 0,
+    /// Covered cells with nothing to neutralize.
+    inert: u16 = 0,
+
+    /// Total cells the cast changed.
+    pub fn total_downgraded(self: ShapeOutcome) u16 {
+        var n: u16 = 0;
+        for (self.downgraded) |d| n += d;
+        return n;
+    }
+
+    /// Covered cells the cast achieved nothing on.
+    pub fn wasted(self: ShapeOutcome) u16 {
+        return self.off_grid + self.inert;
+    }
+};
+
 /// What one bite produced.  `hunger_extra` is healable by medicine matching
-/// the eaten cell's color; `hunger_normal` never is.
+/// the eaten cell's tier; `hunger_normal` never is.
 pub const BiteOutcome = struct {
     /// The cell that was eaten (never `.empty`).
     eaten: c.SlimeCell = .neutral,
     /// Hunger from eating a unit at all.
     hunger_normal: u32 = 0,
-    /// Extra hunger, non-zero only for un-neutralized modified slime.
+    /// Extra hunger, non-zero only for un-neutralized hazard slime.
     hunger_extra: u32 = 0,
-    /// Score: 1 for neutral/neutralized slime, 0 for modified.
+    /// Score: 1 for neutral/neutralized slime, 0 for a live hazard.
     score: u32 = 0,
 
-    /// The color whose medicine can heal `hunger_extra`, or null when this
+    /// The tier whose medicine can heal `hunger_extra`, or null when this
     /// bite produced no healable hunger.
-    pub fn healable_color(self: BiteOutcome) ?c.Element {
+    pub fn healable_tier(self: BiteOutcome) ?c.Tier {
         return switch (self.eaten) {
-            .modified => |color| color,
+            .tiered => |tier| tier,
             else => null,
         };
     }
@@ -247,16 +256,69 @@ fn prng(seed: u64) std.Random.DefaultPrng {
     return std.Random.DefaultPrng.init(seed);
 }
 
-const el = struct {
-    fn i(e: c.Element) usize {
-        return @intFromEnum(e);
-    }
-}.i;
+fn ti(t: c.Tier) usize {
+    return @intFromEnum(t);
+}
+
+/// A shape from authored rows, for tests only (config.zig does this at load).
+/// `rows` are `#`/`.` strings; anchor is the bounding box centre, rounded down.
+/// The offsets live in a generated namespace so the returned slice is static.
+fn Shaped(comptime rows: []const []const u8) type {
+    return struct {
+        const offsets = blk: {
+            var offs: [balance.MAX_SHAPE_CELLS]balance.ShapeOffset = undefined;
+            var n: usize = 0;
+            const anchor_r: i8 = @intCast(rows.len / 2);
+            const anchor_c: i8 = @intCast(rows[0].len / 2);
+            for (rows, 0..) |line, r| {
+                for (line, 0..) |ch, cl| {
+                    if (ch != '#') continue;
+                    offs[n] = .{
+                        .d_row = @as(i8, @intCast(r)) - anchor_r,
+                        .d_col = @as(i8, @intCast(cl)) - anchor_c,
+                    };
+                    n += 1;
+                }
+            }
+            break :blk offs[0..n].*;
+        };
+        const shape = balance.Shape{
+            .offsets = &offsets,
+            .rows = @intCast(rows.len),
+            .cols = @intCast(rows[0].len),
+        };
+    };
+}
+
+fn test_shape(comptime rows: []const []const u8) balance.Shape {
+    return Shaped(rows).shape;
+}
+
+const SQUARE_3X3 = test_shape(&.{ "###", "###", "###" });
+const DOT = test_shape(&.{"#"});
+const PLUS = test_shape(&.{ ".#.", "###", ".#." });
+
+/// Paint every live cell of a field, bypassing the reservoir.
+fn paint(field: *SlimeField, cell: c.SlimeCell) void {
+    var flat: u16 = 0;
+    while (flat < field.grid.len()) : (flat += 1) field.grid.put(flat, cell);
+}
+
+fn empty_field(rows: u8, cols: u8) SlimeField {
+    return .{ .grid = c.SlimeGrid.init(rows, cols), .reservoir = .{} };
+}
+
+test "Tier.downgrade walks red -> yellow -> green -> defused" {
+    try testing.expectEqual(c.Tier.yellow, c.Tier.red.downgrade().?);
+    try testing.expectEqual(c.Tier.green, c.Tier.yellow.downgrade().?);
+    // Green has no lower tier: the next application defuses the unit.
+    try testing.expectEqual(@as(?c.Tier, null), c.Tier.green.downgrade());
+}
 
 test "init fills the grid from the reservoir and keeps the overflow" {
     var rng = prng(1);
     var res = c.SlimeReservoir{ .neutral = 20 };
-    res.modified[el(.red)] = 30;
+    res.tiered[ti(.red)] = 30;
     const field = SlimeField.init(.{ .rows = 2, .cols = 3 }, res, rng.random());
 
     // 6 cells filled, 50 - 6 = 44 left in the reservoir.
@@ -271,7 +333,6 @@ test "init leaves cells empty when the reservoir cannot fill the grid" {
     const field = SlimeField.init(.{ .rows = 4, .cols = 4 }, .{ .neutral = 5 }, rng.random());
     try testing.expectEqual(@as(u16, 5), field.grid.occupied());
     try testing.expect(field.reservoir.is_empty());
-    try testing.expectEqual(@as(u32, 5), field.remaining());
     // Filled top-first: the first 5 flat cells hold the slime.
     for (field.grid.live(), 0..) |cell, i| {
         try testing.expectEqual(i < 5, cell.is_slime());
@@ -283,7 +344,6 @@ test "fill refills empty cells from the top row downward" {
     var field = SlimeField.init(.{ .rows = 3, .cols = 2 }, .{ .neutral = 6 }, rng.random());
     try testing.expect(field.reservoir.is_empty());
 
-    // Empty the top row and one bottom cell, then top the reservoir back up.
     field.grid.set(0, 0, .empty);
     field.grid.set(0, 1, .empty);
     field.grid.set(2, 1, .empty);
@@ -300,8 +360,8 @@ test "fill refills empty cells from the top row downward" {
 test "fill draws every reservoir bucket and exhausts it exactly" {
     var rng = prng(4);
     var res = c.SlimeReservoir{ .neutral = 4 };
-    res.modified[el(.red)] = 4;
-    res.modified[el(.blue)] = 4;
+    res.tiered[ti(.red)] = 4;
+    res.tiered[ti(.green)] = 4;
     const field = SlimeField.init(.{ .rows = 3, .cols = 4 }, res, rng.random());
 
     try testing.expectEqual(@as(u16, 12), field.grid.occupied());
@@ -312,124 +372,145 @@ test "fill draws every reservoir bucket and exhausts it exactly" {
         if (cell == .neutral) neutral += 1;
     }
     try testing.expectEqual(@as(u16, 4), neutral);
-    try testing.expectEqual(@as(u16, 4), field.grid.modified_count(.red));
-    try testing.expectEqual(@as(u16, 4), field.grid.modified_count(.blue));
+    try testing.expectEqual(@as(u16, 4), field.grid.tier_count(.red));
+    try testing.expectEqual(@as(u16, 4), field.grid.tier_count(.green));
 }
 
-test "neutralize converts matching-color cells and wastes excess agents" {
-    var rng = prng(5);
-    var res = c.SlimeReservoir{};
-    res.modified[el(.red)] = 9;
-    var field = SlimeField.init(.{ .rows = 3, .cols = 3 }, res, rng.random());
-    try testing.expectEqual(@as(u16, 9), field.grid.modified_count(.red));
+test "reservoir slime always arrives at full difficulty" {
+    // Casting cannot reach off-grid slime, so a refill after a cast brings in
+    // an un-neutralized unit even though the grid was just cleaned.
+    var rng = prng(16);
+    var field = empty_field(1, 2);
+    field.grid.put(0, .{ .tiered = .green });
+    field.reservoir.tiered[ti(.red)] = 1;
 
-    var agents = [_]u32{0} ** c.Element.size;
-    agents[el(.red)] = 4;
-    const moved = field.neutralize(agents, 1.0, rng.random());
+    _ = field.apply_shape(DOT, 0, 0);
+    try testing.expectEqual(c.SlimeCell.neutralized, field.grid.get(0));
 
-    try testing.expectEqual(@as(u16, 4), moved[el(.red)]);
-    try testing.expectEqual(@as(u16, 5), field.grid.modified_count(.red));
-    // residue 1.0: every transmuted cell survives, so the grid is still full.
-    try testing.expectEqual(@as(u16, 9), field.grid.occupied());
-
-    // Far more agents than the remaining cohort: the excess is wasted.
-    agents[el(.red)] = 999;
-    const rest = field.neutralize(agents, 1.0, rng.random());
-    try testing.expectEqual(@as(u16, 5), rest[el(.red)]);
-    try testing.expectEqual(@as(u16, 0), field.grid.modified_count(.red));
+    _ = field.fill(rng.random());
+    try testing.expectEqual(c.SlimeCell{ .tiered = .red }, field.grid.get(1));
 }
 
-test "neutralize reach is limited to the on-grid cohort" {
-    var rng = prng(6);
-    var res = c.SlimeReservoir{};
-    res.modified[el(.red)] = 100; // only 4 fit on the grid
-    var field = SlimeField.init(.{ .rows = 2, .cols = 2 }, res, rng.random());
+test "apply_shape downgrades every covered hazard one tier" {
+    var field = empty_field(3, 3);
+    paint(&field, .{ .tiered = .red });
 
-    var agents = [_]u32{0} ** c.Element.size;
-    agents[el(.red)] = 100;
-    const moved = field.neutralize(agents, 1.0, rng.random());
-
-    // Reach is the 4 on-grid cells; the 96 reservoir units are untouched.
-    try testing.expectEqual(@as(u16, 4), moved[el(.red)]);
-    try testing.expectEqual(@as(u16, 96), field.reservoir.modified[el(.red)]);
-    try testing.expectEqual(@as(u16, 0), field.grid.modified_count(.red));
+    const out = field.apply_shape(SQUARE_3X3, 1, 1);
+    try testing.expectEqual(@as(u16, 9), out.total_downgraded());
+    try testing.expectEqual(@as(u16, 9), out.downgraded[ti(.red)]);
+    try testing.expectEqual(@as(u16, 0), out.neutralized);
+    try testing.expectEqual(@as(u16, 0), out.wasted());
+    // All nine are now yellow — one step, not straight to defused.
+    try testing.expectEqual(@as(u16, 9), field.grid.tier_count(.yellow));
+    try testing.expectEqual(@as(u16, 0), field.grid.tier_count(.red));
 }
 
-test "neutralize ignores wrong-color and already-neutralized cells" {
-    var rng = prng(7);
-    var res = c.SlimeReservoir{};
-    res.modified[el(.red)] = 4;
-    var field = SlimeField.init(.{ .rows = 2, .cols = 2 }, res, rng.random());
+test "a red cell takes three casts to defuse" {
+    var field = empty_field(1, 1);
+    field.grid.put(0, .{ .tiered = .red });
 
-    var wrong = [_]u32{0} ** c.Element.size;
-    wrong[el(.blue)] = 99;
-    const none = field.neutralize(wrong, 1.0, rng.random());
-    for (none) |n| try testing.expectEqual(@as(u16, 0), n);
-    try testing.expectEqual(@as(u16, 4), field.grid.modified_count(.red));
+    const first = field.apply_shape(DOT, 0, 0);
+    try testing.expectEqual(c.SlimeCell{ .tiered = .yellow }, field.grid.get(0));
+    try testing.expectEqual(@as(u16, 0), first.neutralized);
 
-    // Neutralize all red, then dispense red again: nothing left in the cohort.
-    var red = [_]u32{0} ** c.Element.size;
-    red[el(.red)] = 4;
-    _ = field.neutralize(red, 1.0, rng.random());
-    const again = field.neutralize(red, 1.0, rng.random());
-    try testing.expectEqual(@as(u16, 0), again[el(.red)]);
+    _ = field.apply_shape(DOT, 0, 0);
+    try testing.expectEqual(c.SlimeCell{ .tiered = .green }, field.grid.get(0));
+
+    const third = field.apply_shape(DOT, 0, 0);
+    try testing.expectEqual(c.SlimeCell.neutralized, field.grid.get(0));
+    try testing.expectEqual(@as(u16, 1), third.neutralized);
+    try testing.expectEqual(@as(u16, 1), third.downgraded[ti(.green)]);
+
+    // A fourth cast finds nothing left to neutralize.
+    const fourth = field.apply_shape(DOT, 0, 0);
+    try testing.expectEqual(@as(u16, 0), fourth.total_downgraded());
+    try testing.expectEqual(@as(u16, 1), fourth.inert);
 }
 
-test "neutralize residue_mult destroys the non-surviving portion" {
-    var rng = prng(8);
-    var res = c.SlimeReservoir{};
-    res.modified[el(.green)] = 8;
-    var field = SlimeField.init(.{ .rows = 2, .cols = 4 }, res, rng.random());
+test "apply_shape clips at the grid edge and reports the loss" {
+    var field = empty_field(3, 3);
+    paint(&field, .{ .tiered = .green });
 
-    var agents = [_]u32{0} ** c.Element.size;
-    agents[el(.green)] = 8;
-    const moved = field.neutralize(agents, 0.5, rng.random());
+    // Anchored at the top-left corner, a 3x3 lands only its bottom-right
+    // quadrant: 4 cells on, 5 offsets clipped away.
+    const out = field.apply_shape(SQUARE_3X3, 0, 0);
+    try testing.expectEqual(@as(u16, 4), out.total_downgraded());
+    try testing.expectEqual(@as(u16, 5), out.off_grid);
+    try testing.expectEqual(@as(u16, 0), out.inert);
+    try testing.expectEqual(@as(u16, 5), out.wasted());
+    try testing.expectEqual(@as(u16, 4), out.neutralized);
 
-    try testing.expectEqual(@as(u16, 8), moved[el(.green)]);
-    // floor(0.5 × 8) = 4 survive as neutralized; the other 4 cells are empty.
-    try testing.expectEqual(@as(u16, 4), field.grid.occupied());
-    try testing.expectEqual(@as(u16, 0), field.grid.modified_count(.green));
-    for (field.grid.live()) |cell| {
-        try testing.expect(cell == .empty or cell == .neutralized);
-    }
-}
-
-test "neutralize residue_mult 0 empties every transmuted cell" {
-    var rng = prng(9);
-    var res = c.SlimeReservoir{};
-    res.modified[el(.yellow)] = 4;
-    var field = SlimeField.init(.{ .rows = 2, .cols = 2 }, res, rng.random());
-
-    var agents = [_]u32{0} ** c.Element.size;
-    agents[el(.yellow)] = 4;
-    _ = field.neutralize(agents, 0.0, rng.random());
-    try testing.expectEqual(@as(u16, 0), field.grid.occupied());
-    try testing.expect(field.is_exhausted());
-}
-
-test "neutralize picks a random subset, not a fixed prefix" {
-    // Same grid, different seeds → different cells chosen.  (Sampling a few
-    // seeds; a fixed-prefix implementation would make all runs identical.)
-    var seen_distinct = false;
-    var first: ?[4]bool = null;
-    for (0..8) |seed| {
-        var rng = prng(@intCast(100 + seed));
-        var res = c.SlimeReservoir{};
-        res.modified[el(.red)] = 4;
-        var field = SlimeField.init(.{ .rows = 2, .cols = 2 }, res, rng.random());
-        var agents = [_]u32{0} ** c.Element.size;
-        agents[el(.red)] = 2;
-        _ = field.neutralize(agents, 1.0, rng.random());
-
-        var pattern: [4]bool = undefined;
-        for (field.grid.live(), 0..) |cell, i| pattern[i] = cell == .neutralized;
-        if (first) |f| {
-            if (!std.mem.eql(bool, &f, &pattern)) seen_distinct = true;
-        } else {
-            first = pattern;
+    // Exactly the 2x2 block around the anchor was defused.
+    for (0..3) |r| {
+        for (0..3) |cl| {
+            const expect_defused = r <= 1 and cl <= 1;
+            const cell = field.grid.at(@intCast(r), @intCast(cl));
+            try testing.expectEqual(expect_defused, cell == .neutralized);
         }
     }
-    try testing.expect(seen_distinct);
+}
+
+test "apply_shape counts inert cells but leaves them untouched" {
+    var field = empty_field(1, 3);
+    field.grid.put(0, .neutral);
+    field.grid.put(1, .neutralized);
+    field.grid.put(2, .empty);
+
+    const out = field.apply_shape(test_shape(&.{"###"}), 0, 1);
+    try testing.expectEqual(@as(u16, 0), out.total_downgraded());
+    try testing.expectEqual(@as(u16, 3), out.inert);
+    try testing.expectEqual(@as(u16, 0), out.off_grid);
+    // Untouched: neutral stays neutral, defused stays defused, empty stays empty.
+    try testing.expectEqual(c.SlimeCell.neutral, field.grid.get(0));
+    try testing.expectEqual(c.SlimeCell.neutralized, field.grid.get(1));
+    try testing.expectEqual(c.SlimeCell.empty, field.grid.get(2));
+}
+
+test "apply_shape hits exactly the shape's footprint" {
+    var field = empty_field(3, 3);
+    paint(&field, .{ .tiered = .green });
+
+    const out = field.apply_shape(PLUS, 1, 1);
+    try testing.expectEqual(@as(u16, 5), out.total_downgraded());
+    // The four diagonals are untouched; the plus arms are defused.
+    try testing.expectEqual(c.SlimeCell{ .tiered = .green }, field.grid.at(0, 0));
+    try testing.expectEqual(c.SlimeCell{ .tiered = .green }, field.grid.at(0, 2));
+    try testing.expectEqual(c.SlimeCell{ .tiered = .green }, field.grid.at(2, 0));
+    try testing.expectEqual(c.SlimeCell{ .tiered = .green }, field.grid.at(2, 2));
+    try testing.expectEqual(c.SlimeCell.neutralized, field.grid.at(0, 1));
+    try testing.expectEqual(c.SlimeCell.neutralized, field.grid.at(1, 0));
+    try testing.expectEqual(c.SlimeCell.neutralized, field.grid.at(1, 1));
+    try testing.expectEqual(c.SlimeCell.neutralized, field.grid.at(1, 2));
+    try testing.expectEqual(c.SlimeCell.neutralized, field.grid.at(2, 1));
+}
+
+test "apply_shape destroys nothing: the unit count is unchanged" {
+    var field = empty_field(3, 3);
+    paint(&field, .{ .tiered = .red });
+    const before = field.remaining();
+
+    _ = field.apply_shape(SQUARE_3X3, 1, 1);
+    _ = field.apply_shape(SQUARE_3X3, 1, 1);
+    _ = field.apply_shape(SQUARE_3X3, 1, 1);
+
+    // Every cell is defused, and every unit is still there to be eaten.
+    try testing.expectEqual(before, field.remaining());
+    try testing.expectEqual(@as(u16, 9), field.grid.occupied());
+    try testing.expectEqual(@as(u16, 0), field.grid.hazard_count());
+}
+
+test "apply_shape is deterministic — the same aim gives the same field" {
+    const run = struct {
+        fn go() SlimeField {
+            var field = empty_field(4, 4);
+            paint(&field, .{ .tiered = .red });
+            _ = field.apply_shape(PLUS, 2, 2);
+            return field;
+        }
+    }.go;
+    const a = run();
+    const b = run();
+    try testing.expectEqualSlices(c.SlimeCell, a.grid.live(), b.grid.live());
 }
 
 test "pick_target returns an occupied cell and null on an empty grid" {
@@ -441,7 +522,6 @@ test "pick_target returns an occupied cell and null on an empty grid" {
         try testing.expect(field.grid.get(flat).is_slime());
     }
 
-    // Empty every cell: no target remains.
     for (0..field.grid.len()) |i| field.grid.put(@intCast(i), .empty);
     try testing.expectEqual(@as(?u16, null), field.pick_target(rng.random()));
 }
@@ -449,7 +529,6 @@ test "pick_target returns an occupied cell and null on an empty grid" {
 test "pick_target reaches every occupied cell across draws" {
     var rng = prng(11);
     var field = SlimeField.init(.{ .rows = 1, .cols = 4 }, .{ .neutral = 4 }, rng.random());
-    // Leave a hole so the k-th-occupied walk has to skip it.
     field.grid.set(0, 1, .empty);
 
     var hit = [_]bool{false} ** 4;
@@ -459,32 +538,46 @@ test "pick_target reaches every occupied cell across draws" {
 }
 
 test "bite empties the cell and reports hunger and score per cell kind" {
-    var rng = prng(12);
-    var field = SlimeField.init(.{ .rows = 1, .cols = 3 }, .{ .neutral = 3 }, rng.random());
-    field.grid.set(0, 0, .neutral);
-    field.grid.set(0, 1, .{ .modified = .red });
-    field.grid.set(0, 2, .{ .neutralized = .blue });
+    var field = empty_field(1, 3);
+    field.grid.put(0, .neutral);
+    field.grid.put(1, .{ .tiered = .red });
+    field.grid.put(2, .neutralized);
 
     const neutral = field.bite(test_bal, 0).?;
     try testing.expectEqual(test_bal.hunger_cost_normal, neutral.hunger_normal);
     try testing.expectEqual(@as(u32, 0), neutral.hunger_extra);
     try testing.expectEqual(@as(u32, 1), neutral.score);
-    try testing.expectEqual(@as(?c.Element, null), neutral.healable_color());
+    try testing.expectEqual(@as(?c.Tier, null), neutral.healable_tier());
     try testing.expectEqual(c.SlimeCell.empty, field.grid.at(0, 0));
 
-    const modified = field.bite(test_bal, 1).?;
-    try testing.expectEqual(test_bal.hunger_cost_normal, modified.hunger_normal);
-    try testing.expectEqual(test_bal.hunger_cost_modified_extra, modified.hunger_extra);
-    try testing.expectEqual(@as(u32, 0), modified.score);
-    try testing.expectEqual(c.Element.red, modified.healable_color().?);
+    // A live hazard: costs extra hunger, scores nothing, and the extra is
+    // healable by medicine matching the tier that was eaten.
+    const hazard = field.bite(test_bal, 1).?;
+    try testing.expectEqual(test_bal.hunger_cost_normal, hazard.hunger_normal);
+    try testing.expectEqual(test_bal.hunger_cost_hazard_extra, hazard.hunger_extra);
+    try testing.expectEqual(@as(u32, 0), hazard.score);
+    try testing.expectEqual(c.Tier.red, hazard.healable_tier().?);
 
-    const neutralized = field.bite(test_bal, 2).?;
-    try testing.expectEqual(test_bal.hunger_cost_normal, neutralized.hunger_normal);
-    try testing.expectEqual(@as(u32, 0), neutralized.hunger_extra);
-    try testing.expectEqual(@as(u32, 1), neutralized.score);
-    try testing.expectEqual(@as(?c.Element, null), neutralized.healable_color());
+    const defused = field.bite(test_bal, 2).?;
+    try testing.expectEqual(test_bal.hunger_cost_normal, defused.hunger_normal);
+    try testing.expectEqual(@as(u32, 0), defused.hunger_extra);
+    try testing.expectEqual(@as(u32, 1), defused.score);
+    try testing.expectEqual(@as(?c.Tier, null), defused.healable_tier());
 
     try testing.expect(field.is_exhausted());
+}
+
+test "every tier costs the same to eat while it is still a hazard" {
+    // Difficulty is how many casts a unit needs, NOT how badly it hurts:
+    // the eating penalty is identical for red, yellow and green.
+    for ([_]c.Tier{ .red, .yellow, .green }) |tier| {
+        var field = empty_field(1, 1);
+        field.grid.put(0, .{ .tiered = tier });
+        const out = field.bite(test_bal, 0).?;
+        try testing.expectEqual(test_bal.hunger_cost_hazard_extra, out.hunger_extra);
+        try testing.expectEqual(@as(u32, 0), out.score);
+        try testing.expectEqual(tier, out.healable_tier().?);
+    }
 }
 
 test "bite on an already-empty cell returns null" {
@@ -492,15 +585,14 @@ test "bite on an already-empty cell returns null" {
     var field = SlimeField.init(.{ .rows = 1, .cols = 2 }, .{ .neutral = 1 }, rng.random());
     try testing.expect(field.bite(test_bal, 0) != null);
     try testing.expectEqual(@as(?BiteOutcome, null), field.bite(test_bal, 0));
-    // The cell the reservoir never filled is empty too.
     try testing.expectEqual(@as(?BiteOutcome, null), field.bite(test_bal, 1));
 }
 
 test "eating the whole field totals hunger and score over every unit" {
     var rng = prng(14);
     var res = c.SlimeReservoir{ .neutral = 7 };
-    res.modified[el(.red)] = 10;
-    res.modified[el(.green)] = 4;
+    res.tiered[ti(.red)] = 10;
+    res.tiered[ti(.green)] = 4;
     const total_units = res.total();
     var field = SlimeField.init(.{ .rows = 3, .cols = 3 }, res, rng.random());
 
@@ -518,27 +610,24 @@ test "eating the whole field totals hunger and score over every unit" {
         hunger_normal += outcome.hunger_normal;
         hunger_extra += outcome.hunger_extra;
         score += outcome.score;
-        _ = field.fill(rng.random()); // reservoir tops the grid back up
+        _ = field.fill(rng.random());
     }
 
-    // Every unit is eaten exactly once, wherever it started.
     try testing.expectEqual(total_units, eaten);
     try testing.expectEqual(total_units * test_bal.hunger_cost_normal, hunger_normal);
-    // 14 modified units were never neutralized; 7 neutral units scored.
-    try testing.expectEqual(14 * test_bal.hunger_cost_modified_extra, hunger_extra);
+    // 14 hazard units were never neutralized; 7 neutral units scored.
+    try testing.expectEqual(14 * test_bal.hunger_cost_hazard_extra, hunger_extra);
     try testing.expectEqual(@as(u32, 7), score);
 }
 
-test "neutralizing before eating removes the extra hunger" {
+test "defusing before eating removes the extra hunger and earns the score" {
+    var field = empty_field(3, 3);
+    paint(&field, .{ .tiered = .green });
+
+    // One cast over the whole 3x3 defuses all nine.
+    _ = field.apply_shape(SQUARE_3X3, 1, 1);
+
     var rng = prng(15);
-    var res = c.SlimeReservoir{};
-    res.modified[el(.red)] = 9;
-    var field = SlimeField.init(.{ .rows = 3, .cols = 3 }, res, rng.random());
-
-    var agents = [_]u32{0} ** c.Element.size;
-    agents[el(.red)] = 9;
-    _ = field.neutralize(agents, 1.0, rng.random());
-
     var hunger_extra: u32 = 0;
     var score: u32 = 0;
     while (field.pick_target(rng.random())) |flat| {
@@ -555,11 +644,9 @@ test "field ops are reproducible for a given seed" {
         fn go(seed: u64) SlimeField {
             var rng = prng(seed);
             var res = c.SlimeReservoir{ .neutral = 10 };
-            res.modified[el(.red)] = 10;
+            res.tiered[ti(.red)] = 10;
             var field = SlimeField.init(.{ .rows = 3, .cols = 4 }, res, rng.random());
-            var agents = [_]u32{0} ** c.Element.size;
-            agents[el(.red)] = 3;
-            _ = field.neutralize(agents, 1.0, rng.random());
+            _ = field.apply_shape(PLUS, 1, 1);
             const flat = field.pick_target(rng.random()).?;
             _ = field.bite(test_bal, flat);
             _ = field.fill(rng.random());

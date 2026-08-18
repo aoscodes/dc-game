@@ -14,83 +14,130 @@ const config = @import("config.zig");
 
 const mk = c.make_combo;
 
+/// A shape from authored rows, for fixtures only (config.zig does this at load).
+/// `rows` are `#`/`.` strings; anchor is the bounding box centre, rounded down.
+/// The offsets live in a generated namespace so the returned slice is static.
+fn Shaped(comptime rows: []const []const u8) type {
+    return struct {
+        const offsets = blk: {
+            var offs: [balance.MAX_SHAPE_CELLS]balance.ShapeOffset = undefined;
+            var n: usize = 0;
+            const anchor_r: i8 = @intCast(rows.len / 2);
+            const anchor_c: i8 = @intCast(rows[0].len / 2);
+            for (rows, 0..) |line, r| {
+                for (line, 0..) |ch, cl| {
+                    if (ch != '#') continue;
+                    offs[n] = .{
+                        .d_row = @as(i8, @intCast(r)) - anchor_r,
+                        .d_col = @as(i8, @intCast(cl)) - anchor_c,
+                    };
+                    n += 1;
+                }
+            }
+            break :blk offs[0..n].*;
+        };
+        const shape = balance.Shape{
+            .offsets = &offsets,
+            .rows = @intCast(rows.len),
+            .cols = @intCast(rows[0].len),
+        };
+    };
+}
+
+pub fn shape(comptime rows: []const []const u8) balance.Shape {
+    return Shaped(rows).shape;
+}
+
+const D = c.ComboSlot{ .action = .dispense };
+const M = c.ComboSlot{ .action = .medicine };
+
 pub const player_recipes = [_]balance.PlayerRecipe{
-    // Mono-color burst: beats flat conversion (3 slots × 5 = 15 → 20).
+    // The bread-and-butter aim: one cell, one tier.
     .{
-        .label = "crimson_flood",
-        .pattern = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        .output = .{ .units = .{ 20, 0, 0, 0 } },
+        .label = "poke",
+        .pattern = mk(&.{D}),
+        .shape = shape(&.{"#"}),
     },
+    // A horizontal sweep of three.
     .{
-        .label = "verdant_flood",
-        .pattern = mk(&.{ .{ .element = .green }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        .output = .{ .units = .{ 0, 20, 0, 0 } },
+        .label = "sweep",
+        .pattern = mk(&.{ D, D }),
+        .shape = shape(&.{"###"}),
     },
+    // The big one: a full 3x3 block.
     .{
-        .label = "gale_flood",
-        .pattern = mk(&.{ .{ .element = .yellow }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        .output = .{ .units = .{ 0, 0, 20, 0 } },
+        .label = "block",
+        .pattern = mk(&.{ D, D, D }),
+        .shape = shape(&.{ "###", "###", "###" }),
     },
+    // Same five cells as `plus`, rotated: orientation is authored, not derived.
     .{
-        .label = "tide_flood",
-        .pattern = mk(&.{ .{ .element = .blue }, .{ .action = .dispense }, .{ .action = .dispense }, .{ .action = .dispense } }),
-        .output = .{ .units = .{ 0, 0, 0, 20 } },
+        .label = "cross",
+        .pattern = mk(&.{ D, M, D }),
+        .shape = shape(&.{ "#.#", ".#.", "#.#" }),
     },
-    // Multi-color mist: covers every color at once.
+    // A downward triangle.
     .{
-        .label = "prism_mist",
-        .pattern = mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .element = .blue }, .{ .action = .dispense } }),
-        .output = .{ .units = .{ 6, 6, 6, 6 } },
+        .label = "wedge",
+        .pattern = mk(&.{ D, D, M }),
+        .shape = shape(&.{ "###", ".#." }),
     },
-    // Concentrated blue medicine: beats flat conversion (2 slots × 3 = 6 → 10).
+    // Pure heal: minimal footprint, real medicine.
     .{
-        .label = "panacea",
-        .pattern = mk(&.{ .{ .element = .blue }, .{ .action = .medicine }, .{ .action = .medicine } }),
-        .output = .{ .medicine = .{ 0, 0, 0, 10 } },
+        .label = "tonic",
+        .pattern = mk(&.{ M, M }),
+        .shape = shape(&.{"#"}),
+        .medicine = .{ .medicine = .{ 6, 6, 6 } },
+    },
+    // Tier-targeted medicine: only heals what red slime did.
+    .{
+        .label = "red_tonic",
+        .pattern = mk(&.{ M, M, M }),
+        .shape = shape(&.{"#"}),
+        .medicine = .{ .medicine = .{ 10, 0, 0 } },
     },
 };
 
 pub const team_recipes = [_]balance.TeamRecipe{
-    // Two players each cast [red, dispense, dispense] in the same round.
+    // Two players each cast [dispense, medicine]; together they clear a plus
+    // far bigger than either could alone.
     .{
-        .label = "twin_flames",
+        .label = "twin_bloom",
         .patterns = &.{
-            mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } }),
-            mk(&.{ .{ .element = .red }, .{ .action = .dispense }, .{ .action = .dispense } }),
+            mk(&.{ D, M }),
+            mk(&.{ D, M }),
         },
-        .output = .{ .units = .{ 30, 0, 0, 0 }, .medicine = .{ 20, 0, 0, 0 } },
+        .shape = shape(&.{ "..#..", ".###.", "#####", ".###.", "..#.." }),
+        .medicine = .{ .medicine = .{ 4, 4, 4 } },
     },
-    // One dispenses blue, one dispenses green — combined downpour.
+    // Asymmetric: one player brings the line, the other the column.
     .{
-        .label = "mudslide",
+        .label = "crossfire",
         .patterns = &.{
-            mk(&.{ .{ .element = .blue }, .{ .action = .dispense }, .{ .action = .dispense } }),
-            mk(&.{ .{ .element = .green }, .{ .action = .dispense }, .{ .action = .dispense } }),
+            mk(&.{ M, D }),
+            mk(&.{ M, D, D }),
         },
-        .output = .{ .units = .{ 0, 40, 0, 40 } },
+        .shape = shape(&.{ "..#..", "..#..", "#####", "..#..", "..#.." }),
     },
 };
 
-/// Default fixture encounter.  Totals: 110 units (30 neutral + 80 modified)
-/// → 110 normal hunger; fully un-neutralized modified slime adds 160 extra
-/// → 270 (fail without play); full neutralization keeps it at 110
-/// (comfortable clear).  The 6×10 fixture grid holds 60, so 50 units always
-/// start in the reservoir.
+/// Default fixture encounter.  Totals: 110 units (30 neutral + 80 hazard).
+/// Every unit costs 1 normal hunger → 110; the 80 hazards add 2 extra each
+/// → 270 if nothing is ever neutralized (a loss against hunger_max 200).
+/// Defusing everything keeps it at 110, a comfortable clear.  The 6×10
+/// fixture grid holds 60, so 50 units always start in the reservoir.
 pub const encounters = [_]enc.Encounter{
     .{
         .label = "slime_feast_01",
         .hunger_max = 200,
-        .slime = .{ .modified = .{ 35, 25, 15, 5 }, .neutral = 30 },
+        .slime = .{ .tiered = .{ 35, 25, 20 }, .neutral = 30 },
     },
 };
 
 pub const test_config = config.Config{
     .balance = .{
-        .units_per_slot = 5,
-        .medicine_per_slot = 3,
         .hunger_cost_normal = 1,
-        .hunger_cost_modified_extra = 2,
-        .neutralize_residue_mult = 1.0,
+        .hunger_cost_hazard_extra = 2,
         // 6×10 = 60 on-grid cells; the fixture encounter's 110 units mean the
         // reservoir always starts non-empty (exercises refill paths).
         .slime_grid = .{ .rows = 6, .cols = 10 },

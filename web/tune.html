@@ -69,12 +69,30 @@
     }
     .card .row { margin: 6px 0; }
     .muted { color: #888; }
+    /* Tier colors: difficulty ramp, matching TIER_COLOR in web/game.js. */
     .colors span.red    { color: #ff7a5e; }
-    .colors span.green  { color: #8bd36b; }
     .colors span.yellow { color: #fad250; }
-    .colors span.blue   { color: #6ba7ff; }
+    .colors span.green  { color: #8bd36b; }
     .colors input { width: 62px; margin-right: 8px; }
     .slotseq select { margin-right: 4px; }
+
+    /* Shape paint grid: click a cell to toggle it.  The ANCHOR cell (the one
+       the player aims at) is outlined, since every other cell is placed
+       relative to it. */
+    .shape { display: inline-block; vertical-align: top; }
+    .shape .grid { display: grid; gap: 2px; margin: 4px 0; }
+    .shape .cell {
+      width: 22px; height: 22px;
+      border: 1px solid #2c2c40;
+      border-radius: 3px;
+      background: rgba(0,0,0,0.35);
+      padding: 0;
+      cursor: pointer;
+    }
+    .shape .cell.on { background: #6ba7ff; border-color: #9cc6ff; }
+    .shape .cell.anchor { outline: 2px solid #ffd75e; outline-offset: -3px; }
+    .shape .dims { margin-left: 6px; }
+    .error-note { color: #f88; }
     #save-result {
       margin-top: 10px;
       padding: 12px;

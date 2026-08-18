@@ -14,8 +14,12 @@
  *   encounter hunger_max 1..65535, slime grid rows 1..16 × cols 1..16.
  */
 
-const ELEMENTS = ["red", "green", "yellow", "blue"];
-const SLOT_OPTIONS = ["dispense", "medicine", "red", "green", "yellow", "blue"];
+/** Slime difficulty tiers, hardest first — mirrors components.Tier. */
+const TIERS = ["red", "yellow", "green"];
+
+/** A combo is a sequence of ACTION KEYS ONLY.  What a recipe does is carried
+ *  by its SHAPE, not by any color token in the pattern. */
+const SLOT_OPTIONS = ["dispense", "medicine"];
 
 const MAX_RECIPES = 64;
 const MAX_PATTERN_SLOTS = 5;
@@ -23,16 +27,16 @@ const MAX_TEAM_PATTERNS = 6;
 /** Mirrors components.MAX_GRID_ROWS / MAX_GRID_COLS. */
 const MAX_GRID_ROWS = 16;
 const MAX_GRID_COLS = 16;
+/** Shapes are bounded by the grid: mirrors balance.MAX_SHAPE_ROWS/COLS. */
+const MAX_SHAPE_ROWS = MAX_GRID_ROWS;
+const MAX_SHAPE_COLS = MAX_GRID_COLS;
 /** Mirrors balance.DEFAULT_SLIME_GRID (used for pre-grid configs). */
 const DEFAULT_SLIME_GRID = { rows: 6, cols: 10 };
 
 /** Scalar balance fields: [key, label, min, max, step]. */
 const RATE_FIELDS = [
-  ["units_per_slot", "neutralization agent units per dispense", 0, 1000, 1],
-  ["medicine_per_slot", "medicine per dispense", 0, 1000, 1],
   ["hunger_cost_normal", "hunger per unit eaten", 0, 1000, 1],
-  ["hunger_cost_modified_extra", "extra hunger from modified slime", 0, 1000, 1],
-  ["neutralize_residue_mult", "neutralized slime residue (0–1)", 0, 1, 0.05],
+  ["hunger_cost_hazard_extra", "extra hunger from hazard slime (healable)", 0, 1000, 1],
   ["eat_rate_units_per_s", "units eaten /s per lil guy", 0.1, 100, 0.1],
   ["cast_buffer_ms", "team recipe window (ms)", 0, 60000, 50],
   ["cast_lock_ms", "cooldown (ms)", 0, 60000, 50],
@@ -42,7 +46,7 @@ const RATE_FIELDS = [
  * @type {{
  *   balance: object,
  *   encounter: { hunger_max: number,
- *                slime: { modified: object, neutral: number } },
+ *                slime: { tiered: object, neutral: number } },
  * }}
  * `encounter.slime` is the ONE slime pool of the encounter: whatever does not
  * fit on the grid waits in the reservoir and refills from the top.
@@ -60,20 +64,39 @@ function dataUrl(file) {
   return FROM_HASH ? `/config/${FROM_HASH}/data/${file}` : `/data/${file}`;
 }
 
-const colorsFrom = (sparse) =>
-  Object.fromEntries(ELEMENTS.map((e) => [e, (sparse ?? {})[e] ?? 0]));
+/** Densify a sparse per-tier map into every tier, so inputs always bind. */
+const tiersFrom = (sparse) =>
+  Object.fromEntries(TIERS.map((t) => [t, (sparse ?? {})[t] ?? 0]));
+
+/** Drop zero entries: the Zig loader defaults absent tiers to 0, so a sparse
+ *  map keeps saved configs readable and diffable. */
+const sparseTiers = (dense) =>
+  Object.fromEntries(TIERS.filter((t) => (dense?.[t] ?? 0) > 0).map((t) => [t, dense[t]]));
 
 /**
  * Collapse a legacy `zones` array into the one slime pool, mirroring
- * config.zig: per-color modified counts and neutral units are summed.
+ * config.zig: per-tier hazard counts and neutral units are summed.
  */
 function sumZones(zones) {
-  const pool = { modified: colorsFrom(null), neutral: 0 };
+  const pool = { tiered: tiersFrom(null), neutral: 0 };
   for (const z of zones) {
-    for (const e of ELEMENTS) pool.modified[e] += (z.modified ?? {})[e] ?? 0;
+    for (const t of TIERS) pool.tiered[t] += (z.tiered ?? {})[t] ?? 0;
     pool.neutral += z.neutral ?? 0;
   }
   return pool;
+}
+
+/**
+ * Normalise an authored shape into a rectangular rows-of-"#/."  array.
+ *
+ * config.shape_from_rows REJECTS a ragged shape (there is no well-defined
+ * anchor), so the editor pads to the widest row rather than letting the user
+ * save something the loader will refuse.
+ */
+function shapeFrom(rows) {
+  const src = (rows ?? []).length > 0 ? rows : ["#"];
+  const cols = Math.max(...src.map((r) => r.length), 1);
+  return src.map((r) => r.padEnd(cols, "."));
 }
 
 async function load() {
@@ -88,11 +111,8 @@ async function load() {
 
   state = {
     balance: {
-      units_per_slot: bal.units_per_slot,
-      medicine_per_slot: bal.medicine_per_slot,
       hunger_cost_normal: bal.hunger_cost_normal,
-      hunger_cost_modified_extra: bal.hunger_cost_modified_extra,
-      neutralize_residue_mult: bal.neutralize_residue_mult ?? 1.0,
+      hunger_cost_hazard_extra: bal.hunger_cost_hazard_extra,
       // Grid dimensions; default like the server does for pre-grid configs.
       slime_grid: {
         rows: bal.slime_grid?.rows ?? DEFAULT_SLIME_GRID.rows,
@@ -105,12 +125,14 @@ async function load() {
       player_recipes: bal.player_recipes.map((r) => ({
         label: r.label,
         pattern: [...r.pattern],
-        output: { units: colorsFrom(r.output.units), medicine: colorsFrom(r.output.medicine) },
+        shape: shapeFrom(r.shape),
+        medicine: tiersFrom(r.medicine),
       })),
       team_recipes: bal.team_recipes.map((r) => ({
         label: r.label,
         patterns: r.patterns.map((p) => [...p]),
-        output: { units: colorsFrom(r.output.units), medicine: colorsFrom(r.output.medicine) },
+        shape: shapeFrom(r.shape),
+        medicine: tiersFrom(r.medicine),
       })),
     },
     encounter: {
@@ -162,17 +184,89 @@ function numInput(obj, key, min, max, step = 1, cls = "", onChange = null) {
 }
 
 /**
- * Row of 4 per-color inputs bound to a {red, green, yellow, blue} object.
+ * Row of one input per tier, bound to a {red, yellow, green} object.
  * `onChange` (optional) fires after any of them is edited.
  */
-function colorRow(prefix, colors, max = 1000, onChange = null) {
+function tierRow(prefix, tiers, max = 1000, onChange = null) {
   const row = el("span", { class: "colors" });
   if (prefix) row.append(el("span", { class: "muted" }, `${prefix} `));
-  for (const e of ELEMENTS) {
-    row.append(el("span", { class: e }, `${e[0].toUpperCase()} `));
-    row.append(numInput(colors, e, 0, max, 1, "", onChange));
+  for (const t of TIERS) {
+    row.append(el("span", { class: t }, `${t[0].toUpperCase()} `));
+    row.append(numInput(tiers, t, 0, max, 1, "", onChange));
   }
   return row;
+}
+
+/**
+ * Paint grid for a recipe's shape: click any cell to toggle it, and grow or
+ * shrink the bounding box with the row/col buttons.
+ *
+ * The ANCHOR — the cell the caster aims at — is outlined rather than chosen: it
+ * is always the bounding box centre (`len / 2`, floored), because that is what
+ * config.shape_from_rows computes.  Making it editable here would let a saved
+ * config disagree with the loader.
+ *
+ * `recipe.shape` is mutated in place and re-rendered via `onChange`, so the
+ * outlined anchor tracks a resize immediately.
+ */
+function shapeEditor(recipe, onChange) {
+  const rows = recipe.shape;
+  const nRows = rows.length;
+  const nCols = rows[0].length;
+  const anchorR = Math.floor(nRows / 2);
+  const anchorC = Math.floor(nCols / 2);
+
+  const grid = el("div", { class: "grid" });
+  grid.style.gridTemplateColumns = `repeat(${nCols}, 22px)`;
+  rows.forEach((line, r) => {
+    for (let cl = 0; cl < nCols; cl++) {
+      const on = line[cl] === "#";
+      const isAnchor = r === anchorR && cl === anchorC;
+      const cls = ["cell", on ? "on" : "", isAnchor ? "anchor" : ""]
+        .filter(Boolean).join(" ");
+      grid.append(el("button", {
+        class: cls,
+        title: isAnchor ? `anchor (row ${r}, col ${cl})` : `row ${r}, col ${cl}`,
+        onclick: () => {
+          const ch = rows[r][cl] === "#" ? "." : "#";
+          rows[r] = rows[r].slice(0, cl) + ch + rows[r].slice(cl + 1);
+          onChange();
+        },
+      }));
+    }
+  });
+
+  // Resizing preserves what is already painted: added rows/cols start empty,
+  // and removed ones are simply dropped.
+  const resize = (dRows, dCols) => {
+    if (dRows > 0) rows.push(".".repeat(nCols));
+    if (dRows < 0) rows.pop();
+    if (dCols > 0) for (let r = 0; r < rows.length; r++) rows[r] += ".";
+    if (dCols < 0) for (let r = 0; r < rows.length; r++) rows[r] = rows[r].slice(0, -1);
+    onChange();
+  };
+  const btn = (label, enabled, dRows, dCols) => {
+    const b = el("button", { onclick: () => resize(dRows, dCols) }, label);
+    if (!enabled) b.disabled = true;
+    return b;
+  };
+
+  return el("div", { class: "shape" },
+    el("div", { class: "row" }, el("span", { class: "muted" }, "shape (click to paint) ")),
+    grid,
+    el("div", { class: "row" },
+      btn("+ row", nRows < MAX_SHAPE_ROWS, 1, 0),
+      btn("− row", nRows > 1, -1, 0),
+      btn("+ col", nCols < MAX_SHAPE_COLS, 0, 1),
+      btn("− col", nCols > 1, 0, -1),
+      el("span", { class: "muted dims" },
+        `${nRows}×${nCols}, ${cellsOn(rows)} cells, anchor @${anchorR},${anchorC}`)),
+  );
+}
+
+/** Painted cell count — 0 is invalid (config.zig rejects an empty shape). */
+function cellsOn(rows) {
+  return rows.reduce((n, line) => n + [...line].filter((ch) => ch === "#").length, 0);
 }
 
 /** Dropdown sequence editing a pattern (array of slot-name strings). */
@@ -262,8 +356,12 @@ function renderPlayerRecipes() {
           onclick: () => { state.balance.player_recipes.splice(i, 1); renderPlayerRecipes(); },
         }, "remove recipe")),
       el("div", { class: "row" }, el("span", { class: "muted" }, "pattern "), patternEditor(r.pattern, renderPlayerRecipes)),
-      el("div", { class: "row" }, colorRow("units", r.output.units)),
-      el("div", { class: "row" }, colorRow("medicine", r.output.medicine)),
+      el("div", { class: "row" }, shapeEditor(r, renderPlayerRecipes)),
+      el("div", { class: "row" }, tierRow("medicine", r.medicine)),
+      ...(cellsOn(r.shape) === 0
+        ? [el("div", { class: "row" }, el("span", { class: "error-note" },
+          "⚠ shape covers no cells — the server will reject this"))]
+        : []),
     ));
   });
   document.getElementById("pr-count").textContent = `(${state.balance.player_recipes.length}/${MAX_RECIPES})`;
@@ -293,13 +391,17 @@ function renderTeamRecipes() {
         patternEditor(p, renderTeamRecipes), delPattern));
     });
     const addPattern = el("button", {
-      onclick: () => { r.patterns.push(["red", "dispense"]); renderTeamRecipes(); },
+      onclick: () => { r.patterns.push(["dispense"]); renderTeamRecipes(); },
     }, "+ pattern");
     if (r.patterns.length >= MAX_TEAM_PATTERNS) addPattern.disabled = true;
     card.append(
       el("div", { class: "row" }, addPattern),
-      el("div", { class: "row" }, colorRow("units", r.output.units)),
-      el("div", { class: "row" }, colorRow("medicine", r.output.medicine)),
+      el("div", { class: "row" }, shapeEditor(r, renderTeamRecipes)),
+      el("div", { class: "row" }, tierRow("medicine", r.medicine)),
+      ...(cellsOn(r.shape) === 0
+        ? [el("div", { class: "row" }, el("span", { class: "error-note" },
+          "⚠ shape covers no cells — the server will reject this"))]
+        : []),
     );
     box.append(card);
   });
@@ -321,8 +423,11 @@ function renderEncounter() {
   const pool = state.encounter.slime;
   const box = document.getElementById("slime-pool");
   box.replaceChildren(el("div", { class: "card" },
-    el("div", { class: "row" }, el("span", { class: "muted" }, "modified slime units")),
-    el("div", { class: "row" }, colorRow("", pool.modified, 65535, renderSlimeTotal)),
+    // Tier = how many stamps a unit needs before it is harmless: red 3,
+    // yellow 2, green 1.
+    el("div", { class: "row" }, el("span", { class: "muted" },
+      "hazard slime units, by difficulty tier (red = 3 stamps, yellow = 2, green = 1)")),
+    el("div", { class: "row" }, tierRow("", pool.tiered, 65535, renderSlimeTotal)),
     el("div", { class: "row" },
       el("span", { class: "muted" }, "neutral slime units "),
       numInput(pool, "neutral", 0, 65535, 1, "", renderSlimeTotal)),
@@ -334,7 +439,7 @@ function renderEncounter() {
 function renderSlimeTotal() {
   const pool = state.encounter.slime;
   const grid = state.balance.slime_grid;
-  const total = ELEMENTS.reduce((n, e) => n + pool.modified[e], 0) + pool.neutral;
+  const total = TIERS.reduce((n, t) => n + pool.tiered[t], 0) + pool.neutral;
   const cells = grid.rows * grid.cols;
   const reserved = Math.max(0, total - cells);
   document.getElementById("slime-total").textContent = reserved > 0
@@ -357,8 +462,11 @@ function renderAll() {
 document.getElementById("add-player-recipe").addEventListener("click", () => {
   state.balance.player_recipes.push({
     label: "new_recipe",
-    pattern: ["red", "dispense", "dispense"],
-    output: { units: colorsFrom(null), medicine: colorsFrom(null) },
+    pattern: ["dispense", "dispense"],
+    // A single anchor cell: the smallest VALID shape, so a fresh recipe never
+    // starts in a state the loader would reject.
+    shape: ["#"],
+    medicine: tiersFrom(null),
   });
   renderPlayerRecipes();
 });
@@ -366,8 +474,9 @@ document.getElementById("add-player-recipe").addEventListener("click", () => {
 document.getElementById("add-team-recipe").addEventListener("click", () => {
   state.balance.team_recipes.push({
     label: "new_team_recipe",
-    patterns: [["red", "dispense"], ["red", "dispense"]],
-    output: { units: colorsFrom(null), medicine: colorsFrom(null) },
+    patterns: [["dispense"], ["medicine"]],
+    shape: ["#"],
+    medicine: tiersFrom(null),
   });
   renderTeamRecipes();
 });
@@ -388,10 +497,32 @@ document.getElementById("save").addEventListener("click", async () => {
       // `zones` is the loader's legacy field name for the slime pool; the
       // Zig side sums the array, so a single entry is the whole encounter.
       body: JSON.stringify({
-        balance: state.balance,
+        balance: {
+          ...state.balance,
+          // Emit sparse medicine maps: the loader defaults absent tiers to 0,
+          // and a recipe with no medicine should say nothing rather than three
+          // zeroes.
+          player_recipes: state.balance.player_recipes.map((r) => ({
+            label: r.label,
+            pattern: r.pattern,
+            shape: r.shape,
+            ...(Object.keys(sparseTiers(r.medicine)).length > 0
+              ? { medicine: sparseTiers(r.medicine) } : {}),
+          })),
+          team_recipes: state.balance.team_recipes.map((r) => ({
+            label: r.label,
+            patterns: r.patterns,
+            shape: r.shape,
+            ...(Object.keys(sparseTiers(r.medicine)).length > 0
+              ? { medicine: sparseTiers(r.medicine) } : {}),
+          })),
+        },
         encounter: {
           hunger_max: state.encounter.hunger_max,
-          zones: [state.encounter.slime],
+          zones: [{
+            tiered: sparseTiers(state.encounter.slime.tiered),
+            neutral: state.encounter.slime.neutral,
+          }],
         },
       }),
     });

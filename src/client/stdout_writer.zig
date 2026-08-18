@@ -3,16 +3,20 @@ const proto = @import("shared").protocol;
 const c = @import("shared").components;
 const inp = @import("input.zig");
 
-/// JSON serialisation for ComboSlot.
-/// Emits {"action":"damage"} or {"element":"red"} so game.js can branch.
+/// JSON serialisation for ComboSlot.  Emits {"action":"dispense"}.
+///
+/// Kept as an object (rather than a bare string) because slots are keyed by
+/// field name on the JS side, and a combo slot may grow more attributes.
 const JsonComboSlot = struct {
     slot: c.ComboSlot,
 
     pub fn jsonStringify(self: JsonComboSlot, jws: anytype) !void {
         try jws.beginObject();
         switch (self.slot) {
-            .action  => |a| { try jws.objectField("action");  try jws.write(@tagName(a)); },
-            .element => |e| { try jws.objectField("element"); try jws.write(@tagName(e)); },
+            .action => |a| {
+                try jws.objectField("action");
+                try jws.write(@tagName(a));
+            },
         }
         try jws.endObject();
     }
@@ -41,7 +45,7 @@ pub const Writer = struct {
         game.fizzle_count = 0;
         game.recipe_count = 0;
         game.cast_event_count = 0;
-        game.agents_dispensed_count = 0;
+        game.shape_cast_count = 0;
     }
 
     pub fn write_send(self: Writer, bytes: []const u8) void {
@@ -99,10 +103,11 @@ pub const GameState = struct {
     /// Cast-loop events since the last render write (transient).
     cast_events: [16]CastEvent = undefined,
     cast_event_count: u8 = 0,
-    /// Dispense outcomes since the last render write (transient): what each
-    /// converted batch's agents were able to transmute.
-    agents_dispensed: [16]proto.AgentsDispensed = undefined,
-    agents_dispensed_count: u8 = 0,
+    /// Shapes stamped since the last render write (transient): the resolved
+    /// footprint of each landed cast, so the renderer can flash exactly the
+    /// cells the server hit without re-deriving placement.
+    shape_casts: [16]proto.ShapeCast = undefined,
+    shape_cast_count: u8 = 0,
 };
 
 fn write_render_inner(
@@ -155,6 +160,8 @@ fn write_render_inner(
             .last_action = anim,
             .combo = slot_bufs[i][0..e.combo_len],
             .submitted = sub_slot_bufs[i][0..e.submitted_len],
+            .cursor_row = e.cursor_row,
+            .cursor_col = e.cursor_col,
         };
     }
 
@@ -164,22 +171,21 @@ fn write_render_inner(
         recipes_buf[i] = .{ .kind = rf.kind, .index = rf.index };
     }
 
-    // Convert transient dispense outcomes for JSON.  One entry PER COLOR per
-    // event (colors with no agents are skipped), so the renderer can float a
-    // separate label per element without re-deriving anything.
-    var dispensed_buf: [16 * c.Element.size]JsonAgentsDispensed = undefined;
-    var dispensed_len: usize = 0;
-    for (game.agents_dispensed[0..game.agents_dispensed_count]) |ad| {
-        for (ad.dispensed, ad.transmuted, 0..) |n, t, ci| {
-            if (n == 0) continue;
-            const color: c.Element = @enumFromInt(ci);
-            dispensed_buf[dispensed_len] = .{
-                .color = color,
-                .dispensed = n,
-                .transmuted = t,
-            };
-            dispensed_len += 1;
-        }
+    // Convert transient shape stamps for JSON.  The cell list is passed
+    // through verbatim: the server already clipped it to the grid, so the
+    // renderer flashes exactly the cells that were hit.
+    var shape_cast_buf: [16]JsonShapeCast = undefined;
+    var cells_bufs: [16][proto.MAX_SHAPE_CELLS_WIRE]u16 = undefined;
+    for (game.shape_casts[0..game.shape_cast_count], 0..) |sc, i| {
+        @memcpy(cells_bufs[i][0..sc.cell_count], sc.cells[0..sc.cell_count]);
+        shape_cast_buf[i] = .{
+            .caster = sc.caster,
+            .cells = cells_bufs[i][0..sc.cell_count],
+            .downgraded = tiers(sc.downgraded),
+            .neutralized = sc.neutralized,
+            .off_grid = sc.off_grid,
+            .inert = sc.inert,
+        };
     }
 
     // Convert transient cast-loop events for JSON.
@@ -233,8 +239,8 @@ fn write_render_inner(
                 pstats_buf[i] = .{
                     .name = ps.name[0..ps.name_len],
                     .casts = ps.casts,
-                    .dispense = colors(ps.dispense_slots),
-                    .medicine = colors(ps.medicine_slots),
+                    .cells_covered = ps.cells_covered,
+                    .cells_neutralized = ps.cells_neutralized,
                     .recipe_casts = ps.recipe_casts,
                     .fizzles = ps.fizzles,
                 };
@@ -246,11 +252,11 @@ fn write_render_inner(
                 .slime_total = ms.slime_total,
                 .slime_left = ms.slime_left,
                 .feast = .{
-                    .agents = colors(ms.feast.agents_dispensed),
-                    .medicine = colors(ms.feast.medicine_dispensed),
-                    .healed = colors(ms.feast.medicine_healed),
-                    .neutralized = colors(ms.feast.neutralized),
-                    .escaped = colors(ms.feast.modified_escaped),
+                    .covered = tiers(ms.feast.cells_covered),
+                    .medicine = tiers(ms.feast.medicine_dispensed),
+                    .healed = tiers(ms.feast.medicine_healed),
+                    .neutralized = tiers(ms.feast.neutralized),
+                    .escaped = tiers(ms.feast.hazard_escaped),
                     .neutral = ms.feast.neutral_consumed,
                     .hunger_normal = ms.feast.hunger_normal,
                     .hunger_extra = ms.feast.hunger_extra,
@@ -283,12 +289,7 @@ fn write_render_inner(
             .hunger = .{
                 .current = game.snapshot.hunger.current,
                 .max = game.snapshot.hunger.max,
-                .healable = .{
-                    .red = game.snapshot.hunger_healable[0],
-                    .green = game.snapshot.hunger_healable[1],
-                    .yellow = game.snapshot.hunger_healable[2],
-                    .blue = game.snapshot.hunger_healable[3],
-                },
+                .healable = tiers(game.snapshot.hunger_healable),
             },
             .score = game.snapshot.score,
             .grid_rows = game.snapshot.grid_rows,
@@ -299,7 +300,7 @@ fn write_render_inner(
             .fizzles = game.fizzles[0..game.fizzle_count],
             .recipes_fired = recipes_buf[0..game.recipe_count],
             .cast_events = cast_events_buf[0..game.cast_event_count],
-            .agents_dispensed = dispensed_buf[0..dispensed_len],
+            .shape_casts = shape_cast_buf[0..game.shape_cast_count],
         } else null,
         .score = if (phase == .game_over) game.final_score else null,
         .stats = json_stats,
@@ -308,34 +309,28 @@ fn write_render_inner(
     try std.json.Stringify.value(frame, .{ .emit_null_optional_fields = false }, w);
 }
 
-/// One slime cell as a compact renderer-facing name: "empty", "neutral", or
-/// a color suffixed with its state ("red", "red_n" for neutralized red).
+/// One slime cell as a compact renderer-facing name.  Hazards are named by
+/// their difficulty TIER ("red" = 3 casts from harmless, "green" = 1);
+/// "defused" is a fully neutralized cell, which is harmless but still edible.
 fn cell_name(cell: c.SlimeCell) []const u8 {
     return switch (cell) {
         .empty => "empty",
         .neutral => "neutral",
-        .modified => |e| switch (e) {
+        .neutralized => "defused",
+        .tiered => |t| switch (t) {
             .red => "red",
-            .green => "green",
             .yellow => "yellow",
-            .blue => "blue",
-        },
-        .neutralized => |e| switch (e) {
-            .red => "red_n",
-            .green => "green_n",
-            .yellow => "yellow_n",
-            .blue => "blue_n",
+            .green => "green",
         },
     };
 }
 
-/// Convert a per-color u16 array into named JSON fields.
-fn colors(values: [c.Element.size]u16) JsonColors {
+/// Convert a per-tier u16 array into named JSON fields.
+fn tiers(values: [c.Tier.size]u16) JsonTiers {
     return .{
         .red = values[0],
-        .green = values[1],
-        .yellow = values[2],
-        .blue = values[3],
+        .yellow = values[1],
+        .green = values[2],
     };
 }
 
@@ -365,22 +360,21 @@ const JsonRenderFrame = struct {
     stats: ?JsonMatchStats,
 };
 
-/// Per-color values with named fields (Element ordinal order).
-const JsonColors = struct {
+/// Per-tier values with named fields (Tier ordinal order: hardest first).
+const JsonTiers = struct {
     red: u16,
-    green: u16,
     yellow: u16,
-    blue: u16,
+    green: u16,
 };
 
-/// Match-wide feast totals: what was dispensed, healed, neutralized and eaten
-/// over the whole encounter.
+/// Match-wide feast totals over the whole encounter.  `covered` counts cells a
+/// stamp downgraded, bucketed by the tier they were BEFORE the downgrade.
 const JsonFeastStats = struct {
-    agents: JsonColors,
-    medicine: JsonColors,
-    healed: JsonColors,
-    neutralized: JsonColors,
-    escaped: JsonColors,
+    covered: JsonTiers,
+    medicine: JsonTiers,
+    healed: JsonTiers,
+    neutralized: JsonTiers,
+    escaped: JsonTiers,
     neutral: u16,
     hunger_normal: u16,
     hunger_extra: u16,
@@ -389,8 +383,10 @@ const JsonFeastStats = struct {
 const JsonPlayerStats = struct {
     name: []const u8,
     casts: u16,
-    dispense: JsonColors,
-    medicine: JsonColors,
+    /// Hazard cells this player's stamps downgraded, and how many of those
+    /// went all the way to defused.
+    cells_covered: u16,
+    cells_neutralized: u16,
     recipe_casts: u16,
     fizzles: u16,
 };
@@ -426,21 +422,13 @@ const JsonPlayer = struct {
     connected: bool,
 };
 
-/// Portion of hunger healable by medicine, per slime color.  Only
-/// matching-color (symmetrical) medicine heals each bucket.
-const JsonHealable = struct {
-    red: u16,
-    green: u16,
-    yellow: u16,
-    blue: u16,
-};
-
-/// Hunger bar: current fills toward max; `healable` = per-color portions
-/// medicine can heal.
+/// Hunger bar: current fills toward max; `healable` = the per-tier portions
+/// medicine can heal.  Healing is symmetrical: only tier-X medicine touches
+/// the tier-X bucket.
 const JsonHunger = struct {
     current: u16,
     max: u16,
-    healable: JsonHealable,
+    healable: JsonTiers,
 };
 
 /// One Lil Guy: the flat grid index it is biting (null = nothing to bite,
@@ -481,17 +469,24 @@ const JsonGame = struct {
     recipes_fired: []const JsonRecipeFired,
     /// Cast-loop events since the previous frame (transient).
     cast_events: []const JsonCastEvent,
-    /// Dispense outcomes since the previous frame (transient), one per color
-    /// per converted batch.
-    agents_dispensed: []const JsonAgentsDispensed,
+    /// Shapes stamped since the previous frame (transient), one per landed
+    /// cast.
+    shape_casts: []const JsonShapeCast,
 };
 
-/// One color's dispense outcome.  `dispensed - transmuted` is the surplus that
-/// found no on-grid target and was wasted.
-const JsonAgentsDispensed = struct {
-    color: c.Element,
-    dispensed: u16,
-    transmuted: u16,
+/// One landed stamp.  `cells` are ABSOLUTE flat grid indices, already clipped
+/// to the grid by the server, so the renderer never re-derives placement.
+/// `downgraded` is bucketed by each cell's tier BEFORE the downgrade.
+const JsonShapeCast = struct {
+    caster: u8,
+    cells: []const u16,
+    downgraded: JsonTiers,
+    /// Cells that reached defused (they were green).
+    neutralized: u16,
+    /// Shape cells that fell off the grid edge and were clipped away.
+    off_grid: u16,
+    /// In-bounds cells that held nothing downgradable (empty/neutral/defused).
+    inert: u16,
 };
 
 const JsonRecipeFired = struct {
@@ -526,4 +521,9 @@ const JsonEntity = struct {
     /// Clients preview from this in preference to `combo`: it is what will
     /// actually fire.
     submitted: []const JsonComboSlot,
+    /// Where this player is aiming.  While a cast buffers this is the captured
+    /// ANCHOR (where the cast will land); otherwise it is the live cursor.
+    /// Sent for every player so teammates can see each other's aim.
+    cursor_row: u8,
+    cursor_col: u8,
 };
