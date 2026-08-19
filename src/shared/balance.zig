@@ -6,27 +6,37 @@
 //! for rates and recipe tables (wire messages reference recipes by table
 //! index, in file order).
 //!
-//! ## Recipes
+//! ## Moves
 //!
-//! A recipe is an *exact* combo pattern (same slots, same order, same
-//! length) naming a SHAPE and a CHARGE COST.  Casting stamps that shape on the
+//! A move names a SHAPE and a CHARGE COST.  Casting stamps that shape on the
 //! grid anchored at the caster's cursor: every covered hazard cell is
-//! downgraded one tier.  There is no flat fallback — a combo matching no recipe
-//! fizzles, so the recipe tables are the complete move list.
+//! downgraded one tier.
+//!
+//! `player_recipes` is an ordered CYCLE: each player has one move selected and
+//! steps the selection forward/backward a slot at a time (see
+//! session.cycle_selection).  Table order is therefore player-facing — it is the
+//! order the wheel turns in — and a move's index is its identity on the wire.
+//! There is no way to name a move that is not in the table, so the table is the
+//! complete move list and a cast can only fail on price.
 //!
 //! ## Charges
 //!
 //! Charges are the encounter's scarce resource: ONE pool, shared by the whole
 //! team, spent across the WHOLE game and never refilled (the starting amount is
-//! per-encounter — see encounters.json).  Each recipe prices itself via
-//! `cost`, so the recipe table is also the economy: broad shapes can be made
-//! expensive and precise ones cheap.  A cast the pool cannot afford fizzles.
+//! per-encounter — see encounters.json).  Each move prices itself via `cost`,
+//! so the move table is also the economy: broad shapes can be made expensive
+//! and precise ones cheap.  A cast the pool cannot afford fizzles.
 //!
-//! Team recipes match sets of combos cast by distinct players in the same
-//! round.  They are checked first, greedily, in table order; each player's
-//! combo can be consumed by at most one recipe per round.  A team recipe may
-//! fire multiple times per round if several disjoint player groups match.
-//! Player recipes are checked next.
+//! ## Group moves
+//!
+//! A group move (`team_recipes`) is a bigger shape that no single player can
+//! cast: it names a bag of ordinary moves (`moves`) which DISTINCT players must
+//! cast on the SAME square within one turn.  Every cast still stamps its own
+//! shape as it lands; the cast that completes the bag stamps the group shape
+//! *instead of* its own, and pays the group's cost rather than its own (see
+//! game_logic.complete_group).  So a group is discovered by playing normally
+//! into the same cell, not by holding a cast back — nothing is ever escrowed,
+//! and there is no state to lose at turn end.
 
 const std = @import("std");
 const c = @import("components.zig");
@@ -43,6 +53,12 @@ pub const MAX_SHAPE_ROWS: u8 = c.MAX_GRID_ROWS;
 pub const MAX_SHAPE_COLS: u8 = c.MAX_GRID_COLS;
 pub const MAX_SHAPE_CELLS: u16 = @as(u16, MAX_SHAPE_ROWS) * @as(u16, MAX_SHAPE_COLS);
 
+/// Array cap on a group move's component bag.  A group cannot need more
+/// contributors than there are players, and config.zig rejects a bag exceeding
+/// protocol.MAX_PLAYERS; this is the looser static bound (protocol imports
+/// balance, so balance cannot import protocol to reuse it).
+pub const MAX_TEAM_COMPONENTS: u8 = 8;
+
 /// One cell of a shape, as a SIGNED offset from the shape's anchor.  Signed
 /// because the anchor is the bounding box's centre, so cells reach up/left of
 /// it; the grid clips whatever falls outside (see slime.apply_shape).
@@ -55,8 +71,8 @@ pub const ShapeOffset = struct {
 /// relative to the anchor cell the player aims at.
 ///
 /// Orientation is FIXED — rotations and reflections are authored as separate
-/// recipes, so every distinct footprint has its own combo and the move list
-/// stays explicit.
+/// recipes, so every distinct footprint is its own entry on the shape wheel and
+/// the move list stays explicit.
 ///
 /// Built by `config.zig` from JSON rows of `#`/`.` characters, e.g.
 /// `[".#.", "###", ".#."]` is a plus.  The anchor is the bounding box centre
@@ -78,30 +94,34 @@ pub const Shape = struct {
 /// Charges a recipe costs when `cost` is absent from its JSON entry.
 pub const DEFAULT_RECIPE_COST: u16 = 1;
 
+/// One selectable move.  Its INDEX in `Balance.player_recipes` is its identity:
+/// the wire sends a selection as an index, and group moves name their components
+/// by index too.
 pub const PlayerRecipe = struct {
     label: []const u8,
-    pattern: c.ActionCombo,
-    /// Footprint downgraded at the caster's cursor.  Every recipe names a
+    /// Footprint downgraded at the caster's cursor.  Every move names a
     /// shape — the stamp IS the cast's whole effect.
     shape: Shape,
-    /// Charges deducted from the team pool when this recipe fires.  May be 0
+    /// Charges deducted from the team pool when this move fires.  May be 0
     /// for a deliberately free move; a cast is refused (and fizzles) when the
     /// pool holds less than this.
     cost: u16 = DEFAULT_RECIPE_COST,
 };
 
-/// `patterns` — one exact combo per participating player (distinct players).
-///
-/// The combined shape lands at the cursor of the LAST JOINER: the player whose
-/// submit completed the group. They chose to close the circuit, so they aim it.
+/// A shape too big for one player: it fires when DISTINCT players have cast the
+/// moves in `components` on one square during a single turn.
 pub const TeamRecipe = struct {
     label: []const u8,
-    patterns: []const c.ActionCombo,
+    /// Indices into `Balance.player_recipes` — the moves that must land on the
+    /// square, as a BAG (order is irrelevant, repeats are allowed and each
+    /// repeat needs another player).  Resolved from JSON move labels by
+    /// config.zig, so the data file names components the way designers do.
+    components: []const u8,
     shape: Shape,
-    /// Charges deducted ONCE per firing of the group, regardless of how many
-    /// players contributed.  Charged when the group completes, not when the
-    /// individual halves are submitted, so a half that never finds its partner
-    /// costs the pool nothing.
+    /// Charges deducted ONCE when the group fires, INSTEAD of the completing
+    /// cast's own cost.  The earlier component casts already paid their own way
+    /// as they landed, so this is the price of the upgrade, not of the whole
+    /// group.
     cost: u16 = DEFAULT_RECIPE_COST,
 };
 
@@ -136,10 +156,9 @@ pub const Balance = struct {
     /// per-turn power and the length of a turn.  Must be at least 1: a budget
     /// of 0 could never be spent, so no turn could ever end.
     ///
-    /// A fizzled cast (a combo naming no recipe) does NOT spend budget; a
-    /// team half held for a partner who never arrives DOES, and so does a cast
-    /// the charge pool could not afford — otherwise a bankrupt team could never
-    /// end a turn.
+    /// Selection cannot be wrong, so the only way a cast fails is price: a cast
+    /// the charge pool cannot afford fizzles and DOES spend budget — otherwise a
+    /// bankrupt team could never end a turn.
     casts_per_turn: u8,
     player_recipes: []const PlayerRecipe,
     team_recipes: []const TeamRecipe,

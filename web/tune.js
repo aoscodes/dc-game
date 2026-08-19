@@ -10,20 +10,18 @@
  * for limits); the UI bounds below are a convenience layer only.
  *
  * Limits mirrored from src/shared/config.zig / protocol caps:
- *   recipes <= 64 per table, pattern 1..5 slots, team patterns 1..6,
- *   encounter hunger_max 1..65535, slime grid rows 1..16 × cols 1..16.
+ *   recipes <= 64 per table, group components 2..6 (each an existing move
+ *   label), encounter hunger_max 1..65535, slime grid rows 1..16 × cols 1..16.
  */
 
 /** Slime difficulty tiers, hardest first — mirrors components.Tier. */
 const TIERS = ["red", "yellow", "green"];
 
-/** A combo is a sequence of ACTION KEYS ONLY.  What a recipe does is carried
- *  by its SHAPE, not by any color token in the pattern. */
-const SLOT_OPTIONS = ["dispense", "catalyst"];
-
 const MAX_RECIPES = 64;
-const MAX_PATTERN_SLOTS = 5;
-const MAX_TEAM_PATTERNS = 6;
+/** A group needs 2+ DISTINCT players, so it can never want more components
+ *  than there are player slots.  Mirrors config.zig's 2..MAX_PLAYERS check. */
+const MIN_GROUP_MOVES = 2;
+const MAX_GROUP_MOVES = 6;
 /** Mirrors components.MAX_GRID_ROWS / MAX_GRID_COLS. */
 const MAX_GRID_ROWS = 16;
 const MAX_GRID_COLS = 16;
@@ -127,13 +125,12 @@ async function load() {
       casts_per_turn: bal.casts_per_turn ?? DEFAULT_CASTS_PER_TURN,
       player_recipes: bal.player_recipes.map((r) => ({
         label: r.label,
-        pattern: [...r.pattern],
         shape: shapeFrom(r.shape),
         cost: r.cost ?? DEFAULT_RECIPE_COST,
       })),
       team_recipes: bal.team_recipes.map((r) => ({
         label: r.label,
-        patterns: r.patterns.map((p) => [...p]),
+        moves: [...r.moves],
         shape: shapeFrom(r.shape),
         cost: r.cost ?? DEFAULT_RECIPE_COST,
       })),
@@ -284,24 +281,49 @@ function cellsOn(rows) {
   return rows.reduce((n, line) => n + [...line].filter((ch) => ch === "#").length, 0);
 }
 
-/** Dropdown sequence editing a pattern (array of slot-name strings). */
-function patternEditor(pattern, onStructureChange) {
-  const wrap = el("span", { class: "slotseq" });
-  pattern.forEach((slot, i) => {
+/** Every move label currently authored — the only legal group components. */
+function moveLabels() {
+  return state.balance.player_recipes.map((r) => r.label);
+}
+
+/**
+ * Dropdown sequence editing a group's component moves (array of move labels).
+ * Constraining each slot to an existing label by construction is what keeps
+ * the editor from producing a config the Zig loader rejects for an unknown
+ * component.  Repeats are legal and meaningful: two `poke` components means
+ * two DIFFERENT players each casting poke.
+ */
+function movesEditor(moves, onStructureChange) {
+  const labels = moveLabels();
+  const wrap = el("span", { class: "moveseq" });
+  if (labels.length === 0) {
+    wrap.append(el("span", { class: "error-note" },
+      "⚠ define a move first — a group is built out of moves"));
+    return wrap;
+  }
+  moves.forEach((move, i) => {
     const sel = el("select");
-    for (const opt of SLOT_OPTIONS) {
-      sel.append(el("option", slot === opt ? { value: opt, selected: "" } : { value: opt }, opt));
+    for (const opt of labels) {
+      sel.append(el("option", move === opt ? { value: opt, selected: "" } : { value: opt }, opt));
     }
-    sel.addEventListener("change", () => { pattern[i] = sel.value; });
+    // A label the move table no longer has (renamed or removed under this
+    // group): surfaced rather than silently snapped to another move, since
+    // silently rebalancing someone's group is worse than an explicit warning.
+    if (!labels.includes(move)) {
+      sel.prepend(el("option", { value: move, selected: "" }, `${move} (missing!)`));
+    }
+    sel.addEventListener("change", () => { moves[i] = sel.value; });
     wrap.append(sel);
   });
-  const add = el("button", { onclick: () => { pattern.push("dispense"); onStructureChange(); } }, "+ slot");
-  if (pattern.length >= MAX_PATTERN_SLOTS) add.disabled = true;
+  const add = el("button", {
+    onclick: () => { moves.push(labels[0]); onStructureChange(); },
+  }, "+ move");
+  if (moves.length >= MAX_GROUP_MOVES) add.disabled = true;
   const del = el("button", {
     class: "danger",
-    onclick: () => { pattern.pop(); onStructureChange(); },
-  }, "− slot");
-  if (pattern.length <= 1) del.disabled = true;
+    onclick: () => { moves.pop(); onStructureChange(); },
+  }, "− move");
+  if (moves.length <= MIN_GROUP_MOVES) del.disabled = true;
   wrap.append(add, del);
   return wrap;
 }
@@ -370,7 +392,6 @@ function renderPlayerRecipes() {
           class: "danger",
           onclick: () => { state.balance.player_recipes.splice(i, 1); renderPlayerRecipes(); },
         }, "remove recipe")),
-      el("div", { class: "row" }, el("span", { class: "muted" }, "pattern "), patternEditor(r.pattern, renderPlayerRecipes)),
       el("div", { class: "row" }, shapeEditor(r, renderPlayerRecipes)),
       el("div", { class: "row" }, costRow(r)),
       ...(cellsOn(r.shape) === 0
@@ -395,22 +416,10 @@ function renderTeamRecipes() {
           class: "danger",
           onclick: () => { state.balance.team_recipes.splice(i, 1); renderTeamRecipes(); },
         }, "remove recipe")));
-    r.patterns.forEach((p, pi) => {
-      const delPattern = el("button", {
-        class: "danger",
-        onclick: () => { r.patterns.splice(pi, 1); renderTeamRecipes(); },
-      }, "− pattern");
-      if (r.patterns.length <= 1) delPattern.disabled = true;
-      card.append(el("div", { class: "row" },
-        el("span", { class: "muted" }, `player ${pi + 1} `),
-        patternEditor(p, renderTeamRecipes), delPattern));
-    });
-    const addPattern = el("button", {
-      onclick: () => { r.patterns.push(["dispense"]); renderTeamRecipes(); },
-    }, "+ pattern");
-    if (r.patterns.length >= MAX_TEAM_PATTERNS) addPattern.disabled = true;
     card.append(
-      el("div", { class: "row" }, addPattern),
+      el("div", { class: "row" },
+        el("span", { class: "muted" }, `needs ${r.moves.length} players: `),
+        movesEditor(r.moves, renderTeamRecipes)),
       el("div", { class: "row" }, shapeEditor(r, renderTeamRecipes)),
       el("div", { class: "row" }, costRow(r)),
       ...(cellsOn(r.shape) === 0
@@ -486,8 +495,7 @@ function renderAll() {
 
 document.getElementById("add-player-recipe").addEventListener("click", () => {
   state.balance.player_recipes.push({
-    label: "new_recipe",
-    pattern: ["dispense", "dispense"],
+    label: "new_move",
     // A single anchor cell: the smallest VALID shape, so a fresh recipe never
     // starts in a state the loader would reject.
     shape: ["#"],
@@ -497,9 +505,12 @@ document.getElementById("add-player-recipe").addEventListener("click", () => {
 });
 
 document.getElementById("add-team-recipe").addEventListener("click", () => {
+  // Seeded from the first two moves (or the first twice, which is legal — two
+  // DIFFERENT players each casting it), so a fresh group is already valid.
+  const labels = moveLabels();
   state.balance.team_recipes.push({
-    label: "new_team_recipe",
-    patterns: [["dispense"], ["catalyst"]],
+    label: "new_group",
+    moves: [labels[0] ?? "", labels[1] ?? labels[0] ?? ""],
     shape: ["#"],
     cost: DEFAULT_RECIPE_COST,
   });
@@ -528,13 +539,12 @@ document.getElementById("save").addEventListener("click", async () => {
           // decision, and omitting it would silently reload as the default 1.
           player_recipes: state.balance.player_recipes.map((r) => ({
             label: r.label,
-            pattern: r.pattern,
             shape: r.shape,
             cost: r.cost,
           })),
           team_recipes: state.balance.team_recipes.map((r) => ({
             label: r.label,
-            patterns: r.patterns,
+            moves: r.moves,
             shape: r.shape,
             cost: r.cost,
           })),

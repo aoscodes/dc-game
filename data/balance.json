@@ -8,9 +8,6 @@
   "player_recipes": [
     {
       "label": "poke",
-      "pattern": [
-        "dispense"
-      ],
       "shape": [
         "#"
       ],
@@ -18,10 +15,6 @@
     },
     {
       "label": "sweep",
-      "pattern": [
-        "dispense",
-        "dispense"
-      ],
       "shape": [
         "###"
       ],
@@ -29,11 +22,6 @@
     },
     {
       "label": "column",
-      "pattern": [
-        "catalyst",
-        "catalyst",
-        "dispense"
-      ],
       "shape": [
         "#",
         "#",
@@ -43,11 +31,6 @@
     },
     {
       "label": "block",
-      "pattern": [
-        "dispense",
-        "dispense",
-        "dispense"
-      ],
       "shape": [
         "###",
         "###",
@@ -57,11 +40,6 @@
     },
     {
       "label": "wedge",
-      "pattern": [
-        "dispense",
-        "catalyst",
-        "dispense"
-      ],
       "shape": [
         "###",
         ".#."
@@ -70,10 +48,6 @@
     },
     {
       "label": "breach",
-      "pattern": [
-        "catalyst",
-        "catalyst"
-      ],
       "shape": [
         "#",
         "#"
@@ -84,15 +58,9 @@
   "team_recipes": [
     {
       "label": "twin_bloom",
-      "patterns": [
-        [
-          "dispense",
-          "catalyst"
-        ],
-        [
-          "dispense",
-          "catalyst"
-        ]
+      "moves": [
+        "poke",
+        "poke"
       ],
       "shape": [
         "..#..",
@@ -105,16 +73,9 @@
     },
     {
       "label": "crossfire",
-      "patterns": [
-        [
-          "catalyst",
-          "dispense"
-        ],
-        [
-          "catalyst",
-          "dispense",
-          "dispense"
-        ]
+      "moves": [
+        "poke",
+        "sweep"
       ],
       "shape": [
         "..#..",

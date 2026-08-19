@@ -74,7 +74,7 @@
     .colors span.yellow { color: #fad250; }
     .colors span.green  { color: #8bd36b; }
     .colors input { width: 62px; margin-right: 8px; }
-    .slotseq select { margin-right: 4px; }
+    .moveseq select { margin-right: 4px; }
 
     /* Shape paint grid: click a cell to toggle it.  The ANCHOR cell (the one
        the player aims at) is outlined, since every other cell is placed
@@ -115,15 +115,15 @@
   </fieldset>
 
   <fieldset>
-    <legend>Player recipes <span class="muted" id="pr-count"></span></legend>
+    <legend>Moves (shape wheel order) <span class="muted" id="pr-count"></span></legend>
     <div id="player-recipes"></div>
-    <button id="add-player-recipe">+ add player recipe</button>
+    <button id="add-player-recipe">+ add move</button>
   </fieldset>
 
   <fieldset>
-    <legend>Team recipes <span class="muted" id="tr-count"></span></legend>
+    <legend>Groups (2+ players, same square) <span class="muted" id="tr-count"></span></legend>
     <div id="team-recipes"></div>
-    <button id="add-team-recipe">+ add team recipe</button>
+    <button id="add-team-recipe">+ add group</button>
   </fieldset>
 
   <fieldset>

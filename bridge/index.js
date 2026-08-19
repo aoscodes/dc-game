@@ -27,7 +27,7 @@
  * Shared:
  *   - HTTP static file server on port 3000 (serves web/)
  *   - Hardware controller discovery/pairing over USB serial (controllers.js):
- *     board buttons feed the same KEY: path; pending-combo feedback flows
+ *     board buttons feed the same KEY: path; selected-shape feedback flows
  *     back to the board's e-paper.
  *
  * Stdio protocol (Zig ↔ bridge):
@@ -45,7 +45,7 @@ const fs          = require("fs");
 const path        = require("path");
 const { WebSocketServer, WebSocket } = require("ws");
 const { PlayerSession } = require("./session");
-const { ControllerManager, comboFromRender } = require("./controllers");
+const { ControllerManager, shapeFromRender } = require("./controllers");
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -80,6 +80,36 @@ const HASH_RE = /^[0-9a-f]{16}$/;
 /** Data dir for a config hash, or the shipped defaults when hash is null. */
 function dataDirFor(hash) {
   return hash ? path.join(CUSTOM_DIR, hash) : DATA_DIR;
+}
+
+/**
+ * Move labels in balance-file order, which is the index space of a render
+ * frame's `selected_shape`.  Only hardware e-paper feedback needs this (the
+ * browser fetches balance.json itself), so a read failure degrades to "no
+ * labels" rather than taking a room down.  Cached per config hash: these
+ * files are immutable once written (content-addressed), and DATA_DIR only
+ * changes across a bridge restart.
+ *
+ * @type {Map<string | null, string[]>}
+ */
+const moveLabelCache = new Map();
+
+/** @param {string | null} hash @returns {string[]} */
+function moveLabelsFor(hash) {
+  const hit = moveLabelCache.get(hash);
+  if (hit !== undefined) return hit;
+  let labels = [];
+  try {
+    const raw = fs.readFileSync(path.join(dataDirFor(hash), "balance.json"), "utf8");
+    const recipes = JSON.parse(raw).player_recipes;
+    if (Array.isArray(recipes)) {
+      labels = recipes.map((r) => (typeof r.label === "string" ? r.label : "?"));
+    }
+  } catch (err) {
+    console.warn(`[bridge] move labels unavailable (config=${hash ?? "default"}):`, err.message);
+  }
+  moveLabelCache.set(hash, labels);
+  return labels;
 }
 
 const MAX_SESSIONS          = 6;
@@ -452,6 +482,7 @@ const controllerManager = new ControllerManager({
   roomJoined: (room) => roomTabJoined(room),
   roomLeft: (room) => roomTabLeft(room),
   isRoomAlive: (room) => lobbyRegistry.get(room.code) === room,
+  moveLabels: (configHash) => moveLabelsFor(configHash ?? null),
 });
 
 class TabSession extends PlayerSession {
@@ -468,8 +499,12 @@ class TabSession extends PlayerSession {
   onZigFrame(msg, line) {
     if (msg.tag === "render") {
       if (this.tabWs.readyState === WebSocket.OPEN) this.tabWs.send(line);
-      // Mirror the pending combo to a paired hardware controller's e-paper.
-      if (this.controller !== null) this.controller.sendCombo(comboFromRender(msg));
+      // Mirror the selected shape to a paired hardware controller's e-paper.
+      if (this.controller !== null) {
+        this.controller.sendShape(
+          shapeFromRender(msg, moveLabelsFor(this.room ? this.room.configHash : null)),
+        );
+      }
     } else {
       console.warn("[bridge] unknown Zig frame tag:", msg.tag);
     }

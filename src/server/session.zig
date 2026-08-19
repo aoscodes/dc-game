@@ -33,19 +33,34 @@
 //! ever have?".  Running the pool dry with slime still walled off is a loss
 //! (`out_of_charges`) — see check_end.
 //!
-//! CASTING.  A submit RESOLVES IMMEDIATELY:
-//!   - It matches a player recipe → if the pool can pay, the shape stamps now.
-//!   - It completes a team recipe against teammates' HELD halves → the whole
-//!     group resolves now for ONE charge cost, anchored at the joiner's cursor.
-//!   - It is an unpaired team half → it is HELD (`cast_committed`) for free
-//!     until a partner completes it or the turn ends.
-//!   - It matches nothing → `cast_fizzled`, and the cast budget is NOT spent.
-//!   - It matches but the pool cannot pay → `cast_fizzled`, and the budget IS
+//! SELECTING.  Each player holds ONE selected move: an index into
+//! `balance.player_recipes` that they step around with `cycle_shape` and fire
+//! with `cast`.  The selection is SERVER-OWNED — a client sends a direction,
+//! never a move — so no client can name a move that is not in the table.  It
+//! persists across turns (a player who found their move keeps it) and is
+//! snapshotted for everyone, so a team can see what each other is holding and
+//! agree on a group before spending anything.
+//!
+//! CASTING.  Every cast RESOLVES IMMEDIATELY — there is no held state and
+//! nothing to wait for:
+//!   - It completes a GROUP against casts teammates already made on the SAME
+//!     square this turn → it stamps the group's shape and pays the group's
+//!     price instead of its own.  The priors it consumed have already stamped
+//!     and paid for themselves; they leave the log so they cannot be counted
+//!     into a second group.
+//!   - Otherwise → it stamps its own move's shape for its own cost.
+//!   - The pool cannot pay for the group → it falls back to the plain move.
+//!     The player cast something legal; downgrading beats refusing.
+//!   - The pool cannot pay even for that → `cast_fizzled`, and the budget IS
 //!     spent.  A bankrupt team still burns through turns, so the game keeps
 //!     moving to its conclusion instead of hanging.
 //! Stamping downgrades every covered hazard cell one tier (red -> yellow ->
 //! green -> defused); coverage off the grid edge, or on a cell with nothing
 //! left to downgrade, is wasted.  A stamp never empties a cell.
+//!
+//! Because every cast pays as it lands, a group is a DISCOUNT ON THE LAST
+//! CONTRIBUTION, not a joint purchase: coordinating turns the completing
+//! player's small move into the group's big one for the group's price.
 //!
 //! TURN END.  When every connected player's budget is spent, the field settles
 //! in three ordered steps (see slime.zig):
@@ -56,8 +71,9 @@
 //!   2. COLLAPSE — survivors fall straight down into the holes the feast left.
 //!   3. FILL — the reservoir tops the field up from the row the collapse
 //!      cleared.
-//! Held halves then fizzle (their budget stays spent), budgets reset, and
-//! `turn_ended` is broadcast.
+//! The turn's cast log is then cleared — groups form WITHIN a turn only, so a
+//! contribution nobody joined is simply a move that already landed — budgets
+//! reset, and `turn_ended` is broadcast.
 //!
 //! The encounter's end is checked ONLY at turn end: the hunger bar filling is a
 //! loss, a dead position (nothing eaten and nothing affordable) is a loss, and
@@ -143,20 +159,22 @@ pub const Session = struct {
     /// Casts each player has left this turn.  The turn ends when every
     /// CONNECTED player's entry is 0, so this is the only turn-progress state.
     casts_left: [MAX_PLAYERS]u8 = [_]u8{0} ** MAX_PLAYERS,
-    /// Live combo preview per player (latest edit wins; Escape cancels).
-    action_pool: [MAX_PLAYERS]?c.ActionCombo,
-    /// Each player's HELD team half: a cast that was accepted but needs a
-    /// partner to resolve (null = none).  Cleared when a partner completes the
-    /// recipe, and at turn end (where it fizzles).
-    held_pool: [MAX_PLAYERS]?c.ActionCombo = [_]?c.ActionCombo{null} ** MAX_PLAYERS,
+    /// Each player's selected move, as an index into
+    /// `balance.player_recipes`.  SERVER-OWNED: clients send a cycle DIRECTION,
+    /// so this is always a valid index and no client can name a move outside
+    /// the loaded table.  Persists across turns; reset to 0 per encounter.
+    selected: [MAX_PLAYERS]u8 = [_]u8{0} ** MAX_PLAYERS,
     /// Each player's aiming cursor, as a flat grid index.  SERVER-OWNED: the
     /// client sends directions and this clamps, so a cursor is always a valid
     /// cell of the current grid and no client can aim out of bounds.
     cursors: [MAX_PLAYERS]u16 = [_]u16{0} ** MAX_PLAYERS,
-    /// Where each cast was aimed, captured at SUBMIT time.  A held half lands
-    /// where the player was aiming when they committed it, so re-aiming while
-    /// waiting for a partner cannot retarget it.
-    cast_anchors: [MAX_PLAYERS]u16 = [_]u16{0} ** MAX_PLAYERS,
+    /// Every cast made THIS TURN that is still available to a group, in cast
+    /// order — the pool a group is completed against (see
+    /// logic.complete_group).  Casts a group consumed are REMOVED, so one
+    /// contribution can never count toward two groups.  Cleared at turn end:
+    /// groups form within a turn only.
+    turn_casts: [logic.MAX_CASTS]logic.TurnCast = undefined,
+    turn_cast_count: usize = 0,
     /// Tuning stats accumulated over the match; broadcast with game_over.
     /// `players` is indexed by player_id during play and compacted (dense,
     /// names filled) in end_game.
@@ -193,7 +211,6 @@ pub const Session = struct {
             .world = world,
             // Sized properly at game start; a 1x1 empty field until then.
             .field = .{ .grid = c.SlimeGrid.init(1, 1), .reservoir = .{} },
-            .action_pool = [_]?c.ActionCombo{null} ** MAX_PLAYERS,
             .prng = std.Random.DefaultPrng.init(seed),
         };
     }
@@ -285,7 +302,6 @@ pub const Session = struct {
         self.world.deinit();
         self.world = try GameWorld.init(self.allocator);
         set_world_system_signatures(&self.world);
-        for (&self.action_pool) |*a| a.* = @as(?c.ActionCombo, null);
         self.stats = .{
             .player_recipe_count = @intCast(self.cfg.balance.player_recipes.len),
             .team_recipe_count = @intCast(self.cfg.balance.team_recipes.len),
@@ -294,8 +310,11 @@ pub const Session = struct {
 
         self.phase = .playing;
         self.current_encounter = encounter;
-        for (&self.held_pool) |*hp| hp.* = null;
-        self.cast_anchors = [_]u16{0} ** MAX_PLAYERS;
+        self.turn_cast_count = 0;
+        // Everyone opens on the first move in the table: the encounter is a
+        // fresh start, so a selection carried over from a previous game would
+        // be state the players never chose here.
+        self.selected = [_]u8{0} ** MAX_PLAYERS;
         self.turn = 1;
         self.reset_budgets();
 
@@ -386,66 +405,121 @@ pub const Session = struct {
         }
     }
 
-    /// Resolve one submitted cast IMMEDIATELY.
+    /// Resolve one cast IMMEDIATELY: pick its stamp, pay for it, land it.
     ///
-    /// Returns whether the cast consumed a budget slot.  Three outcomes:
-    ///   - It matches something on its own (a player recipe) → resolved now.
-    ///   - It completes a team recipe against held halves → that whole group
-    ///     resolves now, anchored at this player (the joiner).
-    ///   - It is an unpaired team half → HELD (budget still spent, because the
-    ///     player did commit it).  Holding is FREE; the group is charged only
-    ///     when it actually fires.
-    /// A cast that matches nothing at all never reaches here: `submit_spell`
-    /// fizzles it and keeps the budget.
+    /// The cast's own move is the baseline.  If it completes a GROUP against
+    /// this turn's earlier casts on the same square it is upgraded to the
+    /// group's shape at the group's price — the coordination payoff.
     ///
-    /// Returns false when the batch matched but the charge pool could not pay
-    /// for it, so the caller can announce the fizzle.
-    fn resolve_cast(self: *Session, player_id: u8, combo: c.ActionCombo) !bool {
-        // Everything currently on the table: this cast plus every held half.
-        var batch: [MAX_PLAYERS]logic.Cast = undefined;
-        var batch_len: usize = 0;
-        var joiner_index: usize = 0;
-        for (&self.held_pool, 0..) |*hp, pid| {
-            const held = hp.* orelse continue;
-            batch[batch_len] = .{ .player_id = @intCast(pid), .combo = held };
-            batch_len += 1;
-        }
-        joiner_index = batch_len;
-        batch[batch_len] = .{ .player_id = player_id, .combo = combo };
-        batch_len += 1;
+    /// Pricing is a two-step fallback, from best to worst, because a player who
+    /// pressed cast deserves the most the pool can actually buy:
+    ///   1. the group, if one completed and the pool can pay for it;
+    ///   2. the plain move, if the pool can pay for that;
+    ///   3. nothing — the cast fizzles (`false`), with the budget already gone.
+    ///
+    /// A group that fires consumes its WHOLE bag — the contributing priors AND
+    /// the cast that completed it — so no cast is ever counted into two groups.
+    /// Leaving the trigger behind would let two players alternate contributions
+    /// and collect a group on every press after the first, which is a chain, not
+    /// a coordination.  Consumed casts are NOT refunded: each prior already
+    /// stamped and paid for itself when it landed, and the trigger paid the
+    /// group price.
+    ///
+    /// Returns false only for case 3, so the caller can announce the fizzle.
+    fn resolve_cast(self: *Session, player_id: u8, square: u16) !bool {
+        const bal = &self.cfg.balance;
+        const move = self.selected[player_id];
+        const cast = logic.TurnCast{
+            .player_id = player_id,
+            .move = move,
+            .square = square,
+        };
 
-        var report = logic.MatchReport{};
-        _ = logic.match_recipes(&self.cfg.balance, batch[0..batch_len], player_id, &report);
+        const priors = self.turn_casts[0..self.turn_cast_count];
+        const group = logic.complete_group(bal, priors, cast);
 
-        if (report.consumed[joiner_index] == .none) {
-            // Nothing this cast can do yet: it is a team half waiting for a
-            // partner.  (A combo that matches nothing at all was already
-            // fizzled by the caller.)
-            self.held_pool[player_id] = combo;
-            var buf: [4]u8 = undefined;
-            var fbs = std.io.fixedBufferStream(&buf);
-            try proto.encode(fbs.writer(), .cast_committed, proto.CastCommitted{
-                .player_id = player_id,
+        // The group is only worth having if the pool can pay for it; otherwise
+        // the plain move still stands.
+        const stamp = blk: {
+            if (group) |hit| {
+                const gs = logic.group_stamp(bal, hit, player_id);
+                if (gs.cost <= self.charges) break :blk gs;
+                std.log.debug("group '{s}' costs {} charges, pool holds {} — falling back to '{s}'", .{
+                    bal.team_recipes[hit.recipe_index].label,
+                    gs.cost,
+                    self.charges,
+                    bal.player_recipes[move].label,
+                });
+            }
+            break :blk logic.move_stamp(bal, move, player_id);
+        };
+
+        if (stamp.cost > self.charges) {
+            std.log.debug("'{s}' costs {} charges, pool holds {} — fizzled", .{
+                bal.player_recipes[move].label, stamp.cost, self.charges,
             });
-            try self.broadcast_raw(fbs.getWritten());
-            return true;
+            // The cast is still logged: it did happen, and a teammate may yet
+            // build a group on the square even though this stamp never landed.
+            self.log_turn_cast(cast);
+            return false;
         }
 
-        // This cast resolves.  Everything it consumed leaves the table with it;
-        // halves that contributed nothing stay held for a future partner.
-        // They are released even if the pool then refuses to pay: the group
-        // TRIED, and re-holding halves the players believe they have spent
-        // would leave the table in a state the client never saw.
-        var resolved: [MAX_PLAYERS]logic.Cast = undefined;
-        var resolved_len: usize = 0;
-        for (batch[0..batch_len], 0..) |cast, bi| {
-            if (report.consumed[bi] == .none) continue;
-            if (cast.player_id != player_id) self.held_pool[cast.player_id] = null;
-            resolved[resolved_len] = cast;
-            resolved_len += 1;
+        // A group swallows its whole bag: the priors it matched, and this cast.
+        // Otherwise only the plain move landed, and this cast joins the log as a
+        // component a teammate can still build on.
+        if (stamp.is_team) {
+            if (group) |hit| self.consume_priors(hit.spent());
+        } else {
+            self.log_turn_cast(cast);
         }
 
-        return self.convert_batch(resolved[0..resolved_len], player_id);
+        self.charges -= stamp.cost;
+        self.stats.feast.charges_spent +|= stat_u16(stamp.cost);
+        const kind: proto.RecipeKind = if (stamp.is_team) .team else .player;
+        if (stamp.is_team) {
+            self.stats.team_recipe_hits[stamp.recipe_index] +|= 1;
+        } else {
+            self.stats.player_recipe_hits[stamp.recipe_index] +|= 1;
+        }
+        self.stats.players[player_id].recipe_casts +|= 1;
+        try self.broadcast_recipe_fired(kind, stamp.recipe_index, 1);
+
+        try self.stamp_shape(stamp, square);
+        return true;
+    }
+
+    /// Append a cast to this turn's log, dropping it if the log is full.
+    ///
+    /// Overflow needs no ceremony: MAX_CASTS covers every player spending every
+    /// cast of a turn with headroom, so a full log means a pathological config,
+    /// and the only consequence is that a late cast cannot anchor a group.
+    fn log_turn_cast(self: *Session, cast: logic.TurnCast) void {
+        if (self.turn_cast_count >= logic.MAX_CASTS) return;
+        self.turn_casts[self.turn_cast_count] = cast;
+        self.turn_cast_count += 1;
+    }
+
+    /// Remove the casts a group consumed from this turn's log.
+    ///
+    /// `indices` are into the log as it stood when the group was matched, so
+    /// removal walks HIGH to LOW: taking a lower index first would shift the
+    /// higher ones and delete the wrong casts.
+    fn consume_priors(self: *Session, indices: []const u8) void {
+        var sorted: [shared.balance.MAX_TEAM_COMPONENTS]u8 = undefined;
+        const n = @min(indices.len, sorted.len);
+        @memcpy(sorted[0..n], indices[0..n]);
+        std.mem.sort(u8, sorted[0..n], {}, std.sort.desc(u8));
+        for (sorted[0..n]) |idx| {
+            if (idx >= self.turn_cast_count) continue;
+            // Order-preserving: the log is matched oldest-first, so shuffling
+            // it would change which cast a later group picks up.
+            std.mem.copyForwards(
+                logic.TurnCast,
+                self.turn_casts[idx .. self.turn_cast_count - 1],
+                self.turn_casts[idx + 1 .. self.turn_cast_count],
+            );
+            self.turn_cast_count -= 1;
+        }
     }
 
     /// True once every CONNECTED player has spent their budget.  Disconnected
@@ -501,16 +575,10 @@ pub const Session = struct {
             .value = stat_u16(hunger_added),
         });
 
-        // Halves nobody completed are lost — and the casts they cost are NOT
-        // refunded: committing to a team play you could not finish is the risk.
-        var fizzled_mask: u8 = 0;
-        for (&self.held_pool, 0..) |*hp, pid| {
-            if (hp.* == null) continue;
-            hp.* = null;
-            fizzled_mask |= @as(u8, 1) << @intCast(pid);
-            self.stats.players[pid].fizzles +|= 1;
-        }
-        if (fizzled_mask != 0) try self.broadcast_fizzles(fizzled_mask);
+        // Groups form within a turn only: a contribution nobody joined was
+        // still a move that landed and paid, so there is nothing to fizzle —
+        // clearing the log is the whole of it.
+        self.turn_cast_count = 0;
 
         // Gravity, THEN the refill: survivors settle to the bottom of their
         // column first so the new slime has the cleared top rows to land in.
@@ -561,74 +629,13 @@ pub const Session = struct {
         }
     }
 
-    /// CONVERT one batch of resolving casts: recipes match within the batch and
-    /// each matched recipe STAMPS its shape on the grid at the anchoring
-    /// player's cursor — downgrading every covered hazard cell by one tier.
-    /// Each recipe fire and each stamp is broadcast.
+    /// Apply one shape to the grid at `anchor` (a flat grid index), then
+    /// broadcast the resolved footprint and outcome.
     ///
-    /// The batch is paid for ATOMICALLY out of the shared charge pool: either
-    /// the whole thing fires or none of it does.  A team recipe is therefore
-    /// charged ONCE for the group, not once per contributing player, and a
-    /// group that would half-fire on a nearly-empty pool fizzles cleanly
-    /// instead of leaving a partial effect nobody can reason about.
-    ///
-    /// Returns false when the pool could not pay.  The caller has already spent
-    /// the cast budget by then and deliberately does NOT refund it: discovering
-    /// you are broke is a move, and it has to cost a turn's worth of time or a
-    /// bankrupt team could stall the game forever.
-    ///
-    /// `joiner` is the player whose submit triggered this conversion; they aim
-    /// any combined team shape (see match_recipes).
-    fn convert_batch(self: *Session, batch: []const logic.Cast, joiner: ?u8) !bool {
-        if (batch.len == 0) return true;
-
-        var report = logic.MatchReport{};
-        const outcome = logic.match_recipes(&self.cfg.balance, batch, joiner, &report);
-
-        const price = outcome.total_cost();
-        if (price > self.charges) {
-            std.log.debug("batch of {} costs {} charges, pool holds {} — fizzled", .{
-                batch.len, price, self.charges,
-            });
-            return false;
-        }
-        self.charges -= price;
-        self.stats.feast.charges_spent +|= stat_u16(price);
-
-        // Recipe stats: fire counts + per-player participation.  Each fire is
-        // also broadcast so clients can show recipe floaters live.  Only the
-        // loaded tables' entries are meaningful (arrays are cap-sized).
-        for (self.cfg.balance.player_recipes, 0..) |_, ri| {
-            const hit = report.player_hits[ri];
-            self.stats.player_recipe_hits[ri] +|= hit;
-            try self.broadcast_recipe_fired(.player, @intCast(ri), hit);
-        }
-        for (self.cfg.balance.team_recipes, 0..) |_, ri| {
-            const hit = report.team_hits[ri];
-            self.stats.team_recipe_hits[ri] +|= hit;
-            try self.broadcast_recipe_fired(.team, @intCast(ri), hit);
-        }
-        for (batch, 0..) |cast, ci| {
-            if (report.consumed[ci] != .none) {
-                self.stats.players[cast.player_id].recipe_casts +|= 1;
-            }
-        }
-
-        // Stamp each shape where its caster was aiming when they committed.
-        for (outcome.stamps()) |stamp| {
-            try self.stamp_shape(stamp);
-        }
-        return true;
-    }
-
-    /// Apply one matched shape to the grid at its anchoring player's cast
-    /// cursor, then broadcast the resolved footprint and outcome.
-    ///
-    /// Anchoring uses `cast_anchors` (where the player aimed at SUBMIT time),
-    /// not the live cursor: a cast that is already in flight must not follow
-    /// the player as they re-aim for their next one.
-    fn stamp_shape(self: *Session, stamp: logic.ShapeCast) !void {
-        const anchor = self.cast_anchors[stamp.anchor_player];
+    /// The anchor is passed in rather than read from the cursor: it is the
+    /// square captured when the cast was accepted, so a stamp lands where the
+    /// player was pointing even if they re-aim in the same tick.
+    fn stamp_shape(self: *Session, stamp: logic.ShapeCast, anchor: u16) !void {
         const grid = &self.field.grid;
         const row = grid.row_of(anchor);
         const col = grid.col_of(anchor);
@@ -637,6 +644,7 @@ pub const Session = struct {
 
         var msg = proto.ShapeCast{
             .caster = stamp.anchor_player,
+            .anchor = anchor,
             .downgraded = outcome.downgraded,
             .neutralized = outcome.neutralized,
             .off_grid = outcome.off_grid,
@@ -697,8 +705,8 @@ pub const Session = struct {
     }
 
     /// Record a committed cast into the tuning stats.  Coverage is credited
-    /// later, when the shape actually lands (see stamp_shape) — a combo is
-    /// just a name until then.
+    /// later, when the shape actually lands (see stamp_shape) — a cast that
+    /// cannot be paid for covers nothing.
     fn record_cast_stats(self: *Session, pid: usize) void {
         self.stats.casts_total +|= 1;
         self.stats.players[pid].casts +|= 1;
@@ -763,18 +771,21 @@ pub const Session = struct {
                     try self.broadcast_game_start(default_label);
                 }
             },
-            .choose_combo => {
-                if (self.phase == .playing and player_id < MAX_PLAYERS) {
-                    const p = try proto.decode_choose_combo(fbs.reader());
-                    self.action_pool[player_id] = p.combo;
-                    std.log.debug("player {} combo len={}", .{ player_id, p.combo.len });
-                }
-            },
-            .cancel_combo => {
-                if (self.phase == .playing and player_id < MAX_PLAYERS) {
-                    self.action_pool[player_id] = null;
-                    std.log.debug("player {} cancelled combo", .{player_id});
-                }
+            .cycle_shape => {
+                // Always decode so the stream stays in sync for messages
+                // queued after this one.
+                const p = try proto.decode_cycle_shape(fbs.reader());
+                if (self.phase != .playing or player_id >= MAX_PLAYERS) return;
+                const moves = self.cfg.balance.player_recipes.len;
+                // An empty move table is impossible (config.zig rejects it),
+                // but cycling would divide by zero, so guard rather than trust.
+                if (moves == 0) return;
+                self.selected[player_id] =
+                    logic.cycle_selection(self.selected[player_id], p.dir, moves);
+                std.log.debug("player {} selected '{s}'", .{
+                    player_id,
+                    self.cfg.balance.player_recipes[self.selected[player_id]].label,
+                });
             },
             .move_cursor => {
                 // Always decode so the stream stays in sync for messages
@@ -787,28 +798,19 @@ pub const Session = struct {
                 self.cursors[player_id] =
                     self.field.grid.step(self.cursors[player_id], d.d_row, d.d_col);
             },
-            .submit_spell => {
-                // Always decode so the stream stays in sync for any
-                // messages queued after this one.
-                const p = try proto.decode_submit_spell(fbs.reader());
+            .cast => {
                 if (self.phase != .playing or player_id >= MAX_PLAYERS) return;
                 // Out of casts this turn: silent ignore.  The turn is waiting
                 // on someone else, and this player has nothing left to say.
                 if (self.casts_left[player_id] == 0) return;
-
-                // A combo that can produce nothing FIZZLES and costs nothing:
-                // the budget only pays for casts that do something.
-                if (!logic.combo_has_output(&self.cfg.balance, p.combo)) {
-                    self.stats.players[player_id].fizzles +|= 1;
-                    try self.broadcast_fizzles(@as(u8, 1) << @intCast(player_id));
-                    return;
-                }
+                // Every selection names a real move, so unlike the old combo
+                // buffer there is no "this spells nothing" case: a cast always
+                // has something to attempt.
 
                 self.casts_left[player_id] -= 1;
                 // Freeze the aim now: this cast lands where the player was
-                // pointing when they committed it, however they move next.
-                self.cast_anchors[player_id] = self.cursors[player_id];
-                self.action_pool[player_id] = null; // clears the live preview
+                // pointing when they pressed it, however they move next.
+                const square = self.cursors[player_id];
                 self.record_cast_stats(player_id);
 
                 const slot = &self.players[player_id];
@@ -821,9 +823,9 @@ pub const Session = struct {
                     });
                 }
 
-                // Resolves now, or is held as a team half awaiting a partner.
-                // An unaffordable batch fizzles with the budget already gone.
-                if (!try self.resolve_cast(player_id, p.combo)) {
+                // Lands as a group if one completed, else as the plain move.
+                // Only a pool too empty for either fizzles, budget already gone.
+                if (!try self.resolve_cast(player_id, square)) {
                     self.stats.players[player_id].fizzles +|= 1;
                     try self.broadcast_fizzles(@as(u8, 1) << @intCast(player_id));
                 }
@@ -915,9 +917,9 @@ pub const Session = struct {
     /// Spawn an ECS entity for a player who joined while the game is in
     /// progress.  IDEMPOTENT: a player owns at most one entity, so a repeated
     /// `join_lobby` (reconnect handshake, retry, duplicated input) is a no-op.
-    /// Snapshots walk the player_marker array and both the client's combo
-    /// projection and the team-recipe matcher treat one entity as one caster,
-    /// so a second body would fake a team recipe from a single player.
+    /// Snapshots walk the player_marker array and the client's selection
+    /// projection treats one entity as one caster, so a second body would show
+    /// a phantom teammate with a wheel of their own.
     fn spawn_player_midgame(self: *Session, player_id: u8) !void {
         if (player_id >= MAX_PLAYERS) return;
         const slot = &self.players[player_id];
@@ -1022,40 +1024,17 @@ pub const Session = struct {
             if (snap.entity_count >= proto.MAX_ENTITIES_WIRE) break;
             const kd = self.world.get_component(e, c.Kind);
             const own = self.world.get_component(e, c.Owner).player_id;
-            const blank_slots =
-                [_]c.ComboSlot{.{ .action = .dispense }} ** c.MAX_COMBO_LEN;
-            // What the player is TYPING (cleared on submit).
-            const combo_len: u8 = if (self.action_pool[own]) |combo| combo.len else 0;
-            const combo_slots = if (self.action_pool[own]) |combo|
-                combo.slots
-            else
-                blank_slots;
-            // The half this player is HOLDING for a partner, so clients keep
-            // previewing what is standing by.
-            const sub_len: u8 = if (self.held_pool[own]) |combo| combo.len else 0;
-            const sub_slots = if (self.held_pool[own]) |combo|
-                combo.slots
-            else
-                blank_slots;
-            const cursor = if (self.held_pool[own] != null)
-                self.cast_anchors[own]
-            else
-                self.cursors[own];
-
             snap.entities[snap.entity_count] = .{
                 .entity = e,
                 .kind = kd.tag,
                 .owner = own,
                 .casts_left = self.casts_left[own],
-                .combo_len = combo_len,
-                .combo_slots = combo_slots,
-                .submitted_len = sub_len,
-                .submitted_slots = sub_slots,
-                // A HELD half shows where it will LAND (its captured anchor);
-                // otherwise the player's live aim.  Snapshotted for every
-                // player so teammates see each other's previews.
-                .cursor_row = self.field.grid.row_of(cursor),
-                .cursor_col = self.field.grid.col_of(cursor),
+                // The move this player would fire, so every client can preview
+                // its footprint under their cursor — theirs AND their
+                // teammates', which is how a group gets agreed on.
+                .selected_shape = self.selected[own],
+                .cursor_row = self.field.grid.row_of(self.cursors[own]),
+                .cursor_col = self.field.grid.col_of(self.cursors[own]),
             };
             snap.entity_count += 1;
         }

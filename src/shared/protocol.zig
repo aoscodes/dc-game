@@ -6,16 +6,14 @@ pub const MsgTag = enum(u8) {
     join_lobby = 0x01,
     ready_up = 0x03,
     reconnect = 0x05,
-    choose_combo = 0x07,
-    cancel_combo = 0x08,
-    submit_spell = 0x09,
+    cycle_shape = 0x07,
+    cast = 0x09,
     move_cursor = 0x0a,
     lobby_update = 0x10,
     game_start = 0x11,
     game_state = 0x12,
     action_result = 0x13,
     game_over = 0x15,
-    cast_committed = 0x16,
     cast_fizzled = 0x17,
     recipe_fired = 0x18,
     shape_cast = 0x1c,
@@ -27,13 +25,20 @@ pub const JoinLobby = struct {
     name_len: u8,
 };
 
-pub const ChooseCombo = struct {
-    combo: components.ActionCombo,
+/// One step of the shape wheel.  A DIRECTION, not a destination, for the same
+/// reason as `MoveCursor`: the server owns the selection, so a client can never
+/// name a move that is not in the table.  `cast` then carries no payload at all
+/// — what fires is whatever the server has selected for that player.
+pub const CycleShape = struct {
+    dir: components.CycleDir,
 };
 
-pub const SubmitSpell = struct {
-    combo: components.ActionCombo,
-};
+pub fn decode_cycle_shape(reader: anytype) !CycleShape {
+    const byte = try reader.readByte();
+    const dir = std.meta.intToEnum(components.CycleDir, byte) catch
+        return DecodeError.InvalidCycleDir;
+    return .{ .dir = dir };
+}
 
 /// One d-pad step of the aiming cursor.  A DIRECTION, not a destination: the
 /// server owns the cursor and clamps it at the field edge, so a client can
@@ -66,33 +71,9 @@ pub fn decode_move_cursor(reader: anytype) !MoveCursor {
     return .{ .dir = dir };
 }
 
-fn encode_combo_slot(w: anytype, slot: components.ComboSlot) !void {
-    switch (slot) {
-        .action => |a| try w.writeByte(@intFromEnum(a)),
-    }
-}
-
-fn decode_combo_slot(byte: u8) !components.ComboSlot {
-    const ac = std.meta.intToEnum(components.ActionChoice, byte) catch
-        return DecodeError.InvalidActionChoice;
-    return .{ .action = ac };
-}
-
 pub const Reconnect = struct {
     player_id: u8,
 };
-
-/// A cast was accepted but could not resolve yet: it is one half of a team
-/// recipe, HELD until a partner completes it or the turn ends.  A cast that
-/// resolves immediately is announced by its shape_cast / recipe_fired instead,
-/// so this tag means precisely "waiting for a teammate".
-pub const CastCommitted = struct {
-    player_id: u8,
-};
-
-pub fn decode_cast_committed(reader: anytype) !CastCommitted {
-    return .{ .player_id = try reader.readByte() };
-}
 
 pub const CastFizzled = struct {
     player_id: u8,
@@ -177,9 +158,14 @@ pub const MAX_SHAPE_CELLS_WIRE: u16 = balance.MAX_SHAPE_CELLS;
 /// coverage is wasted — the headline aiming signal, which is why they travel
 /// alongside rather than being inferred.
 pub const ShapeCast = struct {
-    /// Player whose cursor anchored this shape (the last joiner, for a team
-    /// recipe).
+    /// Player whose cursor anchored this shape (the completing caster, for a
+    /// group).
     caster: u8 = 0,
+    /// The cell the caster was aiming at, as a flat grid index.  Travels
+    /// separately because it is NOT derivable from `cells`: clipping can drop
+    /// the anchor itself, and a group forms per-square, so clients need the
+    /// square a cast claimed in order to hint at a group coming together.
+    anchor: u16 = 0,
     /// Cells actually covered, as flat grid indices (already clipped).
     cell_count: u16 = 0,
     cells: [MAX_SHAPE_CELLS_WIRE]u16 = [_]u16{0} ** MAX_SHAPE_CELLS_WIRE,
@@ -192,6 +178,7 @@ pub const ShapeCast = struct {
 pub fn decode_shape_cast(reader: anytype) !ShapeCast {
     var p = ShapeCast{};
     p.caster = try reader.readByte();
+    p.anchor = try reader.readInt(u16, .little);
     p.cell_count = try reader.readInt(u16, .little);
     if (p.cell_count > MAX_SHAPE_CELLS_WIRE) return DecodeError.TooManyShapeCells;
     for (p.cells[0..p.cell_count]) |*cell| cell.* = try reader.readInt(u16, .little);
@@ -249,19 +236,11 @@ pub const EntitySnapshot = struct {
     /// 0 for every connected player, so it is both a budget readout and the
     /// only turn-progress signal a client needs.
     casts_left: u8,
-    /// The combo this player is CURRENTLY TYPING (server `action_pool`).
-    /// Cleared on submit.
-    combo_len: u8,
-    combo_slots: [components.MAX_COMBO_LEN]components.ComboSlot,
-    /// The combo this player has committed that is HELD waiting for a team
-    /// partner (server `held_pool`), so clients can show a half-cast standing
-    /// by.  Empty for a cast that resolved immediately — those are gone by the
-    /// time the next snapshot is built.
-    ///
-    /// Independent of `combo_*`: committing clears `action_pool` but the player
-    /// may immediately start typing again, so both can be non-empty at once.
-    submitted_len: u8,
-    submitted_slots: [components.MAX_COMBO_LEN]components.ComboSlot,
+    /// This player's index into `balance.player_recipes` — the move that `cast`
+    /// will fire.  Snapshotted for EVERY player so teammates can see what each
+    /// other is holding and coordinate a group before anyone spends a cast;
+    /// that visibility is the whole point of a server-owned selection.
+    selected_shape: u8,
     /// Where this player is aiming.  Server-owned and always in bounds, and
     /// snapshotted for EVERY player (not just the receiver) so teammates can
     /// see each other's cursors and shape previews.
@@ -273,10 +252,7 @@ pub const EntitySnapshot = struct {
         .kind = .player,
         .owner = 0xFF,
         .casts_left = 0,
-        .combo_len = 0,
-        .combo_slots = [_]components.ComboSlot{.{ .action = .dispense }} ** components.MAX_COMBO_LEN,
-        .submitted_len = 0,
-        .submitted_slots = [_]components.ComboSlot{.{ .action = .dispense }} ** components.MAX_COMBO_LEN,
+        .selected_shape = 0,
         .cursor_row = 0,
         .cursor_col = 0,
     };
@@ -428,23 +404,14 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
         .join_lobby => try encode_join_lobby(writer, payload),
         .ready_up => {},
         .reconnect => try writer.writeByte(payload.player_id),
-        .choose_combo => {
-            try writer.writeByte(payload.combo.len);
-            for (payload.combo.slots[0..payload.combo.len]) |slot|
-                try encode_combo_slot(writer, slot);
-        },
-        .submit_spell => {
-            try writer.writeByte(payload.combo.len);
-            for (payload.combo.slots[0..payload.combo.len]) |slot|
-                try encode_combo_slot(writer, slot);
-        },
-        .cancel_combo => {},
-        .cast_committed => try writer.writeByte(payload.player_id),
+        .cycle_shape => try writer.writeByte(@intFromEnum(payload.dir)),
+        .cast => {},
         .cast_fizzled => try writer.writeByte(payload.player_id),
         .move_cursor => try writer.writeByte(@intFromEnum(payload.dir)),
         .shape_cast => {
             const p: ShapeCast = payload;
             try writer.writeByte(p.caster);
+            try writer.writeInt(u16, p.anchor, .little);
             try writer.writeInt(u16, p.cell_count, .little);
             for (p.cells[0..p.cell_count]) |cell| try writer.writeInt(u16, cell, .little);
             try encode_u16_tiers(writer, p.downgraded);
@@ -554,14 +521,7 @@ fn encode_game_state(w: anytype, p: GameState) !void {
         try w.writeByte(@intFromEnum(e.kind));
         try w.writeByte(e.owner);
         try w.writeByte(e.casts_left);
-        try w.writeByte(e.combo_len);
-        var j: u8 = 0;
-        while (j < e.combo_len) : (j += 1)
-            try encode_combo_slot(w, e.combo_slots[j]);
-        try w.writeByte(e.submitted_len);
-        var k: u8 = 0;
-        while (k < e.submitted_len) : (k += 1)
-            try encode_combo_slot(w, e.submitted_slots[k]);
+        try w.writeByte(e.selected_shape);
         try w.writeByte(e.cursor_row);
         try w.writeByte(e.cursor_col);
     }
@@ -685,14 +645,13 @@ fn encode_action_result(w: anytype, p: ActionResult) !void {
 pub const DecodeError = error{
     UnknownTag,
     InvalidKind,
-    InvalidActionChoice,
+    InvalidCycleDir,
     InvalidCursorDir,
     InvalidTier,
     TooManyShapeCells,
     InvalidActionResultTag,
     NameTooLong,
     TooManyEntities,
-    InvalidComboLen,
     InvalidEndReason,
     TooManyRecipes,
     InvalidRecipeKind,
@@ -711,29 +670,6 @@ pub fn decode_join_lobby(reader: anytype) !JoinLobby {
     var p = JoinLobby{ .name = [_]u8{0} ** 16, .name_len = len };
     _ = try reader.readAll(p.name[0..len]);
     return p;
-}
-
-fn decode_combo_payload(reader: anytype) !components.ActionCombo {
-    const len = try reader.readByte();
-    if (len == 0 or len > components.MAX_COMBO_LEN) return DecodeError.InvalidComboLen;
-    var combo = components.ActionCombo{
-        .slots = [_]components.ComboSlot{.{ .action = .dispense }} ** components.MAX_COMBO_LEN,
-        .len = len,
-    };
-    var i: u8 = 0;
-    while (i < len) : (i += 1) {
-        const byte = try reader.readByte();
-        combo.slots[i] = try decode_combo_slot(byte);
-    }
-    return combo;
-}
-
-pub fn decode_choose_combo(reader: anytype) !ChooseCombo {
-    return .{ .combo = try decode_combo_payload(reader) };
-}
-
-pub fn decode_submit_spell(reader: anytype) !SubmitSpell {
-    return .{ .combo = try decode_combo_payload(reader) };
 }
 
 pub fn decode_reconnect(reader: anytype) !Reconnect {
@@ -801,22 +737,10 @@ pub fn decode_game_state(reader: anytype) !GameState {
             return DecodeError.InvalidKind;
         e.owner = try reader.readByte();
         e.casts_left = try reader.readByte();
-        e.combo_len = try reader.readByte();
-        if (e.combo_len > components.MAX_COMBO_LEN) return DecodeError.InvalidComboLen;
-        e.combo_slots = [_]components.ComboSlot{.{ .action = .dispense }} ** components.MAX_COMBO_LEN;
-        var j: u8 = 0;
-        while (j < e.combo_len) : (j += 1) {
-            const ab = try reader.readByte();
-            e.combo_slots[j] = try decode_combo_slot(ab);
-        }
-        e.submitted_len = try reader.readByte();
-        if (e.submitted_len > components.MAX_COMBO_LEN) return DecodeError.InvalidComboLen;
-        e.submitted_slots = [_]components.ComboSlot{.{ .action = .dispense }} ** components.MAX_COMBO_LEN;
-        var k: u8 = 0;
-        while (k < e.submitted_len) : (k += 1) {
-            const sb = try reader.readByte();
-            e.submitted_slots[k] = try decode_combo_slot(sb);
-        }
+        // Not range-checked against the move table: protocol.zig does not see
+        // the loaded balance.  The server only ever sends a valid index, and a
+        // client that receives a stale one clamps at render time.
+        e.selected_shape = try reader.readByte();
         e.cursor_row = try reader.readByte();
         e.cursor_col = try reader.readByte();
         p.entities[i] = e;
@@ -940,7 +864,7 @@ test "round-trip: join_lobby" {
     try std.testing.expectEqualSlices(u8, name, decoded.name[0..decoded.name_len]);
 }
 
-test "round-trip: game_state — turn, hunger, score, grid, and combos survive" {
+test "round-trip: game_state — turn, hunger, score, grid, and selection survive" {
     var buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
 
@@ -968,24 +892,7 @@ test "round-trip: game_state — turn, hunger, score, grid, and combos survive" 
         .kind = .player,
         .owner = 0,
         .casts_left = 2,
-        .combo_len = 2,
-        .combo_slots = [_]components.ComboSlot{
-            .{ .action = .catalyst },
-            .{ .action = .dispense },
-            .{ .action = .dispense },
-            .{ .action = .dispense },
-            .{ .action = .dispense },
-        },
-        // A DIFFERENT combo is already committed and held for a partner: both
-        // pools must survive the round trip independently.
-        .submitted_len = 3,
-        .submitted_slots = [_]components.ComboSlot{
-            .{ .action = .catalyst },
-            .{ .action = .catalyst },
-            .{ .action = .dispense },
-            .{ .action = .dispense },
-            .{ .action = .dispense },
-        },
+        .selected_shape = 4,
         .cursor_row = 2,
         .cursor_col = 5,
     };
@@ -1014,14 +921,9 @@ test "round-trip: game_state — turn, hunger, score, grid, and combos survive" 
     // Cells beyond the live 2x4 area stay empty rather than carrying stale data.
     try std.testing.expectEqual(components.SlimeCell.empty, decoded.grid[8]);
     try std.testing.expectEqual(@as(u32, 44), decoded.reservoir);
-    try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].combo_len);
-    try std.testing.expectEqual(components.ActionChoice.catalyst, decoded.entities[0].combo_slots[0].action);
-    try std.testing.expectEqual(components.ActionChoice.dispense, decoded.entities[0].combo_slots[1].action);
-    // The committed pool round-trips separately from the typed one.
-    try std.testing.expectEqual(@as(u8, 3), decoded.entities[0].submitted_len);
-    try std.testing.expectEqual(components.ActionChoice.catalyst, decoded.entities[0].submitted_slots[0].action);
-    try std.testing.expectEqual(components.ActionChoice.catalyst, decoded.entities[0].submitted_slots[1].action);
-    try std.testing.expectEqual(components.ActionChoice.dispense, decoded.entities[0].submitted_slots[2].action);
+    // The move this player would fire travels with them, so teammates can see
+    // it before anyone spends a cast.
+    try std.testing.expectEqual(@as(u8, 4), decoded.entities[0].selected_shape);
     // The aiming cursor travels with the rest of the player's state.
     try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].cursor_row);
     try std.testing.expectEqual(@as(u8, 5), decoded.entities[0].cursor_col);
@@ -1083,79 +985,41 @@ test "round-trip: game_start — grid dims and cast buffer survive" {
     try std.testing.expectEqualSlices(u8, label, decoded.encounter_label[0..decoded.encounter_label_len]);
 }
 
-test "round-trip: choose_combo [dispense, catalyst]" {
-    var buf: [16]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-
-    const combo = components.make_combo(&.{
-        .{ .action = .dispense },
-        .{ .action = .catalyst },
-    });
-
-    try encode(fbs.writer(), .choose_combo, ChooseCombo{ .combo = combo });
-    fbs.reset();
-    const tag = try read_tag(fbs.reader());
-    try std.testing.expectEqual(MsgTag.choose_combo, tag);
-    const decoded = try decode_choose_combo(fbs.reader());
-    try std.testing.expectEqual(@as(u8, 2), decoded.combo.len);
-    try std.testing.expectEqual(components.ActionChoice.dispense, decoded.combo.slots[0].action);
-    try std.testing.expectEqual(components.ActionChoice.catalyst, decoded.combo.slots[1].action);
+test "round-trip: cycle_shape carries the direction" {
+    for ([_]components.CycleDir{ .forward, .backward }) |dir| {
+        var buf: [8]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        try encode(fbs.writer(), .cycle_shape, CycleShape{ .dir = dir });
+        fbs.reset();
+        try std.testing.expectEqual(MsgTag.cycle_shape, try read_tag(fbs.reader()));
+        const decoded = try decode_cycle_shape(fbs.reader());
+        try std.testing.expectEqual(dir, decoded.dir);
+    }
 }
 
-test "round-trip: choose_combo max-length all dispense" {
-    var buf: [16]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-
-    const combo = components.ActionCombo{
-        .slots = [_]components.ComboSlot{.{ .action = .dispense }} ** components.MAX_COMBO_LEN,
-        .len = components.MAX_COMBO_LEN,
-    };
-    try encode(fbs.writer(), .choose_combo, ChooseCombo{ .combo = combo });
-    fbs.reset();
-    _ = try read_tag(fbs.reader());
-    const decoded = try decode_choose_combo(fbs.reader());
-    try std.testing.expectEqual(components.MAX_COMBO_LEN, decoded.combo.len);
-    for (decoded.combo.slots[0..decoded.combo.len]) |s|
-        try std.testing.expectEqual(components.ActionChoice.dispense, s.action);
+test "decode_cycle_shape: an unknown direction byte is rejected" {
+    var fbs = std.io.fixedBufferStream(&[_]u8{9});
+    try std.testing.expectError(DecodeError.InvalidCycleDir, decode_cycle_shape(fbs.reader()));
 }
 
-test "round-trip: a mixed action combo survives in order" {
-    // Order is the whole identity of a combo, so it must survive exactly.
-    var buf: [16]u8 = undefined;
+test "round-trip: cast carries no payload" {
+    // What fires is whatever the server has selected, so the message is a bare
+    // tag — a client cannot name a move, only ask to fire the one it holds.
+    var buf: [8]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-
-    const combo = components.make_combo(&.{
-        .{ .action = .catalyst },
-        .{ .action = .dispense },
-        .{ .action = .catalyst },
-    });
-    try encode(fbs.writer(), .choose_combo, ChooseCombo{ .combo = combo });
+    try encode(fbs.writer(), .cast, {});
+    try std.testing.expectEqual(@as(usize, 1), fbs.pos);
     fbs.reset();
-    _ = try read_tag(fbs.reader());
-    const decoded = try decode_choose_combo(fbs.reader());
-    try std.testing.expectEqual(@as(u8, 3), decoded.combo.len);
-    try std.testing.expectEqual(components.ActionChoice.catalyst, decoded.combo.slots[0].action);
-    try std.testing.expectEqual(components.ActionChoice.dispense, decoded.combo.slots[1].action);
-    try std.testing.expectEqual(components.ActionChoice.catalyst, decoded.combo.slots[2].action);
+    try std.testing.expectEqual(MsgTag.cast, try read_tag(fbs.reader()));
 }
 
-test "round-trip: submit_spell carries the combo" {
-    var buf: [16]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-
-    const combo = components.make_combo(&.{
-        .{ .action = .catalyst },
-        .{ .action = .dispense },
-        .{ .action = .dispense },
-    });
-    try encode(fbs.writer(), .submit_spell, SubmitSpell{ .combo = combo });
-    fbs.reset();
-    const tag = try read_tag(fbs.reader());
-    try std.testing.expectEqual(MsgTag.submit_spell, tag);
-    const decoded = try decode_submit_spell(fbs.reader());
-    try std.testing.expectEqual(@as(u8, 3), decoded.combo.len);
-    try std.testing.expectEqual(components.ActionChoice.catalyst, decoded.combo.slots[0].action);
-    try std.testing.expectEqual(components.ActionChoice.dispense, decoded.combo.slots[1].action);
+test "retired combo tags no longer decode" {
+    // 0x08 was cancel_combo and 0x16 was cast_committed.  Both are gone: there
+    // is no half-typed combo to cancel and no cast that waits for a partner.
+    for ([_]u8{ 0x08, 0x16 }) |byte| {
+        var fbs = std.io.fixedBufferStream(&[_]u8{byte});
+        try std.testing.expectError(DecodeError.UnknownTag, read_tag(fbs.reader()));
+    }
 }
 
 test "round-trip: a full MAX grid of every cell kind survives" {
@@ -1242,34 +1106,6 @@ test "decode_game_state: oversized grid dimensions are rejected" {
     try std.testing.expectError(DecodeError.InvalidGridDims, decode_game_state(fbs.reader()));
 }
 
-test "decode_choose_combo: len=0 returns InvalidComboLen" {
-    var buf: [2]u8 = .{ 0x00, 0x00 };
-    var fbs = std.io.fixedBufferStream(&buf);
-    try std.testing.expectError(DecodeError.InvalidComboLen, decode_choose_combo(fbs.reader()));
-}
-
-test "decode_choose_combo: len over max returns InvalidComboLen" {
-    var buf: [2]u8 = .{ components.MAX_COMBO_LEN + 1, 0x00 };
-    var fbs = std.io.fixedBufferStream(&buf);
-    try std.testing.expectError(DecodeError.InvalidComboLen, decode_choose_combo(fbs.reader()));
-}
-
-test "decode_choose_combo: legacy heal byte (0x02) is rejected" {
-    // Old protocol had 3 actions; byte 0x02 is no longer a valid ActionChoice.
-    var buf: [3]u8 = .{ 0x01, 0x02, 0x00 };
-    var fbs = std.io.fixedBufferStream(&buf);
-    try std.testing.expectError(DecodeError.InvalidActionChoice, decode_choose_combo(fbs.reader()));
-}
-
-test "round-trip: cancel_combo (zero payload)" {
-    var buf: [4]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try encode(fbs.writer(), .cancel_combo, {});
-    fbs.reset();
-    const tag = try read_tag(fbs.reader());
-    try std.testing.expectEqual(MsgTag.cancel_combo, tag);
-}
-
 test "round-trip: a blank game_state (pre-start, no grid) survives" {
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -1285,17 +1121,6 @@ test "round-trip: a blank game_state (pre-start, no grid) survives" {
     try std.testing.expectEqual(@as(u32, 7), decoded.tick);
     try std.testing.expectEqual(@as(u16, 0), decoded.grid_len());
     try std.testing.expectEqual(@as(u16, 0), decoded.turn);
-}
-
-test "round-trip: cast_committed carries player_id" {
-    var buf: [4]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try encode(fbs.writer(), .cast_committed, CastCommitted{ .player_id = 3 });
-    fbs.reset();
-    const tag = try read_tag(fbs.reader());
-    try std.testing.expectEqual(MsgTag.cast_committed, tag);
-    const decoded = try decode_cast_committed(fbs.reader());
-    try std.testing.expectEqual(@as(u8, 3), decoded.player_id);
 }
 
 test "round-trip: cast_fizzled carries player_id" {
@@ -1363,7 +1188,7 @@ test "round-trip: action_result damage (the feast) tag" {
 test "shape_cast round-trips its footprint and outcome" {
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    var sc = ShapeCast{ .caster = 3, .cell_count = 4 };
+    var sc = ShapeCast{ .caster = 3, .anchor = 17, .cell_count = 4 };
     sc.cells = [_]u16{0} ** MAX_SHAPE_CELLS_WIRE;
     sc.cells[0] = 0;
     sc.cells[1] = 17;
@@ -1381,6 +1206,7 @@ test "shape_cast round-trips its footprint and outcome" {
     try std.testing.expectEqual(MsgTag.shape_cast, try read_tag(r));
     const got = try decode_shape_cast(r);
     try std.testing.expectEqual(@as(u8, 3), got.caster);
+    try std.testing.expectEqual(@as(u16, 17), got.anchor);
     try std.testing.expectEqual(@as(u16, 4), got.cell_count);
     try std.testing.expectEqualSlices(u16, sc.cells[0..4], got.cells[0..4]);
     try std.testing.expectEqual(@as(u16, 2), got.downgraded[@intFromEnum(components.Tier.red)]);
@@ -1395,7 +1221,7 @@ test "shape_cast round-trips its footprint and outcome" {
 test "shape_cast: a fully-clipped cast carries no cells" {
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    const sc = ShapeCast{ .caster = 1, .cell_count = 0, .off_grid = 9 };
+    const sc = ShapeCast{ .caster = 1, .anchor = 42, .cell_count = 0, .off_grid = 9 };
     try encode(fbs.writer(), .shape_cast, sc);
 
     var rfbs = std.io.fixedBufferStream(fbs.getWritten());
@@ -1404,6 +1230,9 @@ test "shape_cast: a fully-clipped cast carries no cells" {
     const got = try decode_shape_cast(r);
     try std.testing.expectEqual(@as(u16, 0), got.cell_count);
     try std.testing.expectEqual(@as(u16, 9), got.off_grid);
+    // The square aimed at survives even when nothing landed on it — which is
+    // exactly the case `cells` could never carry.
+    try std.testing.expectEqual(@as(u16, 42), got.anchor);
 }
 
 test "round-trip: move_cursor carries each direction" {

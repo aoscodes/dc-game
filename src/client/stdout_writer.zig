@@ -1,26 +1,6 @@
 const std = @import("std");
 const proto = @import("shared").protocol;
 const c = @import("shared").components;
-const inp = @import("input.zig");
-
-/// JSON serialisation for ComboSlot.  Emits {"action":"dispense"}.
-///
-/// Kept as an object (rather than a bare string) because slots are keyed by
-/// field name on the JS side, and a combo slot may grow more attributes.
-const JsonComboSlot = struct {
-    slot: c.ComboSlot,
-
-    pub fn jsonStringify(self: JsonComboSlot, jws: anytype) !void {
-        try jws.beginObject();
-        switch (self.slot) {
-            .action => |a| {
-                try jws.objectField("action");
-                try jws.write(@tagName(a));
-            },
-        }
-        try jws.endObject();
-    }
-};
 
 pub const Writer = struct {
     mu: *std.Thread.Mutex,
@@ -74,7 +54,6 @@ pub const LastActionEntry = struct { entity: u32, anim: c.ActionAnimation };
 pub const GameState = struct {
     snapshot: proto.GameState = proto.GameState.blank,
     player_id: u8 = 0xFF,
-    pending_combo: inp.ComboBuffer = .{},
     /// Casts each player gets per turn, as announced in game_start.  Constant
     /// for the whole encounter, so the renderer can draw a budget gauge.
     casts_per_turn: u8 = 0,
@@ -124,10 +103,6 @@ fn write_render_inner(
         };
     }
 
-    // Per-entity slot buffers for JSON serialisation.  Typed and submitted
-    // combos are independent (a player may hold both), so each gets a buffer.
-    var slot_bufs: [proto.MAX_ENTITIES_WIRE][c.MAX_COMBO_LEN]JsonComboSlot = undefined;
-    var sub_slot_bufs: [proto.MAX_ENTITIES_WIRE][c.MAX_COMBO_LEN]JsonComboSlot = undefined;
     var entities_buf: [proto.MAX_ENTITIES_WIRE]JsonEntity = undefined;
     for (0..game.snapshot.entity_count) |i| {
         const e = &game.snapshot.entities[i];
@@ -138,20 +113,13 @@ fn write_render_inner(
                 break;
             }
         }
-        for (e.combo_slots[0..e.combo_len], 0..) |s, j| {
-            slot_bufs[i][j] = .{ .slot = s };
-        }
-        for (e.submitted_slots[0..e.submitted_len], 0..) |s, j| {
-            sub_slot_bufs[i][j] = .{ .slot = s };
-        }
         entities_buf[i] = .{
             .id = e.entity,
             .kind = e.kind,
             .owner = e.owner,
             .casts_left = e.casts_left,
             .last_action = anim,
-            .combo = slot_bufs[i][0..e.combo_len],
-            .submitted = sub_slot_bufs[i][0..e.submitted_len],
+            .selected_shape = e.selected_shape,
             .cursor_row = e.cursor_row,
             .cursor_col = e.cursor_col,
         };
@@ -190,12 +158,6 @@ fn write_render_inner(
         .score_added = te.score_added,
         .charges_left = te.charges_left,
     } else null;
-
-    // Convert pending combo slots for JSON.
-    var pending_slots_buf: [c.MAX_COMBO_LEN]JsonComboSlot = undefined;
-    for (game.pending_combo.slots[0..game.pending_combo.len], 0..) |s, i| {
-        pending_slots_buf[i] = .{ .slot = s };
-    }
 
     // The slime grid as one compact string per cell (row-major, row 0 = top),
     // so JS can index it directly as grid[row * cols + col].
@@ -257,7 +219,6 @@ fn write_render_inner(
             .encounter = game.encounter_label[0..game.encounter_label_len],
             .player_id = game.player_id,
             .casts_per_turn = game.casts_per_turn,
-            .pending_combo = pending_slots_buf[0..game.pending_combo.len],
             .turn = game.snapshot.turn,
             .tick = game.snapshot.tick,
             .entities = entities_buf[0..game.snapshot.entity_count],
@@ -414,7 +375,6 @@ const JsonGame = struct {
     player_id: u8,
     /// Casts each player gets per turn, from game_start.
     casts_per_turn: u8,
-    pending_combo: []const JsonComboSlot,
     /// The turn now being played, 1-based.
     turn: u16,
     tick: u32,
@@ -488,15 +448,12 @@ const JsonEntity = struct {
     /// Casts this player has left in the current turn.
     casts_left: u8,
     last_action: ?c.ActionAnimation,
-    /// The combo being typed right now.
-    combo: []const JsonComboSlot,
-    /// The team-recipe half this player is holding, waiting for a partner to
-    /// complete it (empty when none).  Clients preview from this in preference
-    /// to `combo`: it is what a partner would complete.
-    submitted: []const JsonComboSlot,
-    /// Where this player is aiming.  While a half is held this is the captured
-    /// ANCHOR (where the completed shape will land); otherwise it is the live
-    /// cursor.  Sent for every player so teammates can see each other's aim.
+    /// Index into the move table of the shape this player would cast.  Sent for
+    /// every player, not just the local one: seeing what a teammate has chosen
+    /// is how a group gets agreed on before anyone spends a charge.
+    selected_shape: u8,
+    /// Where this player is aiming: the live cursor, sent for every player so
+    /// teammates can see each other's aim.
     cursor_row: u8,
     cursor_col: u8,
 };

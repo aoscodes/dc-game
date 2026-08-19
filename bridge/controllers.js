@@ -10,7 +10,7 @@
  *                      CTRL:BTN <name> <D|U>   button press/release edges
  *   bridge -> board:   GAME:HELLO v=1          link request (repeated until acked)
  *                      GAME:HB                 1s keepalive
- *                      FB:COMBO <slots|->      pending-combo feedback (e-paper)
+ *                      FB:SHAPE <label|->      selected-shape feedback (e-paper)
  *
  * Unknown lines in either direction are ignored (the board emits unrelated
  * sibling-link chatter like "dev cnt=..." until the link is established).
@@ -48,32 +48,33 @@ const LINK_TIMEOUT_MS = 3000;
 const PLAYER_GRACE_MS = 30_000;
 
 // Board button -> browser KeyboardEvent.key (the Zig client's KEY: protocol).
-// D-pad = agent colors, face buttons = actions (see src/client/input.zig).
+// D-pad = aim, face buttons = shape wheel + cast (see src/client/input.zig).
+// Every value here must be one of input.zig's parse_key_name names, or the
+// Zig client silently drops the press.
 const KEY_MAP = {
-  UP: "q", // red
-  LEFT: "w", // green
-  DOWN: "e", // yellow
-  RIGHT: "r", // blue
-  A: "1", // dispense
-  B: "2", // catalyst
-  C: "Enter", // submit (realtime) / ready toggle (lobby)
-  D: "Escape", // cancel
+  UP: "ArrowUp",
+  LEFT: "ArrowLeft",
+  DOWN: "ArrowDown",
+  RIGHT: "ArrowRight",
+  A: "1", // shape wheel forward
+  B: "2", // shape wheel backward
+  C: "Enter", // cast (realtime) / ready toggle (lobby)
+  D: "Escape", // inert in game; lobby/menu back
 };
 
 /**
- * Compact pending-combo string for controller feedback: one char per slot
- * ('1' dispense, '2' catalyst, R/G/Y/B agent colors), "-" when empty.
- * Mirrors the JsonComboSlot encoding in src/client/stdout_writer.zig.
+ * Label of the move this board's player currently has selected, for the
+ * e-paper: the wheel is server-authoritative, so the render frame carries an
+ * index (`entities[own].selected_shape`) into the balance move table and the
+ * caller resolves it against that room's config.  "-" when unknown (lobby,
+ * pre-join, or a table that shrank under a stale frame).
  */
-function comboFromRender(msg) {
-  const slots = (msg.game && Array.isArray(msg.game.pending_combo))
-    ? msg.game.pending_combo : [];
-  if (slots.length === 0) return "-";
-  const colors = { red: "R", green: "G", yellow: "Y", blue: "B" };
-  return slots.map((s) => {
-    if (typeof s.action === "string") return s.action === "catalyst" ? "2" : "1";
-    return colors[s.element] || "?";
-  }).join("");
+function shapeFromRender(msg, labels) {
+  const game = msg.game;
+  if (!game || !Array.isArray(game.entities)) return "-";
+  const mine = game.entities.find((e) => e.owner === game.player_id);
+  if (!mine || typeof mine.selected_shape !== "number") return "-";
+  return labels[mine.selected_shape] ?? "-";
 }
 
 /** One physical board on a serial port. */
@@ -94,7 +95,7 @@ class Controller {
     /** Owned headless ControllerSession (board IS the player), or null. */
     this.playerSession = null;
     this.lastRxMs = 0;
-    this.lastCombo = null; // last FB:COMBO payload sent (dedupe)
+    this.lastShape = null; // last FB:SHAPE payload sent (dedupe)
     this.helloTimer = null;
     this.hbTimer = null;
     this.closed = false;
@@ -180,11 +181,11 @@ class Controller {
     // CTRL:HB and future extensions: keepalive only (lastRxMs above).
   }
 
-  /** Push combo feedback to the board's e-paper (deduped). */
-  sendCombo(combo) {
-    if (!this.linked || combo === this.lastCombo) return;
-    this.lastCombo = combo;
-    this.write(`FB:COMBO ${combo}`);
+  /** Push selected-shape feedback to the board's e-paper (deduped). */
+  sendShape(shape) {
+    if (!this.linked || shape === this.lastShape) return;
+    this.lastShape = shape;
+    this.write(`FB:SHAPE ${shape}`);
   }
 
   close() {
@@ -202,7 +203,7 @@ class Controller {
 
 /**
  * A headless player owned by a hardware controller: dedicated Zig client in
- * a room, no browser. Render frames drive the board's combo feedback.
+ * a room, no browser. Render frames drive the board's shape feedback.
  */
 class ControllerSession extends PlayerSession {
   /**
@@ -242,7 +243,11 @@ class ControllerSession extends PlayerSession {
 
   onZigFrame(msg, _line) {
     if (msg.tag === "render") {
-      if (this.controller !== null) this.controller.sendCombo(comboFromRender(msg));
+      if (this.controller !== null) {
+        this.controller.sendShape(
+          shapeFromRender(msg, this.manager.moveLabels(this.room.configHash)),
+        );
+      }
     } else {
       console.warn(`[bridge] unknown Zig frame tag (${this.label}):`, msg.tag);
     }
@@ -314,8 +319,11 @@ class ControllerManager {
    * @param {(room: object) => void} hooks.roomJoined  occupancy up
    * @param {(room: object) => void} hooks.roomLeft    occupancy down
    * @param {(room: object) => boolean} hooks.isRoomAlive
+   * @param {(configHash: string | null) => string[]} hooks.moveLabels  move
+   *   labels in balance-file order for a room's config (index space of
+   *   `selected_shape`)
    */
-  constructor({ clientBin, getSessions, onKey, pickRoom, roomJoined, roomLeft, isRoomAlive }) {
+  constructor({ clientBin, getSessions, onKey, pickRoom, roomJoined, roomLeft, isRoomAlive, moveLabels }) {
     this.clientBin = clientBin;
     this.getSessions = getSessions;
     this.onKey = onKey;
@@ -323,6 +331,7 @@ class ControllerManager {
     this.roomJoined = roomJoined;
     this.roomLeft = roomLeft;
     this.isRoomAlive = isRoomAlive;
+    this.moveLabels = moveLabels;
     /** @type {Map<string, Controller>} port path -> controller */
     this.controllers = new Map();
     /** @type {Map<string, object>} uid -> TabSession (sticky tab pairing) */
@@ -421,9 +430,9 @@ class ControllerManager {
     session.controller = ctrl;
     this.uidToSession.set(ctrl.uid, session);
     this.uidToPlayer.delete(ctrl.uid); // pairing modes are exclusive per uid
-    // Force a fresh combo push for the new pairing.
-    ctrl.lastCombo = null;
-    ctrl.sendCombo("-");
+    // Force a fresh shape push for the new pairing.
+    ctrl.lastShape = null;
+    ctrl.sendShape("-");
     console.log(`[ctrl] paired uid=${ctrl.uid} to a tab session`);
   }
 
@@ -439,7 +448,7 @@ class ControllerManager {
     ctrl.playerSession = player;
     this.uidToPlayer.set(ctrl.uid, player);
     this.uidToSession.delete(ctrl.uid); // pairing modes are exclusive per uid
-    ctrl.lastCombo = null;
+    ctrl.lastShape = null;
     player.start();
     console.log(`[ctrl] uid=${ctrl.uid} joined room ${room.code} as ${name}`);
   }
@@ -496,4 +505,4 @@ class ControllerManager {
   }
 }
 
-module.exports = { ControllerManager, ControllerSession, comboFromRender };
+module.exports = { ControllerManager, ControllerSession, shapeFromRender };

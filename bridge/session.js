@@ -12,7 +12,7 @@
  *                                        browser (and a paired controller)
  *   - ControllerSession (controllers.js) headless hardware-controller player:
  *                                        no browser, render frames feed the
- *                                        board's e-paper combo feedback
+ *                                        board's e-paper shape feedback
  *
  * Stdio protocol with the Zig client (see README):
  *   stdin  <- WIRE:<hex>\n  raw server bytes    stdin <- KEY:<name>\n

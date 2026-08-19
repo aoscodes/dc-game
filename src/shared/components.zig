@@ -37,18 +37,13 @@
 //! hazard it covers.  Cells outside the grid or holding nothing to neutralize
 //! are wasted, which is the player's aiming feedback.
 //!
-//! ## Combo slot model
+//! ## Move selection model
 //!
-//! A combo is a sequence of up to MAX_COMBO_LEN `ComboSlot` values, each an
-//! `ActionChoice` (dispense/catalyst).  The sequence is a NAME: it is matched
-//! exactly against the recipe tables (player/team, loaded from
-//! data/balance.json — see config.zig) to find the shape it stamps and the
-//! charges it costs.  There is no flat fallback — an unmatched combo fizzles,
-//! so the recipe tables are the complete move list.
-//!
-//! The two tokens are interchangeable as far as the rules go: they exist to
-//! give recipes distinguishable NAMES, not distinguishable effects.  Every
-//! effect a cast has comes from the recipe it names.
+//! There is no input alphabet to learn: the move list (balance.player_recipes)
+//! is a CYCLE, each player has exactly one move selected in it, and the two
+//! buttons step that selection forward and backward.  A selection is therefore
+//! just an index, always valid, and a cast is always a legal move — the only
+//! way to fail is being unable to pay for it.
 
 const std = @import("std");
 
@@ -75,23 +70,11 @@ pub const Owner = struct {
     player_id: u8,
 };
 
-/// Player actions — the whole combo alphabet.  A combo is a sequence of these
-/// tokens; which SHAPE it stamps is decided by matching the sequence against
-/// the recipe tables (see balance.Shape).  There are no element/color tokens:
-/// a cast's power is its shape, and a cell's color is its difficulty.
-///
-/// Both tokens are pure NAMING alphabet: neither has an effect of its own, and
-/// swapping them in a recipe's pattern changes only which key sequence casts
-/// it.  Two tokens rather than one so recipes can differ by CONTENT instead of
-/// only by length.
-///
-///   dispense — the Neutralizing Agent tap.
-///   catalyst — the second reagent tap.
-pub const ActionChoice = enum(u8) {
-    dispense = 0,
-    catalyst = 1,
-
-    pub const size = @typeInfo(ActionChoice).@"enum".fields.len;
+/// Which way a button steps the move selection through the move cycle.  The
+/// wheel wraps in both directions, so neither end is a dead stop.
+pub const CycleDir = enum(u8) {
+    forward = 0,
+    backward = 1,
 };
 
 /// Slime DIFFICULTY, not slime type: how many Neutralizing Agent applications
@@ -115,37 +98,6 @@ pub const Tier = enum(u8) {
         return @enumFromInt(next);
     }
 };
-
-/// One slot in a combo.  A single-field union rather than a bare
-/// `ActionChoice` so the wire format and the recipe tables keep room for
-/// future slot kinds without another protocol break.
-/// Wire encoding: action = raw ActionChoice value (0x00–0x01).
-pub const ComboSlot = union(enum) {
-    action: ActionChoice,
-};
-
-pub const MAX_COMBO_LEN: u8 = 5;
-
-/// An ordered sequence of 1–MAX_COMBO_LEN action tokens submitted by a player.
-/// The sequence is a NAME, matched exactly against the recipe tables to find
-/// the shape it stamps; an unmatched sequence fizzles.  See
-/// `game_logic.match_recipes`.
-pub const ActionCombo = struct {
-    slots: [MAX_COMBO_LEN]ComboSlot,
-    len: u8, // 1..MAX_COMBO_LEN
-};
-
-/// Build an ActionCombo from a slice of slots (must be 1..MAX_COMBO_LEN).
-/// Unused trailing slots are padded with a harmless dispense action.
-pub fn make_combo(slots: []const ComboSlot) ActionCombo {
-    std.debug.assert(slots.len >= 1 and slots.len <= MAX_COMBO_LEN);
-    var combo = ActionCombo{
-        .slots = [_]ComboSlot{.{ .action = .dispense }} ** MAX_COMBO_LEN,
-        .len = @intCast(slots.len),
-    };
-    @memcpy(combo.slots[0..slots.len], slots);
-    return combo;
-}
 
 /// Upper bounds on the slime grid (wire + array sizing).  The config loader
 /// rejects `slime_grid` dimensions exceeding these.

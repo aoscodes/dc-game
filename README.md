@@ -113,9 +113,9 @@ Until you have a domain, the game is playable over plain `http://`.
 
 All designer-tunable data lives in two JSON files:
 
-- `data/balance.json` — conversion rates, hunger costs, casts per round,
-  default round duration, and the player/team recipe
-  tables (patterns are slot-name lists: `"red"`, `"dispense"`, ...).
+- `data/balance.json` — conversion rates, hunger costs, casts per turn, and the
+  move + group tables (a move has a `shape` and a `cost`; a group names its
+  component moves by label, e.g. `"moves": ["poke","sweep"]`).
 - `data/encounters.json` — encounters (zones, slime amounts per color,
   hunger budget) plus which encounter is the default.
 
@@ -126,14 +126,14 @@ lobby, so **editing the JSON takes effect on the next lobby created; no
 rebuild or bridge restart needed**.  Invalid files fail loudly at server
 start with the exact field and reason; unknown fields are rejected so typos
 can't silently default.  Caps enforced by the loader: 64 recipes per table,
-16 zones per encounter, combo patterns ≤ 5 slots.
+16 zones per encounter, group components 2..6 (each an existing move label).
 `server --data-dir <dir> --validate` checks a data dir and exits.
 
 ### /tune — in-browser config editor
 
 Open **`/tune`** for a form with every knob: rates/costs, casts per round,
-round duration, player/team recipes (add/remove recipes,
-pattern slots, per-color outputs) and the encounter (add/remove rounds,
+round duration, moves and groups (add/remove, paint shapes, pick a group's
+component moves) and the encounter (add/remove rounds,
 per-color slime, hunger budget).  Saving POSTs to `/api/tune/save`:
 
 - The bridge content-addresses the config (`sha256` prefix) into
@@ -154,17 +154,21 @@ Saved configs are never garbage-collected (tiny JSON dirs).
 | ------- | ------------ |
 | `Enter` | Toggle ready |
 
-**Rounds (combo composition)**
+**Turns (shape wheel)**
 
-Each round (shared countdown timer) every player composes one combo — latest
-cast wins, `Esc` cancels:
+Each player has a fixed budget of casts per turn.  A move is picked off a
+**shape wheel** — the move table in file order — and cast at the aimed square:
 
-| Key                       | Action                                        |
-| ------------------------- | --------------------------------------------- |
-| `1`                       | Dispense (Neutralizing Agent of current color) |
-| `2`                       | Medicine (heals the Hunger bar)                |
-| `Q` / `W` / `E` / `R`     | Agent color: red / green / yellow / blue       |
-| `Escape`                  | Cancel combo                                   |
+| Key                   | Action                                       |
+| --------------------- | -------------------------------------------- |
+| `1`                   | Shape wheel: next move                       |
+| `2`                   | Shape wheel: previous move                   |
+| `Enter`               | Cast the selected move at the cursor         |
+| `← ↑ ↓ →`             | Aim the cursor                               |
+
+Selection is **server-authoritative** and persists across casts and turns
+(there is no client-side selection state to disagree with the server), so
+every player's current pick is visible to the whole team.
 
 At round end the current zone is consumed in its entirety:
 
@@ -174,9 +178,10 @@ At round end the current zone is consumed in its entirety:
   hunger, and only that extra portion is healable by Medicine.
 - Score += neutralized + naturally-neutral units.
 
-Exact combos can match **recipes** (`data/balance.json`) that replace the
-flat per-slot conversion — including **team recipes** matched across multiple
-players' combos in the same round (e.g. `twin_flames`).
+Casting also composes: when 2+ **distinct** players cast a **group**'s
+component moves on the **same square** within one turn, the group fires at the
+completing player's square, for the group's cost, and consumes its whole bag —
+contributors included, so a grouped cast is not also billed as a solo move.
 
 The encounter ends when all zones are consumed or the Hunger bar fills; the
 final shared score is broadcast either way.
@@ -193,7 +198,7 @@ data/        designer-tunable JSON: balance + recipes + encounters
 e2e/         Zig bot e2e (src/e2e/)
 ```
 
-All game logic runs on the server. Clients send inputs only (`JoinLobby`, `ReadyUp`, `ChooseCombo`, `CancelCombo`, `Reconnect`). The server broadcasts `LobbyUpdate`, `GameState` snapshots, `RoundReset`, `ActionResult`, `GameOver` (final score).
+All game logic runs on the server. Clients send inputs only (`JoinLobby`, `ReadyUp`, `MoveCursor`, `CycleShape`, `Cast`, `Reconnect`). The server broadcasts `LobbyUpdate`, `GameState` snapshots (each entity carries its `selected_shape`), `RoundReset`, `ActionResult`, `GameOver` (final score).
 
 Wire protocol is binary, little-endian, no allocations on the hot path. See `src/shared/protocol.zig`.
 
@@ -211,9 +216,10 @@ Stdio protocol between client and bridge:
 ### Hardware controllers
 
 The bridge also discovers dc_rp2040 boards over USB serial
-(`bridge/controllers.js`). Buttons map to the same `KEY:` path (d-pad =
-Q/W/E/R colors, A=`1`, B=`2`, C=`Enter`, D=`Escape`) and the pending combo is
-mirrored back to the board's e-paper via `FB:COMBO`.
+(`bridge/controllers.js`). Buttons map to the same `KEY:` path (d-pad = aim
+arrows, A=`1` wheel forward, B=`2` wheel back, C=`Enter` cast/ready,
+D=`Escape`) and the selected move's label is mirrored back to the board's
+e-paper via `FB:SHAPE`.
 
 Hybrid player model: a linked board first pairs with the oldest started tab
 session lacking a controller (it drives that tab's player); when no tab is
@@ -229,8 +235,8 @@ src/
   root.zig               ECS core (Austin Morlan-style, comptime)
   shared/
     shared.zig           module root
-    components.zig       component types + combo/zone/agent model
-    game_logic.zig       combo parsing, recipe matching, zone/hunger resolution
+    components.zig       component types + wheel/zone/agent model
+    game_logic.zig       wheel cycling, group matching, zone/hunger resolution
     balance.zig          balance/recipe types (values in data/balance.json)
     config.zig           data-file loader: JSON parse + validation
     fixtures.zig         frozen fixture config for tests
@@ -241,7 +247,7 @@ src/
   client/
     main.zig             entry point, ClientState, stdin reader, game loop
     stdout_writer.zig    JSON render/send frame serialiser
-    input.zig            key name → combo slot mapping
+    input.zig            key name → cursor step / wheel turn / cast
   server/
     main.zig             server entry point
     session.zig          Session: lobby, round timer, zone resolution, broadcasts

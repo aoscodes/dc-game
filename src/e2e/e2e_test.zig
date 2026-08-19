@@ -16,7 +16,6 @@ const std = @import("std");
 const ws = @import("websocket");
 const shared = @import("shared");
 const proto = shared.protocol;
-const c = shared.components;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -329,8 +328,6 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                 ctx.result.max_turn = @max(ctx.result.max_turn, gs.turn);
 
                 // Track our own cursor and budget as the server reports them.
-                // A HELD team half is reported at its captured ANCHOR, so this
-                // also proves anchors are snapshotted.
                 for (gs.entities[0..gs.entity_count]) |e| {
                     if (e.owner != my_player_id) continue;
                     ctx.result.max_cursor_col =
@@ -339,23 +336,20 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                         @min(ctx.result.min_casts_left, @as(u16, e.casts_left));
                 }
 
-                // Submit every frame: casts resolve immediately, and submits
-                // past the budget are harmlessly ignored, so the bots simply
-                // spend their whole allowance as fast as the server will take
-                // it.  Aim first, then cast: the server captures the cursor at
-                // SUBMIT time, so the walk must land before the submit.
+                // Cast every frame: casts resolve immediately, and casts past
+                // the budget are harmlessly ignored, so the bots simply spend
+                // their whole allowance as fast as the server will take it.
+                // Aim first, then cast: the server captures the cursor when the
+                // cast is accepted, so the walk must land before the trigger.
                 // Clamping makes the sweep safe to run forever — a bot that
                 // reaches the edge simply stops advancing.
                 for (0..AIM_STEPS_PER_CAST) |_| {
                     try send_move_cursor(&client, ctx.sweep);
                 }
-                // Both bots submit the twin_bloom half, so the team recipe
-                // fires and stamps its big diamond; unpaired casts still land
-                // as the solo `sweep` recipe.
-                try send_submit(&client, c.make_combo(&.{
-                    .{ .action = .dispense },
-                    .{ .action = .catalyst },
-                }));
+                // Both bots leave the wheel on move 0 (`poke`), so wherever
+                // their sweeps cross they complete a group; everywhere else the
+                // poke lands on its own.
+                try send_cast(&client);
             },
 
             .action_result => {
@@ -430,11 +424,11 @@ fn send_ready_up(client: *ws.Client) !void {
     try client.writeBin(fbs.getWritten());
 }
 
-/// Submit a spell for real (choose_combo is only the live preview).
-fn send_submit(client: *ws.Client, combo: c.ActionCombo) !void {
-    var buf: [16]u8 = undefined;
+/// Fire whatever the server has selected, wherever the server has us aiming.
+fn send_cast(client: *ws.Client) !void {
+    var buf: [2]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    try proto.encode(fbs.writer(), .submit_spell, proto.SubmitSpell{ .combo = combo });
+    try proto.encode(fbs.writer(), .cast, {});
     try client.writeBin(fbs.getWritten());
 }
 

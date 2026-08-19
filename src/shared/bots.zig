@@ -7,9 +7,15 @@
 //!
 //! ## Concepts
 //!
-//! `Profile`   — a repeating combo sequence plus an optional repeating aim
-//!               sequence; on cycle r the bot steps aim[r % aim.len] then
-//!               submits combos[r % combos.len].  Shared across bots.
+//! `Profile`   — a repeating sequence of move LABELS plus an optional repeating
+//!               aim sequence; on cycle r the bot steps aim[r % aim.len], turns
+//!               its shape wheel to moves[r % moves.len], and casts.  Shared
+//!               across bots.
+//!
+//! Moves are named by LABEL, not by table index, for the same reason groups are
+//! (see balance.zig): a profile keeps meaning the same move when the table is
+//! reordered.  The harness resolves the label against the loaded config and
+//! rejects a profile naming a move that config does not have.
 //!
 //! `BotEntry`  — one slot in a BotTeam: profile + display name.
 //!
@@ -20,18 +26,13 @@
 //! Append a new `pub const profile_*` or `pub const team_*` below.
 //! No other file needs to change.
 
-const c = @import("components.zig");
 const protocol = @import("protocol.zig");
-
-const mk = c.make_combo;
-
-const D = c.ComboSlot{ .action = .dispense };
-const M = c.ComboSlot{ .action = .catalyst };
 
 pub const Profile = struct {
     label: []const u8,
-    combos: []const c.ActionCombo,
-    /// Cursor steps taken BEFORE each cast, cycled the same way as `combos`.
+    /// Move labels to cast, one per cycle, repeating.
+    moves: []const []const u8,
+    /// Cursor steps taken BEFORE each cast, cycled the same way as `moves`.
     /// A bot that never aims stays wherever it spawned, which is a legitimate
     /// (if bad) strategy — so this defaults to empty rather than being
     /// required.
@@ -41,6 +42,11 @@ pub const Profile = struct {
     pub fn aim_for(self: *const Profile, n: usize) []const protocol.CursorDir {
         if (self.aim.len == 0) return &.{};
         return self.aim[n % self.aim.len];
+    }
+
+    /// Label of the move this profile casts on cycle `n`.
+    pub fn move_for(self: *const Profile, n: usize) []const u8 {
+        return self.moves[n % self.moves.len];
     }
 };
 
@@ -57,7 +63,7 @@ pub const BotTeam = struct {
 /// Pokes a single cell, never moving: the minimum viable player.
 pub const profile_poker = Profile{
     .label = "poker",
-    .combos = &[_]c.ActionCombo{mk(&.{D})},
+    .moves = &.{"poke"},
 };
 
 /// Walks LEFT one cell per cast, stamping 3x3 blocks — the field-clearing
@@ -67,7 +73,7 @@ pub const profile_poker = Profile{
 /// is precisely where a cast is worth the most.
 pub const profile_sweeper = Profile{
     .label = "sweeper",
-    .combos = &[_]c.ActionCombo{mk(&.{ D, D, D })},
+    .moves = &.{"block"},
     .aim = &.{&.{ .left, .left, .left }},
 };
 
@@ -75,27 +81,25 @@ pub const profile_sweeper = Profile{
 /// the field: it opens the door, drops a row, and opens it again.
 pub const profile_snake = Profile{
     .label = "snake",
-    .combos = &[_]c.ActionCombo{
-        mk(&.{ D, D }),
-        mk(&.{ D, D, D }),
-    },
+    .moves = &.{ "sweep", "block" },
     .aim = &.{
         &.{ .left, .left, .left },
         &.{ .down, .right, .right },
     },
 };
 
-/// Casts nothing but the all-catalyst combo: exercises the cheap-recipe path
-/// and, in a config where that combo matches nothing, the pure fizzle path.
-pub const profile_catalyst = Profile{
-    .label = "catalyst",
-    .combos = &[_]c.ActionCombo{mk(&.{ M, M })},
+/// Casts nothing but the FREE move: exercises the zero-cost path, and proves a
+/// team with an empty pool can still act.
+pub const profile_trickle = Profile{
+    .label = "trickle",
+    .moves = &.{"trickle"},
 };
 
-/// One half of the twin_bloom team recipe, every cycle.
+/// Pokes without ever aiming, so two of these converge on the same square and
+/// complete `twin_bloom` — the minimal cooperating pair.
 pub const profile_twin_bloom = Profile{
     .label = "twin_bloom",
-    .combos = &[_]c.ActionCombo{mk(&.{ D, M })},
+    .moves = &.{"poke"},
 };
 
 pub const team_bloom_pair = BotTeam{
@@ -110,7 +114,7 @@ pub const team_mixed = BotTeam{
     .label = "team_mixed",
     .bots = &[_]BotEntry{
         .{ .name = "Snake", .profile = &profile_snake },
-        .{ .name = "Catalyst", .profile = &profile_catalyst },
+        .{ .name = "Trickle", .profile = &profile_trickle },
         .{ .name = "Sweeper", .profile = &profile_sweeper },
     },
 };

@@ -1,10 +1,17 @@
 //! Bot test harness: injects bots into PlayerSlots in place of real clients.
 //!
-//! Each bot is driven by a `Profile` (a repeating combo sequence, plus an
-//! optional repeating aim sequence, from bots.zig). On every cast cycle the
-//! harness encodes the bot's cursor steps as `move_cursor` messages and its
-//! next combo as a `submit_spell`, enqueueing both into the session — exactly
-//! replicating what a real WebSocket client would send.
+//! Each bot is driven by a `Profile` (a repeating sequence of move labels, plus
+//! an optional repeating aim sequence, from bots.zig). On every cast cycle the
+//! harness encodes the bot's cursor steps as `move_cursor` messages, the turns
+//! of its shape wheel as `cycle_shape` messages, and the trigger as a `cast`,
+//! enqueueing them into the session — exactly replicating what a real WebSocket
+//! client would send.
+//!
+//! Selection is server-side state, so the harness cannot simply assign it: it
+//! must steer the wheel the way a player does.  `inject_select` computes the
+//! shortest run of forward or backward steps from the session's CURRENT
+//! selection to the one the profile wants, which is both fewer messages and a
+//! genuine exercise of the cycling code.
 //!
 //! A "cycle" is one submit per bot, drained in a single tick.  Casts resolve as
 //! they are accepted, so a cycle is exactly one round of casting — NOT a turn.
@@ -15,7 +22,7 @@
 //!
 //!   var h = try BotHarness.init(allocator, &bots.team_mixed, encounter, "BOTKEY".*, .{});
 //!   defer h.deinit();
-//!   // advance one cast cycle (inject combos + drain them):
+//!   // advance one cast cycle (aim, turn the wheel, cast, drain):
 //!   try h.step();
 //!   // check game state via h.session ...
 
@@ -87,7 +94,8 @@ pub const BotHarness = struct {
     /// Asserts:
     ///   - team.bots.len >= 1
     ///   - team.bots.len <= MAX_PLAYERS
-    ///   - every profile has at least one combo
+    ///   - every profile names at least one move
+    ///   - every move a profile names exists in the fixture config
     pub fn init(
         allocator: std.mem.Allocator,
         team: *const bots.BotTeam,
@@ -97,7 +105,12 @@ pub const BotHarness = struct {
     ) !BotHarness {
         std.debug.assert(team.bots.len >= 1);
         std.debug.assert(team.bots.len <= session_mod.MAX_PLAYERS);
-        for (team.bots) |b| std.debug.assert(b.profile.combos.len >= 1);
+        for (team.bots) |b| {
+            std.debug.assert(b.profile.moves.len >= 1);
+            // A typo'd label would otherwise surface as a bot silently casting
+            // move 0 forever, which reads as a balance result rather than a bug.
+            for (b.profile.moves) |label| std.debug.assert(move_index(label) != null);
+        }
 
         const bot_states = try allocator.alloc(BotState, team.bots.len);
         errdefer allocator.free(bot_states);
@@ -132,22 +145,46 @@ pub const BotHarness = struct {
         self.allocator.free(self.bot_states);
     }
 
-    /// Enqueue each bot's cast for this cycle as a `submit_spell`.
-    /// Call this before the tick that drains them, or use step() which does
-    /// both.
+    /// Enqueue each bot's trigger for this cycle as a `cast`.
+    /// Call this after inject_select (or use step(), which orders them), or the
+    /// bot fires whatever its wheel happened to be left on.
     pub fn inject_actions(self: *BotHarness) !void {
-        try self.inject_tag(.submit_spell);
+        for (self.bot_states) |*bs| {
+            var buf: [4]u8 = undefined;
+            var fbs = std.io.fixedBufferStream(&buf);
+            try proto.encode(fbs.writer(), .cast, {});
+            self.session.enqueue_message(bs.player_id, fbs.getWritten());
+        }
     }
 
-    /// Enqueue each bot's combo as a live preview (`choose_combo`), which
-    /// lands in `session.action_pool` without committing a cast.
-    pub fn inject_previews(self: *BotHarness) !void {
-        try self.inject_tag(.choose_combo);
+    /// Turn every bot's shape wheel to the move its profile wants this cycle.
+    ///
+    /// Steps whichever way is shorter; a bot already on its move sends nothing.
+    /// This is a preview in its own right: selection is broadcast, so a client
+    /// watching sees the choice without a cast being committed.
+    pub fn inject_select(self: *BotHarness) !void {
+        const moves = BAL.player_recipes.len;
+        for (self.bot_states) |*bs| {
+            const want = move_index(bs.profile.move_for(self.cycle)) orelse continue;
+            const have = self.session.selected[bs.player_id];
+            if (want == have) continue;
+            // Distance each way round the ring; ties go forward.
+            const fwd = (@as(usize, want) +% moves -% have) % moves;
+            const back = moves - fwd;
+            const dir: c.CycleDir = if (fwd <= back) .forward else .backward;
+            const steps = @min(fwd, back);
+            for (0..steps) |_| {
+                var buf: [4]u8 = undefined;
+                var fbs = std.io.fixedBufferStream(&buf);
+                try proto.encode(fbs.writer(), .cycle_shape, proto.CycleShape{ .dir = dir });
+                self.session.enqueue_message(bs.player_id, fbs.getWritten());
+            }
+        }
     }
 
     /// Enqueue this cycle's cursor steps for every bot, so their next cast
-    /// lands somewhere new.  Aiming is a separate input axis from the combo,
-    /// so this is separable from inject_actions.
+    /// lands somewhere new.  Aiming is a separate input axis from the wheel, so
+    /// this is separable from inject_select and inject_actions.
     pub fn inject_aim(self: *BotHarness) !void {
         for (self.bot_states) |*bs| {
             for (bs.profile.aim_for(self.cycle)) |dir| {
@@ -159,31 +196,10 @@ pub const BotHarness = struct {
         }
     }
 
-    fn inject_tag(self: *BotHarness, tag: proto.MsgTag) !void {
-        for (self.bot_states) |*bs| {
-            const combo = bs.profile.combos[self.cycle % bs.profile.combos.len];
-            var buf: [16]u8 = undefined;
-            var fbs = std.io.fixedBufferStream(&buf);
-            switch (tag) {
-                .submit_spell => try proto.encode(
-                    fbs.writer(),
-                    .submit_spell,
-                    proto.SubmitSpell{ .combo = combo },
-                ),
-                .choose_combo => try proto.encode(
-                    fbs.writer(),
-                    .choose_combo,
-                    proto.ChooseCombo{ .combo = combo },
-                ),
-                else => unreachable,
-            }
-            self.session.enqueue_message(bs.player_id, fbs.getWritten());
-        }
-    }
-
     /// Advance the session by exactly one cast cycle:
-    ///   1. inject_aim() then inject_actions() for every bot — aim first, so
-    ///      the cast is anchored at this cycle's new cursor
+    ///   1. inject_aim(), inject_select(), then inject_actions() for every bot
+    ///      — aim and wheel first, so the cast fires this cycle's move at this
+    ///      cycle's cursor
     ///   2. tick() so the queue drains and every cast resolves
     ///
     /// If that drain exhausts every bot's budget, the session ends the turn
@@ -192,6 +208,7 @@ pub const BotHarness = struct {
     /// Increments self.cycle afterwards.
     pub fn step(self: *BotHarness) !void {
         try self.inject_aim();
+        try self.inject_select();
         try self.inject_actions();
         try self.session.tick(0.0);
         self.cycle += 1;
@@ -208,6 +225,16 @@ pub const BotHarness = struct {
         return r;
     }
 };
+
+/// Fixture-table index of a move label, or null if the fixture has no such
+/// move.  Bots name moves by label (see bots.zig), and this is the one place
+/// that mapping happens.
+fn move_index(label: []const u8) ?u8 {
+    for (BAL.player_recipes, 0..) |r, i| {
+        if (std.mem.eql(u8, r.label, label)) return @intCast(i);
+    }
+    return null;
+}
 
 /// Sum a per-tier stats array.
 fn tier_total(values: [c.Tier.size]u16) u32 {
@@ -346,13 +373,14 @@ test "mixed team makes real progress on the default encounter" {
 }
 
 test "profile cycles correctly across cast cycles" {
-    // Verify a multi-combo profile cycles through its combos cycle by cycle.
+    // Verify a multi-move profile walks its wheel to a different move each
+    // cycle, and that the harness's shortest-path steering actually lands on
+    // the move the profile named.
     //
     // Injection flow: enqueue_message() places bytes in the slot's msg_queue.
     // The session only drains msg_queue during tick() via drain_queues(), so
-    // action_pool is populated only after a tick call.  `choose_combo` is a
-    // preview, not a cast, so no budget is spent and no turn can end — the
-    // previews stay observable.
+    // `selected` only changes after a tick call.  Selecting is not casting, so
+    // no budget is spent and no turn can end — the choices stay observable.
     const allocator = std.testing.allocator;
 
     const snake_team = bots.BotTeam{
@@ -372,16 +400,16 @@ test "profile cycles correctly across cast cycles" {
     var h = try BotHarness.init(allocator, &snake_team, &big_field, "BOTKEY".*, .{});
     defer h.deinit();
 
+    const pid = h.bot_states[0].player_id;
     for (0..5) |i| {
-        const expected = bots.profile_snake.combos[i % bots.profile_snake.combos.len];
-        try h.inject_previews();
+        const want = bots.profile_snake.move_for(i);
+        try h.inject_select();
         try h.session.tick(0.0);
-        const pid = h.bot_states[0].player_id;
-        const got = h.session.action_pool[pid] orelse return error.NoAction;
-        try std.testing.expect(shared.game_logic.combos_equal(expected, got));
+        const got = BAL.player_recipes[h.session.selected[pid]].label;
+        try std.testing.expectEqualStrings(want, got);
         h.cycle += 1;
     }
-    // Previews only: no cast was ever committed, so no turn ended and the
+    // Selection only: no cast was ever committed, so no turn ended and the
     // field is untouched.
     try std.testing.expectEqual(session_mod.SessionPhase.playing, h.session.phase);
     try std.testing.expectEqual(@as(u32, 6), h.session.field.remaining());
@@ -427,9 +455,10 @@ test "aim injection walks the cursor and anchors casts where the bot aimed" {
     try std.testing.expectEqual(grid.row_of(start), grid.row_of(parked));
 }
 
-test "a submitted cast is anchored where the bot aimed, not where it ends up" {
-    // The cast_anchors snapshot exists so a spell resolves at the cursor as it
-    // was WHEN SUBMITTED, even if later messages in the same drain move it.
+test "a cast lands where the bot aimed, not where it ends up" {
+    // A cast captures the cursor when it is ACCEPTED, so a spell resolves where
+    // the player was pointing even if later messages in the same drain move
+    // them.
     const allocator = std.testing.allocator;
 
     const solo = bots.BotTeam{
@@ -459,7 +488,6 @@ test "a submitted cast is anchored where the bot aimed, not where it ends up" {
     }
     try h.session.tick(0.0);
 
-    try std.testing.expectEqual(aimed, h.session.cast_anchors[pid]);
     try std.testing.expect(h.session.cursors[pid] != aimed);
 
     // `poke` is 1x1 and the field is all-green, so the stamp downgraded

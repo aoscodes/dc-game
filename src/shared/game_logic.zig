@@ -1,17 +1,16 @@
 //! Pure resolution logic for the Slime Feast encounter: everything that maps
 //! player CASTS onto game effects.
 //!
-//! Cast pipeline (driven by session.resolve_cast, once per batch of casts that
-//! resolve together):
-//!   1. `match_recipes`   — resolve the batch's casts into the SHAPES to stamp,
-//!                          each with the player whose cursor anchors it and
-//!                          the CHARGES it costs.  Team recipes → player
-//!                          recipes; team recipes need distinct players in the
-//!                          SAME batch.  Unmatched casts produce nothing.
-//!   2. the session checks the shared charge pool can afford `cost` and debits
-//!      it; a stamp the pool cannot pay for never happens.
-//!   3. each affordable shape is handed to `slime.SlimeField.apply_shape` at
-//!      its caster's aimed cursor, which owns all slime state.
+//! Cast pipeline (driven by session.handle_cast, once per cast):
+//!   1. `complete_group` — ask whether this cast, together with the casts
+//!      already made on the same square this turn, completes a GROUP move.  If
+//!      it does the cast is upgraded: it stamps the group's shape and pays the
+//!      group's price instead of its own.
+//!   2. the session checks the shared charge pool can afford the chosen stamp
+//!      and debits it; a stamp the pool cannot pay for never happens.  An
+//!      unaffordable group falls back to the plain move.
+//!   3. the shape is handed to `slime.SlimeField.apply_shape` at the caster's
+//!      aimed cursor, which owns all slime state.
 //!
 //! All functions here are pure/deterministic and unit-testable without a
 //! session.  Slime-field mutation lives in `slime.zig`; hunger/score
@@ -22,206 +21,158 @@ const c = @import("components.zig");
 const balance = @import("balance.zig");
 
 // ---------------------------------------------------------------------------
-// Combo → shapes
+// Selection
 // ---------------------------------------------------------------------------
 
-/// Exact structural equality: same length, same slots in the same order.
-pub fn combos_equal(a: c.ActionCombo, b: c.ActionCombo) bool {
-    if (a.len != b.len) return false;
-    for (a.slots[0..a.len], b.slots[0..b.len]) |x, y| {
-        if (!std.meta.eql(x, y)) return false;
-    }
-    return true;
+/// Step a selection one slot around the move cycle, wrapping at both ends.
+/// `len` is the loaded move count and must be non-zero (config.zig rejects an
+/// empty table, since a player with nothing selected could never cast).
+pub fn cycle_selection(current: u8, dir: c.CycleDir, len: usize) u8 {
+    std.debug.assert(len > 0);
+    const n: u8 = @intCast(len);
+    // A selection can outlive the table it indexed (a lobby reloading a smaller
+    // custom config), so clamp before stepping rather than trusting it.
+    const at: u8 = if (current >= n) 0 else current;
+    return switch (dir) {
+        .forward => if (at + 1 >= n) 0 else at + 1,
+        .backward => if (at == 0) n - 1 else at - 1,
+    };
 }
 
-/// True if committing this combo could produce ANY effect: it exactly matches
-/// a player recipe, or any single pattern of a team recipe (the partner may
-/// commit in the same window).  Since there is no flat fallback, the recipe
-/// tables are the complete move list, and a combo naming no recipe FIZZLES
-/// instead of committing — so a mistyped sequence never wastes a cast.
-pub fn combo_has_output(bal: *const balance.Balance, combo: c.ActionCombo) bool {
-    for (bal.player_recipes) |pr| {
-        if (combos_equal(combo, pr.pattern)) return true;
-    }
-    for (bal.team_recipes) |tr| {
-        for (tr.patterns) |pattern| {
-            if (combos_equal(combo, pattern)) return true;
-        }
-    }
-    return false;
-}
+// ---------------------------------------------------------------------------
+// Casts → shapes
+// ---------------------------------------------------------------------------
 
-/// One committed spell: the combo plus its caster (recipes that span players
-/// must be cast by distinct players).
-pub const Cast = struct {
+/// One cast already made this turn: who cast what, and where it landed.
+/// Group moves are found among these (see `complete_group`).
+pub const TurnCast = struct {
     player_id: u8,
-    combo: c.ActionCombo,
+    /// Index into balance.player_recipes — the move that was cast.
+    move: u8,
+    /// Flat grid index the cast was anchored at.
+    square: u16,
 };
 
-/// Maximum casts per round == max players × casts each; sized for the
-/// consumed-flag arrays.
+/// Cap on the per-turn cast log: max players × casts each, with headroom.
 pub const MAX_CASTS: usize = 64;
 
-/// How a cast was converted during recipe matching.
-pub const ConsumedBy = enum(u8) { none, player_recipe, team_recipe };
+/// A group move completed by the cast under consideration.
+pub const GroupHit = struct {
+    /// Index into balance.team_recipes.
+    recipe_index: u8,
+    /// Indices into the `priors` slice: the earlier casts this group consumed.
+    /// They have already stamped and paid; the session marks them spent so a
+    /// single cast cannot be counted into two groups.
+    consumed: [balance.MAX_TEAM_COMPONENTS]u8 =
+        [_]u8{0} ** balance.MAX_TEAM_COMPONENTS,
+    consumed_len: u8 = 0,
 
-/// team_instance value for casts not consumed by a team recipe.
-pub const NO_TEAM_INSTANCE: u8 = 0xFF;
-
-/// Per-round recipe-matching report for tuning stats.  Hit arrays are sized
-/// by the wire caps; entries beyond the loaded table lengths stay zero.
-pub const MatchReport = struct {
-    /// Fire count per loaded player-recipe entry (table order).
-    player_hits: [balance.MAX_PLAYER_RECIPES]u16 =
-        [_]u16{0} ** balance.MAX_PLAYER_RECIPES,
-    /// Fire count per loaded team-recipe entry (table order).
-    team_hits: [balance.MAX_TEAM_RECIPES]u16 =
-        [_]u16{0} ** balance.MAX_TEAM_RECIPES,
-    /// Parallel to the casts slice: what consumed each cast.
-    consumed: [MAX_CASTS]ConsumedBy = [_]ConsumedBy{.none} ** MAX_CASTS,
-    /// Parallel to the casts slice: team-recipe INSTANCE id (counter across
-    /// all fired team recipes; casts of the same instance share an id).
-    /// NO_TEAM_INSTANCE for casts not consumed by a team recipe.  Lets the
-    /// realtime server group exactly one recipe instance's casts.
-    team_instance: [MAX_CASTS]u8 = [_]u8{NO_TEAM_INSTANCE} ** MAX_CASTS,
+    pub fn spent(self: *const GroupHit) []const u8 {
+        return self.consumed[0..self.consumed_len];
+    }
 };
 
-/// One shape a batch resolved to, who aims it, and what it costs.
+/// Does `new_cast` complete a group move on its square?
+///
+/// A group needs its whole component bag present on ONE square, each component
+/// supplied by a DIFFERENT player — that is what makes a group a coordination
+/// move rather than a long combo.  `new_cast` supplies one component; `priors`
+/// (this turn's earlier casts, in cast order) must supply the rest.
+///
+/// Groups are tried in table order and the first complete one wins, so an
+/// earlier entry shadows a later one whose bag it contains.  Priors are matched
+/// oldest-first, which keeps the choice deterministic and spends the casts that
+/// have been waiting longest.
+///
+/// Returns null when nothing completes — the overwhelmingly common case, since
+/// most casts are just a move landing on a cell.
+pub fn complete_group(
+    bal: *const balance.Balance,
+    priors: []const TurnCast,
+    new_cast: TurnCast,
+) ?GroupHit {
+    std.debug.assert(priors.len <= MAX_CASTS);
+
+    groups: for (bal.team_recipes, 0..) |tr, ti| {
+        // The new cast has to be part of the bag it completes, otherwise this
+        // is a group somebody else's cast should have fired.
+        const supplies = for (tr.components) |comp| {
+            if (comp == new_cast.move) break true;
+        } else false;
+        if (!supplies) continue;
+
+        var hit = GroupHit{ .recipe_index = @intCast(ti) };
+        var used = [_]bool{false} ** MAX_CASTS;
+        var new_cast_used = false;
+
+        for (tr.components) |comp| {
+            // Let the new cast cover one matching component before drawing on
+            // the log: it is the reason we are here, and covering it first is
+            // what makes "the completing cast" well defined.
+            if (!new_cast_used and comp == new_cast.move) {
+                new_cast_used = true;
+                continue;
+            }
+            const found = for (priors, 0..) |p, pi| {
+                if (used[pi]) continue;
+                if (p.square != new_cast.square) continue;
+                if (p.move != comp) continue;
+                if (p.player_id == new_cast.player_id) continue;
+                // Distinct players: a contributor already counted into this
+                // group cannot supply a second component of it.
+                const taken = for (hit.spent()) |s| {
+                    if (priors[s].player_id == p.player_id) break true;
+                } else false;
+                if (taken) continue;
+                break pi;
+            } else null;
+            const pi = found orelse continue :groups;
+            used[pi] = true;
+            hit.consumed[hit.consumed_len] = @intCast(pi);
+            hit.consumed_len += 1;
+        }
+        return hit;
+    }
+    return null;
+}
+
+/// The shape a cast resolves to: its footprint, its price, and what fired.
 pub const ShapeCast = struct {
     shape: balance.Shape,
-    /// Charges this stamp costs the shared pool.  Copied from the recipe so the
-    /// session can price the batch without looking the recipe up again.
+    /// Charges this stamp costs the shared pool.  Copied from the move so the
+    /// session can price it without looking the table up again.
     cost: u16,
-    /// The player whose cursor anchors this stamp.  For a player recipe that
-    /// is the caster; for a team recipe it is the LAST JOINER — the player
-    /// whose submit completed the group, since they chose to close the circuit.
+    /// The player whose cursor anchors this stamp — always the caster, since a
+    /// group is anchored by the cast that completed it.
     anchor_player: u8,
     /// Index into the table this came from, for the recipe_fired broadcast.
     recipe_index: u8,
     is_team: bool,
 };
 
-/// Everything a batch of casts resolves to: the shapes to stamp, in fire order.
-pub const BatchOutcome = struct {
-    shapes: [MAX_CASTS]ShapeCast = undefined,
-    shape_count: usize = 0,
+/// The stamp a plain (ungrouped) cast of `move` by `player` produces.
+pub fn move_stamp(bal: *const balance.Balance, move: u8, player_id: u8) ShapeCast {
+    const pr = bal.player_recipes[move];
+    return .{
+        .shape = pr.shape,
+        .cost = pr.cost,
+        .anchor_player = player_id,
+        .recipe_index = move,
+        .is_team = false,
+    };
+}
 
-    pub fn stamps(self: *const BatchOutcome) []const ShapeCast {
-        return self.shapes[0..self.shape_count];
-    }
-
-    /// Total charges every stamp in this batch would cost.
-    pub fn total_cost(self: *const BatchOutcome) u32 {
-        var n: u32 = 0;
-        for (self.stamps()) |st| n += st.cost;
-        return n;
-    }
-};
-
-/// Resolve one round's committed casts into the shapes to stamp.
-/// When `report` is non-null it is filled with recipe fire counts and
-/// per-cast consumption for stats.
-///
-/// Matching order (a cast is consumed by at most one recipe):
-///   1. Team recipes, greedily in bal.team_recipes order.  Each pattern
-///      must be matched exactly by a DISTINCT player's cast — one player
-///      casting both halves does not trigger a team recipe.  A recipe
-///      repeats while disjoint groups keep matching.  The combined shape is
-///      anchored at the last joiner's cursor.
-///   2. Player recipes in bal.player_recipes order (exact match), anchored at
-///      the caster's own cursor.
-/// Casts matching nothing produce no effect (no flat fallback).
-///
-/// `last_joiner` is the player whose submit triggered this batch, used to
-/// anchor team shapes; pass null when no single player closed the group (e.g.
-/// a batch fired purely by buffer expiry), in which case the team shape falls
-/// back to the first contributor's cursor.
-pub fn match_recipes(
-    bal: *const balance.Balance,
-    casts: []const Cast,
-    last_joiner: ?u8,
-    report: ?*MatchReport,
-) BatchOutcome {
-    std.debug.assert(casts.len <= MAX_CASTS);
-    var out = BatchOutcome{};
-    var consumed = [_]bool{false} ** MAX_CASTS;
-    var instance_counter: u8 = 0;
-
-    // 1. Team recipes — greedy, repeatable, table order, distinct players.
-    for (bal.team_recipes, 0..) |tr, ti| {
-        matching: while (true) {
-            var picks: [MAX_CASTS]usize = undefined;
-            var picked = [_]bool{false} ** MAX_CASTS;
-            for (tr.patterns, 0..) |pattern, pi| {
-                const found = for (casts, 0..) |cast, ci| {
-                    if (consumed[ci] or picked[ci]) continue;
-                    // Distinct players: skip casts by anyone already picked
-                    // for this recipe instance.
-                    const player_taken = for (picks[0..pi]) |prev| {
-                        if (casts[prev].player_id == cast.player_id) break true;
-                    } else false;
-                    if (player_taken) continue;
-                    if (combos_equal(cast.combo, pattern)) break ci;
-                } else null;
-                const ci = found orelse break :matching;
-                picks[pi] = ci;
-                picked[ci] = true;
-            }
-            // The last joiner aims the combined shape — but only if they are
-            // actually in THIS instance; otherwise the first contributor does.
-            var anchor = casts[picks[0]].player_id;
-            if (last_joiner) |lj| {
-                for (tr.patterns, 0..) |_, pi| {
-                    if (casts[picks[pi]].player_id == lj) {
-                        anchor = lj;
-                        break;
-                    }
-                }
-            }
-            for (tr.patterns, 0..) |_, pi| {
-                consumed[picks[pi]] = true;
-                if (report) |r| {
-                    r.consumed[picks[pi]] = .team_recipe;
-                    r.team_instance[picks[pi]] = instance_counter;
-                }
-            }
-            if (report) |r| r.team_hits[ti] +|= 1;
-            instance_counter +|= 1;
-            out.shapes[out.shape_count] = .{
-                .shape = tr.shape,
-                .cost = tr.cost,
-                .anchor_player = anchor,
-                .recipe_index = @intCast(ti),
-                .is_team = true,
-            };
-            out.shape_count += 1;
-        }
-    }
-
-    // 2. Player recipes — each anchored at its own caster's cursor.
-    for (casts, 0..) |cast, ci| {
-        if (consumed[ci]) continue;
-        for (bal.player_recipes, 0..) |pr, pi| {
-            if (combos_equal(cast.combo, pr.pattern)) {
-                out.shapes[out.shape_count] = .{
-                    .shape = pr.shape,
-                    .cost = pr.cost,
-                    .anchor_player = cast.player_id,
-                    .recipe_index = @intCast(pi),
-                    .is_team = false,
-                };
-                out.shape_count += 1;
-                consumed[ci] = true;
-                if (report) |r| {
-                    r.player_hits[pi] +|= 1;
-                    r.consumed[ci] = .player_recipe;
-                }
-                break;
-            }
-        }
-    }
-
-    return out;
+/// The stamp a cast produces when it completes `hit`: the group's shape at the
+/// completing caster, priced as the group.
+pub fn group_stamp(bal: *const balance.Balance, hit: GroupHit, player_id: u8) ShapeCast {
+    const tr = bal.team_recipes[hit.recipe_index];
+    return .{
+        .shape = tr.shape,
+        .cost = tr.cost,
+        .anchor_player = player_id,
+        .recipe_index = hit.recipe_index,
+        .is_team = true,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -249,79 +200,63 @@ pub fn hunger_full(hunger: c.Health) bool {
 // Tests
 // ---------------------------------------------------------------------------
 
-const mk = c.make_combo;
 const fixtures = @import("fixtures.zig");
 /// Frozen fixture balance — designer edits to data/*.json can't break these.
 const test_bal = &fixtures.test_config.balance;
 
-const D = c.ComboSlot{ .action = .dispense };
-const M = c.ComboSlot{ .action = .catalyst };
+const POKE = fixtures.POKE;
+const SWEEP = fixtures.SWEEP;
+const BLOCK = fixtures.BLOCK;
+const TRICKLE = fixtures.TRICKLE;
+const DELUGE = fixtures.DELUGE;
+const TWIN_BLOOM = fixtures.TWIN_BLOOM;
+const CROSSFIRE = fixtures.CROSSFIRE;
 
-/// Fixture recipe patterns, by label, so tests read as intent not as keystrokes.
-const POKE = mk(&.{D});
-const SWEEP = mk(&.{ D, D });
-const BLOCK = mk(&.{ D, D, D });
-const TRICKLE = mk(&.{ M, M });
-const DELUGE = mk(&.{ M, M, M });
-const BLOOM_HALF = mk(&.{ D, M });
-const CROSSFIRE_A = mk(&.{ M, D });
-const CROSSFIRE_B = mk(&.{ M, D, D });
+/// An arbitrary square; group membership is about SHARING a square, so which
+/// one it is never matters.
+const SQ: u16 = 17;
+const OTHER_SQ: u16 = 18;
 
-test "combos_equal: identical combos match" {
-    try std.testing.expect(combos_equal(SWEEP, mk(&.{ D, D })));
+// --- selection -------------------------------------------------------------
+
+test "cycle_selection: forward and backward step one slot" {
+    try std.testing.expectEqual(@as(u8, 1), cycle_selection(0, .forward, 7));
+    try std.testing.expectEqual(@as(u8, 3), cycle_selection(4, .backward, 7));
 }
 
-test "combos_equal: different length / slot / order do not match" {
-    try std.testing.expect(!combos_equal(SWEEP, BLOCK));
-    try std.testing.expect(!combos_equal(SWEEP, mk(&.{ D, M })));
-    try std.testing.expect(!combos_equal(mk(&.{ D, M }), mk(&.{ M, D })));
+test "cycle_selection: the wheel wraps at both ends" {
+    // No dead stop: cycling past the last move returns to the first, and
+    // stepping back from the first reaches the last.
+    try std.testing.expectEqual(@as(u8, 0), cycle_selection(6, .forward, 7));
+    try std.testing.expectEqual(@as(u8, 6), cycle_selection(0, .backward, 7));
 }
 
-test "match_recipes: a player recipe stamps its shape at its own caster" {
-    const casts = [_]Cast{.{ .player_id = 3, .combo = BLOCK }};
-    const out = match_recipes(test_bal, &casts, null, null);
+test "cycle_selection: a single-move table stays put" {
+    try std.testing.expectEqual(@as(u8, 0), cycle_selection(0, .forward, 1));
+    try std.testing.expectEqual(@as(u8, 0), cycle_selection(0, .backward, 1));
+}
 
-    try std.testing.expectEqual(@as(usize, 1), out.shape_count);
-    const stamp = out.stamps()[0];
+test "cycle_selection: an out-of-range selection is clamped, not wrapped past" {
+    // A selection can outlive its table when a lobby loads a smaller custom
+    // config; it must land somewhere valid rather than index off the end.
+    try std.testing.expectEqual(@as(u8, 1), cycle_selection(200, .forward, 7));
+    try std.testing.expectEqual(@as(u8, 6), cycle_selection(200, .backward, 7));
+}
+
+// --- plain casts -----------------------------------------------------------
+
+test "move_stamp: a move stamps its own shape at its own caster" {
+    const stamp = move_stamp(test_bal, BLOCK, 3);
     try std.testing.expectEqual(@as(u8, 3), stamp.anchor_player);
     try std.testing.expect(!stamp.is_team);
+    try std.testing.expectEqual(BLOCK, stamp.recipe_index);
     // `block` is the 3x3.
     try std.testing.expectEqual(@as(usize, 9), stamp.shape.size());
 }
 
-test "match_recipes: an unmatched combo produces nothing" {
-    // No flat fallback: the recipe tables are the whole move list.
-    const nonsense = mk(&.{ M, D, M, D, M });
-    const casts = [_]Cast{.{ .player_id = 0, .combo = nonsense }};
-    const out = match_recipes(test_bal, &casts, null, null);
-    try std.testing.expectEqual(@as(usize, 0), out.shape_count);
-    try std.testing.expectEqual(@as(u32, 0), out.total_cost());
-}
-
-test "match_recipes: a stamp carries the charge cost of the recipe that named it" {
-    const casts = [_]Cast{.{ .player_id = 0, .combo = DELUGE }};
-    const out = match_recipes(test_bal, &casts, null, null);
-    try std.testing.expectEqual(@as(usize, 1), out.shape_count);
-    try std.testing.expectEqual(@as(u16, 9), out.stamps()[0].cost);
-    try std.testing.expectEqual(@as(u32, 9), out.total_cost());
-}
-
-test "match_recipes: a zero-cost recipe is free" {
-    const casts = [_]Cast{.{ .player_id = 0, .combo = TRICKLE }};
-    const out = match_recipes(test_bal, &casts, null, null);
-    try std.testing.expectEqual(@as(usize, 1), out.shape_count);
-    try std.testing.expectEqual(@as(u16, 0), out.stamps()[0].cost);
-}
-
-test "match_recipes: total_cost adds every stamp in the batch" {
-    const casts = [_]Cast{
-        .{ .player_id = 0, .combo = POKE },   // cost 1
-        .{ .player_id = 1, .combo = DELUGE }, // cost 9
-        .{ .player_id = 2, .combo = TRICKLE }, // cost 0
-    };
-    const out = match_recipes(test_bal, &casts, null, null);
-    try std.testing.expectEqual(@as(usize, 3), out.shape_count);
-    try std.testing.expectEqual(@as(u32, 10), out.total_cost());
+test "move_stamp: a stamp carries the charge cost of its move" {
+    try std.testing.expectEqual(@as(u16, 9), move_stamp(test_bal, DELUGE, 0).cost);
+    try std.testing.expectEqual(@as(u16, 0), move_stamp(test_bal, TRICKLE, 0).cost);
 }
 
 test "cheapest_cost is the floor of the whole move list" {
@@ -330,175 +265,138 @@ test "cheapest_cost is the floor of the whole move list" {
     try std.testing.expectEqual(@as(u16, 0), test_bal.cheapest_cost());
 }
 
-test "match_recipes: team recipe consumes both casts and stamps ONE shape" {
-    const casts = [_]Cast{
-        .{ .player_id = 0, .combo = BLOOM_HALF },
-        .{ .player_id = 1, .combo = BLOOM_HALF },
+// --- groups ----------------------------------------------------------------
+
+test "complete_group: a lone cast completes nothing" {
+    // The first component to land is just a move landing.
+    const hit = complete_group(test_bal, &.{}, .{ .player_id = 0, .move = POKE, .square = SQ });
+    try std.testing.expect(hit == null);
+}
+
+test "complete_group: a second player on the same square completes the group" {
+    const priors = [_]TurnCast{.{ .player_id = 0, .move = POKE, .square = SQ }};
+    const hit = complete_group(test_bal, &priors, .{ .player_id = 1, .move = POKE, .square = SQ }).?;
+
+    try std.testing.expectEqual(TWIN_BLOOM, hit.recipe_index);
+    // The prior cast is spent, so it cannot be counted into a second group.
+    try std.testing.expectEqualSlices(u8, &.{0}, hit.spent());
+}
+
+test "complete_group: the completing cast anchors and prices the group" {
+    const priors = [_]TurnCast{.{ .player_id = 0, .move = POKE, .square = SQ }};
+    const hit = complete_group(test_bal, &priors, .{ .player_id = 1, .move = POKE, .square = SQ }).?;
+    const stamp = group_stamp(test_bal, hit, 1);
+
+    // Player 1 closed the circuit, so player 1 aims it.
+    try std.testing.expectEqual(@as(u8, 1), stamp.anchor_player);
+    try std.testing.expect(stamp.is_team);
+    try std.testing.expectEqual(TWIN_BLOOM, stamp.recipe_index);
+    // Priced as the group, not as the poke that completed it.
+    try std.testing.expectEqual(@as(u16, 4), stamp.cost);
+    try std.testing.expectEqual(@as(usize, 13), stamp.shape.size());
+}
+
+test "complete_group: a different square is a different group" {
+    // Casts must converge on ONE cell; scattering them coordinates nothing.
+    const priors = [_]TurnCast{.{ .player_id = 0, .move = POKE, .square = OTHER_SQ }};
+    const hit = complete_group(test_bal, &priors, .{ .player_id = 1, .move = POKE, .square = SQ });
+    try std.testing.expect(hit == null);
+}
+
+test "complete_group: one player cannot supply two components" {
+    // A group is a COOPERATION requirement, not a repeat-press.
+    const priors = [_]TurnCast{.{ .player_id = 0, .move = POKE, .square = SQ }};
+    const hit = complete_group(test_bal, &priors, .{ .player_id = 0, .move = POKE, .square = SQ });
+    try std.testing.expect(hit == null);
+}
+
+test "complete_group: a distinct player still completes alongside a duplicate" {
+    const priors = [_]TurnCast{
+        .{ .player_id = 0, .move = POKE, .square = SQ },
+        .{ .player_id = 0, .move = POKE, .square = SQ }, // same player again
     };
-    var report = MatchReport{};
-    const out = match_recipes(test_bal, &casts, null, &report);
-
-    // Two casts, one combined shape — not one shape each.
-    try std.testing.expectEqual(@as(usize, 1), out.shape_count);
-    try std.testing.expect(out.stamps()[0].is_team);
-    try std.testing.expectEqual(@as(u16, 1), report.team_hits[0]);
-    try std.testing.expectEqual(ConsumedBy.team_recipe, report.consumed[0]);
-    try std.testing.expectEqual(ConsumedBy.team_recipe, report.consumed[1]);
+    const hit = complete_group(test_bal, &priors, .{ .player_id = 1, .move = POKE, .square = SQ }).?;
+    try std.testing.expectEqual(TWIN_BLOOM, hit.recipe_index);
+    // Oldest-first: the earliest usable prior is the one spent.
+    try std.testing.expectEqualSlices(u8, &.{0}, hit.spent());
 }
 
-test "match_recipes: the last joiner aims the team shape" {
-    const casts = [_]Cast{
-        .{ .player_id = 0, .combo = BLOOM_HALF },
-        .{ .player_id = 1, .combo = BLOOM_HALF },
+test "complete_group: an asymmetric group completes from either side" {
+    // crossfire = sweep + block; whoever brings the second half completes it.
+    const sweep_first = [_]TurnCast{.{ .player_id = 0, .move = SWEEP, .square = SQ }};
+    const a = complete_group(test_bal, &sweep_first, .{ .player_id = 1, .move = BLOCK, .square = SQ }).?;
+    try std.testing.expectEqual(CROSSFIRE, a.recipe_index);
+
+    const block_first = [_]TurnCast{.{ .player_id = 0, .move = BLOCK, .square = SQ }};
+    const b = complete_group(test_bal, &block_first, .{ .player_id = 1, .move = SWEEP, .square = SQ }).?;
+    try std.testing.expectEqual(CROSSFIRE, b.recipe_index);
+}
+
+test "complete_group: the completing cast must supply a component" {
+    // A wedge is in no group's bag, so landing it on a waiting poke completes
+    // nothing — the group belongs to whoever brings the move it actually needs.
+    const priors = [_]TurnCast{.{ .player_id = 0, .move = POKE, .square = SQ }};
+    const hit = complete_group(test_bal, &priors, .{ .player_id = 1, .move = fixtures.WEDGE, .square = SQ });
+    try std.testing.expect(hit == null);
+}
+
+test "complete_group: an incomplete bag fires nothing" {
+    // crossfire needs a block too; a lone sweep partner is not enough.
+    const priors = [_]TurnCast{.{ .player_id = 0, .move = SWEEP, .square = SQ }};
+    const hit = complete_group(test_bal, &priors, .{ .player_id = 1, .move = SWEEP, .square = SQ });
+    try std.testing.expect(hit == null);
+}
+
+test "complete_group: an earlier group shadows a later one containing its bag" {
+    // triad (3 pokes) contains twin_bloom's bag (2 pokes) and is listed after
+    // it, so the second poke fires twin_bloom and triad can never be reached.
+    // Table order is the tiebreak, which is why it is designer-visible.
+    const priors = [_]TurnCast{
+        .{ .player_id = 0, .move = POKE, .square = SQ },
+        .{ .player_id = 1, .move = POKE, .square = SQ },
     };
-    // Player 1 closed the circuit, so player 1 aims it...
-    const p1 = match_recipes(test_bal, &casts, 1, null);
-    try std.testing.expectEqual(@as(u8, 1), p1.stamps()[0].anchor_player);
-
-    // ...and player 0 aims it when they were the one to complete the group.
-    const p0 = match_recipes(test_bal, &casts, 0, null);
-    try std.testing.expectEqual(@as(u8, 0), p0.stamps()[0].anchor_player);
+    const hit = complete_group(test_bal, &priors, .{ .player_id = 2, .move = POKE, .square = SQ }).?;
+    try std.testing.expectEqual(TWIN_BLOOM, hit.recipe_index);
+    try std.testing.expectEqual(@as(u8, 1), hit.consumed_len);
 }
 
-test "match_recipes: team shape falls back to the first contributor" {
-    const casts = [_]Cast{
-        .{ .player_id = 2, .combo = BLOOM_HALF },
-        .{ .player_id = 5, .combo = BLOOM_HALF },
+test "complete_group: three distinct players fire two pairs, not one triple" {
+    // Following on from the shadowing above: the session marks spent priors, so
+    // the third poke pairs with the one the second left behind.
+    const first = [_]TurnCast{.{ .player_id = 0, .move = POKE, .square = SQ }};
+    const pair_a = complete_group(test_bal, &first, .{ .player_id = 1, .move = POKE, .square = SQ }).?;
+    try std.testing.expectEqual(@as(u8, 1), pair_a.consumed_len);
+
+    // Player 1's completing cast is itself logged, and player 0's is spent.
+    const remaining = [_]TurnCast{.{ .player_id = 1, .move = POKE, .square = SQ }};
+    const pair_b = complete_group(test_bal, &remaining, .{ .player_id = 2, .move = POKE, .square = SQ }).?;
+    try std.testing.expectEqual(TWIN_BLOOM, pair_b.recipe_index);
+}
+
+test "complete_group: an empty group table completes nothing" {
+    var bal = test_bal.*;
+    bal.team_recipes = &.{};
+    const priors = [_]TurnCast{.{ .player_id = 0, .move = POKE, .square = SQ }};
+    try std.testing.expect(complete_group(&bal, &priors, .{ .player_id = 1, .move = POKE, .square = SQ }) == null);
+}
+
+test "complete_group: a three-component group needs three distinct players" {
+    var bal = test_bal.*;
+    // Only `triad` loaded, so nothing shadows it.
+    bal.team_recipes = fixtures.team_recipes[fixtures.TRIAD..];
+    const two = [_]TurnCast{
+        .{ .player_id = 0, .move = POKE, .square = SQ },
+        .{ .player_id = 1, .move = POKE, .square = SQ },
     };
-    // No joiner (pure buffer expiry): the first contributor aims it.
-    const none = match_recipes(test_bal, &casts, null, null);
-    try std.testing.expectEqual(@as(u8, 2), none.stamps()[0].anchor_player);
+    const hit = complete_group(&bal, &two, .{ .player_id = 2, .move = POKE, .square = SQ }).?;
+    try std.testing.expectEqual(@as(u8, 2), hit.consumed_len);
 
-    // A joiner who is not in this instance cannot aim it either.
-    const outsider = match_recipes(test_bal, &casts, 7, null);
-    try std.testing.expectEqual(@as(u8, 2), outsider.stamps()[0].anchor_player);
-}
-
-test "match_recipes: an asymmetric team recipe matches either cast order" {
-    const forward = [_]Cast{
-        .{ .player_id = 0, .combo = CROSSFIRE_A },
-        .{ .player_id = 1, .combo = CROSSFIRE_B },
+    // The same two casts plus a REPEAT of player 1 leaves the bag one short.
+    const dup = [_]TurnCast{
+        .{ .player_id = 0, .move = POKE, .square = SQ },
+        .{ .player_id = 1, .move = POKE, .square = SQ },
     };
-    const backward = [_]Cast{
-        .{ .player_id = 0, .combo = CROSSFIRE_B },
-        .{ .player_id = 1, .combo = CROSSFIRE_A },
-    };
-    try std.testing.expectEqual(@as(usize, 1), match_recipes(test_bal, &forward, null, null).shape_count);
-    try std.testing.expectEqual(@as(usize, 1), match_recipes(test_bal, &backward, null, null).shape_count);
-}
-
-test "match_recipes: team recipe fires twice for two disjoint pairs" {
-    const casts = [_]Cast{
-        .{ .player_id = 0, .combo = BLOOM_HALF },
-        .{ .player_id = 1, .combo = BLOOM_HALF },
-        .{ .player_id = 2, .combo = BLOOM_HALF },
-        .{ .player_id = 3, .combo = BLOOM_HALF },
-    };
-    var report = MatchReport{};
-    const out = match_recipes(test_bal, &casts, null, &report);
-    try std.testing.expectEqual(@as(usize, 2), out.shape_count);
-    try std.testing.expectEqual(@as(u16, 2), report.team_hits[0]);
-    // Cost accrues per INSTANCE: firing the pair twice costs twice.
-    try std.testing.expectEqual(@as(u32, 8), out.total_cost());
-}
-
-test "match_recipes: team_instance groups each recipe instance's casts" {
-    const casts = [_]Cast{
-        .{ .player_id = 0, .combo = BLOOM_HALF },
-        .{ .player_id = 1, .combo = BLOOM_HALF },
-        .{ .player_id = 2, .combo = BLOOM_HALF },
-        .{ .player_id = 3, .combo = BLOOM_HALF },
-    };
-    var report = MatchReport{};
-    _ = match_recipes(test_bal, &casts, null, &report);
-    // Two instances of two casts each; members share an id, instances differ.
-    try std.testing.expectEqual(report.team_instance[0], report.team_instance[1]);
-    try std.testing.expectEqual(report.team_instance[2], report.team_instance[3]);
-    try std.testing.expect(report.team_instance[0] != report.team_instance[2]);
-}
-
-test "match_recipes: same player casting both halves does NOT fire team recipe" {
-    // A team recipe is a COOPERATION requirement, not a combo length.
-    const casts = [_]Cast{
-        .{ .player_id = 0, .combo = BLOOM_HALF },
-        .{ .player_id = 0, .combo = BLOOM_HALF },
-    };
-    const out = match_recipes(test_bal, &casts, null, null);
-    // No team shape fired; `[D,M]` matches no player recipe either.
-    try std.testing.expectEqual(@as(usize, 0), out.shape_count);
-}
-
-test "match_recipes: distinct-player pair still fires alongside a duplicate" {
-    const casts = [_]Cast{
-        .{ .player_id = 0, .combo = BLOOM_HALF },
-        .{ .player_id = 0, .combo = BLOOM_HALF },
-        .{ .player_id = 1, .combo = BLOOM_HALF },
-    };
-    var report = MatchReport{};
-    const out = match_recipes(test_bal, &casts, null, &report);
-    // Exactly one pair can be formed across distinct players.
-    try std.testing.expectEqual(@as(usize, 1), out.shape_count);
-    try std.testing.expectEqual(@as(u16, 1), report.team_hits[0]);
-}
-
-test "match_recipes: a lone half of a team recipe does nothing" {
-    const casts = [_]Cast{.{ .player_id = 0, .combo = BLOOM_HALF }};
-    const out = match_recipes(test_bal, &casts, null, null);
-    try std.testing.expectEqual(@as(usize, 0), out.shape_count);
-}
-
-test "match_recipes: team pair plus an independent player recipe" {
-    const casts = [_]Cast{
-        .{ .player_id = 0, .combo = BLOOM_HALF },
-        .{ .player_id = 1, .combo = BLOOM_HALF },
-        .{ .player_id = 2, .combo = POKE },
-    };
-    const out = match_recipes(test_bal, &casts, 1, null);
-    try std.testing.expectEqual(@as(usize, 2), out.shape_count);
-    // Team shape first (table order), then the player recipe.
-    try std.testing.expect(out.stamps()[0].is_team);
-    try std.testing.expectEqual(@as(u8, 1), out.stamps()[0].anchor_player);
-    try std.testing.expect(!out.stamps()[1].is_team);
-    try std.testing.expectEqual(@as(u8, 2), out.stamps()[1].anchor_player);
-    try std.testing.expectEqual(@as(usize, 1), out.stamps()[1].shape.size());
-}
-
-test "match_recipes: every cast in a batch gets its own anchor" {
-    const casts = [_]Cast{
-        .{ .player_id = 4, .combo = POKE },
-        .{ .player_id = 7, .combo = SWEEP },
-    };
-    const out = match_recipes(test_bal, &casts, null, null);
-    try std.testing.expectEqual(@as(usize, 2), out.shape_count);
-    try std.testing.expectEqual(@as(u8, 4), out.stamps()[0].anchor_player);
-    try std.testing.expectEqual(@as(u8, 7), out.stamps()[1].anchor_player);
-}
-
-test "match_recipes: report records fire counts and per-cast consumption" {
-    const casts = [_]Cast{
-        .{ .player_id = 0, .combo = BLOCK },
-        .{ .player_id = 1, .combo = mk(&.{ M, D, M, D, M }) }, // matches nothing
-    };
-    var report = MatchReport{};
-    _ = match_recipes(test_bal, &casts, null, &report);
-    // `block` is index 2 in the fixture player table.
-    try std.testing.expectEqual(@as(u16, 1), report.player_hits[2]);
-    try std.testing.expectEqual(ConsumedBy.player_recipe, report.consumed[0]);
-    try std.testing.expectEqual(ConsumedBy.none, report.consumed[1]);
-    try std.testing.expectEqual(NO_TEAM_INSTANCE, report.team_instance[0]);
-}
-
-test "combo_has_output: a combo naming no recipe fizzles" {
-    try std.testing.expect(!combo_has_output(test_bal, mk(&.{ M, D, M, D, M })));
-    try std.testing.expect(!combo_has_output(test_bal, mk(&.{ M, M, M, M })));
-}
-
-test "combo_has_output: player and team patterns both count" {
-    try std.testing.expect(combo_has_output(test_bal, BLOCK));
-    try std.testing.expect(combo_has_output(test_bal, TRICKLE));
-    // A team half commits: the partner may still complete it this window.
-    try std.testing.expect(combo_has_output(test_bal, BLOOM_HALF));
-    try std.testing.expect(combo_has_output(test_bal, CROSSFIRE_B));
+    try std.testing.expect(complete_group(&bal, &dup, .{ .player_id = 1, .move = POKE, .square = SQ }) == null);
 }
 
 test "add_hunger: clamps at max" {

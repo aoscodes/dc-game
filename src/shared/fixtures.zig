@@ -12,8 +12,6 @@ const balance = @import("balance.zig");
 const enc = @import("encounter.zig");
 const config = @import("config.zig");
 
-const mk = c.make_combo;
-
 /// A shape from authored rows, for fixtures only (config.zig does this at load).
 /// `rows` are `#`/`.` strings; anchor is the bounding box centre, rounded down.
 /// The offsets live in a generated namespace so the returned slice is static.
@@ -48,77 +46,87 @@ pub fn shape(comptime rows: []const []const u8) balance.Shape {
     return Shaped(rows).shape;
 }
 
-const D = c.ComboSlot{ .action = .dispense };
-const M = c.ComboSlot{ .action = .catalyst };
+/// Fixture move indices, by label.  A move's index is its wire identity and the
+/// way group components are named, so tests refer to these instead of counting
+/// table rows by hand.
+pub const POKE: u8 = 0;
+pub const SWEEP: u8 = 1;
+pub const BLOCK: u8 = 2;
+pub const CROSS: u8 = 3;
+pub const WEDGE: u8 = 4;
+pub const TRICKLE: u8 = 5;
+pub const DELUGE: u8 = 6;
 
 pub const player_recipes = [_]balance.PlayerRecipe{
     // The bread-and-butter aim: one cell, one tier.
     .{
         .label = "poke",
-        .pattern = mk(&.{D}),
         .shape = shape(&.{"#"}),
     },
     // A horizontal sweep of three.
     .{
         .label = "sweep",
-        .pattern = mk(&.{ D, D }),
         .shape = shape(&.{"###"}),
     },
     // The big one: a full 3x3 block.
     .{
         .label = "block",
-        .pattern = mk(&.{ D, D, D }),
         .shape = shape(&.{ "###", "###", "###" }),
     },
     // Same five cells as `plus`, rotated: orientation is authored, not derived.
     .{
         .label = "cross",
-        .pattern = mk(&.{ D, M, D }),
         .shape = shape(&.{ "#.#", ".#.", "#.#" }),
     },
     // A downward triangle.
     .{
         .label = "wedge",
-        .pattern = mk(&.{ D, D, M }),
         .shape = shape(&.{ "###", ".#." }),
     },
     // The free move: no charges at all, so tests can act with a bankrupt pool
     // and the economy has a floor a team can never fall through.
     .{
         .label = "trickle",
-        .pattern = mk(&.{ M, M }),
         .shape = shape(&.{"#"}),
         .cost = 0,
     },
     // Deliberately expensive: exercises "the pool cannot afford this".
     .{
         .label = "deluge",
-        .pattern = mk(&.{ M, M, M }),
         .shape = shape(&.{ "###", "###", "###" }),
         .cost = 9,
     },
 };
 
+/// Fixture group indices, by label.
+pub const TWIN_BLOOM: u8 = 0;
+pub const CROSSFIRE: u8 = 1;
+pub const TRIAD: u8 = 2;
+
 pub const team_recipes = [_]balance.TeamRecipe{
-    // Two players each cast [dispense, catalyst]; together they clear a plus
-    // far bigger than either could alone.
+    // Two players poke the same cell; together they clear a plus far bigger
+    // than either could alone.
     .{
         .label = "twin_bloom",
-        .patterns = &.{
-            mk(&.{ D, M }),
-            mk(&.{ D, M }),
-        },
+        .components = &.{ POKE, POKE },
         .shape = shape(&.{ "..#..", ".###.", "#####", ".###.", "..#.." }),
         .cost = 4,
     },
-    // Asymmetric: one player brings the line, the other the column.
+    // Asymmetric: one player brings the line, the other the block.
     .{
         .label = "crossfire",
-        .patterns = &.{
-            mk(&.{ M, D }),
-            mk(&.{ M, D, D }),
-        },
+        .components = &.{ SWEEP, BLOCK },
         .shape = shape(&.{ "..#..", "..#..", "#####", "..#..", "..#.." }),
+    },
+    // A three-player group whose bag CONTAINS twin_bloom's, listed after it: the
+    // fixture for "an earlier group shadows a later one" (see complete_group).
+    // Deliberately unaffordable on a near-empty pool, so the solo-fallback path
+    // has something to fall back from.
+    .{
+        .label = "triad",
+        .components = &.{ POKE, POKE, POKE },
+        .shape = shape(&.{ "#####", "#####", "#####" }),
+        .cost = 12,
     },
 };
 

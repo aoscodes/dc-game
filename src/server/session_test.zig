@@ -10,25 +10,29 @@
 //! the PRNG stream.
 //!
 //! Mechanics under test:
-//!   - combo intake (latest preview wins, cancel clears)
+//!   - shape selection: a server-owned wheel per player, cycled forward and
+//!     backward, wrapping, persisting across turns
 //!   - aiming: server-authoritative per-player cursor, clamped at the edges;
-//!     a cast is anchored where the player aimed at SUBMIT time
-//!   - turn-based casting: a per-player per-turn budget, casts resolving
-//!     IMMEDIATELY, unpaired team halves HELD until a partner or turn end
+//!     a cast lands where the player aimed when the cast was ACCEPTED
+//!   - turn-based casting: a per-player per-turn budget, every cast resolving
+//!     IMMEDIATELY as its own move, and GROUPS forming when a cast completes a
+//!     group's component bag using distinct teammates' earlier casts on the
+//!     same square
 //!   - shape stamping: a matched recipe's footprint downgrades every covered
 //!     hazard cell by exactly one tier (red→yellow→green→defused); cells off
 //!     the grid edge are clipped, non-hazard cells are inert
 //!   - turn end: the PATHED feast (flood from the left edge, live hazards and
-//!     specials as walls), gravity collapse, refill, held halves fizzling and
+//!     specials as walls), gravity collapse, refill, the cast log clearing and
 //!     budgets reset — in that order
-//!   - the shared charge pool: one per game, never refilled, per-recipe cost,
-//!     team recipes charged once for the group, and the fizzle-but-spend rule
-//!     when the pool cannot pay
+//!   - the shared charge pool: one per game, never refilled, per-move cost, a
+//!     group priced at the GROUP cost (a discount on the last contribution, not
+//!     a joint purchase), and the fizzle-but-spend rule when the pool cannot pay
 //!   - hunger accounting: a flat cost per unit EATEN, and nothing else
 //!   - score = units eaten (all of which are neutral or defused)
 //!   - end conditions: field cleared / hunger bar full / dead position with an
 //!     empty pool, all checked at turn end
-//!   - wire contents: grid, reservoir, turn, cursors, cast budgets, charges
+//!   - wire contents: grid, reservoir, turn, cursors, selections, cast budgets,
+//!     charges
 
 const std = @import("std");
 const shared = @import("shared");
@@ -40,8 +44,6 @@ const fixtures = shared.fixtures;
 
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
-
-const mk = c.make_combo;
 
 /// Frozen fixture config — designer edits to data/*.json can't break these.
 const TEST_CFG = &fixtures.test_config;
@@ -56,22 +58,21 @@ const RED: usize = @intFromEnum(c.Tier.red);
 const YELLOW: usize = @intFromEnum(c.Tier.yellow);
 const GREEN: usize = @intFromEnum(c.Tier.green);
 
-/// Fixture recipe combos, by the shape they stamp.  Kept as named consts so a
-/// test reads as an intent ("stamp a 3x3 block") rather than a slot soup.
-const POKE = mk(&.{D}); // "#"
-const SWEEP = mk(&.{ D, D }); // "###"
-const BLOCK = mk(&.{ D, D, D }); // 3x3
-const TRICKLE = mk(&.{ M, M }); // "#", costs 0 charges — the free move
-const DELUGE = mk(&.{ M, M, M }); // 3x3, costs 9 charges — the expensive move
-const BLOOM_HALF = mk(&.{ D, M }); // half of team twin_bloom (5x5 diamond)
-const CROSSFIRE_A = mk(&.{ M, D });
-const CROSSFIRE_B = mk(&.{ M, D, D });
-/// Matches nothing in the fixture tables.  There is NO flat fallback, so this
-/// always fizzles — the recipe list is the complete move list.
-const UNMATCHED = mk(&.{ D, D, D, D, D });
+/// Fixture move indices, by label — re-exported so a test reads as an intent
+/// ("select the 3x3 block") rather than a table offset.  A move's index is its
+/// wire identity, so these are what `cast_as` and `select` speak in.
+const POKE = fixtures.POKE; // "#", 1 charge
+const SWEEP = fixtures.SWEEP; // "###"
+const BLOCK = fixtures.BLOCK; // 3x3
+const CROSS = fixtures.CROSS;
+const WEDGE = fixtures.WEDGE;
+const TRICKLE = fixtures.TRICKLE; // "#", costs 0 charges — the free move
+const DELUGE = fixtures.DELUGE; // 3x3, costs 9 charges — the expensive move
 
-const D = c.ComboSlot{ .action = .dispense };
-const M = c.ComboSlot{ .action = .catalyst };
+/// Fixture group indices, by label.
+const TWIN_BLOOM = fixtures.TWIN_BLOOM; // poke + poke  -> 5x5 diamond
+const CROSSFIRE = fixtures.CROSSFIRE; // sweep + block
+const TRIAD = fixtures.TRIAD; // poke x3, deliberately unaffordable
 
 /// A live hazard cell of the given tier — the thing casts downgrade.
 fn tiered(tier: c.Tier) c.SlimeCell {
@@ -216,15 +217,13 @@ fn consume_payload(tag: proto.MsgTag, r: anytype) bool {
         .join_lobby => if (proto.decode_join_lobby(r)) |_| true else |_| false,
         .reconnect => if (proto.decode_reconnect(r)) |_| true else |_| false,
         .ready_up => true, // zero-payload
-        .choose_combo => if (proto.decode_choose_combo(r)) |_| true else |_| false,
-        .submit_spell => if (proto.decode_submit_spell(r)) |_| true else |_| false,
-        .cancel_combo => true, // zero-payload
+        .cycle_shape => if (proto.decode_cycle_shape(r)) |_| true else |_| false,
+        .cast => true, // zero-payload
         .lobby_update => if (proto.decode_lobby_update(r)) |_| true else |_| false,
         .game_start => if (proto.decode_game_start(r)) |_| true else |_| false,
         .game_state => if (proto.decode_game_state(r)) |_| true else |_| false,
         .action_result => if (proto.decode_action_result(r)) |_| true else |_| false,
         .game_over => if (proto.decode_game_over(r)) |_| true else |_| false,
-        .cast_committed => if (proto.decode_cast_committed(r)) |_| true else |_| false,
         .cast_fizzled => if (proto.decode_cast_fizzled(r)) |_| true else |_| false,
         .recipe_fired => if (proto.decode_recipe_fired(r)) |_| true else |_| false,
         .shape_cast => if (proto.decode_shape_cast(r)) |_| true else |_| false,
@@ -275,12 +274,32 @@ fn enqueue_msg(sess: *Session, pid: u8, comptime tag: proto.MsgTag, payload: any
     sess.enqueue_message(pid, fbs.getWritten());
 }
 
-fn enqueue_combo(sess: *Session, pid: u8, combo: c.ActionCombo) !void {
-    try enqueue_msg(sess, pid, .choose_combo, proto.ChooseCombo{ .combo = combo });
+/// Turn `pid`'s wheel one step.  Selection is server state, so tests steer it
+/// the way a player does rather than assigning it.
+fn enqueue_cycle(sess: *Session, pid: u8, dir: c.CycleDir) !void {
+    try enqueue_msg(sess, pid, .cycle_shape, proto.CycleShape{ .dir = dir });
 }
 
-fn enqueue_submit(sess: *Session, pid: u8, combo: c.ActionCombo) !void {
-    try enqueue_msg(sess, pid, .submit_spell, proto.SubmitSpell{ .combo = combo });
+/// Queue a bare trigger: fires whatever `pid` currently has selected, wherever
+/// they are currently aiming.
+fn enqueue_cast(sess: *Session, pid: u8) !void {
+    try enqueue_msg(sess, pid, .cast, {});
+}
+
+/// Point `pid`'s wheel AT `move`, by queueing forward turns.  Cheaper to read
+/// than a hand-counted run of cycle messages, and it exercises the real path.
+fn enqueue_select(sess: *Session, pid: u8, move: u8) !void {
+    const moves = BAL.player_recipes.len;
+    const have = sess.selected[pid];
+    const steps = (@as(usize, move) +% moves -% have) % moves;
+    for (0..steps) |_| try enqueue_cycle(sess, pid, .forward);
+}
+
+/// Queue "select `move`, then fire it" — the two-key sequence a player performs
+/// for a single deliberate cast, which is what most tests actually mean.
+fn enqueue_cast_as(sess: *Session, pid: u8, move: u8) !void {
+    try enqueue_select(sess, pid, move);
+    try enqueue_cast(sess, pid);
 }
 
 /// Drain queues and broadcast.  Casts resolve inside the drain, so this is the
@@ -365,6 +384,14 @@ fn init_two_player_session_seeded(
 /// Start `encounter` with the pinned seed.
 fn start(s: *TwoPlayerSession, encounter: *const enc.Encounter) !void {
     try s.sess.start_game_encounter(encounter);
+}
+
+/// Join one more player into an already-built session, for the few tests about
+/// groups that need MORE than a pair.  The extra player has no TestPlayer, so
+/// its outbound bytes go to the session's own sink and are not inspected —
+/// these tests assert on session state, not on what the newcomer was told.
+fn join_extra(s: *TwoPlayerSession, name: []const u8) !u8 {
+    return s.sess.join(s.p[0].transport(), name) orelse error.JoinFailed;
 }
 
 /// Overwrite the whole grid with one cell value — the deterministic setup for
@@ -562,7 +589,7 @@ test "a disconnected player no longer holds the turn open" {
     // P0 spends everything; P1 is still holding the turn open.
     aim_at(&s.sess, s.p[0].pid, 0, 0);
     for (0..BUDGET) |_| {
-        try enqueue_submit(&s.sess, s.p[0].pid, POKE);
+        try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
         try flush(&s.sess);
     }
     try std.testing.expectEqual(@as(u16, 1), s.sess.turn);
@@ -594,10 +621,10 @@ test "an empty room never ends turns on its own" {
 }
 
 // ---------------------------------------------------------------------------
-// Combo intake (live preview)
+// Shape selection (the wheel)
 // ---------------------------------------------------------------------------
 
-test "choose_combo stores the latest preview; cancel clears it" {
+test "the wheel starts on the first move for every player" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -605,24 +632,13 @@ test "choose_combo stores the latest preview; cancel clears it" {
     defer s.deinit();
     try start(&s, &enc_fifty_green);
 
-    const combo_a = POKE;
-    const combo_b = SWEEP;
-
-    try enqueue_combo(&s.sess, s.p[0].pid, combo_a);
-    try flush(&s.sess);
-    try std.testing.expect(logic.combos_equal(combo_a, s.sess.action_pool[s.p[0].pid].?));
-
-    // Latest edit wins.
-    try enqueue_combo(&s.sess, s.p[0].pid, combo_b);
-    try flush(&s.sess);
-    try std.testing.expect(logic.combos_equal(combo_b, s.sess.action_pool[s.p[0].pid].?));
-
-    try enqueue_msg(&s.sess, s.p[0].pid, .cancel_combo, {});
-    try flush(&s.sess);
-    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.action_pool[s.p[0].pid]);
+    // Move 0 is where everyone begins, so a player who never touches the wheel
+    // still has something castable — there is no unselected state.
+    try std.testing.expectEqual(@as(u8, 0), s.sess.selected[s.p[0].pid]);
+    try std.testing.expectEqual(@as(u8, 0), s.sess.selected[s.p[1].pid]);
 }
 
-test "submitting clears the live preview" {
+test "cycling forward walks the move table in order and wraps at the end" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -630,15 +646,135 @@ test "submitting clears the live preview" {
     defer s.deinit();
     try start(&s, &enc_fifty_green);
 
-    const combo = BLOOM_HALF; // [dispense, catalyst] — two distinguishable slots
-    try enqueue_combo(&s.sess, s.p[0].pid, combo);
+    const pid = s.p[0].pid;
+    const moves = BAL.player_recipes.len;
+    for (1..moves) |want| {
+        try enqueue_cycle(&s.sess, pid, .forward);
+        try flush(&s.sess);
+        try std.testing.expectEqual(@as(u8, @intCast(want)), s.sess.selected[pid]);
+    }
+    // One more turn past the last move returns to the first: the wheel is a
+    // ring, so no amount of cycling can strand a player on nothing.
+    try enqueue_cycle(&s.sess, pid, .forward);
     try flush(&s.sess);
-    try enqueue_submit(&s.sess, s.p[0].pid, combo);
+    try std.testing.expectEqual(@as(u8, 0), s.sess.selected[pid]);
+}
+
+test "cycling backward from the first move wraps to the last" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+
+    const pid = s.p[0].pid;
+    const last: u8 = @intCast(BAL.player_recipes.len - 1);
+
+    try enqueue_cycle(&s.sess, pid, .backward);
+    try flush(&s.sess);
+    try std.testing.expectEqual(last, s.sess.selected[pid]);
+
+    // And back again: forward and backward are exact inverses.
+    try enqueue_cycle(&s.sess, pid, .forward);
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u8, 0), s.sess.selected[pid]);
+}
+
+test "each player turns their own wheel independently" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+
+    try enqueue_select(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
 
-    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.action_pool[s.p[0].pid]);
-    // BLOOM_HALF is an unpaired team half, so it is HELD rather than resolved.
-    try std.testing.expect(logic.combos_equal(combo, s.sess.held_pool[s.p[0].pid].?));
+    try std.testing.expectEqual(BLOCK, s.sess.selected[s.p[0].pid]);
+    try std.testing.expectEqual(@as(u8, 0), s.sess.selected[s.p[1].pid]);
+}
+
+test "cycling costs nothing: it is not a cast" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+
+    const pid = s.p[0].pid;
+    const charges_before = s.sess.charges;
+    for (0..10) |_| try enqueue_cycle(&s.sess, pid, .forward);
+    try flush(&s.sess);
+
+    // Nothing spent, nothing stamped, nothing logged: choosing is free, and a
+    // player may deliberate as long as they like.
+    try std.testing.expectEqual(charges_before, s.sess.charges);
+    try std.testing.expectEqual(BUDGET, s.sess.casts_left[pid]);
+    try std.testing.expectEqual(@as(usize, 0), s.sess.turn_cast_count);
+}
+
+test "a selection survives the turn that used it" {
+    // The wheel is not a per-turn choice: a player who found their move keeps
+    // it, and pays no keystrokes to cast it again next turn.
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+
+    const pid = s.p[0].pid;
+    try enqueue_select(&s.sess, pid, SWEEP);
+    try flush(&s.sess);
+    try end_turn_mid_game(&s.sess);
+
+    try std.testing.expectEqual(@as(u16, 2), s.sess.turn);
+    try std.testing.expectEqual(SWEEP, s.sess.selected[pid]);
+}
+
+test "a cast fires the selected move" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+
+    const pid = s.p[0].pid;
+    aim_at(&s.sess, pid, 3, 3);
+    try enqueue_cast_as(&s.sess, pid, SWEEP);
+    try flush(&s.sess);
+
+    // `sweep` is "###", so exactly three cells defused — the wheel, not the
+    // keystrokes, decided the shape.
+    try std.testing.expectEqual(@as(u16, 3), count_defused(&s.sess));
+    try std.testing.expectEqual(
+        BAL.player_recipes[SWEEP].cost,
+        enc_fifty_green.charges - s.sess.charges,
+    );
+}
+
+test "a cast with the wheel untouched fires the first move" {
+    // There is no "nothing selected" to guard against: pressing cast on a fresh
+    // session is a legal, cheap poke rather than an error.
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+
+    const pid = s.p[0].pid;
+    aim_at(&s.sess, pid, 3, 3);
+    try enqueue_cast(&s.sess, pid);
+    try flush(&s.sess);
+
+    try std.testing.expectEqual(@as(u16, 1), count_defused(&s.sess));
 }
 
 // ---------------------------------------------------------------------------
@@ -682,7 +818,7 @@ test "a stamp downgrades exactly the cells its shape covers" {
 
     // `block` is 3x3 = 9 cells, centred on the anchor and fully in-bounds here.
     aim_at(&s.sess, s.p[0].pid, 2, 5);
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
 
     // Green is one step from defused, so all 9 covered cells defuse and the
@@ -714,7 +850,7 @@ test "a stamp lands at the caster's cursor, not at a fixed spot" {
 
     // `poke` is a single cell, so the anchor IS the footprint.
     aim_at(&s.sess, s.p[0].pid, 4, 7);
-    try enqueue_submit(&s.sess, s.p[0].pid, POKE);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
     try flush(&s.sess);
 
     try std.testing.expect(s.sess.field.grid.at(4, 7) == .neutralized);
@@ -734,7 +870,7 @@ test "a shape hanging off the edge is clipped, and the surplus is reported" {
     // 3x3 anchored in the top-left corner: only the bottom-right 2x2 quadrant
     // is on the grid.  Clipping must not wrap to the far edge.
     aim_at(&s.sess, s.p[0].pid, 0, 0);
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
 
     try std.testing.expectEqual(@as(u16, 4), count_defused(&s.sess));
@@ -758,27 +894,27 @@ test "a stamp steps a red cell down one tier at a time, taking three casts" {
     aim_at(&s.sess, pid, 3, 4);
 
     // Cast 1: red → yellow.
-    try enqueue_submit(&s.sess, pid, POKE);
+    try enqueue_cast_as(&s.sess, pid, POKE);
     try flush(&s.sess);
     try std.testing.expectEqual(c.Tier.yellow, s.sess.field.grid.at(3, 4).tiered);
 
     // Cast 2: yellow → green.
     aim_at(&s.sess, pid, 3, 4);
-    try enqueue_submit(&s.sess, pid, POKE);
+    try enqueue_cast_as(&s.sess, pid, POKE);
     try flush(&s.sess);
     try std.testing.expectEqual(c.Tier.green, s.sess.field.grid.at(3, 4).tiered);
 
     // Cast 3: green → defused, and no further.
     try s.sess.tick(1.0);
     aim_at(&s.sess, pid, 3, 4);
-    try enqueue_submit(&s.sess, pid, POKE);
+    try enqueue_cast_as(&s.sess, pid, POKE);
     try flush(&s.sess);
     try std.testing.expect(s.sess.field.grid.at(3, 4) == .neutralized);
 
     // A fourth cast is inert: a defused cell cannot be downgraded further.
     try s.sess.tick(1.0);
     aim_at(&s.sess, pid, 3, 4);
-    try enqueue_submit(&s.sess, pid, POKE);
+    try enqueue_cast_as(&s.sess, pid, POKE);
     try flush(&s.sess);
     try std.testing.expect(s.sess.field.grid.at(3, 4) == .neutralized);
     // Three tiers covered, one per tier — the fourth cast covered nothing.
@@ -801,7 +937,7 @@ test "empty and neutral cells under a shape are inert" {
     s.sess.field.reservoir = .{};
 
     aim_at(&s.sess, s.p[0].pid, 2, 5);
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
 
     try std.testing.expectEqual(@as(u16, 0), count_defused(&s.sess));
@@ -826,7 +962,7 @@ test "a stamp only reaches the grid; the reservoir is out of range" {
     try std.testing.expectEqual(@as(u16, 60), count_tier(&s.sess, .green));
 
     aim_at(&s.sess, s.p[0].pid, 2, 5);
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
 
     try std.testing.expectEqual(@as(u16, 9), count_defused(&s.sess));
@@ -851,7 +987,7 @@ test "shape_cast reports the resolved footprint and the tiers it downgraded" {
     s.p[1].clear();
     // `sweep` is a horizontal run of three, centred on the anchor.
     aim_at(&s.sess, s.p[0].pid, 3, 5);
-    try enqueue_submit(&s.sess, s.p[0].pid, SWEEP);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, SWEEP);
     try flush(&s.sess);
 
     // Broadcast to everyone, so teammates can animate the hit.
@@ -893,7 +1029,7 @@ test "shape_cast counts clipped cells as off_grid and dead cells as inert" {
     // 3x3 in the corner: 5 of 9 cells fall off the grid, 3 of the remaining 4
     // are empty, and only (0,0) is a hazard.
     aim_at(&s.sess, s.p[0].pid, 0, 0);
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
 
     const msgs = try drain(s.p[1].buf.items, arena);
@@ -920,10 +1056,10 @@ test "a fizzled cast broadcasts no shape_cast" {
 
     s.p[0].clear();
     s.p[1].clear();
-    // No recipe table entry matches this combo, and there is no flat
-    // fallback — the recipe list IS the move list, so this is a no-op.
-    const unmatched = mk(&.{ D, D, D, D, D });
-    try enqueue_submit(&s.sess, s.p[0].pid, unmatched);
+    // Every selection names a real move now, so the only way to stamp nothing
+    // is to be unable to PAY: `deluge` costs 9 against an empty pool.
+    s.sess.charges = 0;
+    try enqueue_cast_as(&s.sess, s.p[0].pid, DELUGE);
     try flush(&s.sess);
 
     const msgs = try drain(s.p[1].buf.items, arena);
@@ -931,10 +1067,11 @@ test "a fizzled cast broadcasts no shape_cast" {
     try std.testing.expect(find_tag(msgs, .cast_fizzled) != null);
 }
 
-test "a team recipe stamps one big shape; a half alone stamps nothing" {
+test "two pokes on one square become the group shape; one poke stays a poke" {
     const allocator = std.testing.allocator;
 
-    // Together: twin_bloom's 5x5 diamond = 13 cells, one stamp.
+    // Together: both pokes land, and the second completes twin_bloom's bag, so
+    // its 5x5 diamond (13 cells) is stamped on top of the two pokes.
     var together: TwoPlayerSession = undefined;
     try init_two_player_session(&together, allocator);
     defer together.deinit();
@@ -943,30 +1080,34 @@ test "a team recipe stamps one big shape; a half alone stamps nothing" {
     together.sess.field.reservoir = .{};
     aim_at(&together.sess, together.p[0].pid, 2, 5);
     aim_at(&together.sess, together.p[1].pid, 2, 5);
-    try enqueue_submit(&together.sess, together.p[0].pid, BLOOM_HALF);
-    try enqueue_submit(&together.sess, together.p[1].pid, BLOOM_HALF);
+    try enqueue_cast_as(&together.sess, together.p[0].pid, POKE);
+    try enqueue_cast_as(&together.sess, together.p[1].pid, POKE);
     try flush(&together.sess);
 
+    // The diamond covers the poked cell, so the union is exactly the diamond.
     try std.testing.expectEqual(@as(u16, 13), count_defused(&together.sess));
-    try std.testing.expectEqual(@as(u16, 1), together.sess.stats.team_recipe_hits[0]);
+    try std.testing.expectEqual(@as(u16, 1), together.sess.stats.team_recipe_hits[TWIN_BLOOM]);
+    // Only the FIRST poke was billed as a poke: the second one became the
+    // group, which is what "a discount on the last contribution" means.
+    try std.testing.expectEqual(@as(u16, 1), together.sess.stats.player_recipe_hits[POKE]);
 
-    // Alone: a single half matches no PLAYER recipe, so it stamps nothing and
-    // simply waits to be held.
+    // Alone: nothing to group with, so a poke is just a poke.  The central
+    // change from the old design — a lone contribution is never wasted.
     var alone: TwoPlayerSession = undefined;
     try init_two_player_session(&alone, allocator);
     defer alone.deinit();
     try start(&alone, &enc_fifty_green);
     paint_grid(&alone.sess, tiered(.green));
     alone.sess.field.reservoir = .{};
-    try enqueue_submit(&alone.sess, alone.p[0].pid, BLOOM_HALF);
+    try enqueue_cast_as(&alone.sess, alone.p[0].pid, POKE);
     try flush(&alone.sess);
 
-    try std.testing.expectEqual(@as(u16, 0), count_defused(&alone.sess));
-    try std.testing.expectEqual(@as(u16, 0), alone.sess.stats.team_recipe_hits[0]);
-    try std.testing.expect(alone.sess.held_pool[alone.p[0].pid] != null);
+    try std.testing.expectEqual(@as(u16, 1), count_defused(&alone.sess));
+    try std.testing.expectEqual(@as(u16, 0), alone.sess.stats.team_recipe_hits[TWIN_BLOOM]);
+    try std.testing.expectEqual(@as(u16, 1), alone.sess.stats.player_recipe_hits[POKE]);
 }
 
-test "a held half resolves the moment a partner completes it" {
+test "a contribution waits across drains for a partner to join it" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -976,25 +1117,150 @@ test "a held half resolves the moment a partner completes it" {
     paint_grid(&s.sess, tiered(.green));
     s.sess.field.reservoir = .{};
 
-    // The halves arrive in SEPARATE drains, turns apart in wall-clock terms —
-    // there is no window to miss, only a partner to wait for.
+    // The contributions arrive in SEPARATE drains: a group is not a same-tick
+    // coincidence, it is anything that happens within the turn.
     aim_at(&s.sess, s.p[0].pid, 2, 5);
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOOM_HALF);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
     try flush(&s.sess);
-    try std.testing.expectEqual(@as(u16, 0), count_defused(&s.sess));
+    // The first poke landed on its own merits.
+    try std.testing.expectEqual(@as(u16, 1), count_defused(&s.sess));
+    try std.testing.expectEqual(@as(usize, 1), s.sess.turn_cast_count);
 
     aim_at(&s.sess, s.p[1].pid, 2, 5);
-    try enqueue_submit(&s.sess, s.p[1].pid, BLOOM_HALF);
+    try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
     try flush(&s.sess);
 
     try std.testing.expectEqual(@as(u16, 13), count_defused(&s.sess));
-    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[0]);
-    // Both halves have left the table.
-    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.held_pool[s.p[0].pid]);
-    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.held_pool[s.p[1].pid]);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
 }
 
-test "a held half nobody completes fizzles at turn end, and is not refunded" {
+test "a group's components are consumed, so a third poke starts a fresh bag" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
+
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    aim_at(&s.sess, s.p[1].pid, 2, 5);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
+    // The group ate its whole bag, trigger included: nothing is left to reuse.
+    try std.testing.expectEqual(@as(usize, 0), s.sess.turn_cast_count);
+
+    // So a third poke on the same square has nothing to pair with and is simply
+    // a poke — two players cannot alternate presses for a group every time.
+    try enqueue_cast(&s.sess, s.p[0].pid);
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
+
+    // The fourth completes a NEW bag from the two unspent pokes.
+    try enqueue_cast(&s.sess, s.p[1].pid);
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u16, 2), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
+}
+
+test "contributions on different squares never group" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
+
+    // A group is agreed on by AIM: the whole coordination problem is pointing
+    // at the same cell, so two pokes one cell apart are simply two pokes.
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    aim_at(&s.sess, s.p[1].pid, 2, 6);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
+    try flush(&s.sess);
+
+    try std.testing.expectEqual(@as(u16, 2), count_defused(&s.sess));
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
+}
+
+test "the group shape is anchored at the completing player's cursor" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
+
+    // Same square, reached from both sides: p1 casts second, so p1 completes
+    // the group.  (The square is what matches; the anchor is where the group
+    // lands, and they are the same cell by construction.)
+    aim_at(&s.sess, s.p[0].pid, 3, 7);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try flush(&s.sess);
+    aim_at(&s.sess, s.p[1].pid, 3, 7);
+    try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
+    try flush(&s.sess);
+
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
+    try std.testing.expectEqual(@as(u16, 13), count_defused(&s.sess));
+    // The diamond's tip is two rows above the anchor.
+    try std.testing.expect(s.sess.field.grid.at(1, 7) == .neutralized);
+    // ...and the row above THAT is untouched: the shape is placed, not smeared.
+    try std.testing.expect(s.sess.field.grid.at(0, 7) == .tiered);
+}
+
+test "one player casting twice never forms a group with themselves" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
+
+    // A group is a COOPERATION: it needs distinct players, or a solo player
+    // would simply buy the big shape at a discount by pressing twice.
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try enqueue_cast(&s.sess, s.p[0].pid);
+    try flush(&s.sess);
+
+    // Two pokes on one cell: the cell is defused once and nothing more.
+    try std.testing.expectEqual(@as(u16, 1), count_defused(&s.sess));
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
+    try std.testing.expectEqual(@as(u16, 2), s.sess.stats.player_recipe_hits[POKE]);
+}
+
+test "an asymmetric group fires from either side" {
+    // crossfire is sweep + block, so it must not matter who brings which.
+    const allocator = std.testing.allocator;
+
+    for ([_][2]u8{ .{ SWEEP, BLOCK }, .{ BLOCK, SWEEP } }) |order| {
+        var s: TwoPlayerSession = undefined;
+        try init_two_player_session(&s, allocator);
+        defer s.deinit();
+        try start(&s, &enc_fifty_green);
+        paint_grid(&s.sess, tiered(.green));
+        s.sess.field.reservoir = .{};
+
+        aim_at(&s.sess, s.p[0].pid, 2, 5);
+        aim_at(&s.sess, s.p[1].pid, 2, 5);
+        try enqueue_cast_as(&s.sess, s.p[0].pid, order[0]);
+        try enqueue_cast_as(&s.sess, s.p[1].pid, order[1]);
+        try flush(&s.sess);
+
+        try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[CROSSFIRE]);
+    }
+}
+
+test "the cast log clears at turn end, so a partner cannot join yesterday" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -1004,11 +1270,42 @@ test "a held half nobody completes fizzles at turn end, and is not refunded" {
     paint_grid(&s.sess, .empty); // nothing to eat, so the game cannot end here
     s.sess.field.reservoir = .{ .neutral = 5 };
 
-    const pid = s.p[0].pid;
-    try enqueue_submit(&s.sess, pid, BLOOM_HALF);
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
     try flush(&s.sess);
-    try std.testing.expect(s.sess.held_pool[pid] != null);
+    try std.testing.expectEqual(@as(usize, 1), s.sess.turn_cast_count);
+
+    try end_turn_idly(&s.sess);
+    try std.testing.expectEqual(@as(u16, 2), s.sess.turn);
+    // Groups form within a turn: the feast has been and gone, so last turn's
+    // aim means nothing now.
+    try std.testing.expectEqual(@as(usize, 0), s.sess.turn_cast_count);
+
+    aim_at(&s.sess, s.p[1].pid, 2, 5);
+    try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
+}
+
+test "a lone contribution costs a cast and is never refunded or fizzled" {
+    // The old design HELD a half and fizzled it at turn end.  Now the
+    // contribution is a move that already landed and already paid, so there is
+    // nothing to fizzle — and nothing owed back.
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, .empty);
+    s.sess.field.reservoir = .{ .neutral = 5 };
+
+    const pid = s.p[0].pid;
+    const before = s.sess.charges;
+    try enqueue_cast_as(&s.sess, pid, POKE);
+    try flush(&s.sess);
     try std.testing.expectEqual(BUDGET - 1, s.sess.casts_left[pid]);
+    try std.testing.expectEqual(before - BAL.player_recipes[POKE].cost, s.sess.charges);
 
     s.p[0].clear();
     try end_turn_idly(&s.sess);
@@ -1018,63 +1315,11 @@ test "a held half nobody completes fizzles at turn end, and is not refunded" {
     const arena = arena_state.allocator();
     const msgs = try drain(s.p[0].buf.items, arena);
 
-    // The half is gone and it announced its own failure...
-    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.held_pool[pid]);
-    try std.testing.expect(find_tag(msgs, .cast_fizzled) != null);
-    // ...and the cast it cost stays spent: the fresh budget is a NEW turn's,
-    // not a refund of the old one.
-    try std.testing.expectEqual(@as(u16, 2), s.sess.turn);
+    try std.testing.expect(find_tag(msgs, .cast_fizzled) == null);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.players[pid].fizzles);
+    // The new turn's budget is a NEW turn's, not a refund of the old one.
     try std.testing.expectEqual(BUDGET, s.sess.casts_left[pid]);
-    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.players[pid].fizzles);
-}
-
-test "the team shape is anchored at the joiner's cursor" {
-    const allocator = std.testing.allocator;
-
-    var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
-    defer s.deinit();
-    try start(&s, &enc_fifty_green);
-    paint_grid(&s.sess, tiered(.green));
-    s.sess.field.reservoir = .{};
-
-    // The two halves aim at opposite ends of the field.  p1 submits second, so
-    // p1 completes the recipe and p1's cursor places the combined shape.
-    aim_at(&s.sess, s.p[0].pid, 1, 1);
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOOM_HALF);
-    try flush(&s.sess);
-    aim_at(&s.sess, s.p[1].pid, 3, 7);
-    try enqueue_submit(&s.sess, s.p[1].pid, BLOOM_HALF);
-    try flush(&s.sess);
-
-    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[0]);
-    try std.testing.expectEqual(@as(u16, 13), count_defused(&s.sess));
-    // The diamond's tip is two rows above the joiner's anchor...
-    try std.testing.expect(s.sess.field.grid.at(1, 7) == .neutralized);
-    // ...and nothing landed at the OTHER caster's cursor.
-    try std.testing.expect(s.sess.field.grid.at(1, 1) == .tiered);
-}
-
-test "same player's own recipe halves never fire the team recipe" {
-    const allocator = std.testing.allocator;
-
-    var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
-    defer s.deinit();
-    try start(&s, &enc_fifty_green);
-    paint_grid(&s.sess, tiered(.green));
-    s.sess.field.reservoir = .{};
-
-    // The same player casts the twin_bloom half twice.  Team recipes need
-    // DISTINCT players, so the second cast cannot complete the recipe with the
-    // player's own held half — it simply REPLACES it, still waiting.
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOOM_HALF);
-    try flush(&s.sess);
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOOM_HALF);
-    try flush(&s.sess);
-
-    try std.testing.expectEqual(@as(u16, 0), count_defused(&s.sess));
-    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.team_recipe_hits[0]);
+    try std.testing.expectEqual(before - BAL.player_recipes[POKE].cost, s.sess.charges);
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,7 +1391,7 @@ test "each player aims their own cursor independently" {
     try std.testing.expectEqual(before, s.sess.cursors[s.p[1].pid]);
 }
 
-test "a held half keeps its anchor when the caster re-aims before the partner" {
+test "a contribution keeps the square it was cast on when its caster re-aims" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -1156,20 +1401,52 @@ test "a held half keeps its anchor when the caster re-aims before the partner" {
     paint_grid(&s.sess, tiered(.green));
     s.sess.field.reservoir = .{};
 
-    // p0's half is committed aiming low-right, then p0 wanders to the corner.
+    // p0 pokes low-right, then wanders to the corner.  The cast is logged
+    // against the square it was AIMED at, not against p0's live cursor, or a
+    // player could drag their contribution around after paying for it.
     aim_at(&s.sess, s.p[0].pid, 4, 8);
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOOM_HALF);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
     try flush(&s.sess);
     aim_at(&s.sess, s.p[0].pid, 0, 0);
 
-    // p1 completes it, so the JOINER aims: the combined shape lands on p1's
-    // cursor and, crucially, not on p0's new one.
-    aim_at(&s.sess, s.p[1].pid, 2, 5);
-    try enqueue_submit(&s.sess, s.p[1].pid, BLOOM_HALF);
+    // p1 pokes where p0's contribution actually sits, and the group forms
+    // there.
+    aim_at(&s.sess, s.p[1].pid, 4, 8);
+    try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
     try flush(&s.sess);
 
-    try std.testing.expect(s.sess.field.grid.at(2, 5) == .neutralized);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
+    // The diamond is centred on the shared square...
+    try std.testing.expect(s.sess.field.grid.at(4, 8) == .neutralized);
+    try std.testing.expect(s.sess.field.grid.at(2, 8) == .neutralized);
+    // ...and nothing followed p0 to the corner.
     try std.testing.expect(s.sess.field.grid.at(0, 0) == .tiered);
+}
+
+test "chasing a partner's stale cursor does not form a group" {
+    // The other half of the rule above: aim is matched against where a
+    // contribution WAS CAST, so pointing at where a teammate has since moved TO
+    // is not agreement.
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
+
+    aim_at(&s.sess, s.p[0].pid, 4, 8);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try flush(&s.sess);
+    aim_at(&s.sess, s.p[0].pid, 1, 1);
+
+    aim_at(&s.sess, s.p[1].pid, 1, 1);
+    try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
+    try flush(&s.sess);
+
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
+    try std.testing.expectEqual(@as(u16, 2), count_defused(&s.sess));
 }
 
 // ---------------------------------------------------------------------------
@@ -1397,7 +1674,7 @@ test "a stamp destroys nothing: it converts a wall into a meal" {
     set_block_field(&s.sess, tiered(.green), 2, 1);
 
     aim_at(&s.sess, s.p[0].pid, 2, 1);
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
     // The stamp defused all 9 and removed none.
     try std.testing.expectEqual(@as(u16, 9), count_defused(&s.sess));
@@ -1485,8 +1762,8 @@ test "a turn with no slime on the field is a free turn" {
 // Casting: the per-turn budget
 //
 // Fixture balance: casts_per_turn = 3 per PLAYER.  A cast resolves in the drain
-// that accepts it; a team half with no partner is held; a combo that matches
-// nothing fizzles for free.
+// that accepts it; a lone contribution still stamps its own move and waits on
+// the cast log for a partner; only an unaffordable move fizzles.
 // ---------------------------------------------------------------------------
 
 test "an accepted cast resolves immediately and spends one budget slot" {
@@ -1504,21 +1781,21 @@ test "an accepted cast resolves immediately and spends one budget slot" {
 
     s.p[1].clear();
     aim_at(&s.sess, s.p[0].pid, 2, 5);
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
 
     // The 3x3 block landed in the same drain that accepted it.
     try std.testing.expectEqual(@as(u16, 9), count_defused(&s.sess));
     try std.testing.expectEqual(BUDGET - 1, s.sess.casts_left[s.p[0].pid]);
-    // A resolved cast is not held: there is nothing left waiting.
-    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.held_pool[s.p[0].pid]);
-    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.action_pool[s.p[0].pid]);
+    // The cast is logged for the rest of the turn so a partner can build on it,
+    // but the stamp itself is finished business.
+    try std.testing.expectEqual(@as(usize, 1), s.sess.turn_cast_count);
     try std.testing.expectEqual(@as(u16, 1), s.sess.stats.players[s.p[0].pid].casts);
 
     const msgs = try drain(s.p[1].buf.items, arena);
-    // A cast that resolves announces its SHAPE, not a pending commitment.
+    // A cast announces its SHAPE: every cast resolves, so there is no longer
+    // any such thing as a commitment pending a partner.
     try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .shape_cast));
-    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_committed));
     var cast_count: usize = 0;
     for (msgs) |m| {
         if (m.tag != .action_result) continue;
@@ -1550,7 +1827,7 @@ test "a player may cast their whole budget in one turn, then no more" {
     aim_at(&s.sess, pid, 3, 4);
 
     for (0..BUDGET) |_| {
-        try enqueue_submit(&s.sess, pid, POKE);
+        try enqueue_cast_as(&s.sess, pid, POKE);
         try flush(&s.sess);
     }
     try std.testing.expectEqual(@as(u8, 0), s.sess.casts_left[pid]);
@@ -1558,7 +1835,7 @@ test "a player may cast their whole budget in one turn, then no more" {
 
     // A fourth submit is silently ignored: no fizzle, no effect, no wire noise.
     s.p[1].clear();
-    try enqueue_submit(&s.sess, pid, POKE);
+    try enqueue_cast_as(&s.sess, pid, POKE);
     try flush(&s.sess);
 
     const msgs = try drain(s.p[1].buf.items, arena);
@@ -1582,27 +1859,27 @@ test "the turn ends only when EVERY connected player is out of casts" {
 
     // p0 empties their budget: the turn is still p1's to finish.
     for (0..BUDGET) |_| {
-        try enqueue_submit(&s.sess, s.p[0].pid, POKE);
+        try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
         try flush(&s.sess);
     }
     try std.testing.expectEqual(@as(u16, 1), s.sess.turn);
 
     // p1 spends all but one: still turn 1.
     for (0..BUDGET - 1) |_| {
-        try enqueue_submit(&s.sess, s.p[1].pid, POKE);
+        try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
         try flush(&s.sess);
     }
     try std.testing.expectEqual(@as(u16, 1), s.sess.turn);
 
     // The last cast in the room settles the turn and refills both budgets.
-    try enqueue_submit(&s.sess, s.p[1].pid, POKE);
+    try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
     try flush(&s.sess);
     try std.testing.expectEqual(@as(u16, 2), s.sess.turn);
     try std.testing.expectEqual(BUDGET, s.sess.casts_left[s.p[0].pid]);
     try std.testing.expectEqual(BUDGET, s.sess.casts_left[s.p[1].pid]);
 }
 
-test "a zero-output submit fizzles for free" {
+test "a cast the pool cannot pay for fizzles, and the budget is spent anyway" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1612,61 +1889,67 @@ test "a zero-output submit fizzles for free" {
     try init_two_player_session(&s, allocator);
     defer s.deinit();
     try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
 
-    // No recipe covers this combo, so it fizzles and costs no budget: a typo
-    // must not be able to burn a turn.
+    // Every selection names a real move, so the only failure left is
+    // INSOLVENCY — and that is a real decision the team got wrong, so it costs
+    // the cast.
+    s.sess.charges = 0;
     s.p[1].clear();
-    try enqueue_submit(&s.sess, s.p[0].pid, UNMATCHED);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, DELUGE);
     try flush(&s.sess);
 
-    try std.testing.expectEqual(BUDGET, s.sess.casts_left[s.p[0].pid]);
-    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.held_pool[s.p[0].pid]);
+    try std.testing.expectEqual(BUDGET - 1, s.sess.casts_left[s.p[0].pid]);
+    try std.testing.expectEqual(@as(u16, 0), count_defused(&s.sess));
     try std.testing.expectEqual(@as(u16, 1), s.sess.stats.players[s.p[0].pid].fizzles);
-    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.players[s.p[0].pid].casts);
 
     var msgs = try drain(s.p[1].buf.items, arena);
     try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_fizzled));
     try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .shape_cast));
 
-    // A valid submit right after is accepted normally.
+    // The FREE move still works with the pool at zero: the economy has a floor
+    // a team can never fall through.
     s.p[1].clear();
-    try enqueue_submit(&s.sess, s.p[0].pid, POKE);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, TRICKLE);
     try flush(&s.sess);
 
-    try std.testing.expectEqual(BUDGET - 1, s.sess.casts_left[s.p[0].pid]);
+    try std.testing.expectEqual(@as(u16, 1), count_defused(&s.sess));
     msgs = try drain(s.p[1].buf.items, arena);
     try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .shape_cast));
 }
 
-test "an unpaired team half is held and announced, not resolved" {
+test "a fizzled cast is still logged, so a partner can group on the square" {
+    // The stamp never landed, but the player did aim, did press, and did pay a
+    // cast — so their intent stands and a teammate can still act on it.
     const allocator = std.testing.allocator;
-    var arena_state = std.heap.ArenaAllocator.init(allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_twenty_green);
+    try start(&s, &enc_fifty_green);
     paint_grid(&s.sess, tiered(.green));
     s.sess.field.reservoir = .{};
 
-    s.p[1].clear();
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOOM_HALF);
+    // p0's poke cannot be paid for...
+    s.sess.charges = 0;
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u16, 0), count_defused(&s.sess));
+    try std.testing.expectEqual(@as(usize, 1), s.sess.turn_cast_count);
+
+    // ...but with the pool topped up, p1 completes twin_bloom off it.
+    s.sess.charges = 100;
+    aim_at(&s.sess, s.p[1].pid, 2, 5);
+    try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
     try flush(&s.sess);
 
-    // Held: budget spent, nothing stamped, and the room is told to expect it.
-    try std.testing.expect(s.sess.held_pool[s.p[0].pid] != null);
-    try std.testing.expectEqual(BUDGET - 1, s.sess.casts_left[s.p[0].pid]);
-    try std.testing.expectEqual(@as(u16, 0), count_defused(&s.sess));
-
-    const msgs = try drain(s.p[1].buf.items, arena);
-    try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_committed));
-    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .shape_cast));
-    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_fizzled));
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
+    try std.testing.expectEqual(@as(u16, 13), count_defused(&s.sess));
 }
 
-test "completing a team recipe resolves both halves as one recipe fire" {
+test "a cast broadcasts one shape_cast and one recipe fire, group or not" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1680,29 +1963,30 @@ test "completing a team recipe resolves both halves as one recipe fire" {
     paint_grid(&s.sess, tiered(.green));
     s.sess.field.reservoir = .{};
 
-    const half = BLOOM_HALF; // [dispense, catalyst] — the twin_bloom recipe
-    try enqueue_submit(&s.sess, s.p[0].pid, half);
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
     try flush(&s.sess);
 
     s.p[1].clear();
     aim_at(&s.sess, s.p[1].pid, 2, 5);
-    try enqueue_submit(&s.sess, s.p[1].pid, half);
+    try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
     try flush(&s.sess);
 
-    // ONE stamp of the team's 5x5 diamond (13 cells), not two half-stamps.
+    // ONE stamp of the team's 5x5 diamond (13 cells), and it subsumes the two
+    // pokes that bought it.
     try std.testing.expectEqual(@as(u16, 13), count_defused(&s.sess));
-    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[0]);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
     try std.testing.expectEqual(session_mod.SessionPhase.playing, s.sess.phase);
 
-    // Both halves left the table; each player was charged exactly one cast.
-    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.held_pool[s.p[0].pid]);
-    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.held_pool[s.p[1].pid]);
+    // Each player was charged exactly one cast: a group is a discount on the
+    // last contribution, not an extra purchase.
     try std.testing.expectEqual(@as(u16, 1), s.sess.stats.players[s.p[0].pid].casts);
     try std.testing.expectEqual(@as(u16, 1), s.sess.stats.players[s.p[1].pid].casts);
     try std.testing.expectEqual(@as(u16, 2), s.sess.stats.casts_total);
 
     const msgs = try drain(s.p[1].buf.items, arena);
-    // Exactly one TEAM recipe fire broadcast, and one stamp.
+    // The completing cast broadcasts exactly one stamp, announced as the TEAM
+    // recipe — the solo poke it would otherwise have been never happened.
     try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .shape_cast));
     var team_fires: usize = 0;
     for (msgs) |m| {
@@ -1710,13 +1994,13 @@ test "completing a team recipe resolves both halves as one recipe fire" {
         var fbs = std.io.fixedBufferStream(m.payload);
         const rf = try proto.decode_recipe_fired(fbs.reader());
         try std.testing.expectEqual(proto.RecipeKind.team, rf.kind);
-        try std.testing.expectEqual(@as(u8, 0), rf.index); // twin_bloom
+        try std.testing.expectEqual(TWIN_BLOOM, rf.index);
         team_fires += 1;
     }
     try std.testing.expectEqual(@as(usize, 1), team_fires);
 }
 
-test "a cast that resolves on its own leaves a teammate's unrelated half held" {
+test "a cast that forms no group leaves an unrelated contribution untouched" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -1726,43 +2010,65 @@ test "a cast that resolves on its own leaves a teammate's unrelated half held" {
     paint_grid(&s.sess, tiered(.green));
     s.sess.field.reservoir = .{};
 
-    // p0 holds a crossfire half — nothing p1 is about to do can complete it.
-    try enqueue_submit(&s.sess, s.p[0].pid, CROSSFIRE_A);
-    try flush(&s.sess);
-    try std.testing.expect(s.sess.held_pool[s.p[0].pid] != null);
-
-    // p1 casts a PLAYER recipe: it resolves on its own merits and must not
-    // consume the bystanding half.
-    aim_at(&s.sess, s.p[1].pid, 2, 5);
-    try enqueue_submit(&s.sess, s.p[1].pid, POKE);
+    // p0 puts a sweep down at one end — a crossfire component, but p1 is about
+    // to do something unrelated somewhere else.
+    aim_at(&s.sess, s.p[0].pid, 1, 2);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, SWEEP);
     try flush(&s.sess);
 
-    try std.testing.expect(s.sess.field.grid.at(2, 5) == .neutralized);
-    try std.testing.expectEqual(@as(u16, 1), count_defused(&s.sess));
-    try std.testing.expect(s.sess.held_pool[s.p[0].pid] != null);
+    aim_at(&s.sess, s.p[1].pid, 4, 8);
+    try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
+    try flush(&s.sess);
+
+    // Both landed as themselves, and p0's sweep is still available to group
+    // with for the rest of the turn.
+    try std.testing.expectEqual(@as(u16, 4), count_defused(&s.sess));
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.team_recipe_hits[CROSSFIRE]);
+    try std.testing.expectEqual(@as(usize, 2), s.sess.turn_cast_count);
 }
 
-test "resubmitting replaces a held half rather than stacking one up" {
+test "an unaffordable group falls back to the plain move" {
+    // `triad` (3 pokes, 12 charges) shadows twin_bloom in the fixture table, so
+    // a third poke matches triad first.  With too little in the pool for triad
+    // the cast must not fizzle, and must not silently fire twin_bloom either:
+    // it lands as the poke the player selected.
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_twenty_green);
+    try start(&s, &enc_fifty_green);
     paint_grid(&s.sess, tiered(.green));
     s.sess.field.reservoir = .{};
-    const pid = s.p[0].pid;
 
-    // Two DIFFERENT team halves in a row: a player holds at most one, so the
-    // second replaces the first — and both casts are still charged.
-    try enqueue_submit(&s.sess, pid, BLOOM_HALF);
+    const pid2 = try join_extra(&s, "Carol");
+    // A player who joins mid-encounter has no entity or cursor from start, so
+    // give them one on the shared square like everyone else.
+    s.sess.casts_left[pid2] = BUDGET;
+
+    // Enough for three pokes, nowhere near enough for triad.
+    s.sess.charges = 3 * BAL.player_recipes[POKE].cost;
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    aim_at(&s.sess, s.p[1].pid, 2, 5);
+    aim_at(&s.sess, pid2, 2, 5);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
     try flush(&s.sess);
-    try enqueue_submit(&s.sess, pid, CROSSFIRE_A);
+    // The pair formed twin_bloom, which the pool also cannot afford (4 > 1
+    // remaining), so that fell back to a poke as well.
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.team_recipe_hits[TRIAD]);
+    try std.testing.expectEqual(@as(u16, 2), s.sess.stats.player_recipe_hits[POKE]);
+
+    try enqueue_cast_as(&s.sess, pid2, POKE);
     try flush(&s.sess);
 
-    try std.testing.expect(logic.combos_equal(CROSSFIRE_A, s.sess.held_pool[pid].?));
-    try std.testing.expectEqual(BUDGET - 2, s.sess.casts_left[pid]);
-    try std.testing.expectEqual(@as(u16, 0), count_defused(&s.sess));
+    // Three pokes, one cell, no group: the pool decided, and every player still
+    // got the move they chose.
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.team_recipe_hits[TRIAD]);
+    try std.testing.expectEqual(@as(u16, 3), s.sess.stats.player_recipe_hits[POKE]);
+    try std.testing.expectEqual(@as(u16, 1), count_defused(&s.sess));
+    try std.testing.expectEqual(@as(u32, 0), s.sess.charges);
 }
 
 test "player recipe fires are broadcast when the cast converts" {
@@ -1778,7 +2084,7 @@ test "player recipe fires are broadcast when the cast converts" {
     set_field(&s.sess, tiered(.green), 50);
 
     s.p[1].clear();
-    try enqueue_submit(&s.sess, s.p[0].pid, POKE); // `poke` = player_recipes[0]
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE); // `poke` = player_recipes[0]
     try flush(&s.sess);
 
     const msgs = try drain(s.p[1].buf.items, arena);
@@ -1824,7 +2130,7 @@ test "the pool starts at the encounter's charges and is not refilled by a turn" 
     try std.testing.expectEqual(@as(u32, 10), s.sess.charges);
 
     aim_at(&s.sess, s.p[0].pid, 2, 5);
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK); // costs the default 1
+    try enqueue_cast_as(&s.sess, s.p[0].pid, BLOCK); // costs the default 1
     try flush(&s.sess);
     try std.testing.expectEqual(@as(u32, 9), s.sess.charges);
 
@@ -1845,14 +2151,14 @@ test "each recipe debits its own cost, and a free recipe debits nothing" {
     s.sess.field.reservoir = .{};
 
     aim_at(&s.sess, s.p[0].pid, 2, 5);
-    try enqueue_submit(&s.sess, s.p[0].pid, TRICKLE); // cost 0
+    try enqueue_cast_as(&s.sess, s.p[0].pid, TRICKLE); // cost 0
     try flush(&s.sess);
     try std.testing.expectEqual(@as(u32, 10), s.sess.charges);
     // Free does not mean inert: the shape still landed.
     try std.testing.expectEqual(c.SlimeCell.neutralized, s.sess.field.grid.at(2, 5));
 
     aim_at(&s.sess, s.p[1].pid, 2, 2);
-    try enqueue_submit(&s.sess, s.p[1].pid, DELUGE); // cost 9
+    try enqueue_cast_as(&s.sess, s.p[1].pid, DELUGE); // cost 9
     try flush(&s.sess);
     try std.testing.expectEqual(@as(u32, 1), s.sess.charges);
     try std.testing.expectEqual(@as(u16, 9), s.sess.stats.feast.charges_spent);
@@ -1873,7 +2179,7 @@ test "a cast the pool cannot afford fizzles, and the cast budget is still spent"
 
     // Drain the pool to 1 with one deluge.
     aim_at(&s.sess, s.p[0].pid, 2, 2);
-    try enqueue_submit(&s.sess, s.p[0].pid, DELUGE);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, DELUGE);
     try flush(&s.sess);
     try std.testing.expectEqual(@as(u32, 1), s.sess.charges);
 
@@ -1883,7 +2189,7 @@ test "a cast the pool cannot afford fizzles, and the cast budget is still spent"
 
     // A second deluge costs 9 against a pool of 1.
     aim_at(&s.sess, s.p[0].pid, 4, 7);
-    try enqueue_submit(&s.sess, s.p[0].pid, DELUGE);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, DELUGE);
     try flush(&s.sess);
 
     // Nothing happened to the field and nothing left the pool...
@@ -1910,7 +2216,7 @@ test "a free recipe still works with the pool at zero" {
     s.sess.charges = 0;
 
     aim_at(&s.sess, s.p[0].pid, 3, 4);
-    try enqueue_submit(&s.sess, s.p[0].pid, TRICKLE);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, TRICKLE);
     try flush(&s.sess);
 
     // 0 <= 0, so the pool can pay.  A zero-cost recipe is the floor the
@@ -1919,7 +2225,7 @@ test "a free recipe still works with the pool at zero" {
     try std.testing.expectEqual(@as(u32, 0), s.sess.charges);
 }
 
-test "a team recipe is charged once for the group, not once per player" {
+test "a group is charged the group cost on top of its components" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -1929,20 +2235,25 @@ test "a team recipe is charged once for the group, not once per player" {
     paint_grid(&s.sess, tiered(.green));
     s.sess.field.reservoir = .{};
 
-    // The first half is HELD, which must cost nothing: a player waiting for a
-    // partner has not committed the team's charges yet.
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOOM_HALF);
+    // The first poke pays its OWN cost: a contribution is a move that landed,
+    // not a deposit against a group that may never happen.
+    aim_at(&s.sess, s.p[0].pid, 3, 5);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
     try flush(&s.sess);
-    try std.testing.expectEqual(@as(u32, 10), s.sess.charges);
+    const poke_cost = BAL.player_recipes[POKE].cost;
+    try std.testing.expectEqual(@as(u32, 10) - poke_cost, s.sess.charges);
 
-    // The partner completes it: twin_bloom costs 4, once.
+    // The partner's cast pays the GROUP cost (4) INSTEAD of its own poke cost:
+    // the discount is on the last contribution, and the priors are not refunded
+    // because each already bought a stamp.
     aim_at(&s.sess, s.p[1].pid, 3, 5);
-    try enqueue_submit(&s.sess, s.p[1].pid, BLOOM_HALF);
+    try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
     try flush(&s.sess);
-    try std.testing.expectEqual(@as(u32, 6), s.sess.charges);
+    const group_cost = BAL.team_recipes[TWIN_BLOOM].cost;
+    try std.testing.expectEqual(@as(u32, 10) - poke_cost - group_cost, s.sess.charges);
 }
 
-test "an unaffordable team recipe fizzles as a whole, leaving no partial stamp" {
+test "a group the pool cannot afford falls back to the plain move, not a fizzle" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -1951,22 +2262,56 @@ test "an unaffordable team recipe fizzles as a whole, leaving no partial stamp" 
     try start(&s, &enc_thin_pool);
     paint_grid(&s.sess, tiered(.green));
     s.sess.field.reservoir = .{};
-    s.sess.charges = 3; // twin_bloom costs 4
 
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOOM_HALF);
+    aim_at(&s.sess, s.p[0].pid, 3, 5);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
     try flush(&s.sess);
-    const before = s.sess.field.grid;
 
+    // twin_bloom costs 4; leave enough for a poke and no more.
+    s.sess.charges = BAL.player_recipes[POKE].cost;
     aim_at(&s.sess, s.p[1].pid, 3, 5);
-    try enqueue_submit(&s.sess, s.p[1].pid, BLOOM_HALF);
+    try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
     try flush(&s.sess);
 
-    // All or nothing: a group that cannot be paid for leaves the board alone.
-    try std.testing.expect(grids_equal(before, s.sess.field.grid));
-    try std.testing.expectEqual(@as(u32, 3), s.sess.charges);
-    // The held half is released rather than silently re-held — the players saw
-    // it fire, so the server must not keep it on the table behind their backs.
-    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.held_pool[s.p[0].pid]);
+    // The group did not fire, but the player is not punished for aiming well:
+    // their poke lands, at poke prices.
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
+    try std.testing.expectEqual(@as(u16, 2), s.sess.stats.player_recipe_hits[POKE]);
+    try std.testing.expectEqual(@as(u32, 0), s.sess.charges);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.players[s.p[1].pid].fizzles);
+    // Only the two pokes landed — no partial diamond.
+    try std.testing.expectEqual(@as(u16, 1), count_defused(&s.sess));
+}
+
+test "a group that falls back leaves its components unspent for another try" {
+    // The bag is only consumed when the group actually FIRES, so a pool too thin
+    // this second does not throw the team's coordination away.
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_thin_pool);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
+
+    aim_at(&s.sess, s.p[0].pid, 3, 5);
+    aim_at(&s.sess, s.p[1].pid, 3, 5);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try flush(&s.sess);
+
+    s.sess.charges = BAL.player_recipes[POKE].cost; // too thin for the group
+    try enqueue_cast_as(&s.sess, s.p[1].pid, POKE);
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
+    try std.testing.expectEqual(@as(usize, 2), s.sess.turn_cast_count);
+
+    // Topped up, p0's next poke completes a group off the pair still on the
+    // square.
+    s.sess.charges = 100;
+    try enqueue_cast(&s.sess, s.p[0].pid);
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
 }
 
 // ---------------------------------------------------------------------------
@@ -2044,7 +2389,7 @@ test "defusing the tight budget survives what idle play loses" {
     // are 9 units of reachable food — the entire difference between playing and
     // not playing.
     aim_at(&s.sess, s.p[0].pid, 2, 5);
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
     try std.testing.expectEqual(@as(u16, 9), count_defused(&s.sess));
 
@@ -2142,8 +2487,8 @@ test "match stats: feast tallies, players and recipes are reported" {
     // Alice pokes one green cell (defusing it); Bob sweeps three more.
     aim_at(&s.sess, s.p[0].pid, 0, 0);
     aim_at(&s.sess, s.p[1].pid, 0, 4);
-    try enqueue_submit(&s.sess, s.p[0].pid, POKE);
-    try enqueue_submit(&s.sess, s.p[1].pid, SWEEP);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try enqueue_cast_as(&s.sess, s.p[1].pid, SWEEP);
     try flush(&s.sess);
 
     // The turn ends.  The flood enters at column 0 and finds:
@@ -2255,7 +2600,7 @@ test "game_state reflects the turn counter and stamps as they happen" {
 
     s.p[0].clear();
     aim_at(&s.sess, s.p[0].pid, 2, 5);
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK); // 3x3 = 9 cells defused
+    try enqueue_cast_as(&s.sess, s.p[0].pid, BLOCK); // 3x3 = 9 cells defused
     try flush(&s.sess);
 
     const gs = try last_game_state(try drain(s.p[0].buf.items, arena));
@@ -2279,7 +2624,7 @@ test "game_state reflects the turn counter and stamps as they happen" {
     try std.testing.expectEqual(@as(u32, 0), gs.reservoir);
 }
 
-test "game_state carries the live combo preview on the owner's entity" {
+test "game_state carries every player's selection, not just the viewer's" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -2290,23 +2635,55 @@ test "game_state carries the live combo preview on the owner's entity" {
     defer s.deinit();
     try start(&s, &enc_fifty_green);
 
-    const combo = BLOOM_HALF; // [dispense, catalyst] — two distinguishable slots
-    try enqueue_combo(&s.sess, s.p[0].pid, combo);
+    try enqueue_select(&s.sess, s.p[0].pid, BLOCK);
+    try enqueue_select(&s.sess, s.p[1].pid, WEDGE);
 
+    s.p[0].clear();
+    try flush(&s.sess);
+    const gs = try last_game_state(try drain(s.p[0].buf.items, arena));
+
+    // p0 is the VIEWER here and still sees p1's choice: knowing what a teammate
+    // has lined up is the whole basis for agreeing on a group, so it cannot be
+    // private.
+    var seen: [2]bool = .{ false, false };
+    for (gs.entities[0..gs.entity_count]) |e| {
+        if (e.owner == s.p[0].pid) {
+            try std.testing.expectEqual(BLOCK, e.selected_shape);
+            seen[0] = true;
+        } else if (e.owner == s.p[1].pid) {
+            try std.testing.expectEqual(WEDGE, e.selected_shape);
+            seen[1] = true;
+        }
+    }
+    try std.testing.expect(seen[0] and seen[1]);
+}
+
+test "game_state keeps reporting a selection after it has been cast" {
+    // A cast does not clear the wheel, so the preview a client draws under the
+    // cursor stays truthful — and a second press of the same move needs no
+    // keystrokes to set up.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
+
+    try enqueue_cast_as(&s.sess, s.p[0].pid, SWEEP);
     s.p[0].clear();
     try flush(&s.sess);
     const gs = try last_game_state(try drain(s.p[0].buf.items, arena));
 
     var found = false;
     for (gs.entities[0..gs.entity_count]) |e| {
-        if (e.owner != s.p[0].pid) {
-            try std.testing.expectEqual(@as(u8, 0), e.combo_len);
-            continue;
-        }
+        if (e.owner != s.p[0].pid) continue;
+        try std.testing.expectEqual(SWEEP, e.selected_shape);
         found = true;
-        try std.testing.expectEqual(combo.len, e.combo_len);
-        try std.testing.expectEqual(c.ActionChoice.dispense, e.combo_slots[0].action);
-        try std.testing.expectEqual(c.ActionChoice.catalyst, e.combo_slots[1].action);
     }
     try std.testing.expect(found);
 }
@@ -2333,7 +2710,7 @@ test "game_state carries the turn number and each player's remaining casts" {
 
     // After one cast only the caster's budget drops: budgets are per player.
     s.p[1].clear();
-    try enqueue_submit(&s.sess, s.p[0].pid, POKE);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
     try flush(&s.sess);
     gs = try last_game_state(try drain(s.p[1].buf.items, arena));
     try std.testing.expectEqual(@as(u16, 1), gs.turn);
@@ -2379,7 +2756,7 @@ test "game_state carries the shared charge pool as it drains" {
     try std.testing.expectEqual(@as(u32, 10), before.charges);
 
     aim_at(&s.sess, s.p[0].pid, 2, 2);
-    try enqueue_submit(&s.sess, s.p[0].pid, DELUGE); // cost 9
+    try enqueue_cast_as(&s.sess, s.p[0].pid, DELUGE); // cost 9
     s.p[0].clear();
     try flush(&s.sess);
 
@@ -2431,9 +2808,9 @@ test "a late joiner gets game_start with the grid dimensions and an entity" {
 
 test "a repeated join_lobby does not duplicate the player's entity" {
     // One player MUST own exactly one player_marker entity: snapshots are built
-    // by walking that array, and both the client's combo projection and the
-    // team-recipe matcher treat one entity as one caster.  A duplicate would
-    // project a player's combo twice and fake a two-player team recipe.
+    // by walking that array, and both the client's batch projection and the
+    // group matcher treat one entity as one caster.  A duplicate would project
+    // a player's selection twice and fake a two-player group.
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;

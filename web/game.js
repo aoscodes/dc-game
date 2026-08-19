@@ -53,17 +53,6 @@ const LAYOUT = {
     previewFillAlpha: 0.16,
     previewWashAlpha: 0.3, // scaled by the pulse, so the wash breathes too
 
-    // --- Candidate ghosts (see candidateShapes) ---------------------------
-    //
-    // Deliberately quieter than the committed preview and drawn UNDER it:
-    // ghosts are "this is where it would land IF you keep typing", and must
-    // never be mistaken for the cast that is actually about to fire.  Neutral
-    // (not outcome-colored) for the same reason.
-    ghostWidth: 1,
-    ghostAlpha: 0.22,      // per covering candidate — overlap is ADDITIVE, so
-    ghostAlphaCap: 0.66,   // cells several candidates share read strongest
-    ghostFillAlpha: 0.05,  // ditto, also scaled by the overlap count
-
     // --- Sheltered food ---------------------------------------------------
     //
     // Hatch strength for food the feast cannot reach, and for the brighter
@@ -100,13 +89,20 @@ const LAYOUT = {
 
   headers: { waveX: 40, waveY: 50, waveFont: 20, labelDy: -30, labelFont: 18 },
 
-  // Per-player pending-combo rows, bottom-left beside the action menu.
-  comboPanel: { x: 24, y0: 652, rowH: 18, font: 13, slotW: 14, nameW: 42 },
+  // Per-player shape-wheel rows, bottom-left beside the action menu.
+  // `labelW` is the widest move label the row reserves; longer labels are
+  // clipped by the columns after it rather than reflowing the panel.
+  wheelPanel: { x: 24, y0: 652, rowH: 18, font: 13, labelW: 84, nameW: 42 },
 
   // Lil Guys: one per connected player, purely cosmetic — they mill about the
   // field and pounce at the turn-end feast (see tickLilGuys).  `speed` is px/s;
   // `snap` is how close counts as arrived.
-  lilGuys: { size: 48, speed: 220, snap: 3 },
+  //
+  // `size` is the box drawSprite fits the sprite into.  36 design px is
+  // 72 DEVICE px at renderScale 2 — the art's native frame size, so its 1px
+  // detail lines survive the nearest-neighbour blit.  Any other value resamples
+  // them at a fractional ratio and the face turns to mush.
+  lilGuys: { size: 36, speed: 220, snap: 3 },
 
   // The turn-end feast, played out cell by cell (see the cinematic section).
   // The whole sequence is a deliberate pause in play: input is dead until it
@@ -136,15 +132,10 @@ const LAYOUT = {
     padX: 10, padTopY: 14,
     actionRowDy: 16, actionFont: 16, actionCols: [0, 150],
     aimRowDy: 34, aimFont: 13,
-    cancelRowDy: 48, cancelFont: 12,
+    selectedRowDy: 48, selectedFont: 12,
     castBarDy: 56, castBarH: 16,
     timerTextDy: 86, timerTextFont: 13,
     previewDy: 102, previewFont: 13,
-    candidateDy: 120, candidateFont: 12,
-    // Cap the candidate hint: the panel is a fixed width, and a config may
-    // author far more recipes than share a prefix legibly.  Overflow is
-    // summarised as "+N more" rather than clipped.
-    candidateMax: 3,
   },
 
   // Default floater lifetime ≥ 3s so feedback is readable; cosmetic chomps
@@ -210,8 +201,9 @@ const C_FREE = "rgba(140,230,150,1)";
  *  slime is not a threat, it is wasted opportunity. */
 const C_SHELTERED = "rgba(120,170,210,1)";
 
-/** Sprite used for the cosmetic Lil Guys roaming the slime field. */
-const LIL_GUY_SPRITE = "grunt";
+/** Sprite used for the cosmetic Lil Guys roaming the slime field.  Generated
+ *  from the board build's authored art by scripts/gen_lilguy.py. */
+const LIL_GUY_SPRITE = "lilguy";
 
 /** Sprite sheets to load; Lil Guys are the only sprites rendered. */
 const CLASSES = [LIL_GUY_SPRITE];
@@ -235,15 +227,6 @@ async function loadAssets() {
       sprites.set(cls, { img, meta });
     }),
   ]);
-}
-
-/**
- * Combo slot from its data-file name.  Combos are ACTION KEYS ONLY — a recipe
- * is identified by the sequence of keys pressed, and what it does is carried by
- * its shape, not by any color token in the pattern.
- */
-function slotFromName(name) {
-  return { action: name };
 }
 
 /**
@@ -297,14 +280,18 @@ async function loadBalanceData(hash = PAGE_CONFIG_HASH) {
   CASTS_PER_TURN = bal.casts_per_turn ?? 3;
   PLAYER_RECIPES = bal.player_recipes.map((r) => ({
     label: r.label,
-    pattern: r.pattern.map(slotFromName),
     rows: r.shape,
     offsets: shapeOffsets(r.shape),
     cost: r.cost ?? 1,
   }));
+  // Group components are authored as move LABELS; resolve to move-table
+  // indices once here so the guide and the preview both index the same space
+  // the server does.  An unknown label cannot occur (the Zig loader rejects
+  // the config), but a -1 would poison lookups, so it is dropped.
+  const moveIndex = new Map(PLAYER_RECIPES.map((r, i) => [r.label, i]));
   TEAM_RECIPES = bal.team_recipes.map((r) => ({
     label: r.label,
-    patterns: r.patterns.map((p) => p.map(slotFromName)),
+    components: r.moves.map((m) => moveIndex.get(m)).filter((i) => i !== undefined),
     rows: r.shape,
     offsets: shapeOffsets(r.shape),
     cost: r.cost ?? 1,
@@ -510,17 +497,6 @@ function drawLobby(lobby) {
   drawRecipeGuide();
 }
 
-/** Key binding per action — mirrors src/client/input.zig. */
-const ACTION_KEY = { dispense: "1", catalyst: "2" };
-
-/** Render one combo slot as key+symbol (e.g. "1d") in its action color. */
-function slotKeySymbol(slot) {
-  return {
-    str: `${ACTION_KEY[slot.action] ?? "?"}${ACTION_CHAR[slot.action] ?? "?"}`,
-    color: ACTION_COLOR[slot.action] ?? C_TEXT,
-  };
-}
-
 /** Draw colored text parts left-to-right; returns the x after the last part. */
 function drawParts(x, y, font, parts, gap) {
   let dx = x;
@@ -575,9 +551,9 @@ function drawShapeGlyph(x, y, font, rows) {
 }
 
 /**
- * Lobby study guide: how casting works + every defined recipe with its key
- * sequence AND symbols, all in parity colors (slime = agent = hunger block).
- * Recipes appear in data/balance.json order.
+ * Lobby study guide: how casting works + every move on the shape wheel and
+ * every group, all in parity colors (slime = agent = hunger block).
+ * Moves appear in data/balance.json order, which IS the wheel order.
  */
 function drawRecipeGuide() {
   const L = LAYOUT.lobby;
@@ -589,16 +565,19 @@ function drawRecipeGuide() {
   // The turn loop: a fixed budget of casts each, then the whole field is eaten.
   const castingLine = [
     { str: `Press ENTER to cast — ${CASTS_PER_TURN} casts each per turn.`, color: descColor },
-    { str: "A team recipe needs BOTH halves — the first one waits until a partner casts theirs!", color: RECIPE_COLOR_TEAM },
+    { str: "A GROUP fires when two of you cast its moves on the SAME square in one turn!", color: RECIPE_COLOR_TEAM },
   ];
   const descLines = [
     [
-      { str: "AIM with the arrow keys, then type a combo:", color: descColor },
-      { str: "1d dispense", color: ACTION_COLOR.dispense },
-      { str: "2c catalyst", color: ACTION_COLOR.catalyst },
+      { str: "AIM with the arrow keys. Turn the SHAPE WHEEL to pick your move:", color: descColor },
+      { str: "1 next", color: WHEEL_COLOR.forward },
+      { str: "2 back", color: WHEEL_COLOR.backward },
     ],
     [
-      { str: "Each combo below stamps its SHAPE on the grid, centred on your cursor.", color: descColor },
+      { str: "Your pick STAYS until you turn the wheel again — it survives casting and the turn end.", color: descColor },
+    ],
+    [
+      { str: "Each move below stamps its SHAPE on the grid, centred on your cursor.", color: descColor },
     ],
     [
       { str: "Every covered cell steps down one tier:", color: descColor },
@@ -634,20 +613,18 @@ function drawRecipeGuide() {
   }
   y += L.recipeHeaderGap;
 
-  text("RECIPES", L.guideX, y, L.guideFont + 2, C_HEADER);
+  text("MOVES", L.guideX, y, L.guideFont + 2, C_HEADER);
   y += L.guideLineH;
 
-  const drawRecipeRow = (r, labelColor, patterns, suffix) => {
+  /**
+   * One guide row: label, what it is made of, its shape, its cost.
+   * `made` is the recipe column — empty for a move (the wheel is how you pick
+   * it), the component move labels for a group.
+   */
+  const drawRecipeRow = (r, labelColor, made, suffix) => {
     text(r.label, L.guideX, y, L.recipeFont, labelColor);
     let x = L.guideX + L.recipeLabelW;
-    patterns.forEach((pattern, pi) => {
-      if (pi > 0) {
-        text("+", x, y, L.recipeFont, descColor);
-        ctx.font = `${L.recipeFont}px monospace`;
-        x += ctx.measureText("+").width + L.recipeSlotGap;
-      }
-      x = drawParts(x, y, L.recipeFont, pattern.map(slotKeySymbol), L.recipeSlotGap);
-    });
+    x = drawParts(x, y, L.recipeFont, made, L.recipeSlotGap);
     text("→", x, y, L.recipeFont, descColor);
     x += L.recipeArrowGap;
     x = drawShapeGlyph(x, y, L.recipeFont, r.rows ?? ["#"]) + L.recipeSlotGap;
@@ -659,10 +636,22 @@ function drawRecipeGuide() {
   };
 
   for (const r of PLAYER_RECIPES) {
-    drawRecipeRow(r, RECIPE_COLOR_PLAYER, [r.pattern], null);
+    drawRecipeRow(r, RECIPE_COLOR_PLAYER, [], null);
   }
-  for (const r of TEAM_RECIPES) {
-    drawRecipeRow(r, RECIPE_COLOR_TEAM, r.patterns, `(team ×${r.patterns.length})`);
+  if (TEAM_RECIPES.length > 0) {
+    y += L.recipeHeaderGap;
+    text("GROUPS", L.guideX, y, L.guideFont + 2, C_HEADER);
+    y += L.guideLineH;
+    for (const r of TEAM_RECIPES) {
+      // Components are move labels joined by "+": each must come from a
+      // DIFFERENT player, so the count doubles as "how many of you it takes".
+      const made = [];
+      r.components.forEach((ci, i) => {
+        if (i > 0) made.push({ str: "+", color: descColor });
+        made.push({ str: PLAYER_RECIPES[ci]?.label ?? "?", color: RECIPE_COLOR_PLAYER });
+      });
+      drawRecipeRow(r, RECIPE_COLOR_TEAM, made, `(needs ${r.components.length} players)`);
+    }
   }
 }
 
@@ -715,12 +704,12 @@ function drawSprite(id, kind, cx, cy, cw, ch, lastAction, dt, flip) {
 /**
  * Server marks casters via action_result .cast → entity.last_action for one
  * render frame.  With no player sprites, visualise the cast as a floater
- * rising from the caster's combo-panel row.
+ * rising from the caster's wheel-panel row.
  */
 function spawnCastFloaters(game) {
-  const CP = LAYOUT.comboPanel;
+  const CP = LAYOUT.wheelPanel;
   const rowPos = (i) => ({
-    x: CP.x + CP.nameW + 5 * CP.slotW + 24,
+    x: CP.x + CP.nameW + CP.labelW + 24,
     y: CP.y0 + i * CP.rowH,
   });
   (game.entities || []).forEach((e, i) => {
@@ -728,8 +717,8 @@ function spawnCastFloaters(game) {
     const { x, y } = rowPos(i);
     spawnFloater("✦ cast", x, y, C_OWN_ROW);
   });
-  // A combo that matched nothing, or a team half nobody completed: show the
-  // fizzle on the caster's row (grey — nothing happened).
+  // A cast the shared pool could not pay for: show the fizzle on the caster's
+  // row (grey — the budget was spent, but nothing landed).
   for (const pid of game.fizzles ?? []) {
     const i = (game.entities || []).findIndex((e) => e.owner === pid);
     if (i === -1) continue;
@@ -740,7 +729,7 @@ function spawnCastFloaters(game) {
 
 /** Player-recipe floater color (matches the recipe label color elsewhere). */
 const RECIPE_COLOR_PLAYER = "rgba(255,255,140,1)";
-/** Team-recipe floater color — distinct so co-op combos pop. */
+/** Group floater color — distinct so co-op fires pop. */
 const RECIPE_COLOR_TEAM = "rgba(140,240,255,1)";
 
 /**
@@ -836,44 +825,43 @@ const CAST_EVENT_COLOR = "rgba(120,220,255,1)";
 // when it is over — see spawnFeastTallyFloaters.
 
 /**
- * Compact per-player pending-combo rows (bottom-left UI panel).  No player
- * sprites are rendered — combos are the only per-player element on screen.
- * The local player's row is highlighted, and every row shows how many casts
- * that player has left this turn: the turn cannot end until they are all spent,
- * so a row with casts left is a row the team is waiting on.
+ * Compact per-player shape-wheel rows (bottom-left UI panel).  No player
+ * sprites are rendered — the wheel selection is the only per-player element on
+ * screen.  The local player's row is highlighted, and every row shows how many
+ * casts that player has left this turn: the turn cannot end until they are all
+ * spent, so a row with casts left is a row the team is waiting on.
+ *
+ * Showing EVERY player's selection (not just the local one) is what makes
+ * groups playable: you can see a teammate is holding the move your group needs
+ * before you spend a cast on the square.
  */
-function drawComboPanel(game) {
-  const CP = LAYOUT.comboPanel;
+function drawWheelPanel(game) {
+  const CP = LAYOUT.wheelPanel;
   const entities = game.entities || [];
   entities.forEach((e, i) => {
     const y = CP.y0 + i * CP.rowH;
     const own = e.owner === game.player_id;
     text(`P${e.owner}`, CP.x, y, CP.font, own ? C_OWN_ROW : "rgba(180,200,255,0.75)");
 
-    const combo = e.combo ?? [];
-    for (let s = 0; s < 5; s++) {
-      const slotX = CP.x + CP.nameW + s * CP.slotW;
-      const slot = combo[s];
-      if (slot && slot.action !== undefined) {
-        text(ACTION_CHAR[slot.action] ?? "?", slotX, y, CP.font,
-          ACTION_COLOR[slot.action] ?? C_TEXT);
-      } else {
-        text("·", slotX, y, CP.font, "rgba(120,120,140,0.5)");
-      }
-    }
+    // Selection is server-authoritative, so this is what that player WILL
+    // cast.  A stale frame against a freshly reloaded (shorter) move table
+    // falls back to the first move, matching the server's own clamp.
+    const move = PLAYER_RECIPES[e.selected_shape ?? 0] ?? PLAYER_RECIPES[0];
+    text(move?.label ?? "-", CP.x + CP.nameW, y, CP.font,
+      own ? RECIPE_COLOR_PLAYER : "rgba(180,200,255,0.75)");
 
     // Casts left this turn: a filled pip per remaining cast, so "who are we
     // waiting on" is readable at a glance.
-    const usedX = CP.x + CP.nameW + 5 * CP.slotW + 8;
+    const usedX = CP.x + CP.nameW + CP.labelW;
     const left = e.casts_left ?? 0;
     if (left > 0) {
       text("◆".repeat(left), usedX, y, CP.font, CAST_EVENT_COLOR);
     } else {
       text("done", usedX, y, CP.font, "rgba(120,120,140,0.7)");
     }
-    // A held team half is aimed at its captured ANCHOR, so the row shows where
-    // a completed shape will actually land rather than where the player has
-    // since wandered.
+    // Where that player is aimed: a cast lands on the cursor at the moment
+    // ENTER is pressed, and a group needs two players on the SAME square, so
+    // the coordinates are how you coordinate one.
     text(`@${e.cursor_row ?? 0},${e.cursor_col ?? 0}`, usedX + 44, y, CP.font,
       own ? C_OWN_ROW : "rgba(180,200,255,0.6)");
   });
@@ -922,157 +910,135 @@ function drawFloaters() {
 }
 
 // ---------------------------------------------------------------------------
-// Combo parsing + recipe preview (mirrors game_logic.zig / balance.zig)
+// Shape-wheel + group preview (mirrors game_logic.zig / balance.zig)
 // ---------------------------------------------------------------------------
 
-// Recipe tables are loaded from data/balance.json (loadBalanceData) — the same
+// Move tables are loaded from data/balance.json (loadBalanceData) — the same
 // file the Zig server reads, so there is no hand-mirrored copy to drift.  A
-// recipe's `cost` is what it takes out of the team's shared charge pool; a
-// team recipe is charged ONCE for the group, not once per contributor.
+// move's `cost` is what it takes out of the team's shared charge pool; a group
+// is charged ONCE for the whole group, not once per contributor.
 //
-// There is NO flat fallback: an unmatched combo fizzles.  These tables are the
-// complete move list, both here and on the server.
+// These tables are the complete move list, both here and on the server: the
+// wheel can only ever be pointing at one of them.
 
 /** Casts each player gets per turn, from balance.json.  The server announces
  *  the same number in game_start; this copy is what the LOBBY reads, before
  *  any game_start has arrived. */
 let CASTS_PER_TURN = 3;
 /** @typedef {{dRow: number, dCol: number}} ShapeOffset */
-/** @type {Array<{label: string, pattern: Array<object>, rows: string[],
+/** @type {Array<{label: string, rows: string[],
  *   offsets: ShapeOffset[], cost: number}>} */
 let PLAYER_RECIPES = [];
-/** @type {Array<{label: string, patterns: Array<Array<object>>, rows: string[],
+/** `components` are indices into PLAYER_RECIPES (resolved from the authored
+ *  move labels at load time).
+ *  @type {Array<{label: string, components: number[], rows: string[],
  *   offsets: ShapeOffset[], cost: number}>} */
 let TEAM_RECIPES = [];
 
-/** Two combos are the same move iff they are the same action-key sequence. */
-function slotsEqual(a, b) {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (a[i].action !== b[i].action) return false;
-  }
-  return true;
-}
-
 /**
- * Accumulate one matched recipe into the projected batch: its shape (as a
- * separate stamp, since each stamp lands at its own anchor) and its cost.
+ * Accumulate one projected recipe into the batch: its shape as a stamp at an
+ * absolute anchor, plus its cost.
  *
  * @param {{stamps: Array<object>, cost: number, labels: string[]}} sum
- * @param {object} recipe   - the matched recipe (carries offsets + cost)
- * @param {number} anchorIndex - index into `combos` of the player whose cursor
- *   anchors this stamp; -1 when unknown.
+ * @param {object} recipe - the move or group (carries offsets + cost)
+ * @param {{row: number, col: number}} anchor - square the stamp centres on
  */
-function addOutput(sum, recipe, anchorIndex) {
+function addOutput(sum, recipe, anchor) {
   sum.stamps.push({
     offsets: recipe.offsets ?? [],
     label: recipe.label,
-    anchorIndex,
+    anchor,
   });
   sum.cost += recipe.cost ?? 0;
   sum.labels.push(recipe.label);
 }
 
 /**
- * Match all players' pending combos into the projected batch of stamps.
- * Mirrors game_logic.match_recipes: team recipes (greedy, repeatable, table
- * order) → player recipes → unmatched combos fizzle.
+ * What every player currently has on the wheel, and where they are aimed.
  *
- * CONTRACT: `combos` holds AT MOST ONE COMBO PER PLAYER (see
- * projectedCombos).  The server additionally requires a team recipe's patterns
- * to be filled by DISTINCT players; under this contract two distinct indices
- * are already two distinct players, so matching distinct indices — as the loop
- * below does via `picked` — enforces that rule.  Passing two combos from one
- * player would silently break parity and over-project team recipes.
+ * ONE ENTRY PER OWNER, mirroring the server: casts fire out of a pid-indexed
+ * pool, and a group requires DISTINCT players, so deduplicating by owner here
+ * keeps that rule true of the projection even if a snapshot ever carried two
+ * entities for one player — otherwise a lone player could see a group falsely
+ * projected off their own selection.
  *
- * A team stamp is anchored at the LAST JOINER's cursor (the player whose combo
- * completed the group), falling back to the first contributor.  `lastJoiner`
- * is the server's `session.last_joiner`, which the client cannot observe, so
- * the projection uses the first contributor — the preview may therefore move
- * to the true anchor once the group actually fires.
- *
- * @param {Array<Array<{action?:string}>>} combos
- * @returns {{stamps: Array<{offsets: ShapeOffset[], label: string,
- *   anchorIndex: number}>, cost: number, labels: string[]}}
+ * @returns {Array<{owner: number, move: number, row: number, col: number}>}
  */
-function matchRecipes(combos) {
-  const sum = { stamps: [], cost: 0, labels: [] };
-  const consumed = combos.map(() => false);
-
-  for (const tr of TEAM_RECIPES) {
-    for (; ;) {
-      const picked = combos.map(() => false);
-      const picks = [];
-      let ok = true;
-      for (const pattern of tr.patterns) {
-        let found = -1;
-        for (let ci = 0; ci < combos.length; ci++) {
-          if (consumed[ci] || picked[ci]) continue;
-          if (combos[ci].length > 0 && slotsEqual(combos[ci], pattern)) { found = ci; break; }
-        }
-        if (found === -1) { ok = false; break; }
-        picks.push(found);
-        picked[found] = true;
-      }
-      if (!ok) break;
-      for (const ci of picks) consumed[ci] = true;
-      addOutput(sum, tr, picks[0] ?? -1);
-    }
-  }
-
-  for (let ci = 0; ci < combos.length; ci++) {
-    if (consumed[ci] || combos[ci].length === 0) continue;
-    for (const pr of PLAYER_RECIPES) {
-      if (slotsEqual(combos[ci], pr.pattern)) {
-        addOutput(sum, pr, ci);
-        consumed[ci] = true;
-        break;
-      }
-    }
-  }
-
-  return sum;
-}
-
-/**
- * The combo to project per player: their HELD team half if they have one,
- * otherwise whatever they are currently typing.
- *
- * The held half wins because it is what will actually fire once a partner
- * completes it — and the two are independent server-side (submitting clears the
- * typing pool, but the player may immediately start a new combo), so a player
- * holding a half who has begun
- * typing again would otherwise flip the preview to a combo that is not the
- * one about to land.
- *
- * ONE COMBO PER OWNER, mirroring the server: casts fire out of a pid-indexed
- * pool, so a player can never contribute two casts to a batch, and team
- * recipes require DISTINCT players.  Deduplicating by owner here keeps that
- * rule true of the projection even if a snapshot ever carried two entities for
- * one player — otherwise a lone player typing half of a team recipe would see
- * it falsely projected as complete.
- *
- * Each entry carries its owner's aim, because a stamp lands at the anchoring
- * player's cursor, not the local player's.
- *
- * @returns {{combos: Array<Array<object>>, aims: Array<{row: number,
- *   col: number}>}}
- */
-function projectedCombos(game) {
+function projectedCasts(game) {
   const byOwner = new Map();
   for (const e of game.entities ?? []) {
     if (byOwner.has(e.owner)) continue;
-    const submitted = e.submitted ?? [];
     byOwner.set(e.owner, {
-      combo: submitted.length > 0 ? submitted : (e.combo ?? []),
-      aim: { row: e.cursor_row ?? 0, col: e.cursor_col ?? 0 },
+      owner: e.owner,
+      move: e.selected_shape ?? 0,
+      row: e.cursor_row ?? 0,
+      col: e.cursor_col ?? 0,
     });
   }
-  const entries = [...byOwner.values()];
-  return {
-    combos: entries.map((v) => v.combo),
-    aims: entries.map((v) => v.aim),
-  };
+  return [...byOwner.values()];
+}
+
+/**
+ * Project "what lands if everyone casts right now" from the wheel selections.
+ * Mirrors session.resolve_cast + game_logic.complete_group: a group fires when
+ * its component moves are cast by DISTINCT players on the SAME square, and it
+ * consumes its whole bag (contributors included), so a grouped player does NOT
+ * also stamp their own move.
+ *
+ * Grouping is per square, greedy over the group table in file order and
+ * repeatable — the same rule the server applies to the turn's cast log.
+ *
+ * A group's anchor is NOT a guess: every
+ * contributor is aimed at the same square by definition, so the group stamps
+ * there regardless of who completes it.
+ *
+ * This is a projection of SIMULTANEOUS casts, which is not how a turn actually
+ * plays out (casts are sequential, and a group consumes only casts already
+ * logged this turn).  It answers "if we all pressed ENTER now", which is the
+ * question a player aiming a group is asking.
+ *
+ * @returns {{stamps: Array<{offsets: ShapeOffset[], label: string,
+ *   anchor: {row: number, col: number}}>, cost: number, labels: string[]}}
+ */
+function projectBatch(game) {
+  const sum = { stamps: [], cost: 0, labels: [] };
+  const casts = projectedCasts(game);
+
+  // Bucket by aimed square: only same-square casts can ever group.
+  const bySquare = new Map();
+  for (const c of casts) {
+    const key = `${c.row},${c.col}`;
+    const bucket = bySquare.get(key);
+    if (bucket === undefined) bySquare.set(key, [c]); else bucket.push(c);
+  }
+
+  const consumed = new Set();
+  for (const [, bucket] of bySquare) {
+    if (bucket.length < 2) continue; // a group always needs 2+ players
+    for (const tr of TEAM_RECIPES) {
+      for (; ;) {
+        const picks = [];
+        for (const componentMove of tr.components) {
+          const hit = bucket.find((c) =>
+            !consumed.has(c.owner) && !picks.includes(c) && c.move === componentMove);
+          if (hit === undefined) break;
+          picks.push(hit);
+        }
+        if (picks.length < tr.components.length) break;
+        for (const c of picks) consumed.add(c.owner);
+        addOutput(sum, tr, { row: bucket[0].row, col: bucket[0].col });
+      }
+    }
+  }
+
+  for (const c of casts) {
+    if (consumed.has(c.owner)) continue;
+    const move = PLAYER_RECIPES[c.move];
+    if (move === undefined) continue;
+    addOutput(sum, move, { row: c.row, col: c.col });
+  }
+
+  return sum;
 }
 
 /**
@@ -1091,8 +1057,7 @@ function projectedCombos(game) {
 function shapePreview(game) {
   const { rows, cols } = gridDims(game);
   const grid = game.grid ?? [];
-  const { combos, aims } = projectedCombos(game);
-  const projected = matchRecipes(combos);
+  const projected = projectBatch(game);
 
   const cells = new Map();
   let offGrid = 0;
@@ -1101,11 +1066,9 @@ function shapePreview(game) {
   let defused = 0;
 
   for (const stamp of projected.stamps) {
-    const aim = aims[stamp.anchorIndex];
-    if (aim === undefined) continue;
     for (const { dRow, dCol } of stamp.offsets) {
-      const r = aim.row + dRow;
-      const cl = aim.col + dCol;
+      const r = stamp.anchor.row + dRow;
+      const cl = stamp.anchor.col + dCol;
       if (r < 0 || r >= rows || cl < 0 || cl >= cols) { offGrid++; continue; }
       const flat = r * cols + cl;
       // Chain multiple stamps over the same cell: each one steps it down
@@ -1133,66 +1096,6 @@ function shapePreview(game) {
   }
 
   return { cells, offGrid, inert, hits, defused, opened, projected };
-}
-
-/**
- * Resolve the shapes the local player is currently typing TOWARD, so the field
- * projects the intended footprint before the combo is complete.
- *
- * A candidate is any player recipe whose pattern STARTS WITH the typed buffer.
- * That includes recipes longer than an already-exact match (typing `1` both
- * casts `poke` and is en route to `sweep`), so the ghosts answer "what else is
- * still reachable from here" rather than "what is complete".  The exact match
- * itself is excluded: it is drawn as the committed preview, and drawing it
- * twice would make a complete combo look identical to an incomplete one.
- *
- * Uses the TYPED buffer (`entity.combo`), never the submitted one: this is a
- * projection of keys not yet pressed, and a held half has no keys left to
- * press.  An empty buffer yields nothing — every recipe would be a candidate,
- * which is noise, not aim.
- *
- * Team recipes are excluded: a team stamp lands at the server's `last_joiner`
- * cursor, which the client cannot observe, so ghosting a team half at the LOCAL
- * cursor would confidently point at the wrong cells.
- *
- * Overlap is ADDITIVE, mirroring the mechanic: cells that several candidates
- * cover are the cells that pay off across the most continuations, so `cells`
- * counts coverage rather than merely flagging it.
- *
- * @returns {{cells: Map<number, number>, labels: Array<{label: string,
- *   remaining: number}>}} `cells` maps flat index → how many candidates cover
- *   it; `labels` is ordered by fewest keys remaining, then recipe-table order.
- */
-function candidateShapes(game) {
-  const own = (game.entities ?? []).find((e) => e.owner === game.player_id);
-  const typed = own?.combo ?? [];
-  const cells = new Map();
-  const labels = [];
-  if (typed.length === 0) return { cells, labels };
-
-  const { rows, cols } = gridDims(game);
-  const aimRow = own?.cursor_row ?? 0;
-  const aimCol = own?.cursor_col ?? 0;
-
-  for (const pr of PLAYER_RECIPES) {
-    // Strictly longer, so the exact match is excluded by construction.
-    if (pr.pattern.length <= typed.length) continue;
-    if (!slotsEqual(typed, pr.pattern.slice(0, typed.length))) continue;
-
-    labels.push({ label: pr.label, remaining: pr.pattern.length - typed.length });
-    for (const { dRow, dCol } of pr.offsets) {
-      const r = aimRow + dRow;
-      const cl = aimCol + dCol;
-      // Clipped exactly as slime.apply_shape would: a ghost must not imply
-      // coverage the server could never deliver.
-      if (r < 0 || r >= rows || cl < 0 || cl >= cols) continue;
-      const flat = r * cols + cl;
-      cells.set(flat, (cells.get(flat) ?? 0) + 1);
-    }
-  }
-  // Nearest continuations first: those are the ones one keypress away.
-  labels.sort((a, b) => a.remaining - b.remaining);
-  return { cells, labels };
 }
 
 // ---------------------------------------------------------------------------
@@ -1239,13 +1142,10 @@ function updateFeastTracking(game) {
   }
 }
 
-/** Map ActionChoice enum string → display character. */
-const ACTION_CHAR = { dispense: "d", catalyst: "c" };
-
-/** Map ActionChoice enum string → highlight colour. */
-const ACTION_COLOR = {
-  dispense: "rgba(160,220,255,1)",
-  catalyst: "rgba(255,80,180,1)",
+/** Highlight colour per shape-wheel direction key (1 = next, 2 = back). */
+const WHEEL_COLOR = {
+  forward: "rgba(160,220,255,1)",
+  backward: "rgba(255,80,180,1)",
 };
 
 /** Tier ordinal → name string; matches protocol Tier ordinal order, hardest
@@ -1259,7 +1159,7 @@ const TIER_CHAR = { red: "≡", yellow: "=", green: "-" };
 
 /** Map Tier → colour: a hot-to-cool ramp, so difficulty reads at a glance.
  *
- *  SINGLE SOURCE OF COLOR TRUTH: slime blobs, combo/recipe readouts and the
+ *  SINGLE SOURCE OF COLOR TRUTH: slime blobs, move/group readouts and the
  *  game-over stats tables all read from this map, so a tier always looks the
  *  same wherever it appears. */
 const TIER_COLOR = {
@@ -1816,8 +1716,8 @@ function animProgress(anim) {
  *
  * While the feast cinematic runs, the BOARD DRAWN IS THE CINEMATIC'S, not the
  * frame's: the replay is mid-way between two server boards, so the frame's grid
- * is the future.  Every aiming overlay (cast preview, candidate ghosts,
- * sheltered hatching, cursors) is suppressed for the same reason — they answer
+ * is the future.  Every aiming overlay (cast preview, sheltered hatching,
+ * cursors) is suppressed for the same reason — they answer
  * questions about a board that is not on screen, and input is dead anyway.
  */
 function drawSlimeField(game) {
@@ -1830,18 +1730,14 @@ function drawSlimeField(game) {
   rect(FIELD.x0, FIELD.y0, FIELD.x1 - FIELD.x0, FIELD.y1 - FIELD.y0,
     "rgba(255,255,255,0.03)");
 
-  // Cells a live or pending cast would cover, and what each becomes.  Exact,
-  // not a guess: placement is a pure function of (shape, cursor).  Computed
-  // once per frame, and only while something is actually projected.
+  // Cells the wheel selections would cover if everyone cast now, and what
+  // each becomes.  Exact, not a guess: placement is a pure function of
+  // (shape, cursor).  Computed once per frame.
   const preview = replay ? new Map() : shapePreview(game).cells;
   const pulse = preview.size > 0
     ? FIELD.previewAlphaMin + (FIELD.previewAlphaMax - FIELD.previewAlphaMin) *
       (0.5 + 0.5 * Math.sin(t * Math.PI * 2 * FIELD.previewPulseHz))
     : 0;
-
-  // Cells the combo being TYPED is heading toward.  Static (no pulse) and
-  // neutral, so the eye separates "would land" from the pulsing "will land".
-  const ghosts = replay ? new Map() : candidateShapes(game).cells;
 
   // Who eats and who watches, on THIS board and on the board the pending cast
   // would create.  A cell that is sheltered now but eaten after — `opened` —
@@ -1888,12 +1784,6 @@ function drawSlimeField(game) {
       const p = animProgress(anim);           // 0 → 1
       drawTile(anim.from, x0, y0, g.cell, 1 + p * 0.3, 0, 1 - p);
     }
-
-    // Candidate ghost, UNDER everything else: a committed cast covering the
-    // same cell must visually win, so this only ever shows through where
-    // nothing firmer is drawn.
-    const ghostCount = ghosts.get(flat);
-    if (ghostCount !== undefined) drawGhostMark(x0, y0, inset, body, ghostCount);
 
     // Projected footprint: a socket tinted in the OUTCOME color plus a pulsing
     // outline, on every cell a pending cast will cover.  Drawn UNDER the tile
@@ -2013,25 +1903,9 @@ function drawShelteredMark(x0, y0, inset, body, alpha, color) {
 }
 
 /**
- * Mark one cell a still-being-typed combo could reach.  `count` is how many
- * candidate recipes cover it, and brightness scales with it (capped) so the
- * cells that pay off across the most continuations stand out.
- */
-function drawGhostMark(x0, y0, inset, body, count) {
-  const strength = Math.min(count, FIELD.ghostAlphaCap / FIELD.ghostAlpha);
-  ctx.save();
-  rect(x0 + inset, y0 + inset, body, body,
-    withAlpha(SHAPE_COLOR, FIELD.ghostFillAlpha * strength));
-  ctx.globalAlpha = FIELD.ghostAlpha * strength;
-  rectStroke(x0 + inset, y0 + inset, body, body, FIELD.ghostWidth, SHAPE_COLOR);
-  ctx.restore();
-}
-
-/**
  * Draw every player's aim cursor as a corner crosshair on their cell.
  *
- * The server sends a cursor for EVERY player (and, while a team half is held,
- * the captured anchor instead of the live cursor), so teammates can see where
+ * The server sends a live cursor for EVERY player, so teammates can see where
  * each other are aiming and coordinate a team shape.  The local player's is thicker
  * and yellow; teammates' are thinner and blue.
  *
@@ -2100,7 +1974,7 @@ function drawTile(name, x0, y0, cell, scale, dy, alpha) {
 // `turn_ended` event.  Everything here is animation over that single fact.
 //
 // One guy is shown per connected player (read off `game.entities`, which the
-// server already sends for the combo panel).  Between turns they mill about the
+// server already sends for the wheel panel).  Between turns they mill about the
 // field; when a `turn_ended` arrives the feast cinematic (below) takes them over
 // and walks them cell to cell through the whole meal.
 //
@@ -2767,8 +2641,8 @@ function drawActionMenu(game) {
 
   const px = mx + M.padX;
   const aRowY = my + M.padTopY + M.actionRowDy;
-  text("[1] Dispense", px + M.actionCols[0], aRowY, M.actionFont, ACTION_COLOR.dispense);
-  text("[2] Catalyst", px + M.actionCols[1], aRowY, M.actionFont, ACTION_COLOR.catalyst);
+  text("[1] Next shape", px + M.actionCols[0], aRowY, M.actionFont, WHEEL_COLOR.forward);
+  text("[2] Back", px + M.actionCols[1], aRowY, M.actionFont, WHEEL_COLOR.backward);
 
   // Aim row: the arrow keys move the cursor the shape is stamped on.
   const own0 = (game.entities ?? []).find(e => e.owner === game.player_id);
@@ -2776,7 +2650,19 @@ function drawActionMenu(game) {
   text(`[← ↑ ↓ →] Aim  @${own0?.cursor_row ?? 0},${own0?.cursor_col ?? 0}`,
     px, aimY, M.aimFont, C_OWN_ROW);
 
-  text("[Esc] Cancel", px, my + M.padTopY + M.cancelRowDy, M.cancelFont, "rgba(180,180,180,0.8)");
+  // What ENTER would cast right now: the wheel position, its cost, and where
+  // it sits in the wheel.  Selection is server-authoritative and persists
+  // across casts and turns, so this is the one readout that answers "what am I
+  // holding" without the player having to remember what they pressed.
+  {
+    const sel = own0?.selected_shape ?? 0;
+    const move = PLAYER_RECIPES[sel] ?? PLAYER_RECIPES[0];
+    const wheel = PLAYER_RECIPES.length > 0
+      ? `  (${(sel % PLAYER_RECIPES.length) + 1}/${PLAYER_RECIPES.length})`
+      : "";
+    text(`[Enter] Cast  ${move?.label ?? "-"}  \u26a1${move?.cost ?? 0}${wheel}`,
+      px, my + M.padTopY + M.selectedRowDy, M.selectedFont, RECIPE_COLOR_PLAYER);
+  }
 
   const tbw = mw - M.padX * 2;
 
@@ -2806,12 +2692,11 @@ function drawActionMenu(game) {
       cinematicActive() ? CAST_EVENT_COLOR : left > 0 ? C_TEXT : "rgba(180,180,190,0.75)");
   }
 
-  // Project from a HELD team half in preference to a typed combo, so the
-  // preview shows what a partner would complete rather than blanking the
-  // instant you press ENTER.  The same resolution the field preview draws, so
-  // the numbers and the highlighted cells can never disagree.
+  // What the whole team's wheel selections would do if everyone cast now,
+  // groups included.  The same resolution the field preview draws, so the
+  // numbers and the highlighted cells can never disagree.
   //
-  // The replay suppresses the field's preview and ghosts, so it suppresses these
+  // The replay suppresses the field's preview, so it suppresses these
   // numbers too — they are read off the SERVER's board, which is several stages
   // ahead of the one on screen, and would describe cells the player cannot see
   // yet.  The status line above already explains the wait.
@@ -2865,20 +2750,6 @@ function drawActionMenu(game) {
     text(projected.labels.join(", "), dx + 8, pvY, M.previewFont, "rgba(255,255,140,0.9)");
   }
 
-  // Where the typed combo could still go: the names behind the ghost cells on
-  // the field, each with the number of keys still to press.  Dim, because this
-  // is an invitation rather than a commitment.
-  const cand = candidateShapes(game);
-  if (cand.labels.length > 0) {
-    // Already sorted nearest-first, so a truncated list keeps the most
-    // actionable continuations.
-    const shown = cand.labels.slice(0, M.candidateMax);
-    const parts = shown.map((c) => `${c.label} +${c.remaining}`);
-    const hidden = cand.labels.length - shown.length;
-    if (hidden > 0) parts.push(`+${hidden} more`);
-    text(`\u2192 ${parts.join(" \u00b7 ")}`, px, my + M.candidateDy,
-      M.candidateFont, withAlpha(SHAPE_COLOR, 0.65));
-  }
 }
 
 /** The `game` object whose transient events have already been consumed.
@@ -2949,7 +2820,7 @@ function drawGame(game, dt) {
   drawChargeBar(game);
   drawSlimeField(game);
   drawLilGuys(dt);
-  drawComboPanel(game);
+  drawWheelPanel(game);
   drawActionMenu(game);
 
   // Floaters drawn last so they appear on top of everything.
@@ -3175,7 +3046,11 @@ function connect() {
 // ---------------------------------------------------------------------------
 
 const FORWARDED_KEYS = new Set([
+  // Enter = cast (game) / ready toggle (lobby) / dismiss (game over).
+  // Escape is forwarded but inert in game; the lobby and menus still use it.
   "Enter", "Escape",
+  // Shape wheel: 1 turns forward, 2 turns back.  Selection lives on the
+  // server, so these are the whole of the client's part in it.
   "1", "2",
   // Aim: the arrow keys walk the server-authoritative cursor the shape is
   // stamped on.  Clamped server-side, so holding a direction at an edge is

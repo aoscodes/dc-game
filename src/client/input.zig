@@ -1,15 +1,19 @@
-//! Client input: raw keys in, combo edits and cursor steps out.
+//! Client input: raw keys in, wheel turns and cursor steps out.
 //!
-//! Two independent input axes, which is why draining yields BOTH a combo
-//! result and any cursor steps: the action keys build the combo (the recipe
-//! NAME) while the d-pad aims where it will land.  Neither blocks the other,
-//! so a player can re-aim mid-combo.
+//! Three independent input axes, which is why draining yields all three at
+//! once: `1`/`2` turn the shape wheel, the d-pad aims where a cast will land,
+//! and Enter fires.  Nothing blocks anything else, so a player can re-aim
+//! between turns of the wheel.
+//!
+//! There is NO client-side selection state.  The wheel lives on the server (it
+//! is authoritative, and every client renders every player's choice), so this
+//! layer only reports which way it was turned and how many times.  That is what
+//! makes "client and server disagree about what is selected" unrepresentable.
 
 const std = @import("std");
 const shared = @import("shared");
 const c = shared.components;
 const protocol = shared.protocol;
-const ComboSlot = c.ComboSlot;
 
 pub fn parse_key_name(name: []const u8) ?RawKey {
     if (std.mem.eql(u8, name, "Enter")) return .enter;
@@ -51,96 +55,67 @@ pub const KeyQueue = struct {
     }
 };
 
-pub const ComboBuffer = struct {
-    slots: [c.MAX_COMBO_LEN]ComboSlot = undefined,
-    len: u8 = 0,
-
-    pub fn push(self: *ComboBuffer, slot: ComboSlot) bool {
-        if (self.len >= c.MAX_COMBO_LEN) return false;
-        self.slots[self.len] = slot;
-        self.len += 1;
-        return true;
-    }
-
-    pub fn clear(self: *ComboBuffer) void {
-        self.len = 0;
-    }
-
-    pub fn to_combo(self: *const ComboBuffer) c.ActionCombo {
-        var out = c.ActionCombo{
-            .slots = [_]ComboSlot{.{ .action = .dispense }} ** c.MAX_COMBO_LEN,
-            .len = self.len,
-        };
-        @memcpy(out.slots[0..self.len], self.slots[0..self.len]);
-        return out;
-    }
-};
-
-/// What a drain did to the combo buffer.
-///
-/// The two TERMINAL results — `cancelled` and `submitted` — leave the buffer
-/// EMPTY, because `drain` clears it as it reports them.  `submitted` therefore
-/// carries the combo by value: it is the only surviving copy, which is what
-/// makes "committed a spell but left it in the buffer" unrepresentable rather
-/// than merely discouraged.  (It used to be a bare tag, and the caller cleared
-/// on a server reply — but a cast that resolves immediately never sends one,
-/// so the spent recipe leaked into the next cast.)
-pub const DrainResult = union(enum) {
-    unchanged,
-    appended,
-    cancelled,
-    submitted: c.ActionCombo,
-};
-
 /// Cursor steps to forward, in the order they were pressed.  Steps are sent
 /// individually rather than collapsed into a net delta: the server clamps at
 /// the edge, so "left, left, right" against the wall must end one cell in
 /// from the wall, not back where it started.
 pub const MAX_CURSOR_STEPS: usize = 16;
 
+/// Wheel turns to forward, in press order, for the same reason cursor steps
+/// are: the server wraps, so "forward, forward, backward" is not the same as
+/// "forward" whenever the wheel crosses the end of the table.
+pub const MAX_CYCLE_TURNS: usize = 16;
+
 pub const Drained = struct {
-    combo: DrainResult = .unchanged,
     step_count: usize = 0,
     steps: [MAX_CURSOR_STEPS]protocol.CursorDir = undefined,
+    turn_count: usize = 0,
+    turns: [MAX_CYCLE_TURNS]c.CycleDir = undefined,
+    /// Enter was pressed: fire whatever the server has selected.  At most one
+    /// per drain, because `drain` returns as soon as it sees one.
+    cast: bool = false,
 
     pub fn cursor_steps(self: *const Drained) []const protocol.CursorDir {
         return self.steps[0..self.step_count];
     }
+
+    pub fn cycle_turns(self: *const Drained) []const c.CycleDir {
+        return self.turns[0..self.turn_count];
+    }
 };
 
-/// Drain the key queue, applying action keys to `combo` and collecting d-pad
-/// presses as cursor steps.
+/// Drain the key queue into wheel turns, cursor steps, and at most one cast.
 ///
-/// A terminal combo result (escape/enter) stops the drain so the caller sees
-/// exactly one commit per call, but any cursor steps pressed BEFORE it are
-/// still returned — they are what aimed the cast being committed.
-pub fn drain(queue: *KeyQueue, combo: *ComboBuffer) Drained {
+/// A cast stops the drain so the caller sees exactly one per call, but any
+/// turns and steps pressed BEFORE it are still returned — they are what chose
+/// and aimed the cast being fired.
+pub fn drain(queue: *KeyQueue) Drained {
     var out = Drained{};
     while (queue.pop()) |key| {
         switch (key) {
-            // Both terminal keys hand the buffer back empty: the recipe either
-            // went out on the wire or was thrown away, and either way the next
-            // key starts a new spell.
-            .escape => {
-                combo.clear();
-                out.combo = .cancelled;
-                return out;
-            },
             .enter => {
-                out.combo = .{ .submitted = combo.to_combo() };
-                combo.clear();
+                out.cast = true;
                 return out;
             },
-            // Action keys: 1=dispense  2=catalyst.  These NAME the recipe.
+            // Escape had a job when a cast was something you typed and could
+            // therefore mistype.  A wheel has no half-finished state to throw
+            // away, so in-game it does nothing; the lobby still uses it.
+            .escape => {},
+            // 1 = next shape, 2 = previous.
             .one, .two => {
-                const action: c.ActionChoice = switch (key) {
-                    .one => .dispense,
-                    .two => .catalyst,
+                const dir: c.CycleDir = switch (key) {
+                    .one => .forward,
+                    .two => .backward,
                     else => unreachable,
                 };
-                if (combo.push(.{ .action = action })) out.combo = .appended;
+                // Overflow drops the excess rather than growing unboundedly;
+                // a burst past the cap is beyond human input rates.
+                if (out.turn_count < MAX_CYCLE_TURNS) {
+                    out.turns[out.turn_count] = dir;
+                    out.turn_count += 1;
+                }
             },
-            // D-pad: aims the cursor, never touches the combo.
+            // D-pad: aims the cursor, never touches the wheel.
             .up, .down, .left, .right => {
                 const dir: protocol.CursorDir = switch (key) {
                     .up => .up,
@@ -149,8 +124,6 @@ pub fn drain(queue: *KeyQueue, combo: *ComboBuffer) Drained {
                     .right => .right,
                     else => unreachable,
                 };
-                // Overflow drops the excess rather than growing unboundedly;
-                // a burst past the cap is beyond human input rates.
                 if (out.step_count < MAX_CURSOR_STEPS) {
                     out.steps[out.step_count] = dir;
                     out.step_count += 1;
@@ -161,70 +134,86 @@ pub fn drain(queue: *KeyQueue, combo: *ComboBuffer) Drained {
     return out;
 }
 
-test "drain: enter hands the combo over and empties the buffer" {
+test "drain: enter reports a cast" {
     var queue = KeyQueue{};
-    var combo = ComboBuffer{};
     queue.push(.one);
     queue.push(.enter);
-    const out = drain(&queue, &combo);
-    // The committed recipe travels in the RESULT...
-    const submitted = out.combo.submitted;
-    try std.testing.expectEqual(@as(u8, 1), submitted.len);
-    try std.testing.expectEqual(c.ActionChoice.dispense, submitted.slots[0].action);
-    // ...and no longer in the buffer.
-    try std.testing.expectEqual(@as(u8, 0), combo.len);
+    const out = drain(&queue);
+    try std.testing.expect(out.cast);
+    // The turn that chose the shape travels with the cast that fires it.
+    try std.testing.expectEqualSlices(c.CycleDir, &.{.forward}, out.cycle_turns());
 }
 
-test "drain: a spent recipe never leaks into the next cast" {
-    // Regression.  The buffer used to survive a submit and be cleared only by
-    // a server reply, but a cast that RESOLVES IMMEDIATELY (every solo recipe)
-    // answers with recipe_fired and never with cast_committed/cast_fizzled.
-    // So typing "1" after firing poke sent [dispense, dispense] — a sweep the
-    // player never asked for.
+test "drain: only one cast per call, and the rest of the queue survives" {
+    // Two Enters in one burst must be two casts, not one: each is a charge.
     var queue = KeyQueue{};
-    var combo = ComboBuffer{};
-    queue.push(.one);
     queue.push(.enter);
-    try std.testing.expectEqual(@as(u8, 1), drain(&queue, &combo).combo.submitted.len);
-
-    queue.push(.one);
     queue.push(.enter);
-    const second = drain(&queue, &combo).combo.submitted;
-    try std.testing.expectEqual(@as(u8, 1), second.len);
+    try std.testing.expect(drain(&queue).cast);
+    try std.testing.expect(drain(&queue).cast);
+    try std.testing.expect(!drain(&queue).cast);
 }
 
-test "drain: escape returns cancelled and empties the buffer" {
+test "drain: nothing is carried between calls" {
+    // Regression in spirit: the old ComboBuffer survived a submit and leaked a
+    // spent recipe into the next cast.  There is no client-side state left to
+    // leak — a drain reports only keys pressed since the last one.
     var queue = KeyQueue{};
-    var combo = ComboBuffer{};
     queue.push(.one);
-    queue.push(.two);
+    queue.push(.enter);
+    _ = drain(&queue);
+
+    const second = drain(&queue);
+    try std.testing.expect(!second.cast);
+    try std.testing.expectEqual(@as(usize, 0), second.turn_count);
+}
+
+test "drain: escape is inert in game" {
+    // It used to cancel a half-typed combo.  There is no half-typed anything
+    // now, and the key is left to the lobby.
+    var queue = KeyQueue{};
+    queue.push(.one);
     queue.push(.escape);
-    queue.push(.enter);
-    const out = drain(&queue, &combo);
-    try std.testing.expectEqual(DrainResult.cancelled, out.combo);
-    try std.testing.expectEqual(@as(u8, 0), combo.len);
+    queue.push(.two);
+    const out = drain(&queue);
+    try std.testing.expect(!out.cast);
+    try std.testing.expectEqualSlices(
+        c.CycleDir,
+        &.{ .forward, .backward },
+        out.cycle_turns(),
+    );
 }
 
-test "drain: action keys append in press order" {
+test "drain: 1 goes forward and 2 goes back, in press order" {
     var queue = KeyQueue{};
-    var combo = ComboBuffer{};
     queue.push(.two);
     queue.push(.one);
-    const out = drain(&queue, &combo);
-    try std.testing.expectEqual(DrainResult.appended, out.combo);
-    try std.testing.expectEqual(@as(u8, 2), combo.len);
-    try std.testing.expectEqual(c.ActionChoice.catalyst, combo.slots[0].action);
-    try std.testing.expectEqual(c.ActionChoice.dispense, combo.slots[1].action);
+    queue.push(.one);
+    const out = drain(&queue);
+    try std.testing.expectEqualSlices(
+        c.CycleDir,
+        &.{ .backward, .forward, .forward },
+        out.cycle_turns(),
+    );
 }
 
-test "drain: d-pad keys yield cursor steps and leave the combo alone" {
+test "drain: opposing turns are kept, not cancelled out" {
+    // The server WRAPS, so collapsing these into a net zero would be wrong
+    // whenever the wheel crosses the end of the table.
     var queue = KeyQueue{};
-    var combo = ComboBuffer{};
+    queue.push(.one);
+    queue.push(.two);
+    const out = drain(&queue);
+    try std.testing.expectEqual(@as(usize, 2), out.turn_count);
+}
+
+test "drain: d-pad keys yield cursor steps and leave the wheel alone" {
+    var queue = KeyQueue{};
     queue.push(.up);
     queue.push(.right);
-    const out = drain(&queue, &combo);
-    try std.testing.expectEqual(DrainResult.unchanged, out.combo);
-    try std.testing.expectEqual(@as(u8, 0), combo.len);
+    const out = drain(&queue);
+    try std.testing.expectEqual(@as(usize, 0), out.turn_count);
+    try std.testing.expect(!out.cast);
     try std.testing.expectEqualSlices(
         protocol.CursorDir,
         &.{ .up, .right },
@@ -232,17 +221,16 @@ test "drain: d-pad keys yield cursor steps and leave the combo alone" {
     );
 }
 
-test "drain: aiming and typing interleave freely" {
-    // Re-aiming mid-combo is the core of the mechanic; neither input blocks.
+test "drain: aiming and cycling interleave freely" {
+    // Re-aiming while choosing a shape is the core of the mechanic; neither
+    // input blocks the other.
     var queue = KeyQueue{};
-    var combo = ComboBuffer{};
     queue.push(.one);
     queue.push(.left);
     queue.push(.two);
     queue.push(.left);
-    const out = drain(&queue, &combo);
-    try std.testing.expectEqual(DrainResult.appended, out.combo);
-    try std.testing.expectEqual(@as(u8, 2), combo.len);
+    const out = drain(&queue);
+    try std.testing.expectEqual(@as(usize, 2), out.turn_count);
     try std.testing.expectEqual(@as(usize, 2), out.step_count);
 }
 
@@ -250,11 +238,10 @@ test "drain: opposing steps are kept, not cancelled out" {
     // The server clamps, so collapsing these into a net zero would be wrong
     // whenever the cursor starts against an edge.
     var queue = KeyQueue{};
-    var combo = ComboBuffer{};
     queue.push(.left);
     queue.push(.left);
     queue.push(.right);
-    const out = drain(&queue, &combo);
+    const out = drain(&queue);
     try std.testing.expectEqualSlices(
         protocol.CursorDir,
         &.{ .left, .left, .right },
@@ -262,32 +249,35 @@ test "drain: opposing steps are kept, not cancelled out" {
     );
 }
 
-test "drain: steps pressed before a submit still travel with it" {
+test "drain: steps pressed before a cast still travel with it" {
     var queue = KeyQueue{};
-    var combo = ComboBuffer{};
-    queue.push(.one);
     queue.push(.down);
     queue.push(.enter);
-    const out = drain(&queue, &combo);
-    try std.testing.expectEqual(@as(u8, 1), out.combo.submitted.len);
-    // The step that aimed this cast must not be swallowed by the commit.
+    const out = drain(&queue);
+    try std.testing.expect(out.cast);
+    // The step that aimed this cast must not be swallowed by the trigger.
     try std.testing.expectEqualSlices(protocol.CursorDir, &.{.down}, out.cursor_steps());
 }
 
 test "drain: a step burst past the cap is dropped, not overflowed" {
     var queue = KeyQueue{};
-    var combo = ComboBuffer{};
     var i: usize = 0;
     while (i < MAX_CURSOR_STEPS + 5) : (i += 1) queue.push(.up);
-    const out = drain(&queue, &combo);
-    try std.testing.expectEqual(MAX_CURSOR_STEPS, out.step_count);
+    try std.testing.expectEqual(MAX_CURSOR_STEPS, drain(&queue).step_count);
+}
+
+test "drain: a turn burst past the cap is dropped, not overflowed" {
+    var queue = KeyQueue{};
+    var i: usize = 0;
+    while (i < MAX_CYCLE_TURNS + 5) : (i += 1) queue.push(.one);
+    try std.testing.expectEqual(MAX_CYCLE_TURNS, drain(&queue).turn_count);
 }
 
 test "drain: an empty queue changes nothing" {
     var queue = KeyQueue{};
-    var combo = ComboBuffer{};
-    const out = drain(&queue, &combo);
-    try std.testing.expectEqual(DrainResult.unchanged, out.combo);
+    const out = drain(&queue);
+    try std.testing.expect(!out.cast);
+    try std.testing.expectEqual(@as(usize, 0), out.turn_count);
     try std.testing.expectEqual(@as(usize, 0), out.step_count);
 }
 
@@ -301,13 +291,4 @@ test "parse_key_name maps the d-pad and rejects the old color keys" {
     // Colors are difficulty tiers now, not input.
     try std.testing.expectEqual(@as(?RawKey, null), parse_key_name("q"));
     try std.testing.expectEqual(@as(?RawKey, null), parse_key_name("r"));
-}
-
-test "ComboBuffer refuses to grow past MAX_COMBO_LEN" {
-    var combo = ComboBuffer{};
-    var i: usize = 0;
-    while (i < c.MAX_COMBO_LEN) : (i += 1)
-        try std.testing.expect(combo.push(.{ .action = .dispense }));
-    try std.testing.expect(!combo.push(.{ .action = .catalyst }));
-    try std.testing.expectEqual(c.MAX_COMBO_LEN, combo.len);
 }

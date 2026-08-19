@@ -61,13 +61,12 @@ pub const ConfigError = error{
     InvalidCharges,
     InvalidSlimeGrid,
     TooManyRecipes,
-    InvalidTeamPatternCount,
-    InvalidComboLength,
-    InvalidComboSlot,
+    InvalidGroupSize,
+    UnknownMoveLabel,
     InvalidShapeSize,
     RaggedShape,
     EmptyShape,
-    DuplicatePattern,
+    DuplicateLabel,
     EmptyLabel,
     LabelTooLong,
     NoEncounters,
@@ -142,8 +141,6 @@ const TiersU16Json = struct { red: u16 = 0, yellow: u16 = 0, green: u16 = 0 };
 
 const PlayerRecipeJson = struct {
     label: []const u8,
-    /// Combo slots as strings: "dispense" | "catalyst".
-    pattern: []const []const u8,
     /// Footprint rows of `#` (covered) and any other char (not covered),
     /// e.g. ["###","###","###"] for a 3x3 block.
     shape: []const []const u8,
@@ -154,7 +151,11 @@ const PlayerRecipeJson = struct {
 
 const TeamRecipeJson = struct {
     label: []const u8,
-    patterns: []const []const []const u8,
+    /// The bag of player-move LABELS this group needs, one per contributor,
+    /// e.g. ["poke","poke"].  Labels (not indices) so reordering the move table
+    /// cannot silently repoint a group at different moves.  Repeats are
+    /// meaningful: two "poke" entries mean two different players each poking.
+    moves: []const []const u8,
     shape: []const []const u8,
     /// Charges per FIRING of the group, not per contributing player.
     cost: u16 = balance.DEFAULT_RECIPE_COST,
@@ -248,29 +249,35 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         try validate_recipe_label(pr.label);
         out.* = .{
             .label = pr.label,
-            .pattern = try combo_from_names(pr.label, pr.pattern),
             .shape = try shape_from_rows(a, pr.label, pr.shape),
             .cost = pr.cost,
         };
     }
-    // Two recipes sharing a combo would make the move ambiguous: the first
-    // would always win and the second would be dead data.
-    try reject_duplicate_patterns(players);
+    // Labels are how groups name their components and how the UI names a
+    // selection, so a repeat would make both ambiguous.
+    try reject_duplicate_labels(players);
 
     const teams = try a.alloc(balance.TeamRecipe, raw.team_recipes.len);
     for (raw.team_recipes, teams) |tr, *out| {
         try validate_recipe_label(tr.label);
-        if (tr.patterns.len < 1 or tr.patterns.len > protocol.MAX_PLAYERS) {
-            fail("{s}: team recipe '{s}' has {} patterns (want 1..{})", .{ BALANCE_FILE, tr.label, tr.patterns.len, protocol.MAX_PLAYERS });
-            return ConfigError.InvalidTeamPatternCount;
+        // A one-move group is just a move, and a group can never need more
+        // contributors than a lobby can hold.  MAX_TEAM_COMPONENTS bounds the
+        // fixed-size bag `complete_group` matches against.
+        const max_group = @min(protocol.MAX_PLAYERS, balance.MAX_TEAM_COMPONENTS);
+        if (tr.moves.len < 2 or tr.moves.len > max_group) {
+            fail("{s}: group '{s}' needs {} moves (want 2..{})", .{ BALANCE_FILE, tr.label, tr.moves.len, max_group });
+            return ConfigError.InvalidGroupSize;
         }
-        const pats = try a.alloc(c.ActionCombo, tr.patterns.len);
-        for (tr.patterns, pats) |names, *pat| {
-            pat.* = try combo_from_names(tr.label, names);
+        const comps = try a.alloc(u8, tr.moves.len);
+        for (tr.moves, comps) |name, *comp| {
+            comp.* = move_index(players, name) orelse {
+                fail("{s}: group '{s}' names unknown move '{s}'", .{ BALANCE_FILE, tr.label, name });
+                return ConfigError.UnknownMoveLabel;
+            };
         }
         out.* = .{
             .label = tr.label,
-            .patterns = pats,
+            .components = comps,
             .shape = try shape_from_rows(a, tr.label, tr.shape),
             .cost = tr.cost,
         };
@@ -363,10 +370,6 @@ fn validate_recipe_label(label: []const u8) !void {
     }
 }
 
-fn slot_from_name(name: []const u8) ?c.ComboSlot {
-    if (std.meta.stringToEnum(c.ActionChoice, name)) |action| return .{ .action = action };
-    return null;
-}
 
 /// Turn authored rows of `#` into a Shape.  The anchor — the cell the caster
 /// is aiming at — is the bounding box centre rounded down, so odd-sized
@@ -419,35 +422,27 @@ fn shape_from_rows(
     return .{ .offsets = owned, .rows = @intCast(rows.len), .cols = @intCast(cols) };
 }
 
-/// Player combos are matched first-hit, so a repeated pattern silently
-/// shadows the later recipe.  Reject it at load rather than ship dead data.
-fn reject_duplicate_patterns(recipes: []const balance.PlayerRecipe) !void {
+/// Labels identify a move to groups (`moves: [...]`) and to players (the UI
+/// shows the selected label), so a repeat would make both ambiguous — the
+/// first would always win and the second would be unreachable.
+fn reject_duplicate_labels(recipes: []const balance.PlayerRecipe) !void {
     for (recipes, 0..) |a_rec, i| {
         for (recipes[i + 1 ..]) |b_rec| {
-            if (game_logic.combos_equal(a_rec.pattern, b_rec.pattern)) {
-                fail("{s}: recipes '{s}' and '{s}' share the same pattern", .{ BALANCE_FILE, a_rec.label, b_rec.label });
-                return ConfigError.DuplicatePattern;
+            if (std.mem.eql(u8, a_rec.label, b_rec.label)) {
+                fail("{s}: two moves share the label '{s}'", .{ BALANCE_FILE, a_rec.label });
+                return ConfigError.DuplicateLabel;
             }
         }
     }
 }
 
-fn combo_from_names(recipe_label: []const u8, names: []const []const u8) !c.ActionCombo {
-    if (names.len < 1 or names.len > c.MAX_COMBO_LEN) {
-        fail("{s}: recipe '{s}' pattern length {} outside 1..{}", .{ BALANCE_FILE, recipe_label, names.len, c.MAX_COMBO_LEN });
-        return ConfigError.InvalidComboLength;
+/// Resolve a group component's authored label to its move-table index, which is
+/// the form the runtime matches against.  Null when no move owns the label.
+fn move_index(recipes: []const balance.PlayerRecipe, label: []const u8) ?u8 {
+    for (recipes, 0..) |r, i| {
+        if (std.mem.eql(u8, r.label, label)) return @intCast(i);
     }
-    var combo = c.ActionCombo{
-        .slots = [_]c.ComboSlot{.{ .action = .dispense }} ** c.MAX_COMBO_LEN,
-        .len = @intCast(names.len),
-    };
-    for (names, 0..) |name, i| {
-        combo.slots[i] = slot_from_name(name) orelse {
-            fail("{s}: recipe '{s}' has unknown slot '{s}' (want dispense|catalyst)", .{ BALANCE_FILE, recipe_label, name });
-            return ConfigError.InvalidComboSlot;
-        };
-    }
-    return combo;
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -493,7 +488,7 @@ test "shipped data files parse and validate" {
     }
 }
 
-test "every shipped recipe has a legal combo and a real footprint" {
+test "every shipped move has a real footprint and every group real components" {
     var loaded = try parse(
         std.testing.allocator,
         @embedFile("balance_data"),
@@ -502,13 +497,16 @@ test "every shipped recipe has a legal combo and a real footprint" {
     defer loaded.deinit();
     const bal = &loaded.config.balance;
     for (bal.player_recipes) |pr| {
-        try std.testing.expect(pr.pattern.len >= 1);
-        try std.testing.expect(pr.pattern.len <= c.MAX_COMBO_LEN);
         try std.testing.expect(pr.shape.size() >= 1);
     }
     for (bal.team_recipes) |tr| {
-        try std.testing.expect(tr.patterns.len >= 1);
+        // A group needs at least two contributors to be a group at all, and
+        // every component must index a move that actually exists.
+        try std.testing.expect(tr.components.len >= 2);
         try std.testing.expect(tr.shape.size() >= 1);
+        for (tr.components) |comp| {
+            try std.testing.expect(comp < bal.player_recipes.len);
+        }
     }
 }
 
@@ -542,7 +540,7 @@ test "a shape's anchor centres an odd footprint on the aimed cell" {
     var loaded = try parse(
         std.testing.allocator,
         one_recipe(
-            \\{"label":"x","pattern":["dispense"],"shape":["###","###","###"]}
+            \\{"label":"x","shape":["###","###","###"]}
         ),
         minimal_encounters,
     );
@@ -563,7 +561,7 @@ test "a shape reads only '#' as covered" {
     var loaded = try parse(
         std.testing.allocator,
         one_recipe(
-            \\{"label":"x","pattern":["dispense"],"shape":["#.#",".#.","#.#"]}
+            \\{"label":"x","shape":["#.#",".#.","#.#"]}
         ),
         minimal_encounters,
     );
@@ -575,7 +573,7 @@ test "a 1x1 shape sits exactly on the cursor" {
     var loaded = try parse(
         std.testing.allocator,
         one_recipe(
-            \\{"label":"x","pattern":["dispense"],"shape":["#"]}
+            \\{"label":"x","shape":["#"]}
         ),
         minimal_encounters,
     );
@@ -590,7 +588,7 @@ test "a shape covering no cells is rejected" {
     try std.testing.expectError(ConfigError.EmptyShape, parse(
         std.testing.allocator,
         one_recipe(
-            \\{"label":"x","pattern":["dispense"],"shape":["...","..."]}
+            \\{"label":"x","shape":["...","..."]}
         ),
         minimal_encounters,
     ));
@@ -600,7 +598,7 @@ test "a shape with no rows is rejected" {
     try std.testing.expectError(ConfigError.InvalidShapeSize, parse(
         std.testing.allocator,
         one_recipe(
-            \\{"label":"x","pattern":["dispense"],"shape":[]}
+            \\{"label":"x","shape":[]}
         ),
         minimal_encounters,
     ));
@@ -610,7 +608,7 @@ test "a ragged shape is rejected" {
     try std.testing.expectError(ConfigError.RaggedShape, parse(
         std.testing.allocator,
         one_recipe(
-            \\{"label":"x","pattern":["dispense"],"shape":["###","#"]}
+            \\{"label":"x","shape":["###","#"]}
         ),
         minimal_encounters,
     ));
@@ -621,7 +619,7 @@ test "an over-tall shape is rejected" {
     const rows = "[" ++ "\"#\"," ** balance.MAX_SHAPE_ROWS ++ "\"#\"]";
     try std.testing.expectError(ConfigError.InvalidShapeSize, parse(
         std.testing.allocator,
-        one_recipe("{\"label\":\"x\",\"pattern\":[\"dispense\"],\"shape\":" ++ rows ++ "}"),
+        one_recipe("{\"label\":\"x\",\"shape\":" ++ rows ++ "}"),
         minimal_encounters,
     ));
 }
@@ -630,29 +628,32 @@ test "an over-wide shape is rejected" {
     const wide = "\"" ++ "#" ** (balance.MAX_SHAPE_COLS + 1) ++ "\"";
     try std.testing.expectError(ConfigError.InvalidShapeSize, parse(
         std.testing.allocator,
-        one_recipe("{\"label\":\"x\",\"pattern\":[\"dispense\"],\"shape\":[" ++ wide ++ "]}"),
+        one_recipe("{\"label\":\"x\",\"shape\":[" ++ wide ++ "]}"),
         minimal_encounters,
     ));
 }
 
-test "two recipes sharing a pattern are rejected" {
-    // The second would be unreachable: first-hit matching shadows it.
-    try std.testing.expectError(ConfigError.DuplicatePattern, parse(
+test "two moves sharing a label are rejected" {
+    // Groups name components by label, so a repeat makes a group ambiguous and
+    // leaves the second move unreachable from the group table.
+    try std.testing.expectError(ConfigError.DuplicateLabel, parse(
         std.testing.allocator,
         one_recipe(
-            \\{"label":"a","pattern":["dispense","catalyst"],"shape":["#"]},
-            \\{"label":"b","pattern":["dispense","catalyst"],"shape":["##"]}
+            \\{"label":"a","shape":["#"]},
+            \\{"label":"a","shape":["##"]}
         ),
         minimal_encounters,
     ));
 }
 
-test "recipes differing only in order are distinct patterns" {
+test "moves sharing a shape but not a label are both kept" {
+    // Two ways to spend on the same footprint is a pricing decision, not an
+    // error: only the label has to be unique.
     var loaded = try parse(
         std.testing.allocator,
         one_recipe(
-            \\{"label":"a","pattern":["dispense","catalyst"],"shape":["#"]},
-            \\{"label":"b","pattern":["catalyst","dispense"],"shape":["##"]}
+            \\{"label":"cheap","shape":["#"],"cost":1},
+            \\{"label":"dear","shape":["#"],"cost":5}
         ),
         minimal_encounters,
     );
@@ -664,9 +665,9 @@ test "recipe cost defaults to one and 0 is a legal free move" {
     var loaded = try parse(
         std.testing.allocator,
         one_recipe(
-            \\{"label":"plain","pattern":["dispense"],"shape":["#"]},
-            \\{"label":"free","pattern":["catalyst"],"shape":["#"],"cost":0},
-            \\{"label":"heavy","pattern":["catalyst","catalyst"],"shape":["###"],"cost":12}
+            \\{"label":"plain","shape":["#"]},
+            \\{"label":"free","shape":["#"],"cost":0},
+            \\{"label":"heavy","shape":["###"],"cost":12}
         ),
         minimal_encounters,
     );
@@ -682,56 +683,53 @@ test "recipe cost defaults to one and 0 is a legal free move" {
 test "cheapest_cost spans both recipe tables" {
     const doc =
         \\{"hunger_cost_normal":1,
-        \\ "player_recipes":[{"label":"p","pattern":["dispense"],"shape":["#"],"cost":5}],
-        \\ "team_recipes":[{"label":"t","patterns":[["dispense"],["catalyst"]],
+        \\ "player_recipes":[{"label":"p","shape":["#"],"cost":5}],
+        \\ "team_recipes":[{"label":"t","moves":["p","p"],
         \\   "shape":["#"],"cost":2}]}
     ;
     var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
     defer loaded.deinit();
-    // The team recipe is the cheapest move, so it decides when a team is broke.
+    // The group is the cheapest move, so it decides when a team is broke.
     try std.testing.expectEqual(@as(u16, 2), loaded.config.balance.cheapest_cost());
 }
 
-test "an element name is no longer a valid combo slot" {
-    // Colors are difficulty tiers now; they were never castable input.
-    try std.testing.expectError(ConfigError.InvalidComboSlot, parse(
-        std.testing.allocator,
-        one_recipe(
-            \\{"label":"x","pattern":["red","dispense"],"shape":["#"]}
-        ),
-        minimal_encounters,
-    ));
+test "a group naming an unknown move is rejected" {
+    // Typo protection: a group whose bag can never be filled is dead data.
+    const bad =
+        \\{"hunger_cost_normal":1,
+        \\ "player_recipes":[{"label":"poke","shape":["#"]}],
+        \\ "team_recipes":[{"label":"t","moves":["poke","pokke"],"shape":["#"]}]}
+    ;
+    try std.testing.expectError(
+        ConfigError.UnknownMoveLabel,
+        parse(std.testing.allocator, bad, minimal_encounters),
+    );
 }
 
-test "unknown combo slot name is rejected" {
-    try std.testing.expectError(ConfigError.InvalidComboSlot, parse(
-        std.testing.allocator,
-        one_recipe(
-            \\{"label":"x","pattern":["lava","dispense"],"shape":["#"]}
-        ),
-        minimal_encounters,
-    ));
+test "a group's components resolve to move-table indices in authored order" {
+    const doc =
+        \\{"hunger_cost_normal":1,
+        \\ "player_recipes":[{"label":"a","shape":["#"]},
+        \\   {"label":"b","shape":["##"]},{"label":"c","shape":["###"]}],
+        \\ "team_recipes":[{"label":"t","moves":["c","a"],"shape":["#"]}]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    // Indices, not labels, are what the runtime matches — and file order is the
+    // index, which is also the order players cycle through.
+    try std.testing.expectEqualSlices(u8, &.{ 2, 0 }, loaded.config.balance.team_recipes[0].components);
 }
 
-test "over-long combo pattern is rejected" {
-    try std.testing.expectError(ConfigError.InvalidComboLength, parse(
-        std.testing.allocator,
-        one_recipe(
-            \\{"label":"x","shape":["#"],
-            \\ "pattern":["dispense","dispense","dispense","dispense","dispense","dispense"]}
-        ),
-        minimal_encounters,
-    ));
-}
-
-test "empty combo pattern is rejected" {
-    try std.testing.expectError(ConfigError.InvalidComboLength, parse(
-        std.testing.allocator,
-        one_recipe(
-            \\{"label":"x","pattern":[],"shape":["#"]}
-        ),
-        minimal_encounters,
-    ));
+test "a group may name the same move twice" {
+    // Two players each poking is the canonical group; the repeat is the point.
+    const doc =
+        \\{"hunger_cost_normal":1,
+        \\ "player_recipes":[{"label":"poke","shape":["#"]}],
+        \\ "team_recipes":[{"label":"t","moves":["poke","poke"],"shape":["###"]}]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0 }, loaded.config.balance.team_recipes[0].components);
 }
 
 test "casts_per_turn defaults when absent" {
@@ -832,9 +830,21 @@ test "retired realtime and medicine fields are rejected" {
         ,
         // A recipe's medicine output has no meaning any more.
         \\{"hunger_cost_normal":1,
-        \\ "player_recipes":[{"label":"x","pattern":["dispense"],"shape":["#"],
+        \\ "player_recipes":[{"label":"x","shape":["#"],
         \\   "medicine":{"red":3}}],
         \\ "team_recipes":[]}
+        ,
+        // Button patterns are gone: a move is selected by cycling the wheel, not
+        // spelled out, so a leftover `pattern` would silently do nothing.
+        \\{"hunger_cost_normal":1,
+        \\ "player_recipes":[{"label":"x","pattern":["dispense"],"shape":["#"]}],
+        \\ "team_recipes":[]}
+        ,
+        // Groups name component MOVES now, not per-player button patterns.
+        \\{"hunger_cost_normal":1,
+        \\ "player_recipes":[{"label":"x","shape":["#"]}],
+        \\ "team_recipes":[{"label":"t","patterns":[["dispense"],["catalyst"]],
+        \\   "shape":["#"]}]}
         ,
     }) |bad| {
         try std.testing.expectError(
@@ -872,7 +882,7 @@ test "a removed pre-shape balance field is rejected, not ignored" {
 test "a recipe without a shape is rejected" {
     const bad =
         \\{"hunger_cost_normal":1,
-        \\ "player_recipes":[{"label":"x","pattern":["dispense"]}],
+        \\ "player_recipes":[{"label":"x"}],
         \\ "team_recipes":[]}
     ;
     try std.testing.expectError(
@@ -881,30 +891,51 @@ test "a recipe without a shape is rejected" {
     );
 }
 
-test "team recipes carry one shared shape and one shared cost" {
+test "groups carry one shared shape and one shared cost" {
     const doc =
         \\{"hunger_cost_normal":1,
-        \\ "player_recipes":[],
-        \\ "team_recipes":[{"label":"t","patterns":[["dispense"],["catalyst"]],
+        \\ "player_recipes":[{"label":"a","shape":["#"]},{"label":"b","shape":["##"]}],
+        \\ "team_recipes":[{"label":"t","moves":["a","b"],
         \\   "shape":["#####"],"cost":3}]}
     ;
     var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
     defer loaded.deinit();
     const tr = loaded.config.balance.team_recipes[0];
-    try std.testing.expectEqual(@as(usize, 2), tr.patterns.len);
+    try std.testing.expectEqual(@as(usize, 2), tr.components.len);
     try std.testing.expectEqual(@as(usize, 5), tr.shape.size());
     // One cost for the group, not one per contributing player.
     try std.testing.expectEqual(@as(u16, 3), tr.cost);
 }
 
-test "team recipe with zero patterns is rejected" {
-    const bad =
+test "a group of fewer than two moves is rejected" {
+    // One contributor is just a move; calling it a group would let a solo
+    // player fire group shapes at group prices.
+    for ([_][]const u8{
         \\{"hunger_cost_normal":1,
-        \\ "player_recipes":[],
-        \\ "team_recipes":[{"label":"t","patterns":[],"shape":["#"]}]}
-    ;
+        \\ "player_recipes":[{"label":"a","shape":["#"]}],
+        \\ "team_recipes":[{"label":"t","moves":[],"shape":["#"]}]}
+        ,
+        \\{"hunger_cost_normal":1,
+        \\ "player_recipes":[{"label":"a","shape":["#"]}],
+        \\ "team_recipes":[{"label":"t","moves":["a"],"shape":["#"]}]}
+        ,
+    }) |bad| {
+        try std.testing.expectError(
+            ConfigError.InvalidGroupSize,
+            parse(std.testing.allocator, bad, minimal_encounters),
+        );
+    }
+}
+
+test "a group needing more contributors than a lobby holds is rejected" {
+    // Such a group could never fire, so it is dead data rather than hard mode.
+    const over = @min(protocol.MAX_PLAYERS, balance.MAX_TEAM_COMPONENTS) + 1;
+    const moves = "[" ++ "\"a\"," ** (over - 1) ++ "\"a\"]";
+    const bad = "{\"hunger_cost_normal\":1," ++
+        "\"player_recipes\":[{\"label\":\"a\",\"shape\":[\"#\"]}]," ++
+        "\"team_recipes\":[{\"label\":\"t\",\"moves\":" ++ moves ++ ",\"shape\":[\"#\"]}]}";
     try std.testing.expectError(
-        ConfigError.InvalidTeamPatternCount,
+        ConfigError.InvalidGroupSize,
         parse(std.testing.allocator, bad, minimal_encounters),
     );
 }
