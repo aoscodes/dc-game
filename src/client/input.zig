@@ -76,11 +76,20 @@ pub const ComboBuffer = struct {
     }
 };
 
-pub const DrainResult = enum {
+/// What a drain did to the combo buffer.
+///
+/// The two TERMINAL results — `cancelled` and `submitted` — leave the buffer
+/// EMPTY, because `drain` clears it as it reports them.  `submitted` therefore
+/// carries the combo by value: it is the only surviving copy, which is what
+/// makes "committed a spell but left it in the buffer" unrepresentable rather
+/// than merely discouraged.  (It used to be a bare tag, and the caller cleared
+/// on a server reply — but a cast that resolves immediately never sends one,
+/// so the spent recipe leaked into the next cast.)
+pub const DrainResult = union(enum) {
     unchanged,
     appended,
     cancelled,
-    submitted,
+    submitted: c.ActionCombo,
 };
 
 /// Cursor steps to forward, in the order they were pressed.  Steps are sent
@@ -109,12 +118,17 @@ pub fn drain(queue: *KeyQueue, combo: *ComboBuffer) Drained {
     var out = Drained{};
     while (queue.pop()) |key| {
         switch (key) {
+            // Both terminal keys hand the buffer back empty: the recipe either
+            // went out on the wire or was thrown away, and either way the next
+            // key starts a new spell.
             .escape => {
+                combo.clear();
                 out.combo = .cancelled;
                 return out;
             },
             .enter => {
-                out.combo = .submitted;
+                out.combo = .{ .submitted = combo.to_combo() };
+                combo.clear();
                 return out;
             },
             // Action keys: 1=dispense  2=catalyst.  These NAME the recipe.
@@ -147,23 +161,48 @@ pub fn drain(queue: *KeyQueue, combo: *ComboBuffer) Drained {
     return out;
 }
 
-test "drain: enter returns submitted, keeps buffer" {
+test "drain: enter hands the combo over and empties the buffer" {
     var queue = KeyQueue{};
     var combo = ComboBuffer{};
     queue.push(.one);
     queue.push(.enter);
-    // Drain appends '1' then hits enter -> submitted (buffer untouched).
     const out = drain(&queue, &combo);
-    try std.testing.expectEqual(DrainResult.submitted, out.combo);
-    try std.testing.expectEqual(@as(u8, 1), combo.len);
+    // The committed recipe travels in the RESULT...
+    const submitted = out.combo.submitted;
+    try std.testing.expectEqual(@as(u8, 1), submitted.len);
+    try std.testing.expectEqual(c.ActionChoice.dispense, submitted.slots[0].action);
+    // ...and no longer in the buffer.
+    try std.testing.expectEqual(@as(u8, 0), combo.len);
 }
 
-test "drain: escape returns cancelled before later enter" {
+test "drain: a spent recipe never leaks into the next cast" {
+    // Regression.  The buffer used to survive a submit and be cleared only by
+    // a server reply, but a cast that RESOLVES IMMEDIATELY (every solo recipe)
+    // answers with recipe_fired and never with cast_committed/cast_fizzled.
+    // So typing "1" after firing poke sent [dispense, dispense] — a sweep the
+    // player never asked for.
     var queue = KeyQueue{};
     var combo = ComboBuffer{};
+    queue.push(.one);
+    queue.push(.enter);
+    try std.testing.expectEqual(@as(u8, 1), drain(&queue, &combo).combo.submitted.len);
+
+    queue.push(.one);
+    queue.push(.enter);
+    const second = drain(&queue, &combo).combo.submitted;
+    try std.testing.expectEqual(@as(u8, 1), second.len);
+}
+
+test "drain: escape returns cancelled and empties the buffer" {
+    var queue = KeyQueue{};
+    var combo = ComboBuffer{};
+    queue.push(.one);
+    queue.push(.two);
     queue.push(.escape);
     queue.push(.enter);
-    try std.testing.expectEqual(DrainResult.cancelled, drain(&queue, &combo).combo);
+    const out = drain(&queue, &combo);
+    try std.testing.expectEqual(DrainResult.cancelled, out.combo);
+    try std.testing.expectEqual(@as(u8, 0), combo.len);
 }
 
 test "drain: action keys append in press order" {
@@ -230,7 +269,7 @@ test "drain: steps pressed before a submit still travel with it" {
     queue.push(.down);
     queue.push(.enter);
     const out = drain(&queue, &combo);
-    try std.testing.expectEqual(DrainResult.submitted, out.combo);
+    try std.testing.expectEqual(@as(u8, 1), out.combo.submitted.len);
     // The step that aimed this cast must not be swallowed by the commit.
     try std.testing.expectEqualSlices(protocol.CursorDir, &.{.down}, out.cursor_steps());
 }

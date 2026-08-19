@@ -175,9 +175,11 @@ fn send_combo(combo: *const inp.ComboBuffer) void {
     emit_send(fbs.getWritten());
 }
 
-fn send_submit_spell(combo: *const inp.ComboBuffer) void {
+/// Takes the combo BY VALUE: by the time a submit is sent the buffer it came
+/// from has already been emptied by `input.drain`, so this is the only copy.
+fn send_submit_spell(combo: c.ActionCombo) void {
     var fbs = std.io.fixedBufferStream(&g_state.send_buf);
-    proto.encode(fbs.writer(), .submit_spell, proto.SubmitSpell{ .combo = combo.to_combo() }) catch return;
+    proto.encode(fbs.writer(), .submit_spell, proto.SubmitSpell{ .combo = combo }) catch return;
     emit_send(fbs.getWritten());
 }
 
@@ -267,22 +269,14 @@ fn process_recv() void {
                 }
             },
             .cast_committed => {
-                const p = proto.decode_cast_committed(r) catch continue;
-                // Our team-recipe half is held server-side awaiting a partner;
-                // clear the local buffer so the next spell starts fresh, and
-                // cancel any stale in-flight combo the server may have stored
-                // after the commit (keys racing the cast_committed message).
-                if (p.player_id == g_state.player_id) {
-                    g_state.game.pending_combo.clear();
-                    send_cancel_combo();
-                }
+                // Purely informational: our team-recipe half is held
+                // server-side awaiting a partner.  The buffer was already
+                // cleared at submit time, so there is nothing to undo here.
+                // Decoded anyway to keep the stream in sync.
+                _ = proto.decode_cast_committed(r) catch continue;
             },
             .cast_fizzled => {
                 const p = proto.decode_cast_fizzled(r) catch continue;
-                if (p.player_id == g_state.player_id) {
-                    g_state.game.pending_combo.clear();
-                    send_cancel_combo();
-                }
                 // Record for the renderer (transient, drained per frame).
                 if (g_state.game.fizzle_count < g_state.game.fizzles.len) {
                     g_state.game.fizzles[g_state.game.fizzle_count] = p.player_id;
@@ -338,16 +332,11 @@ fn update_game() void {
     switch (drained.combo) {
         .unchanged => {},
         .appended => send_combo(&gs.pending_combo),
-        .cancelled => {
-            gs.pending_combo.clear();
-            send_cancel_combo();
-        },
-        // Explicitly submit the pending combo as a spell.  Do NOT clear
-        // locally — the server's reply (cast_committed for a held half,
-        // cast_fizzled for a combo that matched nothing) triggers the clear.
-        .submitted => {
-            if (gs.pending_combo.len > 0) send_submit_spell(&gs.pending_combo);
-        },
+        // Both terminal results arrive with the buffer already emptied by the
+        // drain, so there is nothing to clear here and nothing left to leak
+        // into the next cast.
+        .cancelled => send_cancel_combo(),
+        .submitted => |combo| if (combo.len > 0) send_submit_spell(combo),
     }
 }
 
