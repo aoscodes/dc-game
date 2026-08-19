@@ -31,7 +31,7 @@ const LAYOUT = {
     symbolAlpha: 0.55,  // tier glyph opacity stamped on the body
     // Per-cell animation durations (seconds) and idle wobble.
     dropS: 0.15,        // refill slide-in from above
-    popS: 0.22,         // eaten-tile burst
+    popS: 0.22,         // eaten-tile burst (driven by the feast cinematic)
     flashS: 0.25,       // downgraded-tile white bloom
     bobAmp: 0.02,       // idle breathing: ±fraction of tile size
     bobFreq: 1.6,       // idle breathing rate (rad/s)
@@ -107,6 +107,29 @@ const LAYOUT = {
   // field and pounce at the turn-end feast (see tickLilGuys).  `speed` is px/s;
   // `snap` is how close counts as arrived.
   lilGuys: { size: 48, speed: 220, snap: 3 },
+
+  // The turn-end feast, played out cell by cell (see the cinematic section).
+  // The whole sequence is a deliberate pause in play: input is dead until it
+  // finishes, because the board on screen is mid-replay and nothing aimed at it
+  // would mean anything.
+  cinematic: {
+    // Wall clock the EAT stage is fitted BETWEEN, whatever the board size, so
+    // the pause never scales with the meal: on a full field the guys hurry, and
+    // on a nearly-walled-off one they amble instead of finishing before the eye
+    // catches them.  A small meal is the common case once the team is walling
+    // well — three cells eaten of sixty is a normal late turn — and it is the
+    // case most worth watching, so it gets the same beat as a feast.
+    eatMinS: 2,
+    eatCapS: 5,
+    chompPauseS: 0.1,   // beat held on each bitten cell, so a bite is legible
+    collapseS: 0.4,     // one fall: survivors dropping, then the refill landing
+    // Longest frame the replay will honour.  requestAnimationFrame stops firing
+    // in a hidden tab, so returning to one delivers a single frame worth however
+    // long it was away — and spending it would eat the whole meal in one step,
+    // which is the jump cut the replay exists to avoid.  Time the player was not
+    // watching is not time the feast ran.
+    maxStepS: 1 / 15,
+  },
 
   actionMenu: {
     w: 340, h: 126, marginBottom: 128,
@@ -358,10 +381,15 @@ function clearEntityState() {
   lilGuys.clear();
   lastBitePos = null;
   // Grid animation state is per-match: a new game's first frame must adopt its
-  // grid silently rather than diff it against the last game's board.
+  // grid silently rather than diff it against the last game's board.  A replay
+  // in flight is abandoned outright — it is animating a board this session has
+  // left, and there is nothing left on screen to land it on.  Its held score and
+  // hunger floaters go with it, deliberately: the deltas are already banked
+  // server-side, and floating them here would mean numbers rising over the
+  // game-over screen from a board that is no longer being shown.
+  cinematic = null;
   prevGrid = [];
   cellAnim.clear();
-  feastThisFrame = false;
   stampedThisFrame.clear();
   lastTransientGame = null;
   chargesSeenMax = 0;
@@ -752,66 +780,60 @@ function spawnStampFloaters(game) {
   const events = game.shape_casts ?? [];
   if (events.length === 0) return;
 
+  for (const ev of events) {
+    for (const flat of ev.cells ?? []) stampedThisFrame.add(flat);
+  }
+
+  // A cast that lands while the feast is replaying is held until the replay
+  // ends.  The board on screen is the pre-feast one, so floating "3 downgraded"
+  // now would point at cells that visibly have not changed — and the cells it
+  // names may not even exist after the collapse.  The stamped-cell record above
+  // is NOT deferred: the diff after the replay needs it to tell a downgrade from
+  // a refill, and it is bookkeeping rather than something on screen.
+  const sink = cinematic ? cinematic.deferred.stamps : null;
+  if (sink) {
+    sink.push(...events);
+    return;
+  }
+
   const { rows, cols } = gridDims(game);
+  events.forEach((ev, i) => floatStampOutcome(ev, i, rows, cols));
+}
+
+/** One landed shape's readout, stacked at `slot` to keep simultaneous casts apart. */
+function floatStampOutcome(ev, slot, rows, cols) {
   const STACK = LAYOUT.floater.stack;
 
-  events.forEach((ev, i) => {
-    for (const flat of ev.cells ?? []) stampedThisFrame.add(flat);
+  // Anchor the readout on the footprint itself — the whole point of aiming
+  // is that the outcome is local, so a field-centre label would hide it.
+  const at = (ev.cells ?? []).length > 0
+    ? cellCenter(ev.cells[0], rows, cols)
+    : fieldCenter();
+  const y = at.y + slot * STACK;
 
-    // Anchor the readout on the footprint itself — the whole point of aiming
-    // is that the outcome is local, so a field-centre label would hide it.
-    const at = (ev.cells ?? []).length > 0
-      ? cellCenter(ev.cells[0], rows, cols)
-      : fieldCenter();
-    const y = at.y + i * STACK;
+  const hits = sumTiers(ev.downgraded);
+  const head = hits > 0
+    ? `${hits} downgraded${ev.neutralized > 0 ? `, ${ev.neutralized} defused` : ""}`
+    : "no effect";
+  spawnFloater(head, at.x, y, hits > 0 ? C_SLIME_HDR : C_BAD,
+    LAYOUT.floater.lifetime, LAYOUT.floater.font);
 
-    const hits = sumTiers(ev.downgraded);
-    const head = hits > 0
-      ? `${hits} downgraded${ev.neutralized > 0 ? `, ${ev.neutralized} defused` : ""}`
-      : "no effect";
-    spawnFloater(head, at.x, y, hits > 0 ? C_SLIME_HDR : C_BAD,
-      LAYOUT.floater.lifetime, LAYOUT.floater.font);
-
-    // Nothing is destroyed by a stamp, so the only waste is coverage thrown
-    // away: cells clipped off the grid edge, or in-bounds cells with nothing
-    // left to downgrade.  Both are aiming feedback.
-    const wasted = (ev.off_grid ?? 0) + (ev.inert ?? 0);
-    if (wasted > 0) {
-      spawnFloater(`(${wasted} wasted)`, at.x, y + STACK * 0.7,
-        C_MUTED, LAYOUT.floater.lifetime, LAYOUT.floater.font);
-    }
-  });
+  // Nothing is destroyed by a stamp, so the only waste is coverage thrown
+  // away: cells clipped off the grid edge, or in-bounds cells with nothing
+  // left to downgrade.  Both are aiming feedback.
+  const wasted = (ev.off_grid ?? 0) + (ev.inert ?? 0);
+  if (wasted > 0) {
+    spawnFloater(`(${wasted} wasted)`, at.x, y + STACK * 0.7,
+      C_MUTED, LAYOUT.floater.lifetime, LAYOUT.floater.font);
+  }
 }
 
 /** Turn-loop floater color (matches the cast-budget gauge). */
 const CAST_EVENT_COLOR = "rgba(120,220,255,1)";
 
-/**
- * Turn-end floaters (`game.turn_ended`, transient): the feast, announced.
- *
- * The per-cell score/hunger deltas are floated separately by
- * updateFeastTracking; this is the headline — how much was eaten, and how much
- * the team could only watch.  Sheltered food is the number that should change
- * how the next turn is played, so it gets equal billing with the feast itself.
- */
-function spawnTurnEndedFloaters(game) {
-  const te = game.turn_ended;
-  if (!te) return;
-
-  const { x, y } = fieldCenter();
-  const STACK = LAYOUT.floater.stack + 8;
-  spawnFloater(`FEAST! ${te.cells_eaten ?? 0} units devoured`, x, y - STACK,
-    CAST_EVENT_COLOR, LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
-
-  // Food that was RIGHT THERE and unreachable — the actionable miss.  Naming
-  // the walls alongside it points at the fix rather than just the failure.
-  const sheltered = te.sheltered ?? 0;
-  if (sheltered > 0) {
-    const walls = te.walls ?? 0;
-    spawnFloater(`${sheltered} walled off by ${walls} live cell${walls === 1 ? "" : "s"}`,
-      x, y + 28, C_SHELTERED, LAYOUT.floater.lifetime, LAYOUT.floater.font);
-  }
-}
+// The turn-end headline ("Lil Guys Eating!", then the tally) is spawned by the
+// feast cinematic, which is the only thing that knows when the meal starts and
+// when it is over — see spawnFeastTallyFloaters.
 
 /**
  * Compact per-player pending-combo rows (bottom-left UI panel).  No player
@@ -1181,10 +1203,13 @@ let lastScoreSeen = 0;
 let lastHungerSeen = 0;
 
 /**
- * Call once per drawGame frame, AFTER tickLilGuys so `lastBitePos` already
- * points at a cell the feast just ate.  Score and hunger ONLY move at the
- * turn-end feast — nothing gives either of them back — so the deltas always
- * belong over the cell that was just bitten.
+ * Call once per drawGame frame, right after any feast replay has been started.
+ * Score and hunger ONLY move at the turn-end feast — nothing gives either of
+ * them back — so the deltas always belong over the cell that was just bitten.
+ *
+ * While the feast is being replayed the deltas are HELD: they are the payout of
+ * a meal the player has not watched yet, and the replay releases them over the
+ * final bite (see finishEat).
  */
 function updateFeastTracking(game) {
   const score = game.score ?? 0;
@@ -1195,6 +1220,12 @@ function updateFeastTracking(game) {
   lastHungerSeen = hunger;
 
   if (scoreGain === 0 && hungerGain === 0) return;
+
+  if (cinematic) {
+    cinematic.deferred.score += scoreGain;
+    cinematic.deferred.hunger += hungerGain;
+    return;
+  }
 
   const at = lastBitePos ?? fieldCenter();
   const jitter = () => (Math.random() - 0.5) * LAYOUT.floater.jitter;
@@ -1437,23 +1468,29 @@ let reachCacheKey = null;
 let reachCacheVal = null;
 
 /**
- * Flood the field from the left edge and report what the feast would take.
+ * Flood an arbitrary board from the left edge and report what the feast takes.
  *
- * @param {object} game    - render frame (grid + dims)
+ * Takes a plain board rather than a render frame so the same flood serves both
+ * the live grid and the PRE-feast board the cinematic replays (which is no
+ * longer any frame the server sent).
+ *
+ * @param {string[]} board - flat cell names, row-major, row 0 = top
+ * @param {number} rows
+ * @param {number} cols
  * @param {Map<number,string>} [overrides] - flat → replacement cell name,
- *   used to ask "what would this cast open up?" without mutating the frame.
- * @returns {{eaten: Set<number>, sheltered: Set<number>, walls: Set<number>}}
- *   `eaten` is food the flood reaches, `sheltered` is food it cannot, and
- *   `walls` is every blocker still standing.
+ *   used to ask "what would this cast open up?" without mutating the board.
+ * @returns {{eaten: Set<number>, order: number[], sheltered: Set<number>,
+ *            walls: Set<number>}}
+ *   `eaten` is food the flood reaches and `order` the same cells in the order
+ *   the flood found them (the route the Lil Guys walk); `sheltered` is food it
+ *   cannot reach, and `walls` is every blocker still standing.
  */
-function reachability(game, overrides) {
-  if (!overrides && reachCacheKey === game && reachCacheVal) return reachCacheVal;
-
-  const { rows, cols } = gridDims(game);
-  const base = game.grid ?? [];
-  const at = (flat) => overrides?.get(flat) ?? base[flat];
+function floodFeast(board, rows, cols, overrides) {
+  const at = (flat) => overrides?.get(flat) ?? board[flat];
 
   const eaten = new Set();
+  /** Eaten cells in flood-discovery order: the front advancing from the door. */
+  const order = [];
   const walls = new Set();
   const seen = new Uint8Array(rows * cols);
   /** @type {number[]} */
@@ -1464,7 +1501,10 @@ function reachability(game, overrides) {
     const name = at(flat);
     if (cellBlocksFeast(name)) return; // a wall is never entered, only noted
     seen[flat] = 1;
-    if (cellIsEdible(name)) eaten.add(flat);
+    if (cellIsEdible(name)) {
+      eaten.add(flat);
+      order.push(flat);
+    }
     queue.push(flat);
   };
 
@@ -1485,7 +1525,20 @@ function reachability(game, overrides) {
     else if (cellIsEdible(name) && !eaten.has(flat)) sheltered.add(flat);
   }
 
-  const out = { eaten, sheltered, walls };
+  return { eaten, order, sheltered, walls };
+}
+
+/**
+ * `floodFeast` over a render frame's own grid, memoised per frame.
+ *
+ * @param {object} game    - render frame (grid + dims)
+ * @param {Map<number,string>} [overrides] - see floodFeast
+ */
+function reachability(game, overrides) {
+  if (!overrides && reachCacheKey === game && reachCacheVal) return reachCacheVal;
+
+  const { rows, cols } = gridDims(game);
+  const out = floodFeast(game.grid ?? [], rows, cols, overrides);
   if (!overrides) {
     reachCacheKey = game;
     reachCacheVal = out;
@@ -1677,23 +1730,25 @@ function tileSprite(name, size) {
 // grid queues nothing, which matters because frames arrive at ~20Hz while we
 // render at 60.
 //
-// The turn-end feast is the exception — it is NOT diffed.  The server eats the
-// whole field and refills it in the same tick, so a cell goes straight from one
-// color to another with no empty frame in between.  The `turn_ended` event is
-// what identifies that frame, and that is what drives the pop.
+// The turn-end feast is NOT diffed at all: the server eats, drops and refills
+// the whole field in one tick, so every cell changes at once and a diff can say
+// nothing useful about which of the three happened.  That frame is replayed
+// instead, and the replay queues these same animations itself — see the feast
+// cinematic section.
 
 /** Previous frame's cell names, for change classification. */
 let prevGrid = [];
 
-/** flat → { kind: "drop"|"pop"|"flash", t } with `t` counting down in seconds.
- *  A "pop" also carries `from`: the tile that was eaten, bursting outward
- *  while its replacement drops in behind it. */
+/**
+ * flat → queued animation, `t` counting down from `dur` in seconds:
+ *   { kind: "drop",  dur, t, cells? }        a tile arriving from above
+ *   { kind: "pop",   dur, t, from, cells? }  a bitten tile bursting outward,
+ *     with any replacement dropping in behind it
+ *   { kind: "flash", dur, t }                a downgraded tile blooming
+ * `cells` is the fall distance in cells, defaulting to one: the feast cinematic
+ * sets a real distance, since its survivors and refills fall arbitrarily far.
+ */
 const cellAnim = new Map();
-
-/** True on the frame a `turn_ended` arrived: EVERY cell was devoured, so every
- *  change on this frame is an eat followed by a refill rather than a plain
- *  server-side replacement.  Set by tickLilGuys, consumed by updateGridAnims. */
-let feastThisFrame = false;
 
 /** Cells a stamp covered this frame, from `game.shape_casts`.  A covered cell
  *  that changed was DOWNGRADED by a cast, so it flashes in place rather than
@@ -1716,7 +1771,10 @@ function bobPhase(flat) {
 
 /**
  * Diff `grid` against the previous frame and queue an animation per changed
- * cell.  Must run AFTER tickLilGuys so `feastThisFrame` is populated.
+ * cell.
+ *
+ * Turn-end frames never reach here: drawGame hands those to the cinematic,
+ * which owns the eat/fall/refill animations and adopts the grid when it is done.
  */
 function updateGridAnims(grid) {
   for (let flat = 0; flat < grid.length; flat++) {
@@ -1728,19 +1786,13 @@ function updateGridAnims(grid) {
     if (stampedThisFrame.has(flat) && now === downgradeName(was)) {
       // A stamp stepped this unit down a tier in place: it survived, so it
       // stays put and blooms.
-      cellAnim.set(flat, { kind: "flash", t: FIELD.flashS });
-    } else if (feastThisFrame && cellIsEdible(was)) {
-      // Only FOOD is ever eaten, so only food may burst.  A wall that vanished
-      // on a feast frame did not die — it fell, and popping it would teach the
-      // exact opposite of the rule the whole board runs on.
-      cellAnim.set(flat, { kind: "pop", t: FIELD.popS, from: was });
+      cellAnim.set(flat, { kind: "flash", dur: FIELD.flashS, t: FIELD.flashS });
     } else {
-      // A survivor that fell, a refilled hole, or any other replacement.
-      cellAnim.set(flat, { kind: "drop", t: FIELD.dropS });
+      // A refilled hole, or any other replacement, sliding in from above.
+      cellAnim.set(flat, { kind: "drop", dur: FIELD.dropS, t: FIELD.dropS });
     }
   }
   prevGrid = grid.slice();
-  feastThisFrame = false;
   stampedThisFrame.clear();
 }
 
@@ -1752,14 +1804,26 @@ function tickGridAnims(dt) {
   }
 }
 
+/** How far a queued cell animation has run, 0 → 1. */
+function animProgress(anim) {
+  return 1 - anim.t / anim.dur;
+}
+
 /**
  * Draw the slime field: recessed sockets, one gel tile per slime unit, and the
  * reservoir readout — units still queued off-grid, which refill emptied cells
  * from the top row.
+ *
+ * While the feast cinematic runs, the BOARD DRAWN IS THE CINEMATIC'S, not the
+ * frame's: the replay is mid-way between two server boards, so the frame's grid
+ * is the future.  Every aiming overlay (cast preview, candidate ghosts,
+ * sheltered hatching, cursors) is suppressed for the same reason — they answer
+ * questions about a board that is not on screen, and input is dead anyway.
  */
 function drawSlimeField(game) {
   const { rows, cols } = gridDims(game);
-  const grid = game.grid ?? [];
+  const replay = cinematicBoard();
+  const grid = replay ?? game.grid ?? [];
   const g = gridRect(rows, cols);
   const t = performance.now() / 1000;
 
@@ -1769,7 +1833,7 @@ function drawSlimeField(game) {
   // Cells a live or pending cast would cover, and what each becomes.  Exact,
   // not a guess: placement is a pure function of (shape, cursor).  Computed
   // once per frame, and only while something is actually projected.
-  const preview = shapePreview(game).cells;
+  const preview = replay ? new Map() : shapePreview(game).cells;
   const pulse = preview.size > 0
     ? FIELD.previewAlphaMin + (FIELD.previewAlphaMax - FIELD.previewAlphaMin) *
       (0.5 + 0.5 * Math.sin(t * Math.PI * 2 * FIELD.previewPulseHz))
@@ -1777,13 +1841,15 @@ function drawSlimeField(game) {
 
   // Cells the combo being TYPED is heading toward.  Static (no pulse) and
   // neutral, so the eye separates "would land" from the pulsing "will land".
-  const ghosts = candidateShapes(game).cells;
+  const ghosts = replay ? new Map() : candidateShapes(game).cells;
 
   // Who eats and who watches, on THIS board and on the board the pending cast
   // would create.  A cell that is sheltered now but eaten after — `opened` —
   // is the payoff of the cast, and it is almost never the cell being aimed at,
   // so nothing else on screen can show it.
-  const reach = reachability(game);
+  const reach = replay
+    ? { eaten: new Set(), sheltered: new Set(), walls: new Set() }
+    : reachability(game);
   const after = preview.size > 0
     ? reachability(game, new Map([...preview].map(([f, b]) => [f, b])))
     : reach;
@@ -1819,7 +1885,7 @@ function drawSlimeField(game) {
     // A popping tile bursts outward over its socket; its replacement (below)
     // drops in behind it.
     if (anim?.kind === "pop") {
-      const p = 1 - anim.t / FIELD.popS;      // 0 → 1
+      const p = animProgress(anim);           // 0 → 1
       drawTile(anim.from, x0, y0, g.cell, 1 + p * 0.3, 0, 1 - p);
     }
 
@@ -1849,11 +1915,11 @@ function drawSlimeField(game) {
     let scale = 1;
     let dy = 0;
     if (anim?.kind === "drop" || anim?.kind === "pop") {
-      // Slide in from the cell above, easing out, with a landing squash.
-      const dur = anim.kind === "drop" ? FIELD.dropS : FIELD.popS;
-      const p = 1 - anim.t / dur;
+      // Fall in from `cells` rows above (one, unless the cinematic set a real
+      // fall distance), easing out, with a landing squash.
+      const p = animProgress(anim);
       const ease = 1 - (1 - p) * (1 - p);
-      dy = -(1 - ease) * g.cell;
+      dy = -(1 - ease) * g.cell * (anim.cells ?? 1);
       scale = 1 + Math.sin(p * Math.PI) * 0.08;
     } else {
       // Idle: every cell breathes on its own stable phase.
@@ -1877,7 +1943,7 @@ function drawSlimeField(game) {
 
     // Downgrade flash: a white bloom over the settled tile.
     if (anim?.kind === "flash") {
-      const p = 1 - anim.t / FIELD.flashS;
+      const p = animProgress(anim);
       ctx.save();
       ctx.globalAlpha = (1 - p) * 0.8;
       rect(x0 + inset, y0 + inset, body, body, "rgba(255,255,255,1)");
@@ -1885,8 +1951,9 @@ function drawSlimeField(game) {
     }
   }
 
-  // Cursors last, so aim is never buried under a tile.
-  drawCursors(game, g, cols);
+  // Cursors last, so aim is never buried under a tile.  Hidden during the
+  // replay: nobody can aim while the feast plays out.
+  if (!replay) drawCursors(game, g, cols);
 
   rectStroke(FIELD.x0, FIELD.y0, FIELD.x1 - FIELD.x0, FIELD.y1 - FIELD.y0, 1,
     FIELD.border);
@@ -2034,8 +2101,8 @@ function drawTile(name, x0, y0, cell, scale, dy, alpha) {
 //
 // One guy is shown per connected player (read off `game.entities`, which the
 // server already sends for the combo panel).  Between turns they mill about the
-// field; on the frame a `turn_ended` arrives they pounce on a cell that was
-// occupied, chomp, and the tile layer pops every eaten cell.
+// field; when a `turn_ended` arrives the feast cinematic (below) takes them over
+// and walks them cell to cell through the whole meal.
 //
 // Because they are cosmetic, a guy's chosen cell is a display choice and can be
 // picked freely — no server state depends on it.
@@ -2083,81 +2150,94 @@ function feastCell(game, nth) {
 }
 
 /**
- * Sync the Lil Guy views with the connected players and advance them one frame.
+ * Ensure a view exists for every connected player, drop the departed, and hand
+ * the surviving views back in `game.entities` order.
  *
- * On a `turn_ended` frame every guy chomps: the tile layer is told the whole
- * field was eaten (`feastThisFrame`) so each cell pops, and the floater layer
- * gets an anchor for the hunger/score deltas.
+ * Shared by the idle milling below and the cinematic, which needs the same
+ * roster to hand out eat queues.
  *
- * `fresh` distinguishes a NEW server frame from a redraw of the one already
- * shown: we redraw at ~60Hz over ~20Hz of frames, so the chomp and its floater
- * must fire only on the first sight of a `turn_ended` or they arrive in triples.
- * Walking is unaffected and advances on every redraw.
+ * @param {number[]} spawnAt - flat index each new guy should appear standing on,
+ *   by roster position.  A guy is born on its cell rather than sprinting in from
+ *   a stale corner of the field.
  */
-function tickLilGuys(game, dt, fresh) {
+function syncLilGuys(game, spawnAt) {
   const G = LAYOUT.lilGuys;
   const { rows, cols } = gridDims(game);
-  const grid = game.grid ?? [];
   const players = (game.entities ?? []).filter((e) => e.owner !== undefined);
-  const feast = fresh ? (game.turn_ended ?? null) : null;
 
-  // Drop views whose player is gone (disconnected).
   const live = new Set(players.map((e) => e.owner));
   for (const pid of lilGuys.keys()) {
     if (!live.has(pid)) lilGuys.delete(pid);
   }
 
-  players.forEach((e, i) => {
-    const target = feastCell(game, i);
-    let g = lilGuys.get(e.owner);
-    if (!g) {
-      // Spawn already standing on its cell: a new guy should not sprint in
-      // from a stale corner of the field.
-      const at = target !== null ? cellCenter(target, rows, cols) : fieldCenter();
-      g = {
-        x: at.x - G.size / 2,
-        y: at.y - G.size / 2,
-        target,
-        facingLeft: false,
-        pendingClip: null,
-        id: LIL_GUY_ANIM_BASE + e.owner,
-      };
-      lilGuys.set(e.owner, g);
-    }
-
-    if (feast) {
-      const at = g.target !== null
-        ? cellCenter(g.target, rows, cols)
-        : { x: g.x + G.size / 2, y: g.y + G.size / 2 };
-      lastBitePos = at;
-      g.pendingClip = "attack";
-      spawnFloater("chomp", at.x, at.y - LAYOUT.floater.stack,
-        "rgba(230,230,240,0.85)", 0.8); // cosmetic: exempt from 3s rule
-    }
-    g.target = target;
-
-    // Walk toward the chosen cell (bare field → hold position).
-    if (target === null) return;
-    const at = cellCenter(target, rows, cols);
-    const tx = at.x - G.size / 2;
-    const ty = at.y - G.size / 2;
-    const dx = tx - g.x, dy = ty - g.y;
-    const dist = Math.hypot(dx, dy);
-    if (dist <= G.snap) {
-      g.x = tx;
-      g.y = ty;
-      return;
-    }
-    const step = Math.min(G.speed * dt, dist);
-    g.x += (dx / dist) * step;
-    g.y += (dy / dist) * step;
-    g.facingLeft = dx < 0;
+  return players.map((e, i) => {
+    const existing = lilGuys.get(e.owner);
+    if (existing) return existing;
+    const seat = spawnAt[i];
+    const at = seat !== undefined && seat !== null
+      ? cellCenter(seat, rows, cols)
+      : fieldCenter();
+    const g = {
+      x: at.x - G.size / 2,
+      y: at.y - G.size / 2,
+      target: seat ?? null,
+      facingLeft: false,
+      pendingClip: null,
+      id: LIL_GUY_ANIM_BASE + e.owner,
+    };
+    lilGuys.set(e.owner, g);
+    return g;
   });
+}
 
-  // The feast ran, so the tile layer must read this frame's changes as eats
-  // and falls rather than plain refills.  Set even with no guys on screen: the
-  // field was still devoured.
-  if (feast) feastThisFrame = true;
+/**
+ * Step one guy toward the centre of cell `flat` for at most `dt` seconds.
+ *
+ * Arrival is resolved WITHIN the slice that reaches the cell rather than on the
+ * frame after: the cinematic walks a queue of cells against a wall-clock budget,
+ * and a frame spent standing still at each one is a frame the budget did not
+ * account for — over a full board that is most of a second.
+ *
+ * @returns {{arrived: boolean, left: number}} `left` is the unused remainder of
+ *   `dt` once it arrived, for the caller to spend on what comes next.
+ */
+function walkLilGuy(g, flat, rows, cols, speed, dt) {
+  const G = LAYOUT.lilGuys;
+  const at = cellCenter(flat, rows, cols);
+  const tx = at.x - G.size / 2;
+  const ty = at.y - G.size / 2;
+  const dx = tx - g.x, dy = ty - g.y;
+  const dist = Math.hypot(dx, dy);
+  const reach = speed * dt;
+  if (dist <= G.snap || dist <= reach) {
+    g.x = tx;
+    g.y = ty;
+    if (dist > 0) g.facingLeft = dx < 0;
+    return { arrived: true, left: dt - Math.min(dt, dist / speed) };
+  }
+  g.x += (dx / dist) * reach;
+  g.y += (dy / dist) * reach;
+  g.facingLeft = dx < 0;
+  return { arrived: false, left: 0 };
+}
+
+/**
+ * Advance the idle Lil Guys one frame: each mills toward a reachable cell of
+ * food, which is a standing answer to "where would the feast go next".
+ *
+ * Not called while the cinematic runs — it drives the guys itself.
+ */
+function tickLilGuys(game, dt) {
+  const { rows, cols } = gridDims(game);
+  const players = (game.entities ?? []).filter((e) => e.owner !== undefined);
+  const seats = players.map((_, i) => feastCell(game, i));
+
+  syncLilGuys(game, seats).forEach((g, i) => {
+    const target = seats[i];
+    g.target = target;
+    if (target === null) return; // bare field: hold position at the door
+    void walkLilGuy(g, target, rows, cols, LAYOUT.lilGuys.speed, dt);
+  });
 }
 
 function drawLilGuys(dt) {
@@ -2166,6 +2246,508 @@ function drawLilGuys(dt) {
     drawSprite(g.id, LIL_GUY_SPRITE, g.x, g.y, G.size, G.size, g.pendingClip,
       dt, g.facingLeft);
     g.pendingClip = null; // one-shot: the animator owns the clip from here
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The feast cinematic: the turn-end meal, played out
+// ---------------------------------------------------------------------------
+//
+// The server does the whole turn end in ONE tick — eat every reachable unit,
+// drop the survivors, refill from the reservoir — and sends only the finished
+// board plus a `turn_ended` event.  Shown as sent it is a jump cut: the board
+// the player aimed at is simply replaced.
+//
+// So the client replays it.  It has both boards (`prevGrid` before, the frame's
+// grid after) and both rules (the flood mirrored in floodFeast, the gravity
+// mirrored below), which is everything needed to reconstruct the three steps in
+// between.  A synthetic `board` is drawn instead of the frame's grid until the
+// replay lands exactly on it:
+//
+//   eat      — the Lil Guys walk the flood's own route, cell to cell, biting
+//   collapse — survivors fall to the bottom of their column
+//   fill     — reservoir units rain into the holes from above
+//
+// The replay is authoritative about NOTHING: it starts from a server board and
+// ends on a server board, and every intermediate step is derived from the same
+// rules the server used.  A survivor that does not match the server's board at
+// the end means a rule drifted, and the replay snaps to the server instead of
+// arguing (see finishFill).
+//
+// It is also a deliberate pause in play: input is dead for its duration
+// (see the keydown handler), because the board on screen is mid-replay and
+// aiming at it would mean nothing.
+
+/**
+ * @typedef {object} Cinematic
+ * @property {"eat"|"collapse"|"fill"} stage
+ * @property {number} rows
+ * @property {number} cols
+ * @property {string[]} board  - what is DRAWN: the replay's current board
+ * @property {string[]} target - the server's post-feast board, adopted at the end
+ * @property {Map<number, number[]>} queues - player id → cells left to eat, in
+ *   flood order.  A queue outliving its player is drained instantly.
+ * @property {Map<number, number>} chomps - player id → chomp pause remaining
+ * @property {number} speed    - walk speed (px/s) fitted to LAYOUT.cinematic.eatCapS
+ * @property {number} chompS   - per-bite pause, shortened on a crowded board
+ * @property {number} t        - seconds left in a timed stage (collapse, fill)
+ * @property {{score: number, hunger: number, stamps: object[]}} deferred - things
+ *   the server already applied, held back until the screen catches up: the feast's
+ *   score and hunger (paid when the eating finishes) and any casts that landed
+ *   mid-replay (floated when it ends, over the board they actually apply to)
+ * @property {{eaten: number, sheltered: number, walls: number}} tally - the
+ *   headline numbers, floated when the replay ends
+ */
+
+/** The replay in progress, or null.  At most one runs at a time. */
+let cinematic = null;
+
+/** The board to DRAW instead of the frame's grid, or null when not replaying. */
+function cinematicBoard() {
+  return cinematic ? cinematic.board : null;
+}
+
+/** True while the feast is being replayed — the window in which input is dead. */
+function cinematicActive() {
+  return cinematic !== null;
+}
+
+/**
+ * Begin replaying the feast announced by `game.turn_ended`.
+ *
+ * @param {object} game - the render frame carrying the event (and the board the
+ *   feast produced)
+ * @returns {boolean} true when a replay started; false when the frame cannot be
+ *   replayed (no previous board to replay FROM, e.g. the first frame of a match,
+ *   or a board whose dimensions just changed), in which case the caller shows
+ *   the server's board as sent.
+ */
+function startFeastCinematic(game) {
+  const te = game.turn_ended;
+  const { rows, cols } = gridDims(game);
+  const target = (game.grid ?? []).slice();
+  const tally = {
+    eaten: te?.cells_eaten ?? 0,
+    sheltered: te?.sheltered ?? 0,
+    walls: te?.walls ?? 0,
+  };
+
+  // A replay in flight when another turn ends: possible, since a player out of
+  // casts is not waiting on their own input.  Land the old one on its board
+  // first — half a meal is not a state to start a second one from.
+  if (cinematic) snapFinishCinematic();
+
+  // Any cast on this frame is folded into the board the replay starts from
+  // (below) and bloomed there, so the covered set has been spent: leaving it for
+  // the next diff would have those cells read as downgrades a second time.
+  stampedThisFrame.clear();
+
+  const before = prevGrid;
+  if (before.length !== target.length || target.length !== rows * cols) {
+    spawnFeastTallyFloaters(tally);
+    return false;
+  }
+
+  const C = LAYOUT.cinematic;
+  const board = before.slice();
+  // The cast that ENDED the turn resolved in the same server tick as the feast,
+  // so `prevGrid` predates it: the meal has to start from the board that cast
+  // produced or the guys walk a route the server never opened.  Replayed the way
+  // the server applied them — in event order, each stamp stepping a cell down
+  // again — and clipped identically, since the cell lists arrive pre-clipped.
+  for (const ev of game.shape_casts ?? []) {
+    for (const flat of ev.cells ?? []) {
+      const next = downgradeName(board[flat]);
+      if (next === null) continue;
+      board[flat] = next;
+      // Bloom it, as any downgrade does: the last cast of a turn is the one most
+      // worth seeing land, and the replay starts on the board it made.
+      cellAnim.set(flat, { kind: "flash", dur: FIELD.flashS, t: FIELD.flashS });
+    }
+  }
+  const order = floodFeast(board, rows, cols).order;
+
+  const queues = new Map();
+  const chomps = new Map();
+  const players = (game.entities ?? []).filter((e) => e.owner !== undefined);
+  players.forEach((e, i) => {
+    // Round robin over the flood's route: every guy walks the same advancing
+    // front, so the meal spreads out from the door however many are eating.
+    const mine = order.filter((_, n) => n % players.length === i);
+    queues.set(e.owner, mine);
+    chomps.set(e.owner, 0);
+  });
+  const guys = syncLilGuys(game, players.map((e) => queues.get(e.owner)?.[0] ?? null));
+
+  // Bites are shortened when the board is crowded enough that the pauses alone
+  // would blow the budget; walking gets whatever is left, never less than half
+  // the cap.
+  const longest = Math.max(0, ...[...queues.values()].map((q) => q.length));
+  let chompS = longest > 0
+    ? Math.min(C.chompPauseS, (C.eatCapS * 0.5) / longest)
+    : C.chompPauseS;
+  const walkBudget = Math.max(C.eatCapS - chompS * longest, C.eatCapS * 0.5);
+
+  // The longest route any one guy has to walk, measured from where he is now.
+  let farthest = 0;
+  guys.forEach((g, i) => {
+    const queue = queues.get(players[i]?.owner) ?? [];
+    let px = g.x, py = g.y, len = 0;
+    for (const flat of queue) {
+      const at = cellCenter(flat, rows, cols);
+      const tx = at.x - LAYOUT.lilGuys.size / 2;
+      const ty = at.y - LAYOUT.lilGuys.size / 2;
+      len += Math.hypot(tx - px, ty - py);
+      px = tx; py = ty;
+    }
+    farthest = Math.max(farthest, len);
+  });
+
+  // Stretch the per-bite hold to reach the floor.  A SMALL meal has almost no
+  // walking in it — the guys idle on the cell they eat first, so a one-cell meal
+  // covers no distance at all and no walk speed can pad it — and it resolved
+  // within a single frame: the animation ran and nobody could see it.  Holding
+  // each bite longer is the honest fix, since on a short meal the bites ARE the
+  // animation.  Capped so a long route is not slowed past the ceiling.
+  const speed = Math.max(LAYOUT.lilGuys.speed, farthest / walkBudget);
+  if (longest > 0) {
+    const walkS = farthest / speed;
+    const floorHold = (C.eatMinS - walkS) / longest;
+    chompS = Math.min(Math.max(chompS, floorHold), C.eatCapS / longest);
+  }
+
+  cinematic = {
+    stage: "eat",
+    rows, cols,
+    board,
+    target,
+    queues,
+    chomps,
+    // Fast enough to finish inside the cap: a full board's route is long, and
+    // the guys sprint it rather than letting the pause scale with the meal.
+    // Making a SHORT meal watchable is NOT this number's job — the guys idle on
+    // the very cell they will eat first, so a one-cell meal has no distance to
+    // cover at any speed.  The per-bite hold does that (see `chompS` above).
+    speed,
+    chompS,
+    t: 0,
+    deferred: { score: 0, hunger: 0, stamps: [] },
+    tally,
+  };
+
+  const { x, y } = fieldCenter();
+  spawnFloater("Lil Guys Eating!", x, y - LAYOUT.floater.stack - 8,
+    CAST_EVENT_COLOR, LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
+
+  // Nothing to walk, or nobody to walk it (every player gone the moment the turn
+  // ended): the field was still devoured, so take it and go straight to the fall.
+  if (order.length === 0 || guys.length === 0) {
+    for (const flat of order) bite(flat, null);
+    beginCollapse();
+  }
+  return true;
+}
+
+/**
+ * The frame step the BOARD advances by: clamped while the feast is replaying.
+ *
+ * requestAnimationFrame stops firing in a hidden tab, so returning to one
+ * delivers a single frame carrying the whole absence.  Spending it would eat the
+ * meal in one step — the jump cut the replay exists to avoid — so time the player
+ * was not watching is not time the feast ran.  The replay takes longer in
+ * wall-clock terms, which is right: it is a cutscene, not a simulation chasing a
+ * clock.
+ *
+ * The clamp covers the queued cell animations too, since the replay's stage
+ * timers and its falling tiles have to stay in lockstep or tiles land before (or
+ * after) the stage that owns them.
+ */
+function boardStep(dt) {
+  return cinematic ? Math.min(dt, LAYOUT.cinematic.maxStepS) : dt;
+}
+
+/** Advance the replay one frame.  Drives the Lil Guys for its duration. */
+function tickCinematic(game, dt) {
+  if (!cinematic) return;
+  switch (cinematic.stage) {
+    case "eat": tickEat(game, dt); break;
+    case "collapse":
+      cinematic.t -= dt;
+      if (cinematic.t <= 0) beginFill();
+      break;
+    case "fill":
+      cinematic.t -= dt;
+      if (cinematic.t <= 0) finishFill();
+      break;
+  }
+}
+
+/** One frame of the eat stage: every guy walks to its next cell and bites it. */
+function tickEat(game, dt) {
+  const c = cinematic;
+  const { rows, cols } = c;
+  const players = (game.entities ?? []).filter((e) => e.owner !== undefined);
+  const roster = new Set(players.map((e) => e.owner));
+
+  // A guy whose player left mid-meal cannot finish it, and the cells it was
+  // walking to WERE eaten — the server said so.  Take them at once rather than
+  // stalling the replay on a sprite that no longer exists.
+  for (const [pid, queue] of c.queues) {
+    if (roster.has(pid)) continue;
+    for (const flat of queue) bite(flat, null);
+    c.queues.delete(pid);
+    c.chomps.delete(pid);
+  }
+
+  const guys = syncLilGuys(game, players.map((e) => c.queues.get(e.owner)?.[0] ?? null));
+  players.forEach((e, i) => {
+    const queue = c.queues.get(e.owner);
+    if (!queue) return;
+    if (queue.length === 0) {
+      // Done eating, but a hold may still be owed on the last bite.  Drain it
+      // here, since the walk loop below is skipped once the queue is empty.
+      const pause = c.chomps.get(e.owner) ?? 0;
+      if (pause > 0) c.chomps.set(e.owner, Math.max(0, pause - dt));
+      return;
+    }
+    const g = guys[i];
+    if (g === undefined) return;
+
+    // Spend the frame's whole slice: walk, bite, hold the beat, and walk on with
+    // whatever is left.  A slice big enough for several cells takes several,
+    // which is what keeps a crowded board inside the cap instead of stretching
+    // the pause out one frame per bite.
+    let left = dt;
+    while (left > 0 && queue.length > 0) {
+      const pause = c.chomps.get(e.owner) ?? 0;
+      if (pause > 0) {
+        c.chomps.set(e.owner, Math.max(0, pause - left));
+        left -= Math.min(left, pause);
+        continue;
+      }
+
+      const flat = queue[0];
+      g.target = flat;
+      const walk = walkLilGuy(g, flat, rows, cols, c.speed, left);
+      if (!walk.arrived) break;
+
+      bite(flat, g);
+      c.chomps.set(e.owner, c.chompS);
+      queue.shift();
+      left = walk.left;
+    }
+  });
+
+  for (const queue of c.queues.values()) {
+    if (queue.length > 0) return;
+  }
+  // Everything is eaten, but the LAST bite's hold is still owed: without waiting
+  // it out the final cell pops and the board collapses in the same frame, which
+  // on a one- or two-cell meal is the whole animation gone in an instant.  Every
+  // other bite gets its beat; so does this one.
+  for (const pause of c.chomps.values()) {
+    if (pause > 0) return;
+  }
+  finishEat();
+}
+
+/**
+ * Eat one cell: it leaves the replay's board and bursts where it stood.
+ * `g` is the guy doing it, or null when the cell is being taken without one
+ * (its eater disconnected).
+ */
+function bite(flat, g) {
+  const c = cinematic;
+  const was = c.board[flat];
+  c.board[flat] = "empty";
+  cellAnim.set(flat, { kind: "pop", dur: FIELD.popS, t: FIELD.popS, from: was });
+  if (g === null) return;
+
+  const at = cellCenter(flat, c.rows, c.cols);
+  lastBitePos = at;
+  g.pendingClip = "attack";
+  spawnFloater("chomp", at.x, at.y - LAYOUT.floater.stack,
+    "rgba(230,230,240,0.85)", 0.8); // cosmetic: exempt from the 3s rule
+}
+
+/**
+ * Float the score and hunger the meal earned, at the last cell bitten.
+ *
+ * The server applied these the instant the turn ended; the replay holds them
+ * back so the numbers arrive with the meal that explains them.  Held deltas are
+ * cleared as they are paid, so every exit from the replay — finishing, being cut
+ * short, or the game ending underneath it — can call this and none can pay
+ * twice.  Silently dropping them would leave the score jumping unexplained.
+ */
+function payDeferredFeast() {
+  if (!cinematic) return;
+  const { score, hunger } = cinematic.deferred;
+  cinematic.deferred.score = 0;
+  cinematic.deferred.hunger = 0;
+  const at = lastBitePos ?? fieldCenter();
+  const jitter = () => (Math.random() - 0.5) * LAYOUT.floater.jitter;
+  const STACK = LAYOUT.floater.stack;
+  if (score > 0) {
+    spawnFloater(`+${score}`, at.x + jitter(), at.y - STACK, "rgba(100,220,100,1)");
+  }
+  if (hunger > 0) {
+    spawnFloater(`+${hunger} hunger`, at.x + jitter(), at.y + STACK, "rgba(255,150,50,1)");
+  }
+}
+
+/** The board is picked clean: pay out the deltas the meal earned, then drop. */
+function finishEat() {
+  payDeferredFeast();
+  beginCollapse();
+}
+
+/**
+ * Enter the collapse stage: survivors fall to the bottom of their column.
+ *
+ * MIRRORS slime.collapse — per column, bottom-up, packing every occupied cell
+ * against the floor in the order it already stood in.  Slime never moves
+ * sideways, so a column is the whole story.  The board is updated at once and
+ * the fall is a per-tile display offset over it.
+ */
+function beginCollapse() {
+  const c = cinematic;
+  const { rows, cols } = c;
+  let longest = 0;
+
+  for (let col = 0; col < cols; col++) {
+    let write = rows - 1;
+    for (let read = rows - 1; read >= 0; read--) {
+      const flat = read * cols + col;
+      const name = c.board[flat];
+      if (!cellIsSlime(name)) continue;
+      if (read !== write) {
+        const dest = write * cols + col;
+        const fell = write - read;
+        c.board[dest] = name;
+        c.board[flat] = "empty";
+        cellAnim.set(dest, {
+          kind: "drop", dur: LAYOUT.cinematic.collapseS,
+          t: LAYOUT.cinematic.collapseS, cells: fell,
+        });
+        longest = Math.max(longest, fell);
+      }
+      write--;
+    }
+  }
+
+  c.stage = "collapse";
+  c.t = longest > 0 ? LAYOUT.cinematic.collapseS : 0;
+  if (c.t === 0) beginFill(); // nothing moved: no fall to watch
+}
+
+/**
+ * Enter the fill stage: the reservoir units the server drew fall into the holes.
+ *
+ * Which units, and where, comes from the server's own post-feast board — the
+ * draw is the one thing in the turn end the client cannot derive, since it comes
+ * out of the session's PRNG.
+ *
+ * Collapse leaves every hole at the TOP of its column, and the server fills in
+ * flat order (whole top row, then the next), so a column's refill is a
+ * contiguous stack of new units hanging above the field.  They fall as ONE RIGID
+ * STACK: every unit in the column travels the same distance, which is what keeps
+ * them exactly one cell apart on the way down, queued in the order they land.
+ * The distance is the stack's own height — just far enough that the lowest unit
+ * starts off-grid, so a single unit drops in from the edge rather than sailing
+ * down from wherever the column happens to be empty.
+ */
+function beginFill() {
+  const c = cinematic;
+  const { rows, cols } = c;
+  const S = LAYOUT.cinematic;
+  let any = false;
+
+  for (let col = 0; col < cols; col++) {
+    const stack = [];
+    for (let row = 0; row < rows; row++) {
+      const flat = row * cols + col;
+      if (cellIsSlime(c.board[flat])) continue;
+      // The reservoir ran dry partway down the board: this hole stays open, and
+      // so does everything under it.  Nothing below is arriving, so the stack
+      // above it is the whole fall.
+      if (!cellIsSlime(c.target[flat])) break;
+      stack.push(flat);
+    }
+    if (stack.length === 0) continue;
+
+    for (const flat of stack) {
+      c.board[flat] = c.target[flat];
+      cellAnim.set(flat, {
+        kind: "drop", dur: S.collapseS, t: S.collapseS,
+        cells: stack.length,
+      });
+    }
+    any = true;
+  }
+
+  c.stage = "fill";
+  c.t = any ? S.collapseS : 0;
+  if (c.t === 0) finishFill(); // nothing left to pour
+}
+
+/**
+ * The replay has landed.  Adopt the server's board and hand the field back.
+ *
+ * The replay's board should now BE the server's; where it is not, a mirrored
+ * rule has drifted from the server's, and the server wins without argument —
+ * the whole point of replaying is that it is derivable, so a mismatch is a bug
+ * to see in the console, not a board to keep.
+ */
+function finishFill() {
+  const c = cinematic;
+  for (let flat = 0; flat < c.target.length; flat++) {
+    if (c.board[flat] === c.target[flat]) continue;
+    console.warn("[game] feast replay diverged from the server board at", flat,
+      c.board[flat], "!=", c.target[flat]);
+    break;
+  }
+  endCinematic();
+}
+
+/** Cut the replay short and land it on the server's board immediately. */
+function snapFinishCinematic() {
+  if (!cinematic) return;
+  payDeferredFeast();
+  cellAnim.clear();
+  endCinematic();
+}
+
+/** Adopt the replay's target board as the new diff baseline and stand down. */
+function endCinematic() {
+  const c = cinematic;
+  cinematic = null;
+  // The baseline is the board the replay reproduced, NOT whatever the latest
+  // frame holds: teammates can cast while the replay runs, and those changes
+  // must still be diffed and animated on the next frame rather than adopted
+  // silently here.
+  prevGrid = c.target.slice();
+  spawnFeastTallyFloaters(c.tally);
+  // Casts held during the replay, released now that the board they describe is
+  // the one on screen.  Stacked after the tally so the headline reads first.
+  c.deferred.stamps.forEach((ev, i) => floatStampOutcome(ev, i + 1, c.rows, c.cols));
+  c.deferred.stamps.length = 0;
+}
+
+/**
+ * The feast's headline numbers, floated once the meal is over.
+ *
+ * Sheltered food gets equal billing with the tally: it is the number that
+ * should change how the next turn is played, and naming the walls alongside it
+ * points at the fix rather than just the failure.
+ */
+function spawnFeastTallyFloaters(tally) {
+  const { x, y } = fieldCenter();
+  spawnFloater(`${tally.eaten} units devoured`, x, y - LAYOUT.floater.stack - 8,
+    CAST_EVENT_COLOR, LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
+  if (tally.sheltered > 0) {
+    const walls = tally.walls;
+    spawnFloater(`${tally.sheltered} walled off by ${walls} live cell${walls === 1 ? "" : "s"}`,
+      x, y + 28, C_SHELTERED, LAYOUT.floater.lifetime, LAYOUT.floater.font);
   }
 }
 
@@ -2213,17 +2795,28 @@ function drawActionMenu(game) {
     }
     rectStroke(px, my + M.castBarDy, tbw, M.castBarH, 1, "rgba(255,255,255,0.3)");
 
-    const status = left > 0
-      ? `Turn ${game.turn ?? 1} — ${left}/${total} casts left`
-      : `Turn ${game.turn ?? 1} — out of casts, waiting on the team`;
+    // While the feast plays out, keys are dropped on the floor, so the panel
+    // says so rather than inviting a cast that will not be sent.
+    const status = cinematicActive()
+      ? "The Lil Guys are eating — hold on"
+      : left > 0
+        ? `Turn ${game.turn ?? 1} — ${left}/${total} casts left`
+        : `Turn ${game.turn ?? 1} — out of casts, waiting on the team`;
     text(status, px, my + M.timerTextDy, M.timerTextFont,
-      left > 0 ? C_TEXT : "rgba(180,180,190,0.75)");
+      cinematicActive() ? CAST_EVENT_COLOR : left > 0 ? C_TEXT : "rgba(180,180,190,0.75)");
   }
 
   // Project from a HELD team half in preference to a typed combo, so the
   // preview shows what a partner would complete rather than blanking the
   // instant you press ENTER.  The same resolution the field preview draws, so
   // the numbers and the highlighted cells can never disagree.
+  //
+  // The replay suppresses the field's preview and ghosts, so it suppresses these
+  // numbers too — they are read off the SERVER's board, which is several stages
+  // ahead of the one on screen, and would describe cells the player cannot see
+  // yet.  The status line above already explains the wait.
+  if (cinematicActive()) return;
+
   const pv = shapePreview(game);
   const projected = pv.projected;
 
@@ -2303,24 +2896,43 @@ function drawGame(game, dt) {
   lastTransientGame = game;
 
   tickFloaters(dt);
-  // Order matters: tickLilGuys reacts to this frame's feast (setting
-  // lastBitePos and feastThisFrame) and updateFeastTracking floats the
-  // score/hunger deltas over that cell.
-  tickLilGuys(game, dt, fresh);
-  // Stamp outcomes must be read BEFORE the grid diff: they tell updateGridAnims
-  // which cells were covered, which is how a downgraded cell is told apart from
-  // one that was merely refilled.
+
+  // Stamp outcomes are read first: they tell the grid diff which cells were
+  // covered (a downgrade blooms in place; a replacement drops in), and the feast
+  // replay below starts from the board those same stamps produced.
   if (fresh) spawnStampFloaters(game);
-  // Then classify grid changes: updateGridAnims needs both the feast
-  // tickLilGuys just registered and the covered cells above to tell an eaten
-  // cell, a downgraded cell and a plain refill apart.
-  tickGridAnims(dt);
-  if (fresh) updateGridAnims(game.grid ?? []);
+
+  // A turn end starts the feast replay, which then owns the board and the Lil
+  // Guys until it lands.  It must start BEFORE anything reads the board, and its
+  // own board must not be diffed against the frame it is replaying toward — the
+  // replay produces that board itself, cell by cell.  A turn that ends while one
+  // is still running lands it early and replays from there, which is why this is
+  // not gated on there being no replay in flight.
+  const startedReplay = fresh && game.turn_ended
+    ? startFeastCinematic(game)
+    : false;
   updateFeastTracking(game);
+
+  // The replay and the cells it drops share one clamped step, or tiles land out
+  // of step with the stage that owns them.  Idle Lil Guys keep real time: they
+  // are ambient, and nobody minds them teleporting a little after a hidden tab.
+  const step = boardStep(dt);
+  if (cinematicActive()) {
+    tickCinematic(game, step);
+  } else {
+    tickLilGuys(game, dt);
+  }
+
+  tickGridAnims(step);
+  // Diffing is the replay's job while it runs: it queues the eats, falls and
+  // refills itself, and adopts the board it landed on when it ends.  Cells
+  // stamped meanwhile are kept, not dropped: the team keeps casting while the
+  // replay plays, and the first diff after it lands is what has to tell those
+  // downgrades from refills.
+  if (fresh && !cinematicActive() && !startedReplay) updateGridAnims(game.grid ?? []);
   if (fresh) {
     spawnCastFloaters(game);
     spawnRecipeFloaters(game);
-    spawnTurnEndedFloaters(game);
   }
 
   clear();
@@ -2587,6 +3199,11 @@ document.addEventListener("keydown", (e) => {
 
   if (!FORWARDED_KEYS.has(e.key)) return;
   e.preventDefault();
+  // The feast replay is a pause in play: the board on screen is mid-meal, so
+  // neither aiming at it nor casting into it would mean anything.  Keys are
+  // dropped rather than queued — a cast the player cannot see land is worse
+  // than one they have to press again.
+  if (cinematicActive()) return;
   sendKey(e.key);
 });
 
