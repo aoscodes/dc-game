@@ -1,6 +1,5 @@
 {
   "hunger_cost_normal": 1,
-  "hunger_cost_hazard_extra": 2,
   "slime_grid": {
     "rows": 6,
     "cols": 10
@@ -14,7 +13,8 @@
       ],
       "shape": [
         "#"
-      ]
+      ],
+      "cost": 1
     },
     {
       "label": "sweep",
@@ -24,20 +24,22 @@
       ],
       "shape": [
         "###"
-      ]
+      ],
+      "cost": 2
     },
     {
       "label": "column",
       "pattern": [
-        "medicine",
-        "medicine",
+        "catalyst",
+        "catalyst",
         "dispense"
       ],
       "shape": [
         "#",
         "#",
         "#"
-      ]
+      ],
+      "cost": 2
     },
     {
       "label": "block",
@@ -50,34 +52,33 @@
         "###",
         "###",
         "###"
-      ]
+      ],
+      "cost": 5
     },
     {
       "label": "wedge",
       "pattern": [
         "dispense",
-        "medicine",
+        "catalyst",
         "dispense"
       ],
       "shape": [
         "###",
         ".#."
-      ]
+      ],
+      "cost": 2
     },
     {
-      "label": "tonic",
+      "label": "breach",
       "pattern": [
-        "medicine",
-        "medicine"
+        "catalyst",
+        "catalyst"
       ],
       "shape": [
+        "#",
         "#"
       ],
-      "medicine": {
-        "red": 6,
-        "yellow": 6,
-        "green": 6
-      }
+      "cost": 1
     }
   ],
   "team_recipes": [
@@ -86,11 +87,11 @@
       "patterns": [
         [
           "dispense",
-          "medicine"
+          "catalyst"
         ],
         [
           "dispense",
-          "medicine"
+          "catalyst"
         ]
       ],
       "shape": [
@@ -100,21 +101,17 @@
         ".###.",
         "..#.."
       ],
-      "medicine": {
-        "red": 4,
-        "yellow": 4,
-        "green": 4
-      }
+      "cost": 6
     },
     {
       "label": "crossfire",
       "patterns": [
         [
-          "medicine",
+          "catalyst",
           "dispense"
         ],
         [
-          "medicine",
+          "catalyst",
           "dispense",
           "dispense"
         ]
@@ -125,7 +122,8 @@
         "#####",
         "..#..",
         "..#.."
-      ]
+      ],
+      "cost": 6
     }
   ]
 }

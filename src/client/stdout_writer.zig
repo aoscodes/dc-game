@@ -185,8 +185,10 @@ fn write_render_inner(
         .turn = te.turn,
         .cells_eaten = te.cells_eaten,
         .hunger_added = te.hunger_added,
-        .healable = tiers(te.healable),
+        .sheltered = te.sheltered,
+        .walls = te.walls,
         .score_added = te.score_added,
+        .charges_left = te.charges_left,
     } else null;
 
     // Convert pending combo slots for JSON.
@@ -226,13 +228,13 @@ fn write_render_inner(
                 .slime_left = ms.slime_left,
                 .feast = .{
                     .covered = tiers(ms.feast.cells_covered),
-                    .medicine = tiers(ms.feast.medicine_dispensed),
-                    .healed = tiers(ms.feast.medicine_healed),
                     .neutralized = tiers(ms.feast.neutralized),
-                    .escaped = tiers(ms.feast.hazard_escaped),
+                    .sheltered = ms.feast.sheltered,
                     .neutral = ms.feast.neutral_consumed,
+                    .defused = ms.feast.defused_consumed,
                     .hunger_normal = ms.feast.hunger_normal,
-                    .hunger_extra = ms.feast.hunger_extra,
+                    .charges_spent = ms.feast.charges_spent,
+                    .charges_left = ms.feast.charges_left,
                 },
                 .players = pstats_buf[0..ms.player_count],
                 .player_recipe_hits = ms.player_recipe_hits[0..ms.player_recipe_count],
@@ -262,8 +264,8 @@ fn write_render_inner(
             .hunger = .{
                 .current = game.snapshot.hunger.current,
                 .max = game.snapshot.hunger.max,
-                .healable = tiers(game.snapshot.hunger_healable),
             },
+            .charges = game.snapshot.charges,
             .score = game.snapshot.score,
             .grid_rows = game.snapshot.grid_rows,
             .grid_cols = game.snapshot.grid_cols,
@@ -284,11 +286,14 @@ fn write_render_inner(
 /// One slime cell as a compact renderer-facing name.  Hazards are named by
 /// their difficulty TIER ("red" = 3 casts from harmless, "green" = 1);
 /// "defused" is a fully neutralized cell, which is harmless but still edible.
+/// "special" is the objective slime: inert to casts, inedible, and a permanent
+/// wall, so the renderer must never draw it as either food or a hazard.
 fn cell_name(cell: c.SlimeCell) []const u8 {
     return switch (cell) {
         .empty => "empty",
         .neutral => "neutral",
         .neutralized => "defused",
+        .special => "special",
         .tiered => |t| switch (t) {
             .red => "red",
             .yellow => "yellow",
@@ -343,13 +348,15 @@ const JsonTiers = struct {
 /// stamp downgraded, bucketed by the tier they were BEFORE the downgrade.
 const JsonFeastStats = struct {
     covered: JsonTiers,
-    medicine: JsonTiers,
-    healed: JsonTiers,
     neutralized: JsonTiers,
-    escaped: JsonTiers,
+    /// Edible units the flood never reached, summed over the match: the team's
+    /// running tally of food a wall kept from them.
+    sheltered: u32,
     neutral: u16,
+    defused: u16,
     hunger_normal: u16,
-    hunger_extra: u16,
+    charges_spent: u32,
+    charges_left: u32,
 };
 
 const JsonPlayerStats = struct {
@@ -394,13 +401,12 @@ const JsonPlayer = struct {
     connected: bool,
 };
 
-/// Hunger bar: current fills toward max; `healable` = the per-tier portions
-/// medicine can heal.  Healing is symmetrical: only tier-X medicine touches
-/// the tier-X bucket.
+/// Hunger bar: current fills toward max, one point per unit eaten, and never
+/// falls.  Nothing in the game undoes hunger — the only question is whether the
+/// team clears the field before the bar does.
 const JsonHunger = struct {
     current: u16,
     max: u16,
-    healable: JsonTiers,
 };
 
 const JsonGame = struct {
@@ -414,6 +420,9 @@ const JsonGame = struct {
     tick: u32,
     entities: []const JsonEntity,
     hunger: JsonHunger,
+    /// The team's shared charge pool: one budget for the whole encounter, never
+    /// refilled.  This is the number every casting decision is weighed against.
+    charges: u32,
     score: u32,
     /// The authoritative slime grid: `grid_rows * grid_cols` cell names in
     /// row-major order, row 0 = TOP.  Index a cell as row * grid_cols + col.
@@ -456,16 +465,20 @@ const JsonRecipeFired = struct {
     index: u8,
 };
 
-/// The turn-end feast: the whole field was devoured at once.  `healable` is the
-/// part of `hunger_added` that medicine can still undo, split by the tier that
-/// caused it.  This is what drives the client's devour animation.
+/// The turn-end feast: everything the Lil Guys could REACH from the left edge
+/// was devoured at once.  `sheltered` is the food `walls` kept from them — the
+/// number the next turn's casts exist to shrink.  This drives the client's
+/// devour animation.
 const JsonTurnEnded = struct {
     /// The turn that just ended (the frame after it carries turn + 1).
     turn: u16,
     cells_eaten: u16,
     hunger_added: u16,
-    healable: JsonTiers,
+    sheltered: u16,
+    walls: u16,
     score_added: u32,
+    /// The shared pool AFTER this turn: the client's running budget readout.
+    charges_left: u32,
 };
 
 const JsonEntity = struct {

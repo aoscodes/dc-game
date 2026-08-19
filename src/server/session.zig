@@ -16,32 +16,52 @@
 //! server-authoritative and transmitted whole in `game_state`, so every client
 //! renders identical slime.
 //!
-//! A TURN is: everyone spends their cast budget, then the Lil Guys eat the
-//! WHOLE FIELD at once and a fresh field arrives.  Nothing is on a clock —
-//! `tick` only drains input and broadcasts, so a session advances solely by
-//! what players do.
+//! A TURN is: everyone spends their cast budget, then the Lil Guys eat every
+//! unit they can REACH and the field settles.  Nothing is on a clock — `tick`
+//! only drains input and broadcasts, so a session advances solely by what
+//! players do.
 //!
-//! CASTING.  Each player gets `balance.casts_per_turn` casts per turn.  A
-//! submit RESOLVES IMMEDIATELY:
-//!   - It matches a player recipe → the shape stamps now and its medicine heals
-//!     now.
+//! ## Two currencies
+//!
+//! CASTS are per player, per turn (`balance.casts_per_turn`): they meter the
+//! pace of a turn and decide when it ends.
+//!
+//! CHARGES are ONE pool shared by the whole team for the WHOLE GAME
+//! (`encounter.charges`).  Nothing ever refills them.  Every recipe has a
+//! `cost`, so the pool is the real resource: the team is not asked "what can
+//! you do this turn?" but "what is this play worth out of everything you will
+//! ever have?".  Running the pool dry with slime still walled off is a loss
+//! (`out_of_charges`) — see check_end.
+//!
+//! CASTING.  A submit RESOLVES IMMEDIATELY:
+//!   - It matches a player recipe → if the pool can pay, the shape stamps now.
 //!   - It completes a team recipe against teammates' HELD halves → the whole
-//!     group resolves now, anchored at the joiner's cursor.
-//!   - It is an unpaired team half → it is HELD (`cast_committed`) until a
-//!     partner completes it or the turn ends.
-//!   - It matches nothing → `cast_fizzled`, and the budget is NOT spent.
+//!     group resolves now for ONE charge cost, anchored at the joiner's cursor.
+//!   - It is an unpaired team half → it is HELD (`cast_committed`) for free
+//!     until a partner completes it or the turn ends.
+//!   - It matches nothing → `cast_fizzled`, and the cast budget is NOT spent.
+//!   - It matches but the pool cannot pay → `cast_fizzled`, and the budget IS
+//!     spent.  A bankrupt team still burns through turns, so the game keeps
+//!     moving to its conclusion instead of hanging.
 //! Stamping downgrades every covered hazard cell one tier (red -> yellow ->
 //! green -> defused); coverage off the grid edge, or on a cell with nothing
 //! left to downgrade, is wasted.  A stamp never empties a cell.
 //!
-//! TURN END.  When every connected player's budget is spent, the field is eaten
-//! in ONE bulk feast: normal hunger per unit plus healable extra per unit still
-//! hazardous, and score for neutral + defused units.  Held halves then fizzle
-//! (their budget stays spent), the grid is cleared and refilled from the
-//! reservoir, budgets reset, and `turn_ended` is broadcast.
+//! TURN END.  When every connected player's budget is spent, the field settles
+//! in three ordered steps (see slime.zig):
+//!   1. EAT — the Lil Guys enter from the LEFT edge and flood through empty
+//!      cells and edible slime.  Live hazards and specials are walls: what is
+//!      behind them is sheltered and survives.  Opening a path is the whole
+//!      point of a cast.
+//!   2. COLLAPSE — survivors fall straight down into the holes the feast left.
+//!   3. FILL — the reservoir tops the field up from the row the collapse
+//!      cleared.
+//! Held halves then fizzle (their budget stays spent), budgets reset, and
+//! `turn_ended` is broadcast.
 //!
 //! The encounter's end is checked ONLY at turn end: the hunger bar filling is a
-//! loss, an exhausted field + reservoir is a win.  Either way the final shared
+//! loss, a dead position (nothing eaten and nothing affordable) is a loss, and
+//! a field holding nothing but specials is a win.  Either way the final shared
 //! score is broadcast via game_over.
 
 const std = @import("std");
@@ -107,10 +127,10 @@ pub const Session = struct {
     current_encounter: ?*const enc.Encounter = null,
     /// Total Hunger bar.  Fills as slime is consumed; full = encounter over.
     hunger: c.Health = .{ .current = 0, .max = 0 },
-    /// Portion of `hunger.current` attributable to hazard slime eaten while
-    /// still a hazard, tracked per difficulty tier (Tier ordinal).  Only
-    /// matching-tier (symmetrical) Medicine can heal each bucket.
-    hunger_healable: [c.Tier.size]u16 = [_]u16{0} ** c.Tier.size,
+    /// The team's shared charge pool for the WHOLE game.  Seeded from
+    /// `encounter.charges` and never replenished: every charge spent is gone
+    /// for good, which is what makes an efficient shape worth aiming.
+    charges: u32 = 0,
     /// The authoritative slime field: grid + off-grid reservoir.  Empty until
     /// start_game_encounter sizes it from balance.slime_grid.
     field: slime.SlimeField,
@@ -280,7 +300,7 @@ pub const Session = struct {
         self.reset_budgets();
 
         self.hunger = .{ .current = 0, .max = encounter.hunger_max };
-        self.hunger_healable = [_]u16{0} ** c.Tier.size;
+        self.charges = encounter.charges;
         self.score = 0;
         self.slime_total = encounter.total_units();
         self.field = slime.SlimeField.init(
@@ -296,12 +316,13 @@ pub const Session = struct {
         );
         self.cursors = [_]u16{centre} ** MAX_PLAYERS;
 
-        std.log.info("game start — encounter: {s} slime={} grid={}x{} hunger_max={} casts/turn={}", .{
+        std.log.info("game start — encounter: {s} slime={} grid={}x{} hunger_max={} charges={} casts/turn={}", .{
             encounter.label,
             self.slime_total,
             self.field.grid.rows,
             self.field.grid.cols,
             self.hunger.max,
+            self.charges,
             self.cfg.balance.casts_per_turn,
         });
         try self.spawn_players();
@@ -372,10 +393,14 @@ pub const Session = struct {
     ///   - It completes a team recipe against held halves → that whole group
     ///     resolves now, anchored at this player (the joiner).
     ///   - It is an unpaired team half → HELD (budget still spent, because the
-    ///     player did commit it).
+    ///     player did commit it).  Holding is FREE; the group is charged only
+    ///     when it actually fires.
     /// A cast that matches nothing at all never reaches here: `submit_spell`
     /// fizzles it and keeps the budget.
-    fn resolve_cast(self: *Session, player_id: u8, combo: c.ActionCombo) !void {
+    ///
+    /// Returns false when the batch matched but the charge pool could not pay
+    /// for it, so the caller can announce the fizzle.
+    fn resolve_cast(self: *Session, player_id: u8, combo: c.ActionCombo) !bool {
         // Everything currently on the table: this cast plus every held half.
         var batch: [MAX_PLAYERS]logic.Cast = undefined;
         var batch_len: usize = 0;
@@ -403,11 +428,14 @@ pub const Session = struct {
                 .player_id = player_id,
             });
             try self.broadcast_raw(fbs.getWritten());
-            return;
+            return true;
         }
 
         // This cast resolves.  Everything it consumed leaves the table with it;
         // halves that contributed nothing stay held for a future partner.
+        // They are released even if the pool then refuses to pay: the group
+        // TRIED, and re-holding halves the players believe they have spent
+        // would leave the table in a state the client never saw.
         var resolved: [MAX_PLAYERS]logic.Cast = undefined;
         var resolved_len: usize = 0;
         for (batch[0..batch_len], 0..) |cast, bi| {
@@ -417,7 +445,7 @@ pub const Session = struct {
             resolved_len += 1;
         }
 
-        try self.convert_batch(resolved[0..resolved_len], player_id);
+        return self.convert_batch(resolved[0..resolved_len], player_id);
     }
 
     /// True once every CONNECTED player has spent their budget.  Disconnected
@@ -446,28 +474,26 @@ pub const Session = struct {
         try self.end_turn();
     }
 
-    /// Settle the turn: the Lil Guys devour the WHOLE field, held halves
-    /// fizzle, a fresh field arrives from the reservoir, and budgets refill.
+    /// Settle the turn: eat, collapse, refill, then fizzle held halves and
+    /// refill budgets.
     ///
-    /// Order matters.  The feast is priced against the field as the casts left
-    /// it, so it must happen BEFORE the refill; and the end condition is
-    /// checked after the refill, because "field cleared" means the reservoir
-    /// had nothing left to send.
+    /// Order matters and is the whole mechanic.  `eat_all` is priced against
+    /// the field exactly as the casts left it, `collapse` drags the survivors
+    /// down into the holes it made, and only then does `fill` top the field up
+    /// — so refills always land ABOVE the survivors.  The end condition is
+    /// checked last, because "field cleared" means the reservoir had nothing
+    /// left to send either.
     fn end_turn(self: *Session) !void {
         const feast = self.field.eat_all(&self.cfg.balance);
         const hunger_added = feast.hunger_total();
         logic.add_hunger(&self.hunger, hunger_added);
-        for (&self.hunger_healable, feast.hunger_extra) |*bucket, extra| {
-            const grown = @as(u32, bucket.*) + extra;
-            bucket.* = @intCast(@min(grown, @as(u32, std.math.maxInt(u16))));
-        }
         self.score += feast.score;
         self.record_feast(feast);
 
         // The feast is the ONLY thing that adds hunger, so it is the only
-        // damage event in the game — announced pool-level (no actor), exactly
-        // like medicine's heal.  Sent even at zero so the client's damage cue
-        // is not silently conditional on the field having been dangerous.
+        // damage event in the game — announced pool-level (no actor).  Sent
+        // even at zero so the client's damage cue is not silently conditional
+        // on the field having been reachable.
         try self.broadcast_action_result(.{
             .tag = .damage,
             .actor_entity = std.math.maxInt(u32),
@@ -486,8 +512,10 @@ pub const Session = struct {
         }
         if (fizzled_mask != 0) try self.broadcast_fizzles(fizzled_mask);
 
-        var healable: [c.Tier.size]u16 = undefined;
-        for (&healable, feast.hunger_extra) |*h, extra| h.* = stat_u16(extra);
+        // Gravity, THEN the refill: survivors settle to the bottom of their
+        // column first so the new slime has the cleared top rows to land in.
+        _ = self.field.collapse();
+        _ = self.field.fill(self.rand());
 
         var buf: [32]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
@@ -495,24 +523,25 @@ pub const Session = struct {
             .turn = self.turn,
             .cells_eaten = feast.cells,
             .hunger_added = stat_u16(hunger_added),
-            .healable = healable,
+            .sheltered = feast.sheltered,
+            .walls = feast.walls,
             .score_added = feast.score,
+            .charges_left = self.charges,
         });
         try self.broadcast_raw(fbs.getWritten());
 
-        // A fresh field for the next turn; an empty reservoir simply means the
-        // grid stays empty, which check_end reads as the encounter won.
-        _ = self.field.fill(self.rand());
-
-        std.log.info("turn {} ended — ate {} hunger+{} score+{} reservoir={}", .{
+        std.log.info("turn {} ended — ate {} sheltered {} behind {} walls, hunger+{} score+{} charges={} reservoir={}", .{
             self.turn,
             feast.cells,
+            feast.sheltered,
+            feast.walls,
             hunger_added,
             feast.score,
+            self.charges,
             self.field.reservoir.total(),
         });
 
-        try self.check_end();
+        try self.check_end(feast);
         if (self.phase != .playing) return;
 
         self.turn +|= 1;
@@ -532,19 +561,39 @@ pub const Session = struct {
         }
     }
 
-    /// CONVERT one batch of resolving casts: recipes match within the batch,
-    /// medicine heals right away (broadcasting a .heal action_result), and each
-    /// matched recipe STAMPS its shape on the grid at the anchoring player's
-    /// cursor — downgrading every covered hazard cell by one tier.  Each recipe
-    /// fire and each stamp is broadcast.
+    /// CONVERT one batch of resolving casts: recipes match within the batch and
+    /// each matched recipe STAMPS its shape on the grid at the anchoring
+    /// player's cursor — downgrading every covered hazard cell by one tier.
+    /// Each recipe fire and each stamp is broadcast.
+    ///
+    /// The batch is paid for ATOMICALLY out of the shared charge pool: either
+    /// the whole thing fires or none of it does.  A team recipe is therefore
+    /// charged ONCE for the group, not once per contributing player, and a
+    /// group that would half-fire on a nearly-empty pool fizzles cleanly
+    /// instead of leaving a partial effect nobody can reason about.
+    ///
+    /// Returns false when the pool could not pay.  The caller has already spent
+    /// the cast budget by then and deliberately does NOT refund it: discovering
+    /// you are broke is a move, and it has to cost a turn's worth of time or a
+    /// bankrupt team could stall the game forever.
     ///
     /// `joiner` is the player whose submit triggered this conversion; they aim
     /// any combined team shape (see match_recipes).
-    fn convert_batch(self: *Session, batch: []const logic.Cast, joiner: ?u8) !void {
-        if (batch.len == 0) return;
+    fn convert_batch(self: *Session, batch: []const logic.Cast, joiner: ?u8) !bool {
+        if (batch.len == 0) return true;
 
         var report = logic.MatchReport{};
         const outcome = logic.match_recipes(&self.cfg.balance, batch, joiner, &report);
+
+        const price = outcome.total_cost();
+        if (price > self.charges) {
+            std.log.debug("batch of {} costs {} charges, pool holds {} — fizzled", .{
+                batch.len, price, self.charges,
+            });
+            return false;
+        }
+        self.charges -= price;
+        self.stats.feast.charges_spent +|= stat_u16(price);
 
         // Recipe stats: fire counts + per-player participation.  Each fire is
         // also broadcast so clients can show recipe floaters live.  Only the
@@ -565,26 +614,11 @@ pub const Session = struct {
             }
         }
 
-        // Medicine heals immediately (already-accrued hazard-slime hunger).
-        const healed = logic.apply_medicine(&self.hunger, &self.hunger_healable, outcome.medicine.medicine);
-        const healed_total = logic.sum_u16(healed);
-        if (healed_total > 0) {
-            try self.broadcast_action_result(.{
-                .tag = .heal,
-                .actor_entity = std.math.maxInt(u32),
-                .target_entity = std.math.maxInt(u32),
-                .value = stat_u16(healed_total),
-            });
-        }
-
         // Stamp each shape where its caster was aiming when they committed.
         for (outcome.stamps()) |stamp| {
             try self.stamp_shape(stamp);
         }
-
-        const fs = &self.stats.feast;
-        for (&fs.medicine_dispensed, outcome.medicine.medicine) |*d, m| d.* +|= stat_u16(m);
-        for (&fs.medicine_healed, healed) |*d, h| d.* +|= h;
+        return true;
     }
 
     /// Apply one matched shape to the grid at its anchoring player's cast
@@ -641,13 +675,11 @@ pub const Session = struct {
     /// again at the feast would double-count the same unit.
     fn record_feast(self: *Session, feast: slime.FeastOutcome) void {
         const fs = &self.stats.feast;
-        fs.hunger_normal +|= stat_u16(feast.hunger_normal);
-        for (feast.hunger_extra) |extra| fs.hunger_extra +|= stat_u16(extra);
-        for (&fs.hazard_escaped, feast.escaped) |*d, e| d.* +|= e;
-        // Defused units are NOT counted here: the cast that achieved the
-        // defusal already recorded it (see stamp_shape), so counting them again
-        // would double-count the same unit.
+        fs.hunger_normal +|= stat_u16(feast.hunger_total());
+        fs.sheltered +|= feast.sheltered;
         fs.neutral_consumed +|= feast.neutral;
+        fs.defused_consumed +|= feast.defused;
+        fs.charges_left = self.charges;
     }
 
     /// Broadcast `count` recipe_fired messages for one recipe table entry.
@@ -790,7 +822,11 @@ pub const Session = struct {
                 }
 
                 // Resolves now, or is held as a team half awaiting a partner.
-                try self.resolve_cast(player_id, p.combo);
+                // An unaffordable batch fizzles with the budget already gone.
+                if (!try self.resolve_cast(player_id, p.combo)) {
+                    self.stats.players[player_id].fizzles +|= 1;
+                    try self.broadcast_fizzles(@as(u8, 1) << @intCast(player_id));
+                }
 
                 std.log.debug("player {} cast ({} left this turn)", .{
                     player_id, self.casts_left[player_id],
@@ -812,16 +848,30 @@ pub const Session = struct {
     /// Decide whether the encounter is over.  Called ONLY from `end_turn`:
     /// nothing between turns can move the hunger bar or the slime count, so
     /// there is no other moment where the answer can change.
-    fn check_end(self: *Session) !void {
+    fn check_end(self: *Session, feast: slime.FeastOutcome) !void {
         if (self.phase != .playing) return;
         // Field-cleared wins ties: if the final feast fills the bar exactly,
-        // the players still ate everything.
+        // the players still ate everything they could.
         if (self.field.is_exhausted()) {
             std.log.info("all slime consumed — encounter over, score={}", .{self.score});
             try self.end_game(.field_cleared);
-        } else if (logic.hunger_full(self.hunger)) {
+            return;
+        }
+        if (logic.hunger_full(self.hunger)) {
             std.log.info("hunger bar full — encounter over, score={}", .{self.score});
             try self.end_game(.hunger_full);
+            return;
+        }
+        // DEAD POSITION.  Slime is left, the Lil Guys reached none of it, and
+        // the pool cannot afford even the cheapest recipe — so no future turn
+        // can differ from this one.  Called it here rather than letting the
+        // room spin turns forever with nothing to show for them.
+        //
+        // A config with a zero-cost recipe can never trip this: there is always
+        // a move, so the game always has somewhere to go.  That is intentional.
+        if (feast.cells == 0 and self.charges < self.cfg.balance.cheapest_cost()) {
+            std.log.info("charges exhausted with slime unreachable — encounter over, score={}", .{self.score});
+            try self.end_game(.out_of_charges);
         }
     }
 
@@ -957,7 +1007,7 @@ pub const Session = struct {
             .current = self.hunger.current,
             .max = self.hunger.max,
         };
-        snap.hunger_healable = self.hunger_healable;
+        snap.charges = self.charges;
         snap.score = self.score;
 
         // The whole authoritative grid, plus the off-grid remainder, so every

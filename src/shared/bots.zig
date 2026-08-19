@@ -26,7 +26,7 @@ const protocol = @import("protocol.zig");
 const mk = c.make_combo;
 
 const D = c.ComboSlot{ .action = .dispense };
-const M = c.ComboSlot{ .action = .medicine };
+const M = c.ComboSlot{ .action = .catalyst };
 
 pub const Profile = struct {
     label: []const u8,
@@ -60,15 +60,19 @@ pub const profile_poker = Profile{
     .combos = &[_]c.ActionCombo{mk(&.{D})},
 };
 
-/// Walks right one cell per cast, stamping 3x3 blocks — the field-clearing
-/// workhorse.  Clamping means it eventually parks on the right edge.
+/// Walks LEFT one cell per cast, stamping 3x3 blocks — the field-clearing
+/// workhorse.  It heads left because the Lil Guys enter from the left edge, so
+/// a hazard in column 0 walls off the entire board no matter what has been
+/// defused behind it.  Clamping means it eventually parks on that edge, which
+/// is precisely where a cast is worth the most.
 pub const profile_sweeper = Profile{
     .label = "sweeper",
     .combos = &[_]c.ActionCombo{mk(&.{ D, D, D })},
-    .aim = &.{&.{ .right, .right, .right }},
+    .aim = &.{&.{ .left, .left, .left }},
 };
 
-/// Alternates a wide sweep and a downward step, snaking across the field.
+/// Alternates a wide sweep and a downward step, snaking down the left side of
+/// the field: it opens the door, drops a row, and opens it again.
 pub const profile_snake = Profile{
     .label = "snake",
     .combos = &[_]c.ActionCombo{
@@ -76,14 +80,15 @@ pub const profile_snake = Profile{
         mk(&.{ D, D, D }),
     },
     .aim = &.{
-        &.{ .right, .right, .right },
-        &.{ .down, .left, .left },
+        &.{ .left, .left, .left },
+        &.{ .down, .right, .right },
     },
 };
 
-/// Brews medicine instead of clearing: exercises the healing path.
-pub const profile_medic = Profile{
-    .label = "medic",
+/// Casts nothing but the all-catalyst combo: exercises the cheap-recipe path
+/// and, in a config where that combo matches nothing, the pure fizzle path.
+pub const profile_catalyst = Profile{
+    .label = "catalyst",
     .combos = &[_]c.ActionCombo{mk(&.{ M, M })},
 };
 
@@ -105,7 +110,7 @@ pub const team_mixed = BotTeam{
     .label = "team_mixed",
     .bots = &[_]BotEntry{
         .{ .name = "Snake", .profile = &profile_snake },
-        .{ .name = "Medic", .profile = &profile_medic },
+        .{ .name = "Catalyst", .profile = &profile_catalyst },
         .{ .name = "Sweeper", .profile = &profile_sweeper },
     },
 };

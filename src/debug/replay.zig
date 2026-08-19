@@ -154,15 +154,17 @@ test "replay: record then play back" {
     gs1.turn = 3;
     gs1.entity_count = 1;
     gs1.hunger = .{ .current = 40, .max = 200 };
-    gs1.hunger_healable = .{ 10, 0, 0 };
+    gs1.charges = 137;
     gs1.score = 25;
     gs1.grid_rows = 2;
-    gs1.grid_cols = 2;
+    gs1.grid_cols = 3;
     // One of every cell variant, so the round-trip covers the whole encoding.
     gs1.grid[0] = .neutral;
     gs1.grid[1] = .{ .tiered = .red };
     gs1.grid[2] = .neutralized;
     gs1.grid[3] = .empty;
+    gs1.grid[4] = .special;
+    gs1.grid[5] = .{ .tiered = .green };
     gs1.reservoir = 15;
     gs1.entities[0] = proto.EntitySnapshot.blank;
     gs1.entities[0].entity = 0;
@@ -188,13 +190,15 @@ test "replay: record then play back" {
     try std.testing.expectEqual(@as(u32, 1), f1.tick);
     try std.testing.expectEqual(@as(u16, 3), f1.turn);
     try std.testing.expectEqual(@as(u16, 40), f1.hunger.current);
-    try std.testing.expectEqual(@as(u16, 10), f1.hunger_healable[0]);
+    try std.testing.expectEqual(@as(u32, 137), f1.charges);
     try std.testing.expectEqual(@as(u32, 25), f1.score);
-    try std.testing.expectEqual(@as(u16, 4), f1.grid_len());
+    try std.testing.expectEqual(@as(u16, 6), f1.grid_len());
     try std.testing.expectEqual(c.SlimeCell.neutral, f1.grid[0]);
     try std.testing.expectEqual(c.SlimeCell{ .tiered = .red }, f1.grid[1]);
     try std.testing.expectEqual(c.SlimeCell.neutralized, f1.grid[2]);
     try std.testing.expectEqual(c.SlimeCell.empty, f1.grid[3]);
+    try std.testing.expectEqual(c.SlimeCell.special, f1.grid[4]);
+    try std.testing.expectEqual(c.SlimeCell{ .tiered = .green }, f1.grid[5]);
     try std.testing.expectEqual(@as(u8, 1), f1.entities[0].cursor_row);
     try std.testing.expectEqual(@as(u8, 0), f1.entities[0].cursor_col);
     try std.testing.expectEqual(@as(u32, 15), f1.reservoir);

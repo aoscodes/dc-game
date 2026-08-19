@@ -246,7 +246,7 @@ fn process_recv() void {
             .action_result => {
                 const p = proto.decode_action_result(r) catch continue;
                 const anim: c.ActionAnimation = switch (p.tag) {
-                    .damage, .heal, .cast => .attack,
+                    .damage, .cast => .attack,
                     .death => .die,
                 };
                 // Record actor animation (pool actions have no specific actor).

@@ -117,11 +117,11 @@ pub fn drain(queue: *KeyQueue, combo: *ComboBuffer) Drained {
                 out.combo = .submitted;
                 return out;
             },
-            // Action keys: 1=dispense  2=medicine.  These NAME the recipe.
+            // Action keys: 1=dispense  2=catalyst.  These NAME the recipe.
             .one, .two => {
                 const action: c.ActionChoice = switch (key) {
                     .one => .dispense,
-                    .two => .medicine,
+                    .two => .catalyst,
                     else => unreachable,
                 };
                 if (combo.push(.{ .action = action })) out.combo = .appended;
@@ -174,7 +174,7 @@ test "drain: action keys append in press order" {
     const out = drain(&queue, &combo);
     try std.testing.expectEqual(DrainResult.appended, out.combo);
     try std.testing.expectEqual(@as(u8, 2), combo.len);
-    try std.testing.expectEqual(c.ActionChoice.medicine, combo.slots[0].action);
+    try std.testing.expectEqual(c.ActionChoice.catalyst, combo.slots[0].action);
     try std.testing.expectEqual(c.ActionChoice.dispense, combo.slots[1].action);
 }
 
@@ -269,6 +269,6 @@ test "ComboBuffer refuses to grow past MAX_COMBO_LEN" {
     var i: usize = 0;
     while (i < c.MAX_COMBO_LEN) : (i += 1)
         try std.testing.expect(combo.push(.{ .action = .dispense }));
-    try std.testing.expect(!combo.push(.{ .action = .medicine }));
+    try std.testing.expect(!combo.push(.{ .action = .catalyst }));
     try std.testing.expectEqual(c.MAX_COMBO_LEN, combo.len);
 }

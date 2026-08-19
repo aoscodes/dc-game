@@ -55,14 +55,14 @@ const KEY_MAP = {
   DOWN: "e", // yellow
   RIGHT: "r", // blue
   A: "1", // dispense
-  B: "2", // medicine
+  B: "2", // catalyst
   C: "Enter", // submit (realtime) / ready toggle (lobby)
   D: "Escape", // cancel
 };
 
 /**
  * Compact pending-combo string for controller feedback: one char per slot
- * ('1' dispense, '2' medicine, R/G/Y/B agent colors), "-" when empty.
+ * ('1' dispense, '2' catalyst, R/G/Y/B agent colors), "-" when empty.
  * Mirrors the JsonComboSlot encoding in src/client/stdout_writer.zig.
  */
 function comboFromRender(msg) {
@@ -71,7 +71,7 @@ function comboFromRender(msg) {
   if (slots.length === 0) return "-";
   const colors = { red: "R", green: "G", yellow: "Y", blue: "B" };
   return slots.map((s) => {
-    if (typeof s.action === "string") return s.action === "medicine" ? "2" : "1";
+    if (typeof s.action === "string") return s.action === "catalyst" ? "2" : "1";
     return colors[s.element] || "?";
   }).join("");
 }

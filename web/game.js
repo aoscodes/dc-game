@@ -63,16 +63,36 @@ const LAYOUT = {
     ghostAlpha: 0.22,      // per covering candidate — overlap is ADDITIVE, so
     ghostAlphaCap: 0.66,   // cells several candidates share read strongest
     ghostFillAlpha: 0.05,  // ditto, also scaled by the overlap count
+
+    // --- Sheltered food ---------------------------------------------------
+    //
+    // Hatch strength for food the feast cannot reach, and for the brighter
+    // version shown on cells the PENDING cast would open up.  The opened mark
+    // is loud on purpose: it is the only place the screen shows what a cast
+    // is worth beyond the cells it lands on.
+    shelteredAlpha: 0.5,
+    openedAlpha: 0.95,
   },
 
   hungerBar: {
     x0: 40, x1: 984, y: 150, h: 18,
     labelFont: 14, labelDy: -8,
     bg: "rgba(30,10,10,0.78)",
-    // Grey, matching neutral/defused slime: this portion is not healable,
-    // and tier colors are reserved for the healable segments.
+    // Grey, matching neutral/defused slime.  The bar is a one-way clock now:
+    // there is nothing to segment it by, because nothing takes hunger back.
     fill: "rgba(150,150,162,0.9)",
     dangerBorder: "rgba(255,60,60,0.95)",
+    textFont: 13,
+  },
+
+  // The shared charge pool, drawn as a DRAINING gauge directly under the
+  // hunger bar: the two are read together, since one fills as the other
+  // empties and the game ends whichever way round they finish.
+  chargeBar: {
+    x0: 40, x1: 984, y: 196, h: 10,
+    labelFont: 13, labelDy: -6,
+    bg: "rgba(40,30,10,0.78)",
+    lowBorder: "rgba(255,196,64,0.95)",
     textFont: 13,
   },
 
@@ -156,6 +176,16 @@ const C_BAD = "rgba(255,110,110,1)";
 /** Muted tint for the wasted tail of a stamp floater — present but not
  *  competing with the count that actually accomplished something. */
 const C_MUTED = "rgba(190,150,150,0.85)";
+
+/** The shared charge pool.  Amber, and used NOWHERE else: charges are the one
+ *  resource that never comes back, so they get a colour of their own rather
+ *  than borrowing a tier's. */
+const C_CHARGE = "rgba(255,196,64,1)";
+/** A recipe that costs nothing — green, because it is always castable. */
+const C_FREE = "rgba(140,230,150,1)";
+/** Food the flood could not reach.  Deliberately cold and dull: sheltered
+ *  slime is not a threat, it is wasted opportunity. */
+const C_SHELTERED = "rgba(120,170,210,1)";
 
 /** Sprite used for the cosmetic Lil Guys roaming the slime field. */
 const LIL_GUY_SPRITE = "grunt";
@@ -247,14 +277,14 @@ async function loadBalanceData(hash = PAGE_CONFIG_HASH) {
     pattern: r.pattern.map(slotFromName),
     rows: r.shape,
     offsets: shapeOffsets(r.shape),
-    medicine: r.medicine ?? {},
+    cost: r.cost ?? 1,
   }));
   TEAM_RECIPES = bal.team_recipes.map((r) => ({
     label: r.label,
     patterns: r.patterns.map((p) => p.map(slotFromName)),
     rows: r.shape,
     offsets: shapeOffsets(r.shape),
-    medicine: r.medicine ?? {},
+    cost: r.cost ?? 1,
   }));
   loadedConfigHash = hash;
 }
@@ -334,6 +364,7 @@ function clearEntityState() {
   feastThisFrame = false;
   stampedThisFrame.clear();
   lastTransientGame = null;
+  chargesSeenMax = 0;
 }
 
 const canvas = document.getElementById("canvas");
@@ -452,7 +483,7 @@ function drawLobby(lobby) {
 }
 
 /** Key binding per action — mirrors src/client/input.zig. */
-const ACTION_KEY = { dispense: "1", medicine: "2" };
+const ACTION_KEY = { dispense: "1", catalyst: "2" };
 
 /** Render one combo slot as key+symbol (e.g. "1d") in its action color. */
 function slotKeySymbol(slot) {
@@ -474,14 +505,14 @@ function drawParts(x, y, font, parts, gap) {
   return dx;
 }
 
-/** Colored parts for a recipe's medicine output (per healable tier). */
-function medicineParts(medicine) {
-  const parts = [];
-  for (const name of TIER_NAMES) {
-    const n = medicine?.[name];
-    if (n) parts.push({ str: `med${TIER_CHAR[name]}${n}`, color: TIER_COLOR[name] });
-  }
-  return parts;
+/**
+ * Colored parts for a recipe's charge cost.  Every recipe shows one, including
+ * the free ones: "0" is a real tactical option and hiding it would make a free
+ * recipe look like an unpriced oversight.
+ */
+function costParts(cost) {
+  const n = cost ?? 0;
+  return [{ str: `${n}\u26a1`, color: n === 0 ? C_FREE : C_CHARGE }];
 }
 
 /**
@@ -517,8 +548,8 @@ function drawShapeGlyph(x, y, font, rows) {
 
 /**
  * Lobby study guide: how casting works + every defined recipe with its key
- * sequence AND symbols, all in parity colors (slime = agent = medicine =
- * hunger block).  Recipes appear in data/balance.json order.
+ * sequence AND symbols, all in parity colors (slime = agent = hunger block).
+ * Recipes appear in data/balance.json order.
  */
 function drawRecipeGuide() {
   const L = LAYOUT.lobby;
@@ -536,7 +567,7 @@ function drawRecipeGuide() {
     [
       { str: "AIM with the arrow keys, then type a combo:", color: descColor },
       { str: "1d dispense", color: ACTION_COLOR.dispense },
-      { str: "2m medicine", color: ACTION_COLOR.medicine },
+      { str: "2c catalyst", color: ACTION_COLOR.catalyst },
     ],
     [
       { str: "Each combo below stamps its SHAPE on the grid, centred on your cursor.", color: descColor },
@@ -554,10 +585,18 @@ function drawRecipeGuide() {
       { str: "Aim is captured when you press ENTER — re-aiming will not move a cast already made.", color: descColor },
     ],
     [
-      { str: "The turn ends once EVERYONE is out of casts: the Lil Guys then devour the whole field.", color: descColor },
+      { str: "The turn ends once EVERYONE is out of casts: the Lil Guys then pour in from the LEFT.", color: descColor },
     ],
     [
-      { str: "Live hazard slime is what hurts to eat — defuse it first, and a fresh field arrives.", color: descColor },
+      { str: "They only eat what they can WALK to. Live hazard slime is a wall — everything behind it survives.", color: descColor },
+    ],
+    [
+      { str: "Defuse a wall and you open a road. Survivors fall to the bottom, then fresh slime drops in on top.", color: descColor },
+    ],
+    [
+      { str: "Every cast spends from ONE shared pool", color: descColor },
+      { str: "\u26a1", color: C_CHARGE },
+      { str: "that lasts the WHOLE encounter and never refills. Spend it where it opens a road.", color: descColor },
     ],
     castingLine,
   ];
@@ -584,7 +623,7 @@ function drawRecipeGuide() {
     text("→", x, y, L.recipeFont, descColor);
     x += L.recipeArrowGap;
     x = drawShapeGlyph(x, y, L.recipeFont, r.rows ?? ["#"]) + L.recipeSlotGap;
-    x = drawParts(x, y, L.recipeFont, medicineParts(r.medicine), L.recipeSlotGap);
+    x = drawParts(x, y, L.recipeFont, costParts(r.cost), L.recipeSlotGap);
     if (suffix) text(suffix, x + 4, y, L.guideFont, RECIPE_COLOR_TEAM);
     // Tall shapes render below the baseline, so advance past the whole block.
     const shapeH = (r.rows?.length ?? 1) * L.recipeFont * 0.82;
@@ -752,7 +791,8 @@ const CAST_EVENT_COLOR = "rgba(120,220,255,1)";
  *
  * The per-cell score/hunger deltas are floated separately by
  * updateFeastTracking; this is the headline — how much was eaten, and how much
- * of the hunger it cost is still healable with medicine.
+ * the team could only watch.  Sheltered food is the number that should change
+ * how the next turn is played, so it gets equal billing with the feast itself.
  */
 function spawnTurnEndedFloaters(game) {
   const te = game.turn_ended;
@@ -763,11 +803,13 @@ function spawnTurnEndedFloaters(game) {
   spawnFloater(`FEAST! ${te.cells_eaten ?? 0} units devoured`, x, y - STACK,
     CAST_EVENT_COLOR, LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
 
-  // Healable hunger is the actionable part: it is what medicine can still undo.
-  const healable = sumTiers(te.healable);
-  if (healable > 0) {
-    spawnFloater(`${healable} hunger still healable`, x, y + 28,
-      C_BAD, LAYOUT.floater.lifetime, LAYOUT.floater.font);
+  // Food that was RIGHT THERE and unreachable — the actionable miss.  Naming
+  // the walls alongside it points at the fix rather than just the failure.
+  const sheltered = te.sheltered ?? 0;
+  if (sheltered > 0) {
+    const walls = te.walls ?? 0;
+    spawnFloater(`${sheltered} walled off by ${walls} live cell${walls === 1 ? "" : "s"}`,
+      x, y + 28, C_SHELTERED, LAYOUT.floater.lifetime, LAYOUT.floater.font);
   }
 }
 
@@ -863,8 +905,8 @@ function drawFloaters() {
 
 // Recipe tables are loaded from data/balance.json (loadBalanceData) — the same
 // file the Zig server reads, so there is no hand-mirrored copy to drift.  A
-// recipe's `medicine` output is per TIER: tier-X medicine heals only the
-// tier-X healable bucket (symmetrical healing).
+// recipe's `cost` is what it takes out of the team's shared charge pool; a
+// team recipe is charged ONCE for the group, not once per contributor.
 //
 // There is NO flat fallback: an unmatched combo fizzles.  These tables are the
 // complete move list, both here and on the server.
@@ -875,10 +917,10 @@ function drawFloaters() {
 let CASTS_PER_TURN = 3;
 /** @typedef {{dRow: number, dCol: number}} ShapeOffset */
 /** @type {Array<{label: string, pattern: Array<object>, rows: string[],
- *   offsets: ShapeOffset[], medicine: Object<string,number>}>} */
+ *   offsets: ShapeOffset[], cost: number}>} */
 let PLAYER_RECIPES = [];
 /** @type {Array<{label: string, patterns: Array<Array<object>>, rows: string[],
- *   offsets: ShapeOffset[], medicine: Object<string,number>}>} */
+ *   offsets: ShapeOffset[], cost: number}>} */
 let TEAM_RECIPES = [];
 
 /** Two combos are the same move iff they are the same action-key sequence. */
@@ -892,11 +934,10 @@ function slotsEqual(a, b) {
 
 /**
  * Accumulate one matched recipe into the projected batch: its shape (as a
- * separate stamp, since each stamp lands at its own anchor) and its medicine.
+ * separate stamp, since each stamp lands at its own anchor) and its cost.
  *
- * @param {{stamps: Array<object>, medicine: Object<string,number>,
- *   labels: string[]}} sum
- * @param {object} recipe   - the matched recipe (carries offsets + medicine)
+ * @param {{stamps: Array<object>, cost: number, labels: string[]}} sum
+ * @param {object} recipe   - the matched recipe (carries offsets + cost)
  * @param {number} anchorIndex - index into `combos` of the player whose cursor
  *   anchors this stamp; -1 when unknown.
  */
@@ -906,9 +947,7 @@ function addOutput(sum, recipe, anchorIndex) {
     label: recipe.label,
     anchorIndex,
   });
-  for (const [t, n] of Object.entries(recipe.medicine ?? {})) {
-    sum.medicine[t] = (sum.medicine[t] ?? 0) + n;
-  }
+  sum.cost += recipe.cost ?? 0;
   sum.labels.push(recipe.label);
 }
 
@@ -932,10 +971,10 @@ function addOutput(sum, recipe, anchorIndex) {
  *
  * @param {Array<Array<{action?:string}>>} combos
  * @returns {{stamps: Array<{offsets: ShapeOffset[], label: string,
- *   anchorIndex: number}>, medicine: Object<string,number>, labels: string[]}}
+ *   anchorIndex: number}>, cost: number, labels: string[]}}
  */
 function matchRecipes(combos) {
-  const sum = { stamps: [], medicine: {}, labels: [] };
+  const sum = { stamps: [], cost: 0, labels: [] };
   const consumed = combos.map(() => false);
 
   for (const tr of TEAM_RECIPES) {
@@ -1057,7 +1096,21 @@ function shapePreview(game) {
       if (next === "defused") defused++;
     }
   }
-  return { cells, offGrid, inert, hits, defused, projected };
+  // Food this batch would unwall.  A cast's real value is almost never the
+  // cells it lands on — it is the road those cells open — so the preview has
+  // to price that explicitly or the whole mechanic stays invisible.
+  let opened = 0;
+  if (cells.size > 0) {
+    const before = reachability(game);
+    if (before.sheltered.size > 0) {
+      const after = reachability(game, cells);
+      for (const flat of before.sheltered) {
+        if (after.eaten.has(flat)) opened++;
+      }
+    }
+  }
+
+  return { cells, offGrid, inert, hits, defused, opened, projected };
 }
 
 /**
@@ -1129,9 +1182,9 @@ let lastHungerSeen = 0;
 
 /**
  * Call once per drawGame frame, AFTER tickLilGuys so `lastBitePos` already
- * points at a cell the feast just ate.  Score and hunger only move at the
- * turn-end feast or when medicine lands, so the deltas are floated over that
- * cell (falling back to the field center for medicine, which has no cell).
+ * points at a cell the feast just ate.  Score and hunger ONLY move at the
+ * turn-end feast — nothing gives either of them back — so the deltas always
+ * belong over the cell that was just bitten.
  */
 function updateFeastTracking(game) {
   const score = game.score ?? 0;
@@ -1152,21 +1205,16 @@ function updateFeastTracking(game) {
   }
   if (hungerGain > 0) {
     spawnFloater(`+${hungerGain} hunger`, at.x + jitter(), at.y + STACK, "rgba(255,150,50,1)");
-  } else if (hungerGain < 0) {
-    // Medicine: healing is cast-driven, so anchor it at the field center.
-    const p = fieldCenter();
-    spawnFloater(`${hungerGain} hunger (medicine)`, p.x + jitter(), p.y + STACK,
-      "rgba(255,80,180,1)");
   }
 }
 
 /** Map ActionChoice enum string → display character. */
-const ACTION_CHAR = { dispense: "d", medicine: "m" };
+const ACTION_CHAR = { dispense: "d", catalyst: "c" };
 
 /** Map ActionChoice enum string → highlight colour. */
 const ACTION_COLOR = {
   dispense: "rgba(160,220,255,1)",
-  medicine: "rgba(255,80,180,1)",
+  catalyst: "rgba(255,80,180,1)",
 };
 
 /** Tier ordinal → name string; matches protocol Tier ordinal order, hardest
@@ -1180,9 +1228,9 @@ const TIER_CHAR = { red: "≡", yellow: "=", green: "-" };
 
 /** Map Tier → colour: a hot-to-cool ramp, so difficulty reads at a glance.
  *
- *  SINGLE SOURCE OF COLOR TRUTH: slime blobs, combo/recipe readouts,
- *  hunger-bar healable segments, and the game-over stats tables all read from
- *  this map, so a tier always looks the same wherever it appears. */
+ *  SINGLE SOURCE OF COLOR TRUTH: slime blobs, combo/recipe readouts and the
+ *  game-over stats tables all read from this map, so a tier always looks the
+ *  same wherever it appears. */
 const TIER_COLOR = {
   red: "rgba(255,90,90,1)",
   yellow: "rgba(250,210,80,1)",
@@ -1194,9 +1242,13 @@ const TIER_COLOR = {
 const SHAPE_COLOR = "rgba(160,220,255,1)";
 
 /** Neutral and defused slime: harmless, so it must not read as any tier color.
- *  Grey is the "safe / inert" color — shared by both tiles and by the
- *  non-healable portion of the hunger bar. */
+ *  Grey is the "safe / inert" color — shared by both tiles and by the hunger
+ *  bar's fill. */
 const NEUTRAL_COLOR = "rgba(150,150,162,1)";
+
+/** Special slime: the objective. Violet, shared with nothing, because it is
+ *  neither food nor hazard and no cast can touch it. */
+const SPECIAL_COLOR = "rgba(198,130,255,1)";
 
 /**
  * Restate an `rgba(r,g,b,a)` color at a new alpha.
@@ -1239,47 +1291,64 @@ function downgradeName(name) {
 // ---------------------------------------------------------------------------
 
 /**
- * Draw the Total Hunger bar.  Fills left→right as slime is consumed; the
- * healable (hazard-slime) portion sits at the right end of the fill as
- * color-coded segments — one per TIER — since only same-tier medicine can heal
- * each segment.
+ * Draw the Total Hunger bar: a one-way clock.  It only ever fills, so there is
+ * nothing to segment it by and no reason for tier colour here — the single
+ * grey fill IS the message.
  */
 function drawHungerBar(game) {
   const H = LAYOUT.hungerBar;
-  const hunger = game.hunger ?? { current: 0, max: 0, healable: {} };
-  const healable = hunger.healable ?? {};
+  const hunger = game.hunger ?? { current: 0, max: 0 };
   const w = H.x1 - H.x0;
   const frac = hunger.max > 0 ? Math.min(1, hunger.current / hunger.max) : 0;
-
-  const healableTotal = sumTiers(healable);
-  const healFracTotal = hunger.max > 0 ? Math.min(frac, healableTotal / hunger.max) : 0;
 
   text("TOTAL HUNGER", H.x0, H.y + H.labelDy, H.labelFont, C_HEADER);
 
   rect(H.x0, H.y, w, H.h, H.bg);
   if (frac > 0) rect(H.x0, H.y, w * frac, H.h, H.fill);
 
-  // Healable segments: right end of the current fill, one per tier (only these
-  // use tier colors — grey fill = unhealable hunger).  Scale segments
-  // proportionally if the fill clamped at the bar edge.
-  if (healFracTotal > 0 && healableTotal > 0) {
-    const scale = (w * healFracTotal) / healableTotal;
-    let x = H.x0 + w * (frac - healFracTotal);
-    for (const name of TIER_NAMES) {
-      const units = healable[name] ?? 0;
-      if (units === 0) continue;
-      const segW = units * scale;
-      rect(x, H.y, segW, H.h, TIER_COLOR[name]);
-      x += segW;
-    }
-  }
   // Danger is signalled by the border, never the fill.
   const nearFull = frac > 0.85;
   rectStroke(H.x0 - 2, H.y - 2, w + 4, H.h + 4, nearFull ? 3 : 1,
     nearFull ? H.dangerBorder : "rgba(255,255,255,0.25)");
 
-  text(`${hunger.current}/${hunger.max}  (healable ${healableTotal})`,
-    H.x0 + w + 6 - 230, H.y + H.h + 14, H.textFont, "rgba(200,200,210,0.9)");
+  text(`${hunger.current}/${hunger.max}`,
+    H.x0 + w - 90, H.y + H.h + 14, H.textFont, "rgba(200,200,210,0.9)");
+}
+
+/**
+ * Highest charges seen this game — the denominator for the pool gauge.
+ *
+ * The server sends only what is LEFT, and the starting figure comes from the
+ * encounter, which the client never reads.  Since the pool is monotonically
+ * non-increasing within a game, the first value observed is the maximum, and
+ * clearEntityState() resets it between games.
+ */
+let chargesSeenMax = 0;
+
+/**
+ * Draw the shared charge pool.  Drains right→left, opposite to hunger, so the
+ * two gauges visibly close on each other as the encounter runs out of road.
+ */
+function drawChargeBar(game) {
+  const B = LAYOUT.chargeBar;
+  const charges = game.charges ?? 0;
+  if (charges > chargesSeenMax) chargesSeenMax = charges;
+  const w = B.x1 - B.x0;
+  const frac = chargesSeenMax > 0 ? Math.min(1, charges / chargesSeenMax) : 0;
+
+  text("TEAM CHARGES (whole encounter — never refills)",
+    B.x0, B.y + B.labelDy, B.labelFont, C_CHARGE);
+
+  rect(B.x0, B.y, w, B.h, B.bg);
+  // Anchored at the LEFT so the remaining pool stays where the eye expects a
+  // quantity to be, and the empty gap grows into the space it used to hold.
+  if (frac > 0) rect(B.x0, B.y, w * frac, B.h, C_CHARGE);
+
+  const low = frac <= 0.15;
+  rectStroke(B.x0 - 2, B.y - 2, w + 4, B.h + 4, low ? 3 : 1,
+    low ? B.lowBorder : "rgba(255,255,255,0.25)");
+
+  text(`\u26a1 ${charges}`, B.x0 + w - 90, B.y + B.h + 14, B.textFont, C_CHARGE);
 }
 
 function drawScore(game) {
@@ -1351,6 +1420,79 @@ function fieldCenter() {
   return { x: (FIELD.x0 + FIELD.x1) / 2, y: (FIELD.y0 + FIELD.y1) / 2 };
 }
 
+// --- Feast reachability ------------------------------------------------------
+//
+// MIRRORS slime.eat_all.  The Lil Guys enter along the LEFT edge and flood
+// 4-connected through empty cells and food; live hazards and specials stop
+// them dead.  Everything the flood misses survives the turn.
+//
+// The client recomputes this rather than being told, because it needs the
+// answer for a HYPOTHETICAL board — the one the player's pending cast would
+// create — and no server message can describe a turn that has not happened.
+
+/** Memo for reachability(), keyed on the frame object.  drawGame calls this
+ *  from several places per frame and the flood is O(cells); one entry is
+ *  enough, since frames are processed strictly in order. */
+let reachCacheKey = null;
+let reachCacheVal = null;
+
+/**
+ * Flood the field from the left edge and report what the feast would take.
+ *
+ * @param {object} game    - render frame (grid + dims)
+ * @param {Map<number,string>} [overrides] - flat → replacement cell name,
+ *   used to ask "what would this cast open up?" without mutating the frame.
+ * @returns {{eaten: Set<number>, sheltered: Set<number>, walls: Set<number>}}
+ *   `eaten` is food the flood reaches, `sheltered` is food it cannot, and
+ *   `walls` is every blocker still standing.
+ */
+function reachability(game, overrides) {
+  if (!overrides && reachCacheKey === game && reachCacheVal) return reachCacheVal;
+
+  const { rows, cols } = gridDims(game);
+  const base = game.grid ?? [];
+  const at = (flat) => overrides?.get(flat) ?? base[flat];
+
+  const eaten = new Set();
+  const walls = new Set();
+  const seen = new Uint8Array(rows * cols);
+  /** @type {number[]} */
+  const queue = [];
+
+  const visit = (flat) => {
+    if (seen[flat]) return;
+    const name = at(flat);
+    if (cellBlocksFeast(name)) return; // a wall is never entered, only noted
+    seen[flat] = 1;
+    if (cellIsEdible(name)) eaten.add(flat);
+    queue.push(flat);
+  };
+
+  for (let r = 0; r < rows; r++) visit(r * cols);
+  for (let head = 0; head < queue.length; head++) {
+    const flat = queue[head];
+    const r = Math.floor(flat / cols), cl = flat % cols;
+    if (r > 0) visit(flat - cols);
+    if (r + 1 < rows) visit(flat + cols);
+    if (cl > 0) visit(flat - 1);
+    if (cl + 1 < cols) visit(flat + 1);
+  }
+
+  const sheltered = new Set();
+  for (let flat = 0; flat < rows * cols; flat++) {
+    const name = at(flat);
+    if (cellBlocksFeast(name)) walls.add(flat);
+    else if (cellIsEdible(name) && !eaten.has(flat)) sheltered.add(flat);
+  }
+
+  const out = { eaten, sheltered, walls };
+  if (!overrides) {
+    reachCacheKey = game;
+    reachCacheVal = out;
+  }
+  return out;
+}
+
 // --- Slime unit tiles --------------------------------------------------------
 //
 // A tile is pure function of (cell state, cell size), so each distinct tile is
@@ -1383,6 +1525,7 @@ function parseRgb(str) {
 const TILE_RGB = {
   ...Object.fromEntries(TIER_NAMES.map((n) => [n, parseRgb(TIER_COLOR[n])])),
   neutral: parseRgb(NEUTRAL_COLOR),
+  special: parseRgb(SPECIAL_COLOR),
 };
 
 /**
@@ -1391,6 +1534,7 @@ const TILE_RGB = {
  *   "neutral"  → grey body, no glyph        (harmless filler)
  *   "red"      → red body + ≡ glyph         (hazard, 3 stamps from harmless)
  *   "defused"  → grey body + a dim ring     (was a hazard, now harmless)
+ *   "special"  → violet body + ★ glyph      (the objective: inert, inedible)
  * A defused cell is safe to eat, so its BODY is grey like neutral; the ring
  * distinguishes "someone defused this" from "this was never a threat".
  */
@@ -1398,14 +1542,28 @@ function cellStyle(name) {
   if (!name || name === "empty") return null;
   if (name === "neutral") return { body: "neutral", glyph: null, ring: false };
   if (name === "defused") return { body: "neutral", glyph: null, ring: true };
+  if (name === "special") return { body: "special", glyph: "\u2605", ring: false };
   return TIER_NAMES.includes(name)
     ? { body: name, glyph: TIER_CHAR[name], ring: false }
     : { body: "neutral", glyph: null, ring: false };
 }
 
-/** True when the cell name denotes slime — anything the feast will eat. */
+/** True when the cell name denotes an occupied cell — anything with a tile. */
 function cellIsSlime(name) {
   return cellStyle(name) !== null;
+}
+
+/** True when the flood can EAT this cell.  Live hazards and specials are walls;
+ *  empty space conducts but is not food. */
+function cellIsEdible(name) {
+  return name === "neutral" || name === "defused";
+}
+
+/** True when this cell stops the flood dead.  The single rule the whole board
+ *  is read through: a wall is not just uneaten, it shelters everything the
+ *  flood would have reached through it. */
+function cellBlocksFeast(name) {
+  return name === "special" || TIER_NAMES.includes(name);
 }
 
 /** The tier of a cell that is still a HAZARD, or null for anything else
@@ -1571,11 +1729,13 @@ function updateGridAnims(grid) {
       // A stamp stepped this unit down a tier in place: it survived, so it
       // stays put and blooms.
       cellAnim.set(flat, { kind: "flash", t: FIELD.flashS });
-    } else if (feastThisFrame && was !== "empty") {
-      // The feast ate it; whatever is here now arrived from the reservoir.
+    } else if (feastThisFrame && cellIsEdible(was)) {
+      // Only FOOD is ever eaten, so only food may burst.  A wall that vanished
+      // on a feast frame did not die — it fell, and popping it would teach the
+      // exact opposite of the rule the whole board runs on.
       cellAnim.set(flat, { kind: "pop", t: FIELD.popS, from: was });
     } else {
-      // Refilled hole, or any other server-side replacement.
+      // A survivor that fell, a refilled hole, or any other replacement.
       cellAnim.set(flat, { kind: "drop", t: FIELD.dropS });
     }
   }
@@ -1619,6 +1779,19 @@ function drawSlimeField(game) {
   // neutral, so the eye separates "would land" from the pulsing "will land".
   const ghosts = candidateShapes(game).cells;
 
+  // Who eats and who watches, on THIS board and on the board the pending cast
+  // would create.  A cell that is sheltered now but eaten after — `opened` —
+  // is the payoff of the cast, and it is almost never the cell being aimed at,
+  // so nothing else on screen can show it.
+  const reach = reachability(game);
+  const after = preview.size > 0
+    ? reachability(game, new Map([...preview].map(([f, b]) => [f, b])))
+    : reach;
+  const opened = new Set();
+  for (const flat of reach.sheltered) {
+    if (after.eaten.has(flat)) opened.add(flat);
+  }
+
   // Walk the grid off `g` directly: cellRect would recompute the same
   // placement (and allocate a rect) for every one of up to 256 cells.
   const inset = g.cell * FIELD.tileGap;
@@ -1631,6 +1804,15 @@ function drawSlimeField(game) {
     // Socket: every cell gets one, so holes are visibly waiting to be filled.
     rect(x0 + inset, y0 + inset, body, body, FIELD.socketFill);
     rectStroke(x0 + inset, y0 + inset, body, body, 1, FIELD.socketBorder);
+
+    // Food the flood cannot reach: a cold hatch across the socket.  Drawn
+    // under the tile so it reads as the GROUND being cut off rather than
+    // anything wrong with the unit standing on it.
+    if (reach.sheltered.has(flat)) {
+      drawShelteredMark(x0, y0, inset, body,
+        opened.has(flat) ? FIELD.openedAlpha : FIELD.shelteredAlpha,
+        opened.has(flat) ? C_SLIME_HDR : C_SHELTERED);
+    }
 
     const anim = cellAnim.get(flat);
 
@@ -1732,6 +1914,34 @@ function drawPreviewMark(x0, y0, inset, body, becomes, pulse) {
   ctx.globalAlpha = pulse;
   rectStroke(x0 + inset, y0 + inset, body, body, FIELD.previewWidth,
     becomesColor(becomes));
+  ctx.restore();
+}
+
+/**
+ * Hatch one cell of food the flood cannot reach.
+ *
+ * Diagonal strokes, not a tint: a tint would read as another outcome colour
+ * and compete with the cast preview, whereas hatching reads as "crossed out"
+ * at any density.  Callers brighten it to green for cells the pending cast
+ * would OPEN, which is the same mark saying the opposite thing — deliberately,
+ * since it is the same fact either way.
+ */
+function drawShelteredMark(x0, y0, inset, body, alpha, color) {
+  ctx.save();
+  // Clip first: the strokes are drawn as full-length diagonals and trimmed to
+  // the socket, which keeps the hatch spacing identical in every cell.
+  ctx.beginPath();
+  ctx.rect(x0 + inset, y0 + inset, body, body);
+  ctx.clip();
+  ctx.strokeStyle = withAlpha(color, alpha);
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  const step = body / 4;
+  for (let d = -body; d < body; d += step) {
+    ctx.moveTo(x0 + inset + d, y0 + inset);
+    ctx.lineTo(x0 + inset + d + body, y0 + inset + body);
+  }
+  ctx.stroke();
   ctx.restore();
 }
 
@@ -1852,15 +2062,24 @@ const LIL_GUY_ANIM_BASE = 1_000_000;
  *  floaters (see updateFeastTracking).  null until the first feast. */
 let lastBitePos = null;
 
-/** Pick a flat index of an occupied cell for a guy to stand on, or null when
- *  the field is bare.  `nth` spreads the horde out instead of stacking it. */
-function feastCell(grid, nth) {
-  const occupied = [];
+/**
+ * Pick a flat index of REACHABLE food for a guy to stand on, or null when
+ * there is none.  `nth` spreads the horde out instead of stacking it.
+ *
+ * Guys must never loiter on food they cannot get to: standing on a sheltered
+ * cell would say "this is next" about the one cell that is not.  With nothing
+ * reachable they hold at the door instead, which is exactly where the problem
+ * is.
+ */
+function feastCell(game, nth) {
+  const grid = game.grid ?? [];
+  const reach = reachability(game);
+  const edible = [];
   for (let flat = 0; flat < grid.length; flat++) {
-    if (cellIsSlime(grid[flat])) occupied.push(flat);
+    if (reach.eaten.has(flat)) edible.push(flat);
   }
-  if (occupied.length === 0) return null;
-  return occupied[(nth * 7) % occupied.length];
+  if (edible.length === 0) return null;
+  return edible[(nth * 7) % edible.length];
 }
 
 /**
@@ -1889,7 +2108,7 @@ function tickLilGuys(game, dt, fresh) {
   }
 
   players.forEach((e, i) => {
-    const target = feastCell(grid, i);
+    const target = feastCell(game, i);
     let g = lilGuys.get(e.owner);
     if (!g) {
       // Spawn already standing on its cell: a new guy should not sprint in
@@ -1935,8 +2154,8 @@ function tickLilGuys(game, dt, fresh) {
     g.facingLeft = dx < 0;
   });
 
-  // The feast emptied every cell, so the tile layer must treat this frame's
-  // changes as eats rather than refills.  Set even with no guys on screen: the
+  // The feast ran, so the tile layer must read this frame's changes as eats
+  // and falls rather than plain refills.  Set even with no guys on screen: the
   // field was still devoured.
   if (feast) feastThisFrame = true;
 }
@@ -1967,7 +2186,7 @@ function drawActionMenu(game) {
   const px = mx + M.padX;
   const aRowY = my + M.padTopY + M.actionRowDy;
   text("[1] Dispense", px + M.actionCols[0], aRowY, M.actionFont, ACTION_COLOR.dispense);
-  text("[2] Medicine", px + M.actionCols[1], aRowY, M.actionFont, ACTION_COLOR.medicine);
+  text("[2] Catalyst", px + M.actionCols[1], aRowY, M.actionFont, ACTION_COLOR.catalyst);
 
   // Aim row: the arrow keys move the cursor the shape is stamped on.
   const own0 = (game.entities ?? []).find(e => e.owner === game.player_id);
@@ -2020,10 +2239,21 @@ function drawActionMenu(game) {
   // in red rather than hidden.
   const wasted = pv.offGrid + pv.inert;
   if (wasted > 0) parts.push({ str: `${wasted} wasted`, color: C_BAD });
-  // Medicine is per tier: shown in the color of the healable bucket it heals.
-  for (const name of TIER_NAMES) {
-    const n = projected.medicine[name];
-    if (n) parts.push({ str: `med${TIER_CHAR[name]}${n}`, color: TIER_COLOR[name] });
+  // What this batch would OPEN: food that is walled off now and eaten after.
+  // Ranked alongside the cells hit, because on most turns it is the larger
+  // number and always the one worth aiming for.
+  if (pv.opened > 0) {
+    parts.push({ str: `opens ${pv.opened} food`, color: C_SLIME_HDR });
+  }
+  // The price, and whether the pool can actually pay it.  Shown even at zero
+  // cost, and shown in red when unaffordable: a cast the team cannot afford
+  // still burns a turn slot, so this is a warning, not a footnote.
+  if (projected.cost > 0 || projected.labels.length > 0) {
+    const affordable = (game.charges ?? 0) >= projected.cost;
+    parts.push({
+      str: `\u26a1${projected.cost}${affordable ? "" : " CAN'T AFFORD"}`,
+      color: affordable ? C_CHARGE : C_BAD,
+    });
   }
 
   let dx = px;
@@ -2104,6 +2334,7 @@ function drawGame(game, dt) {
 
   drawScore(game);
   drawHungerBar(game);
+  drawChargeBar(game);
   drawSlimeField(game);
   drawLilGuys(dt);
   drawComboPanel(game);
@@ -2134,11 +2365,11 @@ function drawTierCells(x, y, font, obj) {
 
 /**
  * End-of-game tuning report: outcome, match-wide feast tallies, per-player
- * table, recipe fire counts, derived waste/overheal totals.
+ * table, recipe fire counts, and the charge pool's final ledger.
  *
  * The report is a single match-wide summary across every turn: how much of the
- * field the team's stamps covered and defused, and how much of it was still a
- * live hazard when the feast came for it.
+ * field the team's stamps covered and defused, how much food they never opened
+ * a road to, and what the whole effort cost from the shared pool.
  */
 function drawGameOver(msg) {
   clear();
@@ -2146,9 +2377,12 @@ function drawGameOver(msg) {
   const score = msg && msg.score !== undefined && msg.score !== null ? msg.score : "?";
   const stats = msg ? msg.stats : null;
 
-  const reasonText = stats
-    ? (stats.reason === "hunger_full" ? "The Lil Guys got full!" : "Slime field cleared!")
-    : "";
+  const REASON_TEXT = {
+    hunger_full: "The Lil Guys got full!",
+    field_cleared: "Slime field cleared!",
+    out_of_charges: "Out of charges — nothing left to cast, and nothing left to eat.",
+  };
+  const reasonText = stats ? (REASON_TEXT[stats.reason] ?? stats.reason) : "";
   text(`Encounter over — ${reasonText}`, L.x, L.titleY, L.titleFont, C_HEADER);
   const hungerText = stats ? `   ·   Hunger ${stats.hunger_final}/${stats.hunger_max}` : "";
   text(`Neutral slime consumed: ${score}${hungerText}`, L.x, L.scoreY, L.scoreFont, C_SLIME_HDR);
@@ -2175,19 +2409,28 @@ function drawGameOver(msg) {
   // the stamp, so the rows read as "what did we hit", not "what is left".
   feastRow("cells downgraded", feast.covered);
   feastRow("cells defused", feast.neutralized);
-  feastRow("hazard slime eaten", feast.escaped);
-  feastRow("medicine dispensed", feast.medicine);
-  feastRow("hunger healed", feast.healed);
 
-  // Derived: medicine poured into hunger that was not there — the number a
-  // designer tunes medicine pools on.
-  const overheal = sumTiers(feast.medicine) - sumTiers(feast.healed);
   y += 4;
+  const spent = feast.charges_spent ?? 0;
+  const left = feast.charges_left ?? 0;
+  const consumed = (feast.neutral ?? 0) + (feast.defused ?? 0);
   text(
-    `neutral eaten ${feast.neutral ?? 0}  ·  hunger ${feast.hunger_normal ?? 0} base ` +
-    `+ ${feast.hunger_extra ?? 0} from hazards  ·  medicine overheal ${overheal}`,
+    `eaten ${consumed} (${feast.neutral ?? 0} neutral + ${feast.defused ?? 0} defused)` +
+    `  ·  hunger ${feast.hunger_normal ?? 0}`,
     F.label, y, L.rowFont, "rgba(200,200,210,0.9)",
   );
+  y += L.rowH;
+  // The headline tuning number: food that existed, was edible, and was never
+  // reached.  A high figure means the charges went somewhere that did not open
+  // a road, which is the only way this game is really lost.
+  text(`walled off and never eaten: ${feast.sheltered ?? 0}`,
+    F.label, y, L.rowFont, C_SHELTERED);
+  y += L.rowH;
+  // Charges per unit of food: the single ratio that says whether the encounter
+  // was priced right.  Guarded, because a team can finish having spent nothing.
+  const perUnit = consumed > 0 ? (spent / consumed).toFixed(2) : "—";
+  text(`\u26a1 ${spent} spent, ${left} unspent  ·  ${perUnit} per unit eaten`,
+    F.label, y, L.rowFont, C_CHARGE);
   y += L.rowH + 14;
 
   // ---- Per-player table ----------------------------------------------------

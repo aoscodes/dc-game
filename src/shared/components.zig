@@ -12,11 +12,15 @@
 //! refills emptied cells from the top row.  One grid per game.
 //!
 //! Play is TURN-BASED.  Each player gets `casts_per_turn` casts; once every
-//! connected player has spent theirs the turn ends and the ENTIRE field is
-//! eaten in one bulk feast, then refilled from the reservoir.  Hazard slime
-//! (`tiered`) costs extra hunger unless players neutralize it first.  Medicine
-//! heals the hunger bar, but only the portion attributable to eating
-//! un-neutralized hazard slime.
+//! connected player has spent theirs the turn ends and the field is EATEN
+//! ALONG A PATH: the feast enters from the LEFT edge and consumes every
+//! edible unit it can reach, so live hazards and `special` units wall it off
+//! and protect whatever hides behind them.  Survivors then fall to the bottom
+//! of their column and the reservoir refills from the top.
+//!
+//! Casting costs CHARGES from one team-shared, whole-game pool (each recipe
+//! prices its own cost), so the campaign's real resource is charges and the
+//! per-turn cast budget only paces how fast they can be spent.
 //!
 //! The "Lil Guys" who do the eating are a CLIENT-SIDE animation over that bulk
 //! feast — there is no Lil Guy entity, timer or target anywhere on the server.
@@ -36,11 +40,15 @@
 //! ## Combo slot model
 //!
 //! A combo is a sequence of up to MAX_COMBO_LEN `ComboSlot` values, each an
-//! `ActionChoice` (dispense/medicine).  The sequence is a NAME: it is matched
+//! `ActionChoice` (dispense/catalyst).  The sequence is a NAME: it is matched
 //! exactly against the recipe tables (player/team, loaded from
 //! data/balance.json — see config.zig) to find the shape it stamps and the
-//! medicine it brews.  There is no flat fallback — an unmatched combo fizzles,
+//! charges it costs.  There is no flat fallback — an unmatched combo fizzles,
 //! so the recipe tables are the complete move list.
+//!
+//! The two tokens are interchangeable as far as the rules go: they exist to
+//! give recipes distinguishable NAMES, not distinguishable effects.  Every
+//! effect a cast has comes from the recipe it names.
 
 const std = @import("std");
 
@@ -72,11 +80,16 @@ pub const Owner = struct {
 /// the recipe tables (see balance.Shape).  There are no element/color tokens:
 /// a cast's power is its shape, and a cell's color is its difficulty.
 ///
-///   dispense — release Neutralizing Agent: downgrades the shape's cells.
-///   medicine — contribute to the medicine pool that heals eaten-slime hunger.
+/// Both tokens are pure NAMING alphabet: neither has an effect of its own, and
+/// swapping them in a recipe's pattern changes only which key sequence casts
+/// it.  Two tokens rather than one so recipes can differ by CONTENT instead of
+/// only by length.
+///
+///   dispense — the Neutralizing Agent tap.
+///   catalyst — the second reagent tap.
 pub const ActionChoice = enum(u8) {
     dispense = 0,
-    medicine = 1,
+    catalyst = 1,
 
     pub const size = @typeInfo(ActionChoice).@"enum".fields.len;
 };
@@ -145,30 +158,54 @@ pub const MAX_GRID_CELLS: u16 = @as(u16, MAX_GRID_ROWS) * @as(u16, MAX_GRID_COLS
 /// This is the whole slime state model: there are no scalar bucket counts.
 /// A cell is:
 ///   empty       — eaten (or never filled); refilled from the reservoir
-///   neutral     — naturally-neutral slime, costs hunger_cost_normal
-///   tiered      — hazardous slime at difficulty `Tier`; costs the normal +
-///                 hazard-extra hunger, and that extra is healable by
-///                 medicine matching the tier that was eaten.  A cast
-///                 downgrades it one tier (red -> yellow -> green).
-///   neutralized — defused: a `tiered` cell that was downgraded past green.
-///                 Costs only hunger_cost_normal and scores like neutral.
-///                 Distinct from `neutral` so the render can show it was won.
+///   neutral     — naturally-neutral slime; edible
+///   tiered      — hazardous slime at difficulty `Tier`.  INEDIBLE: the feast
+///                 will not eat it and cannot pass through it.  A cast
+///                 downgrades it one tier (red -> yellow -> green -> defused),
+///                 which is the only way to open the path it blocks.
+///   neutralized — defused: a `tiered` cell downgraded past green.  Edible and
+///                 scores like neutral, but kept distinct so the render can
+///                 show the team earned it.
+///   special     — an objective placeholder.  PERMANENT: no cast affects it,
+///                 the feast never eats it, and it blocks the path like a live
+///                 hazard.  Objective behaviour will be built on top of this
+///                 cell later; until then it is terrain.
+///
+/// The edible/blocking split is the heart of the game: see `is_edible` and
+/// `blocks_feast`, which `slime.eat_all` flood-fills over.
 ///
 /// Wire encoding (one byte, see protocol.zig):
-///   0x00 = empty, 0x01 = neutral, 0x02 = neutralized, 0x10|t = tiered.
+///   0x00 = empty, 0x01 = neutral, 0x02 = neutralized, 0x03 = special,
+///   0x10|t = tiered.
 pub const SlimeCell = union(enum) {
     empty,
     neutral,
     neutralized,
+    special,
     tiered: Tier,
 
-    /// True if this cell holds a slime unit — anything the feast will eat.
+    /// True if this cell holds a slime unit of any kind — anything that
+    /// occupies space and must fall when the column collapses.
     pub fn is_slime(self: SlimeCell) bool {
         return self != .empty;
     }
 
+    /// True if the turn-end feast will eat this unit once it can reach it.
+    /// Defused slime counts: taking a hazard to `neutralized` is precisely
+    /// what turns it into food.
+    pub fn is_edible(self: SlimeCell) bool {
+        return self == .neutral or self == .neutralized;
+    }
+
+    /// True if this cell stops the feast advancing through it — a live hazard
+    /// or a special.  Everything else (empty, edible) conducts the path, since
+    /// an edible cell is eaten and therefore opens.
+    pub fn blocks_feast(self: SlimeCell) bool {
+        return self == .tiered or self == .special;
+    }
+
     /// True if this cell still needs neutralizing — the only kind a cast
-    /// affects, and the only kind that costs extra hunger when eaten.
+    /// affects.  Specials are NOT hazards: nothing can change them.
     pub fn is_hazard(self: SlimeCell) bool {
         return self == .tiered;
     }
@@ -279,19 +316,39 @@ pub const SlimeGrid = struct {
         }
         return n;
     }
+
+    /// Count of `special` cells — objective placeholders, which no play can
+    /// remove.
+    pub fn special_count(self: *const SlimeGrid) u16 {
+        var n: u16 = 0;
+        for (self.live()) |cell| {
+            if (cell == .special) n += 1;
+        }
+        return n;
+    }
+
+    /// Occupied cells that are not specials: the slime still genuinely in play.
+    /// Zero here (with an equally special-only reservoir) is the win.
+    pub fn non_special_count(self: *const SlimeGrid) u16 {
+        return self.occupied() - self.special_count();
+    }
 };
 
 /// Off-grid slime waiting to enter the grid from the top.
 ///
 /// The reservoir only ever holds slime in its ORIGINAL state — neutralizing
 /// happens on the grid, so no `neutralized` bucket exists here.  `tiered[t]`
-/// is indexed by Tier ordinal.
+/// is indexed by Tier ordinal.  Specials enter from here too, so an encounter
+/// can hold its objectives back rather than opening with all of them.
 pub const SlimeReservoir = struct {
     tiered: [Tier.size]u16 = [_]u16{0} ** Tier.size,
     neutral: u16 = 0,
+    /// Objective placeholders waiting to enter (see SlimeCell.special).
+    special: u16 = 0,
 
     pub fn total(self: SlimeReservoir) u32 {
         var n: u32 = self.neutral;
+        n += self.special;
         for (self.tiered) |m| n += m;
         return n;
     }
@@ -299,27 +356,15 @@ pub const SlimeReservoir = struct {
     pub fn is_empty(self: SlimeReservoir) bool {
         return self.total() == 0;
     }
-};
 
-/// Medicine produced by one batch of combos, per tier.  Tier-T medicine heals
-/// only the healable hunger caused by eating un-neutralized tier-T slime
-/// (symmetrical healing); medicine for a tier nobody ate is wasted.
-///
-/// Neutralizing is NOT counted here: a cast's effect is a shape stamped on the
-/// grid, not a pool of units (see balance.Shape / slime.apply_shape).
-pub const MedicineOutput = struct {
-    medicine: [Tier.size]u32 = [_]u32{0} ** Tier.size,
-
-    pub fn add(self: *MedicineOutput, other: MedicineOutput) void {
-        for (&self.medicine, other.medicine) |*m, o| m.* +|= o;
-    }
-
-    pub fn total(self: MedicineOutput) u32 {
-        var n: u32 = 0;
-        for (self.medicine) |m| n +|= m;
-        return n;
+    /// Units here that are NOT specials.  The win condition asks whether
+    /// anything but objectives is left in play, and the reservoir half of that
+    /// question is this.
+    pub fn non_special(self: SlimeReservoir) u32 {
+        return self.total() - self.special;
     }
 };
+
 
 /// Animation to play on an entity, signalled by the server via action_result
 /// and forwarded to the browser in the render JSON.  Extend by adding variants.
@@ -405,24 +450,47 @@ test "SlimeCell.is_slime is false only for empty" {
     try testing.expect(!empty.is_slime());
     const neutral: SlimeCell = .neutral;
     const neutralized: SlimeCell = .neutralized;
+    const special: SlimeCell = .special;
     try testing.expect(neutral.is_slime());
     try testing.expect((SlimeCell{ .tiered = .red }).is_slime());
     try testing.expect(neutralized.is_slime());
+    // A special occupies its cell like any other unit — it falls, and it is
+    // never "nothing".
+    try testing.expect(special.is_slime());
 }
 
 test "SlimeCell.is_hazard is true only for a live tiered cell" {
-    // Only hazards are worth casting at, and only hazards cost extra hunger.
+    // Only hazards are worth casting at.  A special looks immovable in the same
+    // way a red does, but no cast can ever touch it, so it is NOT a hazard.
     try testing.expect((SlimeCell{ .tiered = .red }).is_hazard());
     try testing.expect((SlimeCell{ .tiered = .green }).is_hazard());
     const neutralized: SlimeCell = .neutralized;
     const neutral: SlimeCell = .neutral;
     const empty: SlimeCell = .empty;
+    const special: SlimeCell = .special;
     try testing.expect(!neutralized.is_hazard());
     try testing.expect(!neutral.is_hazard());
     try testing.expect(!empty.is_hazard());
+    try testing.expect(!special.is_hazard());
 }
 
-test "SlimeReservoir totals across tiers and neutral" {
+test "edible and blocking are exact opposites over the occupied cells" {
+    // The feast's whole rulebook: an occupied cell either feeds it or stops it,
+    // never both and never neither.  Empty conducts without feeding.
+    const cases = [_]SlimeCell{
+        .neutral,                 .neutralized,
+        .special,                 .{ .tiered = .red },
+        .{ .tiered = .yellow },   .{ .tiered = .green },
+    };
+    for (cases) |cell| {
+        try testing.expect(cell.is_edible() != cell.blocks_feast());
+    }
+    const empty: SlimeCell = .empty;
+    try testing.expect(!empty.is_edible());
+    try testing.expect(!empty.blocks_feast());
+}
+
+test "SlimeReservoir totals across tiers, neutral and specials" {
     var res = SlimeReservoir{};
     try testing.expect(res.is_empty());
     try testing.expectEqual(@as(u32, 0), res.total());
@@ -432,18 +500,20 @@ test "SlimeReservoir totals across tiers and neutral" {
     res.tiered[@intFromEnum(Tier.green)] = 3;
     try testing.expect(!res.is_empty());
     try testing.expectEqual(@as(u32, 10), res.total());
+    try testing.expectEqual(@as(u32, 10), res.non_special());
+
+    // Specials count toward the total (they still have to enter the grid) but
+    // are excluded from `non_special`, which is what the win check reads.
+    res.special = 4;
+    try testing.expectEqual(@as(u32, 14), res.total());
+    try testing.expectEqual(@as(u32, 10), res.non_special());
 }
 
-test "MedicineOutput sums per tier and saturates" {
-    var a = MedicineOutput{};
-    a.medicine[@intFromEnum(Tier.red)] = 4;
-    var b = MedicineOutput{};
-    b.medicine[@intFromEnum(Tier.red)] = 6;
-    b.medicine[@intFromEnum(Tier.green)] = 1;
-    a.add(b);
-    try testing.expectEqual(@as(u32, 10), a.medicine[@intFromEnum(Tier.red)]);
-    try testing.expectEqual(@as(u32, 1), a.medicine[@intFromEnum(Tier.green)]);
-    try testing.expectEqual(@as(u32, 11), a.total());
+test "a reservoir of nothing but specials is not empty, but has no real slime" {
+    // The win condition: nothing left in play except objectives.
+    var res = SlimeReservoir{ .special = 3 };
+    try testing.expect(!res.is_empty());
+    try testing.expectEqual(@as(u32, 0), res.non_special());
 }
 
 test "grid capacity bounds agree" {

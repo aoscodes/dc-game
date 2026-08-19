@@ -49,7 +49,7 @@ pub fn shape(comptime rows: []const []const u8) balance.Shape {
 }
 
 const D = c.ComboSlot{ .action = .dispense };
-const M = c.ComboSlot{ .action = .medicine };
+const M = c.ComboSlot{ .action = .catalyst };
 
 pub const player_recipes = [_]balance.PlayerRecipe{
     // The bread-and-butter aim: one cell, one tier.
@@ -82,24 +82,25 @@ pub const player_recipes = [_]balance.PlayerRecipe{
         .pattern = mk(&.{ D, D, M }),
         .shape = shape(&.{ "###", ".#." }),
     },
-    // Pure heal: minimal footprint, real medicine.
+    // The free move: no charges at all, so tests can act with a bankrupt pool
+    // and the economy has a floor a team can never fall through.
     .{
-        .label = "tonic",
+        .label = "trickle",
         .pattern = mk(&.{ M, M }),
         .shape = shape(&.{"#"}),
-        .medicine = .{ .medicine = .{ 6, 6, 6 } },
+        .cost = 0,
     },
-    // Tier-targeted medicine: only heals what red slime did.
+    // Deliberately expensive: exercises "the pool cannot afford this".
     .{
-        .label = "red_tonic",
+        .label = "deluge",
         .pattern = mk(&.{ M, M, M }),
-        .shape = shape(&.{"#"}),
-        .medicine = .{ .medicine = .{ 10, 0, 0 } },
+        .shape = shape(&.{ "###", "###", "###" }),
+        .cost = 9,
     },
 };
 
 pub const team_recipes = [_]balance.TeamRecipe{
-    // Two players each cast [dispense, medicine]; together they clear a plus
+    // Two players each cast [dispense, catalyst]; together they clear a plus
     // far bigger than either could alone.
     .{
         .label = "twin_bloom",
@@ -108,7 +109,7 @@ pub const team_recipes = [_]balance.TeamRecipe{
             mk(&.{ D, M }),
         },
         .shape = shape(&.{ "..#..", ".###.", "#####", ".###.", "..#.." }),
-        .medicine = .{ .medicine = .{ 4, 4, 4 } },
+        .cost = 4,
     },
     // Asymmetric: one player brings the line, the other the column.
     .{
@@ -121,24 +122,27 @@ pub const team_recipes = [_]balance.TeamRecipe{
     },
 };
 
-/// Default fixture encounter.  Totals: 110 units (30 neutral + 80 hazard).
-/// Every unit costs 1 normal hunger → 110; the 80 hazards add 2 extra each
-/// → 270 if nothing is ever neutralized (a loss against hunger_max 200).
-/// Defusing everything keeps it at 110, a comfortable clear.  The 6×10
-/// fixture grid holds 60, so 50 units always start in the reservoir.
+/// Default fixture encounter.  Totals: 112 units — 30 neutral, 80 hazard and 2
+/// specials.  Every unit eaten costs 1 hunger against a 200 bar, so hunger is
+/// deliberately NOT the binding constraint here: the fixture exists to exercise
+/// the path and the charge economy.  The 6×10 fixture grid holds 60, so 52
+/// units always start in the reservoir, and the 2 specials guarantee tests meet
+/// a cell nothing can remove.
 pub const encounters = [_]enc.Encounter{
     .{
         .label = "slime_feast_01",
         .hunger_max = 200,
-        .slime = .{ .tiered = .{ 35, 25, 20 }, .neutral = 30 },
+        // Enough charges to matter but not enough to ignore: 40 charges against
+        // 80 hazards means the team cannot simply defuse everything.
+        .charges = 40,
+        .slime = .{ .tiered = .{ 35, 25, 20 }, .neutral = 30, .special = 2 },
     },
 };
 
 pub const test_config = config.Config{
     .balance = .{
         .hunger_cost_normal = 1,
-        .hunger_cost_hazard_extra = 2,
-        // 6×10 = 60 on-grid cells; the fixture encounter's 110 units mean the
+        // 6×10 = 60 on-grid cells; the fixture encounter's 112 units mean the
         // reservoir always starts non-empty (exercises refill paths).
         .slime_grid = .{ .rows = 6, .cols = 10 },
         // 3 casts per player per turn: enough for a team recipe plus a solo

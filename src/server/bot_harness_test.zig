@@ -221,21 +221,25 @@ fn tier_total(values: [c.Tier.size]u16) u32 {
 // ---------------------------------------------------------------------------
 
 /// Green-only field, exactly the size of the 6x10 fixture grid, so every unit
-/// is on-grid (in cursor reach) from the first tick.  Green is one downgrade
-/// from defused, so a single stamp per cell suffices.
+/// is on-grid (in cursor reach) from the first tick and NOTHING is edible: the
+/// whole board is one live wall until a cast opens it.  Green is one downgrade
+/// from defused, so a single stamp per cell suffices.  Charges are generous
+/// because this encounter is about whether bots make progress at all, not about
+/// rationing.
 const enc_green_field = enc.Encounter{
     .label = "bot_green_field",
     .hunger_max = 1000,
+    .charges = 500,
     .slime = .{ .tiered = .{ 0, 0, 60 } },
 };
 
-/// Exactly fills the 6x10 fixture grid, so every stamp is guaranteed to land on
-/// slime (a sparse field would make a coverage comparison a coin flip).  The
-/// hunger budget is roomy on purpose: this encounter is for comparing the PRICE
-/// two teams pay for the same field, not for deciding a win.
+/// The same solid green wall, used to contrast a team that casts with one that
+/// does not.  The hunger budget is roomy on purpose: this encounter is about
+/// what the two teams can REACH, not about who fills the bar first.
 const enc_survival = enc.Encounter{
     .label = "bot_survival",
     .hunger_max = 1000,
+    .charges = 500,
     .slime = .{ .tiered = .{ 0, 0, 60 } },
 };
 
@@ -243,30 +247,39 @@ const enc_survival = enc.Encounter{
 // Tests
 // ---------------------------------------------------------------------------
 
-test "sweeping bots make progress against a full hazard field" {
+test "sweeping bots eat their way into a field that starts completely walled" {
     const allocator = std.testing.allocator;
     var h = try BotHarness.init(allocator, &bots.team_mixed, &enc_green_field, "BOTKEY".*, .{});
     defer h.deinit();
 
     _ = try h.run_to_completion(400);
 
-    try std.testing.expectEqual(session_mod.SessionPhase.lobby, h.session.phase);
-    try std.testing.expectEqual(@as(u32, 60), h.session.stats.slime_total);
-
-    // Every unit was either scored (defused before its bite) or escaped as a
-    // live hazard; nothing else can consume a unit.
-    const escaped = tier_total(h.session.stats.feast.hazard_escaped);
-    try std.testing.expectEqual(@as(u32, 60), h.session.score + escaped);
-    // Stamps landed on real hazards, so defusals happened.
-    try std.testing.expect(h.session.score > 0);
+    // `stats.slime_total` is only finalised by end_game, and a walled field may
+    // well outlast the run, so the live counter is what this asserts against.
+    try std.testing.expectEqual(@as(u32, 60), h.session.slime_total);
+    // A unit is EITHER eaten (and therefore scored, 1 point each) or still
+    // sitting somewhere.  Nothing else can consume one, so this holds at any
+    // point in the run — including a run that never finished.
+    try std.testing.expectEqual(
+        @as(u32, 60),
+        h.session.score + h.session.field.remaining(),
+    );
+    // The board opened: stamps defused cells and the flood got in behind them.
     try std.testing.expect(tier_total(h.session.stats.feast.cells_covered) > 0);
+    try std.testing.expect(h.session.score > 0);
+    // Charges are spent, never conjured.
+    try std.testing.expect(h.session.charges <= enc_green_field.charges);
+    try std.testing.expectEqual(
+        enc_green_field.charges - h.session.charges,
+        @as(u32, h.session.stats.feast.charges_spent),
+    );
 }
 
-test "defusing before the feast is cheaper than letting the field be eaten live" {
-    // The whole field is devoured at the end of every turn no matter what, so a
-    // cast can never save a unit from being eaten — only change what eating it
-    // COSTS.  This pins that: same field, same seed, one team stamping and one
-    // not.
+test "a live wall feeds nobody: only casting turns slime into score" {
+    // The central change from the old design: a hazard is no longer eaten at a
+    // premium, it is not eaten AT ALL.  A team that never casts therefore makes
+    // literally zero progress, however many turns pass.  Same field, same seed,
+    // one team stamping and one not.
     const allocator = std.testing.allocator;
 
     // Idle side: a joined player who never casts would stall the turn forever,
@@ -285,47 +298,51 @@ test "defusing before the feast is cheaper than letting the field be eaten live"
         idle_sess.casts_left = [_]u8{0} ** session_mod.MAX_PLAYERS;
         try idle_sess.tick(0.0);
     }
-    try std.testing.expectEqual(session_mod.SessionPhase.lobby, idle_sess.phase);
-    // Every unit was eaten as a live hazard: full price, and nothing scored.
-    try std.testing.expectEqual(proto.EndReason.field_cleared, idle_sess.stats.reason);
+    // 200 turns of nothing.  The wall never opens, so the encounter cannot end:
+    // no hunger to fill the bar, no slime eaten to clear the field, and a full
+    // charge pool so it is not a dead position either.  A stalemate is the
+    // honest outcome of refusing to play.
+    try std.testing.expectEqual(session_mod.SessionPhase.playing, idle_sess.phase);
     try std.testing.expectEqual(@as(u32, 0), idle_sess.score);
-    try std.testing.expectEqual(
-        @as(u16, @intCast(60 * (BAL.hunger_cost_normal + BAL.hunger_cost_hazard_extra))),
-        idle_sess.hunger.current,
-    );
+    try std.testing.expectEqual(@as(u16, 0), idle_sess.hunger.current);
+    try std.testing.expectEqual(enc_survival.charges, idle_sess.charges);
+    try std.testing.expectEqual(@as(u32, 60), idle_sess.field.remaining());
 
-    // Active side: the same field, but stamped before the feast prices it.
+    // Active side: the same field, but cast at.
     var h = try BotHarness.init(allocator, &bots.team_mixed, &enc_survival, "BOTK02".*, .{});
     defer h.deinit();
     _ = try h.run_to_completion(200);
 
-    try std.testing.expectEqual(session_mod.SessionPhase.lobby, h.session.phase);
-    try std.testing.expectEqual(proto.EndReason.field_cleared, h.session.stats.reason);
-    // Same 60 units eaten either way, but the defused ones cost less and score.
-    try std.testing.expect(h.session.hunger.current < idle_sess.hunger.current);
-    try std.testing.expect(h.session.score > idle_sess.score);
+    try std.testing.expect(h.session.score > 0);
+    try std.testing.expect(h.session.hunger.current > 0);
+    try std.testing.expect(h.session.charges < enc_survival.charges);
     try std.testing.expect(tier_total(h.session.stats.feast.cells_covered) > 0);
-    // Defusing is exactly the extra hunger avoided: 2 per cell neutralised.
-    const neutralised = tier_total(h.session.stats.feast.neutralized);
+    // Hunger is now exactly one point per unit eaten — no hazard surcharge, and
+    // score counts the same units, so the two readings must agree.
     try std.testing.expectEqual(
-        idle_sess.hunger.current - @as(u16, @intCast(neutralised * BAL.hunger_cost_hazard_extra)),
-        h.session.hunger.current,
+        @as(u32, h.session.hunger.current) * BAL.hunger_cost_normal,
+        h.session.score,
     );
 }
 
-test "mixed team finishes the default encounter with a positive score" {
+test "mixed team makes real progress on the default encounter" {
     const allocator = std.testing.allocator;
     var h = try BotHarness.init(allocator, &bots.team_mixed, DEFAULT_ENC, "BOTKEY".*, .{});
     defer h.deinit();
 
     _ = try h.run_to_completion(400);
 
-    try std.testing.expectEqual(session_mod.SessionPhase.lobby, h.session.phase);
-    try std.testing.expectEqual(DEFAULT_ENC.total_units(), h.session.stats.slime_total);
-    // The reservoir feeds the grid, so the horde always reaches neutral slime.
+    try std.testing.expectEqual(DEFAULT_ENC.total_units(), h.session.slime_total);
+    // The encounter's 30 neutral units are edible from the start, so the flood
+    // always finds something even before a single cast lands.
     try std.testing.expect(h.session.score > 0);
     // Casts landed: the tuning report saw them.
     try std.testing.expect(h.session.stats.casts_total > 0);
+    // Conservation holds mid-run as well as at the end.
+    try std.testing.expectEqual(
+        DEFAULT_ENC.total_units(),
+        h.session.score + h.session.field.remaining(),
+    );
 }
 
 test "profile cycles correctly across cast cycles" {
@@ -396,9 +413,9 @@ test "aim injection walks the cursor and anchors casts where the bot aimed" {
     try h.inject_aim();
     try h.session.tick(0.0);
     const moved = h.session.cursors[pid];
-    // Three right steps, same row.
+    // Three LEFT steps, same row: the sweeper heads for the feeding edge.
     try std.testing.expectEqual(grid.row_of(start), grid.row_of(moved));
-    try std.testing.expectEqual(@as(u8, 8), grid.col_of(moved));
+    try std.testing.expectEqual(@as(u8, 2), grid.col_of(moved));
 
     // Aiming past the edge parks against it rather than wrapping.
     for (0..3) |_| {
@@ -406,7 +423,7 @@ test "aim injection walks the cursor and anchors casts where the bot aimed" {
         try h.session.tick(0.0);
     }
     const parked = h.session.cursors[pid];
-    try std.testing.expectEqual(grid.cols - 1, grid.col_of(parked));
+    try std.testing.expectEqual(@as(u8, 0), grid.col_of(parked));
     try std.testing.expectEqual(grid.row_of(start), grid.row_of(parked));
 }
 

@@ -18,14 +18,17 @@
 //!   - shape stamping: a matched recipe's footprint downgrades every covered
 //!     hazard cell by exactly one tier (red→yellow→green→defused); cells off
 //!     the grid edge are clipped, non-hazard cells are inert
-//!   - turn end: the whole field eaten in one feast, held halves fizzling, the
-//!     grid refilled from the reservoir and budgets reset
-//!   - hunger accounting: normal (unhealable) vs extra (healable) portions
-//!   - symmetrical medicine: tier-X medicine heals only tier-X healable
-//!     hunger; asymmetric medicine and overheal are discarded
-//!   - score = neutral + defused units eaten
-//!   - end conditions: field cleared / hunger bar full, checked at turn end
-//!   - wire contents: grid, reservoir, turn, cursors, cast budgets
+//!   - turn end: the PATHED feast (flood from the left edge, live hazards and
+//!     specials as walls), gravity collapse, refill, held halves fizzling and
+//!     budgets reset — in that order
+//!   - the shared charge pool: one per game, never refilled, per-recipe cost,
+//!     team recipes charged once for the group, and the fizzle-but-spend rule
+//!     when the pool cannot pay
+//!   - hunger accounting: a flat cost per unit EATEN, and nothing else
+//!   - score = units eaten (all of which are neutral or defused)
+//!   - end conditions: field cleared / hunger bar full / dead position with an
+//!     empty pool, all checked at turn end
+//!   - wire contents: grid, reservoir, turn, cursors, cast budgets, charges
 
 const std = @import("std");
 const shared = @import("shared");
@@ -58,8 +61,8 @@ const GREEN: usize = @intFromEnum(c.Tier.green);
 const POKE = mk(&.{D}); // "#"
 const SWEEP = mk(&.{ D, D }); // "###"
 const BLOCK = mk(&.{ D, D, D }); // 3x3
-const TONIC = mk(&.{ M, M }); // "#" + medicine 6/6/6
-const RED_TONIC = mk(&.{ M, M, M }); // "#" + medicine 10/0/0
+const TRICKLE = mk(&.{ M, M }); // "#", costs 0 charges — the free move
+const DELUGE = mk(&.{ M, M, M }); // 3x3, costs 9 charges — the expensive move
 const BLOOM_HALF = mk(&.{ D, M }); // half of team twin_bloom (5x5 diamond)
 const CROSSFIRE_A = mk(&.{ M, D });
 const CROSSFIRE_B = mk(&.{ M, D, D });
@@ -68,7 +71,7 @@ const CROSSFIRE_B = mk(&.{ M, D, D });
 const UNMATCHED = mk(&.{ D, D, D, D, D });
 
 const D = c.ComboSlot{ .action = .dispense };
-const M = c.ComboSlot{ .action = .medicine };
+const M = c.ComboSlot{ .action = .catalyst };
 
 /// A live hazard cell of the given tier — the thing casts downgrade.
 fn tiered(tier: c.Tier) c.SlimeCell {
@@ -113,7 +116,9 @@ const enc_mixed = enc.Encounter{
     .slime = .{ .tiered = .{ 10, 0, 8 }, .neutral = 7 },
 };
 
-/// Tiny hunger budget, and exactly as many units as one `block` stamp covers
+/// Tiny hunger budget of EDIBLE units, so one feast overfills the bar.  Live
+/// hazards would be walls and cost nothing, so this has to be neutral slime.
+/// Retained shape: exactly as many units as one `block` stamp covers
 /// (3x3 = 9).  Eating them live costs 3 each, so the bar fills on the 8th unit
 /// — BEFORE the field empties, which is what makes the loss unambiguous (a
 /// simultaneous clear would win the tie).  Defusing them first costs 9 total,
@@ -121,11 +126,19 @@ const enc_mixed = enc.Encounter{
 const enc_tight_budget = enc.Encounter{
     .label = "test_tight_budget",
     .hunger_max = 20,
-    .slime = .{ .tiered = .{ 0, 0, 9 } },
+    .slime = .{ .neutral = 9 },
 };
 
-/// Neutral-only: hunger from these units is never healable, and every unit
-/// scores.
+/// A bar so small that one modest feast overfills it — the shortest path to a
+/// clean `hunger_full` loss with slime still on the board.
+const enc_paper_stomach = enc.Encounter{
+    .label = "test_paper_stomach",
+    .hunger_max = 5,
+    .slime = .{ .neutral = 9 },
+};
+
+/// Neutral-only: nothing walls the flood off, so the whole field is reachable
+/// from the first turn and every unit scores.
 const enc_neutral_only = enc.Encounter{
     .label = "test_neutral_only",
     .hunger_max = 1000,
@@ -292,13 +305,6 @@ fn end_turn_idly(sess: *Session) !void {
 fn end_turn_mid_game(sess: *Session) !void {
     if (sess.field.reservoir.is_empty()) sess.field.reservoir = .{ .neutral = 1 };
     try end_turn_idly(sess);
-}
-
-/// Sum of all per-tier healable hunger buckets.
-fn total_healable(sess: *const Session) u32 {
-    var t: u32 = 0;
-    for (sess.hunger_healable) |h| t += h;
-    return t;
 }
 
 /// Casts each player gets per turn under the fixture balance.
@@ -624,7 +630,7 @@ test "submitting clears the live preview" {
     defer s.deinit();
     try start(&s, &enc_fifty_green);
 
-    const combo = BLOOM_HALF; // [dispense, medicine] — two distinguishable slots
+    const combo = BLOOM_HALF; // [dispense, catalyst] — two distinguishable slots
     try enqueue_combo(&s.sess, s.p[0].pid, combo);
     try flush(&s.sess);
     try enqueue_submit(&s.sess, s.p[0].pid, combo);
@@ -1167,21 +1173,31 @@ test "a held half keeps its anchor when the caster re-aims before the partner" {
 }
 
 // ---------------------------------------------------------------------------
-// Turn end (the feast)
+// Turn end: the pathed feast, gravity, and the refill
 //
-// At turn end the WHOLE field is devoured at once: normal hunger per unit, plus
-// healable extra per unit still hazardous, and score for neutral + defused
-// units.  Then the grid refills from the reservoir.  Nothing here depends on
-// elapsed time — `end_turn_idly` settles the turn by exhausting budgets.
+// The Lil Guys enter from the LEFT edge (column 0) and flood 4-connected
+// through empty cells and edible slime (neutral / defused).  Live hazards and
+// specials are WALLS: the flood never enters one, so everything behind it is
+// sheltered.  Survivors then fall to the bottom of their column, and only then
+// does the reservoir refill the rows that opened up at the top.
+//
+// Nothing here depends on elapsed time — `end_turn_idly` settles the turn by
+// exhausting budgets.
 // ---------------------------------------------------------------------------
 
-test "the feast eats the entire field in one go and refills it" {
+test "an edible field is eaten whole and refilled from the reservoir" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_overflow); // 80 units: 60 on-grid, 20 waiting
+    // 80 NEUTRAL units: nothing blocks, so the flood reaches the whole grid.
+    const enc_all_neutral = enc.Encounter{
+        .label = "test_all_neutral",
+        .hunger_max = 1000,
+        .slime = .{ .neutral = 80 },
+    };
+    try start(&s, &enc_all_neutral); // 60 on-grid, 20 waiting
 
     try end_turn_idly(&s.sess);
 
@@ -1198,7 +1214,11 @@ test "refills enter from the top row" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_overflow);
+    try start(&s, &enc_neutral_only); // 40 neutral, all edible
+    // Clear the board so the refill has the whole grid to itself and the test
+    // is not reading survivors the collapse moved.
+    paint_grid(&s.sess, .empty);
+    s.sess.field.reservoir = .{ .neutral = 20 };
 
     try end_turn_idly(&s.sess);
 
@@ -1212,7 +1232,7 @@ test "refills enter from the top row" {
     }
 }
 
-test "eating live hazard slime adds healable extra hunger; defused does not" {
+test "a live hazard is a wall, not a meal: the flood never touches it" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -1220,56 +1240,66 @@ test "eating live hazard slime adds healable extra hunger; defused does not" {
     defer s.deinit();
     try start(&s, &enc_twenty_green);
 
-    // A field of live green: every unit costs normal + extra and scores nothing.
+    // A field of live green: not one unit is edible, so the feast is empty.
     set_field(&s.sess, tiered(.green), 20);
     try end_turn_mid_game(&s.sess);
 
-    const expected = 20 * (BAL.hunger_cost_normal + BAL.hunger_cost_hazard_extra);
-    try std.testing.expectEqual(@as(u16, @intCast(expected)), s.sess.hunger.current);
-    // Healable hunger is bucketed by the TIER that caused it, so only green
-    // medicine can undo this.
-    try std.testing.expectEqual(
-        @as(u16, @intCast(20 * BAL.hunger_cost_hazard_extra)),
-        s.sess.hunger_healable[GREEN],
-    );
-    try std.testing.expectEqual(@as(u16, 0), s.sess.hunger_healable[RED]);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.hunger.current);
     try std.testing.expectEqual(@as(u32, 0), s.sess.score);
-    try std.testing.expectEqual(@as(u16, 20), s.sess.stats.feast.hazard_escaped[GREEN]);
+    // All 20 are still there, and none of them counted as sheltered food:
+    // a wall is not something the team was denied, it is the obstacle itself.
+    try std.testing.expectEqual(@as(u16, 20), s.sess.field.grid.hazard_count());
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.feast.sheltered);
 
-    // A field of defused slime: normal hunger only, and every unit scores.
+    // Defuse the same field and it becomes 20 units of dinner.
     set_field(&s.sess, .neutralized, 20);
-    const hunger_before = s.sess.hunger.current;
-    const healable_before = s.sess.hunger_healable[GREEN];
     try end_turn_mid_game(&s.sess);
 
     try std.testing.expectEqual(
-        hunger_before + @as(u16, @intCast(20 * BAL.hunger_cost_normal)),
+        @as(u16, @intCast(20 * BAL.hunger_cost_normal)),
         s.sess.hunger.current,
     );
-    try std.testing.expectEqual(healable_before, s.sess.hunger_healable[GREEN]);
     try std.testing.expectEqual(@as(u32, 20), s.sess.score);
+    try std.testing.expectEqual(@as(u16, 20), s.sess.stats.feast.defused_consumed);
 }
 
-test "healable hunger is bucketed by the tier that was eaten" {
+test "food behind a wall is sheltered, and one defusal opens the whole road" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_twenty_red);
+    try start(&s, &enc_twenty_green);
 
-    // Red slime fills the red bucket; green slime fills the green one.  They
-    // never mix, which is what makes tier-targeted medicine meaningful.
-    set_field(&s.sess, tiered(.red), 10);
-    try end_turn_mid_game(&s.sess);
-    try std.testing.expect(s.sess.hunger_healable[RED] > 0);
-    try std.testing.expectEqual(@as(u16, 0), s.sess.hunger_healable[GREEN]);
+    // Column 0 is a solid green wall; columns 1..9 are neutral food.  The door
+    // is shut, so a whole grid of dinner goes untouched.
+    //
+    //   col:  0  1  2 ... 9
+    //         G  n  n ... n     (every row)
+    paint_grid(&s.sess, .neutral);
+    s.sess.field.reservoir = .{};
+    const grid = &s.sess.field.grid;
+    var row: u8 = 0;
+    while (row < grid.rows) : (row += 1) grid.set(row, 0, tiered(.green));
 
-    const red_before = s.sess.hunger_healable[RED];
-    set_field(&s.sess, tiered(.green), 10);
-    try end_turn_mid_game(&s.sess);
-    try std.testing.expectEqual(red_before, s.sess.hunger_healable[RED]);
-    try std.testing.expect(s.sess.hunger_healable[GREEN] > 0);
+    try end_turn_idly(&s.sess);
+    try std.testing.expectEqual(@as(u32, 0), s.sess.score);
+    // 54 neutral units the team could see and not reach, behind 6 walls.
+    try std.testing.expectEqual(@as(u16, 54), s.sess.stats.feast.sheltered);
+    try std.testing.expectEqual(@as(u16, 6), s.sess.field.grid.hazard_count());
+
+    // Now knock ONE hole in the wall.  4-connectivity means a single doorway
+    // is enough: the flood goes in and takes everything.
+    paint_grid(&s.sess, .neutral);
+    row = 0;
+    while (row < grid.rows) : (row += 1) grid.set(row, 0, tiered(.green));
+    grid.set(3, 0, .neutralized);
+
+    try end_turn_idly(&s.sess);
+    // The doorway cell plus all 54 behind it: 55 units, from zero last turn.
+    try std.testing.expectEqual(@as(u32, 55), s.sess.score);
+    // And not one unit was shut out this time.
+    try std.testing.expectEqual(@as(u16, 54), s.sess.stats.feast.sheltered);
 }
 
 test "one feast can mix every cell kind, pricing each on its own terms" {
@@ -1280,42 +1310,67 @@ test "one feast can mix every cell kind, pricing each on its own terms" {
     defer s.deinit();
     try start(&s, &enc_twenty_red);
 
-    // 2 neutral, 2 defused, 2 red, 2 green — and empty cells in between, which
-    // must cost nothing at all.
+    // Row 0 of the 6x10 grid, left to right:
+    //   n  n  .  .  .  x  x  .  .  .      (n neutral, x defused, . empty)
+    // and a neutral unit sealed into the bottom-right corner by two hazards:
+    //   (4,9) red above it, (5,8) green beside it, grid edges on the other two
+    //   sides.  A pocket needs a full seal — an open cell anywhere on its
+    //   border lets the flood in, since empty space conducts.
     paint_grid(&s.sess, .empty);
     s.sess.field.reservoir = .{};
     const grid = &s.sess.field.grid;
-    grid.put(0, .neutral);
-    grid.put(1, .neutral);
-    grid.put(5, .neutralized);
-    grid.put(6, .neutralized);
-    grid.put(20, tiered(.red));
-    grid.put(21, tiered(.red));
-    grid.put(40, tiered(.green));
-    grid.put(41, tiered(.green));
+    grid.set(0, 0, .neutral);
+    grid.set(0, 1, .neutral);
+    grid.set(0, 5, .neutralized);
+    grid.set(0, 6, .neutralized);
+    grid.set(4, 9, tiered(.red));
+    grid.set(5, 8, tiered(.green));
+    grid.set(5, 9, .neutral);
 
     try end_turn_idly(&s.sess);
 
-    // 8 units eaten at normal cost, plus extra for the 4 live hazards.
-    const expected = 8 * BAL.hunger_cost_normal + 4 * BAL.hunger_cost_hazard_extra;
-    try std.testing.expectEqual(@as(u16, @intCast(expected)), s.sess.hunger.current);
-    // Score: the 2 neutral + the 2 defused.
+    // Eaten: 2 neutral + 2 defused.  The hazards are walls, and the corner
+    // neutral has no route to the left edge at all.
+    try std.testing.expectEqual(
+        @as(u16, @intCast(4 * BAL.hunger_cost_normal)),
+        s.sess.hunger.current,
+    );
     try std.testing.expectEqual(@as(u32, 4), s.sess.score);
-    // Extra hunger is split by tier, never pooled.
-    try std.testing.expectEqual(
-        @as(u16, @intCast(2 * BAL.hunger_cost_hazard_extra)),
-        s.sess.hunger_healable[RED],
-    );
-    try std.testing.expectEqual(
-        @as(u16, @intCast(2 * BAL.hunger_cost_hazard_extra)),
-        s.sess.hunger_healable[GREEN],
-    );
-    try std.testing.expectEqual(@as(u16, 2), s.sess.stats.feast.hazard_escaped[RED]);
-    try std.testing.expectEqual(@as(u16, 2), s.sess.stats.feast.hazard_escaped[GREEN]);
-    try std.testing.expect(s.sess.field.is_exhausted());
+    try std.testing.expectEqual(@as(u16, 2), s.sess.stats.feast.neutral_consumed);
+    try std.testing.expectEqual(@as(u16, 2), s.sess.stats.feast.defused_consumed);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.feast.sheltered);
+    // Both hazards survive, so the field is not exhausted.
+    try std.testing.expectEqual(@as(u16, 2), s.sess.field.grid.hazard_count());
+    try std.testing.expect(!s.sess.field.is_exhausted());
 }
 
-test "neutral slime scores but is never healable" {
+test "survivors fall to the bottom of their column after the feast" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_twenty_green);
+
+    // Column 3, top to bottom: neutral, green, empty, empty, empty, empty.
+    // The neutral is edible but unreachable (column 0 is empty corridor, so the
+    // flood arrives along row 0 and eats it) — check the green's fall instead.
+    paint_grid(&s.sess, .empty);
+    s.sess.field.reservoir = .{};
+    const grid = &s.sess.field.grid;
+    grid.set(1, 3, tiered(.green));
+    grid.set(2, 3, tiered(.red));
+
+    try end_turn_idly(&s.sess);
+
+    // Both hazards packed against the bottom, in the order they were stacked.
+    try std.testing.expectEqual(c.SlimeCell.empty, grid.at(1, 3));
+    try std.testing.expectEqual(c.SlimeCell.empty, grid.at(2, 3));
+    try std.testing.expectEqual(c.SlimeCell{ .tiered = .green }, grid.at(4, 3));
+    try std.testing.expectEqual(c.SlimeCell{ .tiered = .red }, grid.at(5, 3));
+}
+
+test "neutral slime is the only thing on the field that needs no work" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -1326,21 +1381,22 @@ test "neutral slime scores but is never healable" {
 
     try end_turn_idly(&s.sess);
     try std.testing.expectEqual(@as(u32, 10), s.sess.score);
-    try std.testing.expectEqual(@as(u32, 0), total_healable(&s.sess));
     try std.testing.expectEqual(@as(u16, 10), s.sess.stats.feast.neutral_consumed);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.feast.sheltered);
 }
 
-test "a stamp destroys nothing, so the feast still eats every cell it touched" {
+test "a stamp destroys nothing: it converts a wall into a meal" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
     try start(&s, &enc_twenty_green);
-    // A 3x3 patch of green — exactly what one `block` stamp covers.
-    set_block_field(&s.sess, tiered(.green), 2, 5);
+    // A 3x3 patch of green anchored on column 1, so the patch touches the left
+    // edge and the flood can reach it the moment it is defused.
+    set_block_field(&s.sess, tiered(.green), 2, 1);
 
-    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    aim_at(&s.sess, s.p[0].pid, 2, 1);
     try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
     // The stamp defused all 9 and removed none.
@@ -1349,9 +1405,9 @@ test "a stamp destroys nothing, so the feast still eats every cell it touched" {
 
     try end_turn_idly(&s.sess);
 
-    // Defusal changes the PRICE, not the quantity: 9 units eaten either way.
+    // Defusal is what makes a unit food at all: 9 eaten, 9 scored.
     try std.testing.expectEqual(@as(u32, 9), s.sess.score);
-    try std.testing.expectEqual(@as(u32, 0), total_healable(&s.sess));
+    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.feast.sheltered);
     try std.testing.expectEqual(
         @as(u16, @intCast(9 * BAL.hunger_cost_normal)),
         s.sess.hunger.current,
@@ -1368,17 +1424,18 @@ test "turn_ended reports the feast the clients must animate" {
     try init_two_player_session(&s, allocator);
     defer s.deinit();
     try start(&s, &enc_twenty_green);
-    // 4 live green + 2 neutral, and reserves so the game does not end.
+    // Row 0: 2 neutral at the door.  Bottom-right: 1 neutral sealed into the
+    // corner by 2 hazards.  Reserves keep the game alive past the turn.
     paint_grid(&s.sess, .empty);
     s.sess.field.reservoir = .{ .neutral = 3 };
     const grid = &s.sess.field.grid;
-    grid.put(0, tiered(.green));
-    grid.put(1, tiered(.green));
-    grid.put(2, tiered(.green));
-    grid.put(3, tiered(.green));
-    grid.put(4, .neutral);
-    grid.put(5, .neutral);
+    grid.set(0, 0, .neutral);
+    grid.set(0, 1, .neutral);
+    grid.set(4, 9, tiered(.green));
+    grid.set(5, 8, tiered(.green));
+    grid.set(5, 9, .neutral);
 
+    const charges_before = s.sess.charges;
     s.p[1].clear();
     try end_turn_idly(&s.sess);
 
@@ -1388,20 +1445,20 @@ test "turn_ended reports the feast the clients must animate" {
     const te = try proto.decode_turn_ended(fbs.reader());
 
     try std.testing.expectEqual(@as(u16, 1), te.turn);
-    try std.testing.expectEqual(@as(u16, 6), te.cells_eaten);
+    try std.testing.expectEqual(@as(u16, 2), te.cells_eaten);
     try std.testing.expectEqual(
-        @as(u16, @intCast(6 * BAL.hunger_cost_normal + 4 * BAL.hunger_cost_hazard_extra)),
+        @as(u16, @intCast(2 * BAL.hunger_cost_normal)),
         te.hunger_added,
     );
-    try std.testing.expectEqual(
-        @as(u16, @intCast(4 * BAL.hunger_cost_hazard_extra)),
-        te.healable[GREEN],
-    );
-    try std.testing.expectEqual(@as(u16, 0), te.healable[RED]);
+    // The two numbers the next turn is planned around: what a wall cost them,
+    // and how many walls there were.
+    try std.testing.expectEqual(@as(u16, 1), te.sheltered);
+    try std.testing.expectEqual(@as(u16, 2), te.walls);
     try std.testing.expectEqual(@as(u32, 2), te.score_added);
     // The broadcast agrees with the session it describes.
     try std.testing.expectEqual(te.hunger_added, s.sess.hunger.current);
     try std.testing.expectEqual(te.score_added, s.sess.score);
+    try std.testing.expectEqual(charges_before, te.charges_left);
 }
 
 test "a turn with no slime on the field is a free turn" {
@@ -1623,7 +1680,7 @@ test "completing a team recipe resolves both halves as one recipe fire" {
     paint_grid(&s.sess, tiered(.green));
     s.sess.field.reservoir = .{};
 
-    const half = BLOOM_HALF; // [dispense, medicine] — the twin_bloom recipe
+    const half = BLOOM_HALF; // [dispense, catalyst] — the twin_bloom recipe
     try enqueue_submit(&s.sess, s.p[0].pid, half);
     try flush(&s.sess);
 
@@ -1740,21 +1797,68 @@ test "player recipe fires are broadcast when the cast converts" {
 }
 
 // ---------------------------------------------------------------------------
-// Medicine (symmetrical healing)
+// The shared charge pool
+//
+// One pool per GAME, seeded from `encounter.charges` and never refilled.  Every
+// recipe has a cost; a team recipe is charged once for the whole group.  The
+// fixture tables put a 0-cost recipe (`trickle`) and a 9-cost one (`deluge`) at
+// the extremes so both "always affordable" and "cannot afford" are reachable.
 // ---------------------------------------------------------------------------
 
-/// Accrue healable hunger of one tier by ending a turn with `units` cells of
-/// that tier still live on the field.  Returns the healable amount accrued.
-///
-/// The reservoir is emptied first, so the next turn starts on a bare field and
-/// the caller decides what (if anything) is there to heal or stamp.
-fn accrue_healable(sess: *Session, tier: c.Tier, units: u16) !u16 {
-    set_field(sess, tiered(tier), units);
-    try end_turn_mid_game(sess);
-    return sess.hunger_healable[@intFromEnum(tier)];
+/// Encounter with a deliberately tiny pool: enough for one `deluge` (9) and a
+/// single charge over, so a second expensive cast must be refused.
+const enc_thin_pool = enc.Encounter{
+    .label = "test_thin_pool",
+    .hunger_max = 1000,
+    .charges = 10,
+    .slime = .{ .tiered = .{ 0, 0, 50 } },
+};
+
+test "the pool starts at the encounter's charges and is not refilled by a turn" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_thin_pool);
+    try std.testing.expectEqual(@as(u32, 10), s.sess.charges);
+
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK); // costs the default 1
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u32, 9), s.sess.charges);
+
+    // Crossing a turn boundary must NOT hand the charge back: the pool is the
+    // budget for the whole encounter, not for the turn.
+    try end_turn_mid_game(&s.sess);
+    try std.testing.expectEqual(@as(u32, 9), s.sess.charges);
 }
 
-test "symmetrical medicine heals matching-tier healable hunger" {
+test "each recipe debits its own cost, and a free recipe debits nothing" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_thin_pool);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
+
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    try enqueue_submit(&s.sess, s.p[0].pid, TRICKLE); // cost 0
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u32, 10), s.sess.charges);
+    // Free does not mean inert: the shape still landed.
+    try std.testing.expectEqual(c.SlimeCell.neutralized, s.sess.field.grid.at(2, 5));
+
+    aim_at(&s.sess, s.p[1].pid, 2, 2);
+    try enqueue_submit(&s.sess, s.p[1].pid, DELUGE); // cost 9
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u32, 1), s.sess.charges);
+    try std.testing.expectEqual(@as(u16, 9), s.sess.stats.feast.charges_spent);
+}
+
+test "a cast the pool cannot afford fizzles, and the cast budget is still spent" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -1763,131 +1867,106 @@ test "symmetrical medicine heals matching-tier healable hunger" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_fifty_green);
+    try start(&s, &enc_thin_pool);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
 
-    // 6 red units eaten as live hazards.
-    const red_healable = try accrue_healable(&s.sess, .red, 6);
-    try std.testing.expectEqual(@as(u16, @intCast(6 * BAL.hunger_cost_hazard_extra)), red_healable);
-    const hunger_before = s.sess.hunger.current;
+    // Drain the pool to 1 with one deluge.
+    aim_at(&s.sess, s.p[0].pid, 2, 2);
+    try enqueue_submit(&s.sess, s.p[0].pid, DELUGE);
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u32, 1), s.sess.charges);
 
-    // `tonic` brews 6 medicine for EVERY tier, so the red bucket is served.
+    const before = s.sess.field.grid;
     s.p[0].clear();
-    try enqueue_submit(&s.sess, s.p[0].pid, TONIC);
+    const budget_before = s.sess.casts_left[s.p[0].pid];
+
+    // A second deluge costs 9 against a pool of 1.
+    aim_at(&s.sess, s.p[0].pid, 4, 7);
+    try enqueue_submit(&s.sess, s.p[0].pid, DELUGE);
     try flush(&s.sess);
 
-    const expected_heal: u16 = @min(6, red_healable);
-    try std.testing.expectEqual(hunger_before - expected_heal, s.sess.hunger.current);
-    try std.testing.expectEqual(red_healable - expected_heal, s.sess.hunger_healable[RED]);
-    try std.testing.expectEqual(expected_heal, s.sess.stats.feast.medicine_healed[RED]);
+    // Nothing happened to the field and nothing left the pool...
+    try std.testing.expect(grids_equal(before, s.sess.field.grid));
+    try std.testing.expectEqual(@as(u32, 1), s.sess.charges);
+    // ...but the turn moved on regardless.  This is the rule that keeps a
+    // bankrupt team from stalling the room forever: being broke costs time.
+    try std.testing.expectEqual(budget_before - 1, s.sess.casts_left[s.p[0].pid]);
 
-    // A heal action_result was broadcast with the healed amount.
     const msgs = try drain(s.p[0].buf.items, arena);
-    var found_heal = false;
-    for (msgs) |m| {
-        if (m.tag != .action_result) continue;
-        var fbs = std.io.fixedBufferStream(m.payload);
-        const ar = try proto.decode_action_result(fbs.reader());
-        if (ar.tag == .heal) {
-            found_heal = true;
-            try std.testing.expectEqual(expected_heal, ar.value);
-        }
-    }
-    try std.testing.expect(found_heal);
+    try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_fizzled));
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .shape_cast));
 }
 
-test "asymmetric medicine heals nothing" {
+test "a free recipe still works with the pool at zero" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_fifty_green);
+    try start(&s, &enc_thin_pool);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
+    s.sess.charges = 0;
 
-    // Green hunger accrued...
-    const green_healable = try accrue_healable(&s.sess, .green, 6);
-    try std.testing.expect(green_healable > 0);
-    const hunger_before = s.sess.hunger.current;
-
-    // ...but `red_tonic` brews 10 RED medicine and nothing else, so it is
-    // entirely wasted: healing is symmetrical by tier.
-    try enqueue_submit(&s.sess, s.p[0].pid, RED_TONIC);
+    aim_at(&s.sess, s.p[0].pid, 3, 4);
+    try enqueue_submit(&s.sess, s.p[0].pid, TRICKLE);
     try flush(&s.sess);
 
-    try std.testing.expectEqual(hunger_before, s.sess.hunger.current);
-    try std.testing.expectEqual(green_healable, s.sess.hunger_healable[GREEN]);
-    // Brewed but healed nothing — the waste is visible in the stats.
-    try std.testing.expectEqual(@as(u16, 10), s.sess.stats.feast.medicine_dispensed[RED]);
-    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.feast.medicine_healed[RED]);
-    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.feast.medicine_healed[GREEN]);
+    // 0 <= 0, so the pool can pay.  A zero-cost recipe is the floor the
+    // economy can never fall through.
+    try std.testing.expectEqual(c.SlimeCell.neutralized, s.sess.field.grid.at(3, 4));
+    try std.testing.expectEqual(@as(u32, 0), s.sess.charges);
 }
 
-test "medicine cannot heal neutral-slime hunger" {
+test "a team recipe is charged once for the group, not once per player" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_neutral_only);
-    set_field(&s.sess, .neutral, 6);
+    try start(&s, &enc_thin_pool);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
 
-    try end_turn_mid_game(&s.sess); // 6 neutral units eaten
-    const hunger_before = s.sess.hunger.current;
-    try std.testing.expect(hunger_before > 0);
-    try std.testing.expectEqual(@as(u32, 0), total_healable(&s.sess));
-
-    // Medicine from both players: neutral slime's hunger is not healable by
-    // ANY tier, so all of it is discarded.
-    try enqueue_submit(&s.sess, s.p[0].pid, TONIC);
-    try enqueue_submit(&s.sess, s.p[1].pid, TONIC);
+    // The first half is HELD, which must cost nothing: a player waiting for a
+    // partner has not committed the team's charges yet.
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOOM_HALF);
     try flush(&s.sess);
+    try std.testing.expectEqual(@as(u32, 10), s.sess.charges);
 
-    try std.testing.expectEqual(hunger_before, s.sess.hunger.current);
+    // The partner completes it: twin_bloom costs 4, once.
+    aim_at(&s.sess, s.p[1].pid, 3, 5);
+    try enqueue_submit(&s.sess, s.p[1].pid, BLOOM_HALF);
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u32, 6), s.sess.charges);
 }
 
-test "medicine heals only up to the healable bucket (overheal discarded)" {
+test "an unaffordable team recipe fizzles as a whole, leaving no partial stamp" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_fifty_green);
+    try start(&s, &enc_thin_pool);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
+    s.sess.charges = 3; // twin_bloom costs 4
 
-    // 2 red units eaten → 4 healable, less than red_tonic's 10.
-    const red_healable = try accrue_healable(&s.sess, .red, 2);
-    try std.testing.expectEqual(@as(u16, @intCast(2 * BAL.hunger_cost_hazard_extra)), red_healable);
-    const hunger_before = s.sess.hunger.current;
+    try enqueue_submit(&s.sess, s.p[0].pid, BLOOM_HALF);
+    try flush(&s.sess);
+    const before = s.sess.field.grid;
 
-    try enqueue_submit(&s.sess, s.p[0].pid, RED_TONIC);
+    aim_at(&s.sess, s.p[1].pid, 3, 5);
+    try enqueue_submit(&s.sess, s.p[1].pid, BLOOM_HALF);
     try flush(&s.sess);
 
-    try std.testing.expectEqual(@as(u16, 0), s.sess.hunger_healable[RED]);
-    try std.testing.expectEqual(hunger_before - red_healable, s.sess.hunger.current);
-    try std.testing.expectEqual(@as(u16, 10), s.sess.stats.feast.medicine_dispensed[RED]);
-    // The surplus 6 is discarded, not banked against future hunger.
-    try std.testing.expectEqual(red_healable, s.sess.stats.feast.medicine_healed[RED]);
-}
-
-test "a medicine recipe both heals and stamps its shape" {
-    const allocator = std.testing.allocator;
-
-    var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
-    defer s.deinit();
-    try start(&s, &enc_fifty_green);
-
-    const red_healable = try accrue_healable(&s.sess, .red, 2);
-    try std.testing.expect(red_healable > 0);
-    // Repaint as green so the stamp has something to defuse.
-    set_field(&s.sess, tiered(.green), 50);
-
-    // `tonic` is a 1x1 shape AND 6/6/6 medicine: every recipe stamps, even the
-    // healing ones.
-    aim_at(&s.sess, s.p[0].pid, 0, 3);
-    try enqueue_submit(&s.sess, s.p[0].pid, TONIC);
-    try flush(&s.sess);
-
-    try std.testing.expect(s.sess.field.grid.at(0, 3) == .neutralized);
-    try std.testing.expect(s.sess.hunger_healable[RED] < red_healable);
+    // All or nothing: a group that cannot be paid for leaves the board alone.
+    try std.testing.expect(grids_equal(before, s.sess.field.grid));
+    try std.testing.expectEqual(@as(u32, 3), s.sess.charges);
+    // The held half is released rather than silently re-held — the players saw
+    // it fire, so the server must not keep it on the table behind their backs.
+    try std.testing.expectEqual(@as(?c.ActionCombo, null), s.sess.held_pool[s.p[0].pid]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1929,23 +2008,23 @@ test "a full hunger bar ends the game with slime left over" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    // 9 live green units = 27 hunger, past the bar's 20.
-    try start(&s, &enc_tight_budget);
+    // 8 edible units on the field against a bar of 5: the feast overfills it.
+    try start(&s, &enc_paper_stomach);
     // Hold one unit back so the field is NOT cleared by the feast: the loss has
     // to be unambiguous.
     s.sess.field.grid.put(8, .empty);
-    s.sess.field.reservoir = .{ .tiered = .{ 0, 0, 1 } };
+    s.sess.field.reservoir = .{ .neutral = 1 };
 
     s.p[0].clear();
     try end_turn_idly(&s.sess);
 
     try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
-    try std.testing.expectEqual(@as(u16, 20), s.sess.hunger.current); // clamped at max
+    try std.testing.expectEqual(@as(u16, 5), s.sess.hunger.current); // clamped at max
 
     const go = try game_over_msg(try drain(s.p[0].buf.items, arena));
     try std.testing.expectEqual(proto.EndReason.hunger_full, go.stats.reason);
-    try std.testing.expectEqual(@as(u16, 20), go.stats.hunger_final);
-    try std.testing.expectEqual(@as(u16, 20), go.stats.hunger_max);
+    try std.testing.expectEqual(@as(u16, 5), go.stats.hunger_final);
+    try std.testing.expectEqual(@as(u16, 5), go.stats.hunger_max);
     try std.testing.expectEqual(@as(u32, 9), go.stats.slime_total);
     // The bar filled before the field was cleared, so slime survives.
     try std.testing.expect(go.stats.slime_left > 0);
@@ -1957,11 +2036,13 @@ test "defusing the tight budget survives what idle play loses" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_tight_budget); // 9 green, hunger_max 20
+    try start(&s, &enc_tight_budget); // hunger_max 20
     set_block_field(&s.sess, tiered(.green), 2, 5);
 
-    // One `block` stamp defuses the whole field, so it costs 9 normal hunger
-    // and every unit scores — where idle play would spend 27 and lose.
+    // One `block` stamp defuses the whole field.  Left alone, those 9 cells are
+    // walls: no hunger, no score, and the encounter never ends.  Defused, they
+    // are 9 units of reachable food — the entire difference between playing and
+    // not playing.
     aim_at(&s.sess, s.p[0].pid, 2, 5);
     try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
     try flush(&s.sess);
@@ -2029,10 +2110,26 @@ test "match stats: feast tallies, players and recipes are reported" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_mixed); // 10 red + 8 green + 7 neutral = 25 units
+    // Same 25-unit mix as `enc_mixed`, but with a hunger bar the single feast
+    // below fills exactly — that is what makes the game end and the report get
+    // sent inside one turn.
+    const enc_stats_mixed = enc.Encounter{
+        .label = "test_stats_mixed",
+        .hunger_max = 8,
+        .charges = 50,
+        .slime = .{ .tiered = .{ 10, 0, 8 }, .neutral = 7 },
+    };
+    try start(&s, &enc_stats_mixed);
 
-    // Pin a layout the stamps can address exactly: the green run sits in the
-    // top-left corner, the red run beside it, neutral after that.
+    // Pin a layout the stamps can address exactly.  On the 6x10 grid this is:
+    //
+    //   row 0:  G G G G G G G G R R
+    //   row 1:  R R R R R R R R n n
+    //   row 2:  n n n n n . . . . .
+    //   rows 3-5: empty
+    //
+    // Row 1's red run is a near-total wall, which is the point: it decides who
+    // gets eaten and who merely watches.
     paint_grid(&s.sess, .empty);
     var flat: u16 = 0;
     while (flat < 8) : (flat += 1) s.sess.field.grid.put(flat, tiered(.green));
@@ -2049,15 +2146,20 @@ test "match stats: feast tallies, players and recipes are reported" {
     try enqueue_submit(&s.sess, s.p[1].pid, SWEEP);
     try flush(&s.sess);
 
-    // The turn ends: the whole field is devoured and the encounter is over.
+    // The turn ends.  The flood enters at column 0 and finds:
+    //   (0,0) defused by Alice -> eaten, but boxed in by green and red.
+    //   (2,0) neutral -> eaten, and it opens the row-2 corridor rightwards,
+    //         which wraps up column 9 to eat the two neutrals at (1,8)/(1,9).
+    //   Bob's three defused cells at (0,3..5) are walled off on every side.
     try end_turn_idly(&s.sess);
 
     const go = try game_over_msg(try drain(s.p[0].buf.items, arena));
     const st = go.stats;
 
-    try std.testing.expectEqual(proto.EndReason.field_cleared, st.reason);
+    try std.testing.expectEqual(proto.EndReason.hunger_full, st.reason);
     try std.testing.expectEqual(@as(u32, 25), st.slime_total);
-    try std.testing.expectEqual(@as(u32, 0), st.slime_left);
+    // 8 of 25 eaten; the other 17 are walls or shut in behind them.
+    try std.testing.expectEqual(@as(u32, 17), st.slime_left);
     try std.testing.expectEqual(@as(u16, 2), st.casts_total);
 
     // Coverage: 4 green cells covered (1 poke + 3 sweep), all defused since
@@ -2065,17 +2167,18 @@ test "match stats: feast tallies, players and recipes are reported" {
     try std.testing.expectEqual(@as(u16, 4), st.feast.cells_covered[GREEN]);
     try std.testing.expectEqual(@as(u16, 0), st.feast.cells_covered[RED]);
     try std.testing.expectEqual(@as(u16, 4), st.feast.neutralized[GREEN]);
-    // Escapes: the 4 untouched green plus all 10 red were eaten live.
-    try std.testing.expectEqual(@as(u16, 4), st.feast.hazard_escaped[GREEN]);
-    try std.testing.expectEqual(@as(u16, 10), st.feast.hazard_escaped[RED]);
+    // Eaten: 7 neutral plus Alice's single defused cell.
     try std.testing.expectEqual(@as(u16, 7), st.feast.neutral_consumed);
-    try std.testing.expectEqual(@as(u16, @intCast(25 * BAL.hunger_cost_normal)), st.feast.hunger_normal);
-    try std.testing.expectEqual(
-        @as(u16, @intCast(14 * BAL.hunger_cost_hazard_extra)),
-        st.feast.hunger_extra,
-    );
-    // Score = defused units + neutral units.
-    try std.testing.expectEqual(@as(u32, 11), go.score);
+    try std.testing.expectEqual(@as(u16, 1), st.feast.defused_consumed);
+    // Bob defused three cells that nothing could reach.  Work that scores
+    // nothing is the report's most useful number, so it is tracked on its own.
+    try std.testing.expectEqual(@as(u16, 3), st.feast.sheltered);
+    try std.testing.expectEqual(@as(u16, @intCast(8 * BAL.hunger_cost_normal)), st.feast.hunger_normal);
+    // Two casts at the fixture default of 1 charge each, out of a pool of 50.
+    try std.testing.expectEqual(@as(u16, 2), st.feast.charges_spent);
+    try std.testing.expectEqual(@as(u32, 48), st.feast.charges_left);
+    // Score = every unit eaten, defused or neutral alike.
+    try std.testing.expectEqual(@as(u32, 8), go.score);
 
     // Players: dense, named, coverage attribution + recipe participation.
     try std.testing.expectEqual(@as(u8, 2), st.player_count);
@@ -2187,7 +2290,7 @@ test "game_state carries the live combo preview on the owner's entity" {
     defer s.deinit();
     try start(&s, &enc_fifty_green);
 
-    const combo = BLOOM_HALF; // [dispense, medicine] — two distinguishable slots
+    const combo = BLOOM_HALF; // [dispense, catalyst] — two distinguishable slots
     try enqueue_combo(&s.sess, s.p[0].pid, combo);
 
     s.p[0].clear();
@@ -2203,7 +2306,7 @@ test "game_state carries the live combo preview on the owner's entity" {
         found = true;
         try std.testing.expectEqual(combo.len, e.combo_len);
         try std.testing.expectEqual(c.ActionChoice.dispense, e.combo_slots[0].action);
-        try std.testing.expectEqual(c.ActionChoice.medicine, e.combo_slots[1].action);
+        try std.testing.expectEqual(c.ActionChoice.catalyst, e.combo_slots[1].action);
     }
     try std.testing.expect(found);
 }
@@ -2255,9 +2358,9 @@ test "game_state carries the turn number and each player's remaining casts" {
     }
 }
 
-test "a fully defused grid broadcasts zero healable hunger in every tier" {
-    // Wire-level regression for "hazard slime showing in the hunger bar after
-    // defusing everything".
+test "game_state carries the shared charge pool as it drains" {
+    // The pool is the only resource a player cannot recover, so the client must
+    // never be shown a stale figure for it.
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -2266,19 +2369,23 @@ test "a fully defused grid broadcasts zero healable hunger in every tier" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_twenty_green);
-    set_block_field(&s.sess, tiered(.green), 2, 5);
+    try start(&s, &enc_thin_pool);
+    paint_grid(&s.sess, tiered(.green));
+    s.sess.field.reservoir = .{};
 
-    // One `block` stamp covers the whole 9-cell field, then it is all eaten.
-    aim_at(&s.sess, s.p[0].pid, 2, 5);
-    try enqueue_submit(&s.sess, s.p[0].pid, BLOCK);
-    try flush(&s.sess);
     s.p[0].clear();
-    try end_turn_mid_game(&s.sess);
+    try flush(&s.sess);
+    const before = try last_game_state(try drain(s.p[0].buf.items, arena));
+    try std.testing.expectEqual(@as(u32, 10), before.charges);
 
-    try std.testing.expectEqual(@as(u32, 0), total_healable(&s.sess));
-    const gs = try last_game_state(try drain(s.p[0].buf.items, arena));
-    for (gs.hunger_healable) |h| try std.testing.expectEqual(@as(u16, 0), h);
+    aim_at(&s.sess, s.p[0].pid, 2, 2);
+    try enqueue_submit(&s.sess, s.p[0].pid, DELUGE); // cost 9
+    s.p[0].clear();
+    try flush(&s.sess);
+
+    const after = try last_game_state(try drain(s.p[0].buf.items, arena));
+    try std.testing.expectEqual(@as(u32, 1), after.charges);
+    try std.testing.expectEqual(s.sess.charges, after.charges);
 }
 
 // ---------------------------------------------------------------------------

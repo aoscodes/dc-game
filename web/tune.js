@@ -19,7 +19,7 @@ const TIERS = ["red", "yellow", "green"];
 
 /** A combo is a sequence of ACTION KEYS ONLY.  What a recipe does is carried
  *  by its SHAPE, not by any color token in the pattern. */
-const SLOT_OPTIONS = ["dispense", "medicine"];
+const SLOT_OPTIONS = ["dispense", "catalyst"];
 
 const MAX_RECIPES = 64;
 const MAX_PATTERN_SLOTS = 5;
@@ -34,22 +34,27 @@ const MAX_SHAPE_COLS = MAX_GRID_COLS;
 const DEFAULT_SLIME_GRID = { rows: 6, cols: 10 };
 /** Mirrors balance.DEFAULT_CASTS_PER_TURN. */
 const DEFAULT_CASTS_PER_TURN = 3;
+/** Mirrors balance.DEFAULT_RECIPE_COST — an unpriced recipe costs one charge. */
+const DEFAULT_RECIPE_COST = 1;
+/** Mirrors encounter.DEFAULT_CHARGES. */
+const DEFAULT_CHARGES = 30;
 
 /** Scalar balance fields: [key, label, min, max, step]. */
 const RATE_FIELDS = [
   ["hunger_cost_normal", "hunger per unit eaten", 0, 1000, 1],
-  ["hunger_cost_hazard_extra", "extra hunger from hazard slime (healable)", 0, 1000, 1],
   ["casts_per_turn", "casts per player per turn", 1, 255, 1],
 ];
 
 /**
  * @type {{
  *   balance: object,
- *   encounter: { hunger_max: number,
- *                slime: { tiered: object, neutral: number } },
+ *   encounter: { hunger_max: number, charges: number,
+ *                slime: { tiered: object, neutral: number, special: number } },
  * }}
  * `encounter.slime` is the ONE slime pool of the encounter: whatever does not
  * fit on the grid waits in the reservoir and refills from the top.
+ * `charges` is the team's whole budget for the encounter — one pool, spent
+ * across every turn and every player, never refilled.
  */
 let state = null;
 
@@ -78,10 +83,11 @@ const sparseTiers = (dense) =>
  * config.zig: per-tier hazard counts and neutral units are summed.
  */
 function sumZones(zones) {
-  const pool = { tiered: tiersFrom(null), neutral: 0 };
+  const pool = { tiered: tiersFrom(null), neutral: 0, special: 0 };
   for (const z of zones) {
     for (const t of TIERS) pool.tiered[t] += (z.tiered ?? {})[t] ?? 0;
     pool.neutral += z.neutral ?? 0;
+    pool.special += z.special ?? 0;
   }
   return pool;
 }
@@ -112,7 +118,6 @@ async function load() {
   state = {
     balance: {
       hunger_cost_normal: bal.hunger_cost_normal,
-      hunger_cost_hazard_extra: bal.hunger_cost_hazard_extra,
       // Grid dimensions; default like the server does for pre-grid configs.
       slime_grid: {
         rows: bal.slime_grid?.rows ?? DEFAULT_SLIME_GRID.rows,
@@ -124,17 +129,18 @@ async function load() {
         label: r.label,
         pattern: [...r.pattern],
         shape: shapeFrom(r.shape),
-        medicine: tiersFrom(r.medicine),
+        cost: r.cost ?? DEFAULT_RECIPE_COST,
       })),
       team_recipes: bal.team_recipes.map((r) => ({
         label: r.label,
         patterns: r.patterns.map((p) => [...p]),
         shape: shapeFrom(r.shape),
-        medicine: tiersFrom(r.medicine),
+        cost: r.cost ?? DEFAULT_RECIPE_COST,
       })),
     },
     encounter: {
       hunger_max: def.hunger_max,
+      charges: def.charges ?? DEFAULT_CHARGES,
       // Multi-zone configs collapse into the single pool, exactly as the Zig
       // loader does, so an old config round-trips to the same game.
       slime: sumZones(def.zones ?? []),
@@ -193,6 +199,17 @@ function tierRow(prefix, tiers, max = 1000, onChange = null) {
     row.append(numInput(tiers, t, 0, max, 1, "", onChange));
   }
   return row;
+}
+
+/**
+ * A recipe's charge cost.  0 is legal and meaningful — a free move — so the
+ * input is always shown rather than being treated as an absent value.
+ */
+function costRow(recipe) {
+  return el("span", { class: "colors" },
+    el("span", { class: "muted" }, "charge cost "),
+    numInput(recipe, "cost", 0, 65535, 1),
+    el("span", { class: "muted" }, " (0 = free)"));
 }
 
 /**
@@ -355,7 +372,7 @@ function renderPlayerRecipes() {
         }, "remove recipe")),
       el("div", { class: "row" }, el("span", { class: "muted" }, "pattern "), patternEditor(r.pattern, renderPlayerRecipes)),
       el("div", { class: "row" }, shapeEditor(r, renderPlayerRecipes)),
-      el("div", { class: "row" }, tierRow("medicine", r.medicine)),
+      el("div", { class: "row" }, costRow(r)),
       ...(cellsOn(r.shape) === 0
         ? [el("div", { class: "row" }, el("span", { class: "error-note" },
           "⚠ shape covers no cells — the server will reject this"))]
@@ -395,7 +412,7 @@ function renderTeamRecipes() {
     card.append(
       el("div", { class: "row" }, addPattern),
       el("div", { class: "row" }, shapeEditor(r, renderTeamRecipes)),
-      el("div", { class: "row" }, tierRow("medicine", r.medicine)),
+      el("div", { class: "row" }, costRow(r)),
       ...(cellsOn(r.shape) === 0
         ? [el("div", { class: "row" }, el("span", { class: "error-note" },
           "⚠ shape covers no cells — the server will reject this"))]
@@ -414,9 +431,13 @@ function renderTeamRecipes() {
  */
 function renderEncounter() {
   const scalars = document.getElementById("encounter-scalars");
-  scalars.replaceChildren(el("label", {},
-    el("span", {}, "hunger budget (bar capacity)"),
-    numInput(state.encounter, "hunger_max", 1, 65535)));
+  scalars.replaceChildren(
+    el("label", {},
+      el("span", {}, "hunger budget (bar capacity)"),
+      numInput(state.encounter, "hunger_max", 1, 65535)),
+    el("label", {},
+      el("span", {}, "team charges (whole encounter, never refills)"),
+      numInput(state.encounter, "charges", 1, 4294967295)));
 
   const pool = state.encounter.slime;
   const box = document.getElementById("slime-pool");
@@ -429,6 +450,12 @@ function renderEncounter() {
     el("div", { class: "row" },
       el("span", { class: "muted" }, "neutral slime units "),
       numInput(pool, "neutral", 0, 65535, 1, "", renderSlimeTotal)),
+    // Specials are the objective: inert to every cast, inedible, and a
+    // permanent wall.  They are counted apart from the pool totals below for
+    // that reason — they are scenery the team must plan around, not content.
+    el("div", { class: "row" },
+      el("span", { class: "muted" }, "special slime units (objective — inert, inedible, permanent wall) "),
+      numInput(pool, "special", 0, 65535, 1, "", renderSlimeTotal)),
   ));
   renderSlimeTotal();
 }
@@ -437,7 +464,7 @@ function renderEncounter() {
 function renderSlimeTotal() {
   const pool = state.encounter.slime;
   const grid = state.balance.slime_grid;
-  const total = TIERS.reduce((n, t) => n + pool.tiered[t], 0) + pool.neutral;
+  const total = TIERS.reduce((n, t) => n + pool.tiered[t], 0) + pool.neutral + pool.special;
   const cells = grid.rows * grid.cols;
   const reserved = Math.max(0, total - cells);
   document.getElementById("slime-total").textContent = reserved > 0
@@ -464,7 +491,7 @@ document.getElementById("add-player-recipe").addEventListener("click", () => {
     // A single anchor cell: the smallest VALID shape, so a fresh recipe never
     // starts in a state the loader would reject.
     shape: ["#"],
-    medicine: tiersFrom(null),
+    cost: DEFAULT_RECIPE_COST,
   });
   renderPlayerRecipes();
 });
@@ -472,9 +499,9 @@ document.getElementById("add-player-recipe").addEventListener("click", () => {
 document.getElementById("add-team-recipe").addEventListener("click", () => {
   state.balance.team_recipes.push({
     label: "new_team_recipe",
-    patterns: [["dispense"], ["medicine"]],
+    patterns: [["dispense"], ["catalyst"]],
     shape: ["#"],
-    medicine: tiersFrom(null),
+    cost: DEFAULT_RECIPE_COST,
   });
   renderTeamRecipes();
 });
@@ -497,29 +524,29 @@ document.getElementById("save").addEventListener("click", async () => {
       body: JSON.stringify({
         balance: {
           ...state.balance,
-          // Emit sparse medicine maps: the loader defaults absent tiers to 0,
-          // and a recipe with no medicine should say nothing rather than three
-          // zeroes.
+          // `cost` is always emitted, including 0: a free recipe is a design
+          // decision, and omitting it would silently reload as the default 1.
           player_recipes: state.balance.player_recipes.map((r) => ({
             label: r.label,
             pattern: r.pattern,
             shape: r.shape,
-            ...(Object.keys(sparseTiers(r.medicine)).length > 0
-              ? { medicine: sparseTiers(r.medicine) } : {}),
+            cost: r.cost,
           })),
           team_recipes: state.balance.team_recipes.map((r) => ({
             label: r.label,
             patterns: r.patterns,
             shape: r.shape,
-            ...(Object.keys(sparseTiers(r.medicine)).length > 0
-              ? { medicine: sparseTiers(r.medicine) } : {}),
+            cost: r.cost,
           })),
         },
         encounter: {
           hunger_max: state.encounter.hunger_max,
+          charges: state.encounter.charges,
           zones: [{
             tiered: sparseTiers(state.encounter.slime.tiered),
             neutral: state.encounter.slime.neutral,
+            ...(state.encounter.slime.special > 0
+              ? { special: state.encounter.slime.special } : {}),
           }],
         },
       }),

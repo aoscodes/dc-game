@@ -73,6 +73,8 @@ const BotCtx = struct {
     /// Which direction this bot sweeps.  The two bots aim differently so the
     /// team stamp lands somewhere neither would reach alone, and so the test
     /// covers a cursor walking into BOTH a clamped edge and open field.
+    /// BotA heads LEFT because column 0 is where the Lil Guys come in: work
+    /// done there is the only work the feast can immediately collect.
     sweep: proto.CursorDir,
     result: BotResult = .{},
 };
@@ -127,7 +129,7 @@ pub fn main() !void {
     std.debug.print("[e2e] server ready on port {d}\n", .{PORT});
 
     // ---- Run two bot threads ------------------------------------------------
-    var ctx_a = BotCtx{ .name = "BotA", .sweep = .right };
+    var ctx_a = BotCtx{ .name = "BotA", .sweep = .left };
     var ctx_b = BotCtx{ .name = "BotB", .sweep = .down };
 
     const thread_a = try std.Thread.spawn(.{}, run_bot, .{&ctx_a});
@@ -352,7 +354,7 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                 // as the solo `sweep` recipe.
                 try send_submit(&client, c.make_combo(&.{
                     .{ .action = .dispense },
-                    .{ .action = .medicine },
+                    .{ .action = .catalyst },
                 }));
             },
 

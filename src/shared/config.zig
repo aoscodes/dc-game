@@ -58,6 +58,7 @@ pub const ConfigError = error{
     InvalidBalanceJson,
     InvalidEncountersJson,
     InvalidCastsPerTurn,
+    InvalidCharges,
     InvalidSlimeGrid,
     TooManyRecipes,
     InvalidTeamPatternCount,
@@ -137,25 +138,26 @@ comptime {
     std.debug.assert(@intFromEnum(c.Tier.green) == 2);
 }
 
-const TiersU32Json = struct { red: u32 = 0, yellow: u32 = 0, green: u32 = 0 };
 const TiersU16Json = struct { red: u16 = 0, yellow: u16 = 0, green: u16 = 0 };
 
 const PlayerRecipeJson = struct {
     label: []const u8,
-    /// Combo slots as strings: "dispense" | "medicine".
+    /// Combo slots as strings: "dispense" | "catalyst".
     pattern: []const []const u8,
     /// Footprint rows of `#` (covered) and any other char (not covered),
     /// e.g. ["###","###","###"] for a 3x3 block.
     shape: []const []const u8,
-    /// Medicine brewed per tier.  Absent = a pure-neutralizing recipe.
-    medicine: TiersU32Json = .{},
+    /// Charges this recipe costs the shared pool.  Absent = DEFAULT_RECIPE_COST;
+    /// 0 is legal and means a free move.
+    cost: u16 = balance.DEFAULT_RECIPE_COST,
 };
 
 const TeamRecipeJson = struct {
     label: []const u8,
     patterns: []const []const []const u8,
     shape: []const []const u8,
-    medicine: TiersU32Json = .{},
+    /// Charges per FIRING of the group, not per contributing player.
+    cost: u16 = balance.DEFAULT_RECIPE_COST,
 };
 
 const SlimeGridJson = struct {
@@ -165,7 +167,6 @@ const SlimeGridJson = struct {
 
 const BalanceJson = struct {
     hunger_cost_normal: u32,
-    hunger_cost_hazard_extra: u32,
     /// Slime grid dimensions; defaulted so pre-grid configs keep validating.
     slime_grid: SlimeGridJson = .{
         .rows = balance.DEFAULT_SLIME_GRID.rows,
@@ -183,11 +184,17 @@ const ZoneJson = struct {
     /// Hazard slime per difficulty tier.
     tiered: TiersU16Json = .{},
     neutral: u16 = 0,
+    /// Objective placeholders (components.SlimeCell.special).  Absent = none,
+    /// so existing configs stay valid and specials are strictly opt-in.
+    special: u16 = 0,
 };
 
 const EncounterJson = struct {
     label: []const u8,
     hunger_max: u16,
+    /// Charges the shared pool starts with; defaulted so configs written before
+    /// the charge economy keep validating.
+    charges: u32 = enc.DEFAULT_CHARGES,
     /// Slime bundles, SUMMED into the encounter's total slime.  Named `zones`
     /// for back-compatibility with saved designer configs (std.json rejects
     /// unknown fields, so the name cannot simply change).
@@ -243,7 +250,7 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
             .label = pr.label,
             .pattern = try combo_from_names(pr.label, pr.pattern),
             .shape = try shape_from_rows(a, pr.label, pr.shape),
-            .medicine = medicine_from_json(pr.medicine),
+            .cost = pr.cost,
         };
     }
     // Two recipes sharing a combo would make the move ambiguous: the first
@@ -265,13 +272,12 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
             .label = tr.label,
             .patterns = pats,
             .shape = try shape_from_rows(a, tr.label, tr.shape),
-            .medicine = medicine_from_json(tr.medicine),
+            .cost = tr.cost,
         };
     }
 
     return .{
         .hunger_cost_normal = raw.hunger_cost_normal,
-        .hunger_cost_hazard_extra = raw.hunger_cost_hazard_extra,
         .slime_grid = .{ .rows = raw.slime_grid.rows, .cols = raw.slime_grid.cols },
         .casts_per_turn = raw.casts_per_turn,
         .player_recipes = players,
@@ -312,11 +318,19 @@ fn parse_encounters(a: std.mem.Allocator, bytes: []const u8) !enc.EncounterSet {
             fail("{s}: encounter '{s}' hunger_max must be > 0", .{ ENCOUNTERS_FILE, e.label });
             return ConfigError.InvalidHungerMax;
         }
+        // With no charges the team could never open a wall, so any encounter
+        // whose field is not already fully edible would be unwinnable from the
+        // first frame.  Rejected at load rather than shipped as a trap.
+        if (e.charges == 0) {
+            fail("{s}: encounter '{s}' charges must be > 0", .{ ENCOUNTERS_FILE, e.label });
+            return ConfigError.InvalidCharges;
+        }
         // Sum every bundle into the encounter's single slime total; saturating
         // so a designer config cannot overflow the u16 buckets.
         var slime = c.SlimeReservoir{};
         for (e.zones) |z| {
             slime.neutral +|= z.neutral;
+            slime.special +|= z.special;
             const per_tier = [_]u16{ z.tiered.red, z.tiered.yellow, z.tiered.green };
             for (&slime.tiered, per_tier) |*acc, add| acc.* +|= add;
         }
@@ -324,7 +338,12 @@ fn parse_encounters(a: std.mem.Allocator, bytes: []const u8) !enc.EncounterSet {
             fail("{s}: encounter '{s}' has no slime", .{ ENCOUNTERS_FILE, e.label });
             return ConfigError.NoSlime;
         }
-        out.* = .{ .label = e.label, .hunger_max = e.hunger_max, .slime = slime };
+        out.* = .{
+            .label = e.label,
+            .hunger_max = e.hunger_max,
+            .charges = e.charges,
+            .slime = slime,
+        };
     }
 
     const default_index = for (list, 0..) |e, i| {
@@ -342,10 +361,6 @@ fn validate_recipe_label(label: []const u8) !void {
         fail("{s}: recipe label must not be empty", .{BALANCE_FILE});
         return ConfigError.EmptyLabel;
     }
-}
-
-fn medicine_from_json(m: TiersU32Json) c.MedicineOutput {
-    return .{ .medicine = .{ m.red, m.yellow, m.green } };
 }
 
 fn slot_from_name(name: []const u8) ?c.ComboSlot {
@@ -428,7 +443,7 @@ fn combo_from_names(recipe_label: []const u8, names: []const []const u8) !c.Acti
     };
     for (names, 0..) |name, i| {
         combo.slots[i] = slot_from_name(name) orelse {
-            fail("{s}: recipe '{s}' has unknown slot '{s}' (want dispense|medicine)", .{ BALANCE_FILE, recipe_label, name });
+            fail("{s}: recipe '{s}' has unknown slot '{s}' (want dispense|catalyst)", .{ BALANCE_FILE, recipe_label, name });
             return ConfigError.InvalidComboSlot;
         };
     }
@@ -441,7 +456,7 @@ fn combo_from_names(recipe_label: []const u8, names: []const []const u8) !c.Acti
 
 /// Minimal valid balance document for rejection tests.
 const minimal_balance =
-    \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+    \\{"hunger_cost_normal":1,
     \\ "player_recipes":[],"team_recipes":[]}
 ;
 
@@ -454,7 +469,7 @@ const minimal_encounters =
 /// A one-recipe balance document, `{...}`-interpolated at the recipe body so
 /// each rejection test states only the field it is exercising.
 fn one_recipe(comptime body: []const u8) []const u8 {
-    return "{\"hunger_cost_normal\":1,\"hunger_cost_hazard_extra\":2," ++
+    return "{\"hunger_cost_normal\":1," ++
         "\"player_recipes\":[" ++ body ++ "],\"team_recipes\":[]}";
 }
 
@@ -625,8 +640,8 @@ test "two recipes sharing a pattern are rejected" {
     try std.testing.expectError(ConfigError.DuplicatePattern, parse(
         std.testing.allocator,
         one_recipe(
-            \\{"label":"a","pattern":["dispense","medicine"],"shape":["#"]},
-            \\{"label":"b","pattern":["dispense","medicine"],"shape":["##"]}
+            \\{"label":"a","pattern":["dispense","catalyst"],"shape":["#"]},
+            \\{"label":"b","pattern":["dispense","catalyst"],"shape":["##"]}
         ),
         minimal_encounters,
     ));
@@ -636,8 +651,8 @@ test "recipes differing only in order are distinct patterns" {
     var loaded = try parse(
         std.testing.allocator,
         one_recipe(
-            \\{"label":"a","pattern":["dispense","medicine"],"shape":["#"]},
-            \\{"label":"b","pattern":["medicine","dispense"],"shape":["##"]}
+            \\{"label":"a","pattern":["dispense","catalyst"],"shape":["#"]},
+            \\{"label":"b","pattern":["catalyst","dispense"],"shape":["##"]}
         ),
         minimal_encounters,
     );
@@ -645,22 +660,36 @@ test "recipes differing only in order are distinct patterns" {
     try std.testing.expectEqual(@as(usize, 2), loaded.config.balance.player_recipes.len);
 }
 
-test "medicine is keyed by tier and defaults to none" {
+test "recipe cost defaults to one and 0 is a legal free move" {
     var loaded = try parse(
         std.testing.allocator,
         one_recipe(
             \\{"label":"plain","pattern":["dispense"],"shape":["#"]},
-            \\{"label":"tonic","pattern":["medicine"],"shape":["#"],
-            \\ "medicine":{"red":7,"green":2}}
+            \\{"label":"free","pattern":["catalyst"],"shape":["#"],"cost":0},
+            \\{"label":"heavy","pattern":["catalyst","catalyst"],"shape":["###"],"cost":12}
         ),
         minimal_encounters,
     );
     defer loaded.deinit();
     const recipes = loaded.config.balance.player_recipes;
-    try std.testing.expectEqual(@as(u32, 0), recipes[0].medicine.total());
-    try std.testing.expectEqual(@as(u32, 7), recipes[1].medicine.medicine[@intFromEnum(c.Tier.red)]);
-    try std.testing.expectEqual(@as(u32, 0), recipes[1].medicine.medicine[@intFromEnum(c.Tier.yellow)]);
-    try std.testing.expectEqual(@as(u32, 2), recipes[1].medicine.medicine[@intFromEnum(c.Tier.green)]);
+    try std.testing.expectEqual(balance.DEFAULT_RECIPE_COST, recipes[0].cost);
+    try std.testing.expectEqual(@as(u16, 0), recipes[1].cost);
+    try std.testing.expectEqual(@as(u16, 12), recipes[2].cost);
+    // The free move sets the floor the dead-position check compares against.
+    try std.testing.expectEqual(@as(u16, 0), loaded.config.balance.cheapest_cost());
+}
+
+test "cheapest_cost spans both recipe tables" {
+    const doc =
+        \\{"hunger_cost_normal":1,
+        \\ "player_recipes":[{"label":"p","pattern":["dispense"],"shape":["#"],"cost":5}],
+        \\ "team_recipes":[{"label":"t","patterns":[["dispense"],["catalyst"]],
+        \\   "shape":["#"],"cost":2}]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    // The team recipe is the cheapest move, so it decides when a team is broke.
+    try std.testing.expectEqual(@as(u16, 2), loaded.config.balance.cheapest_cost());
 }
 
 test "an element name is no longer a valid combo slot" {
@@ -723,7 +752,7 @@ test "slime_grid defaults when absent" {
 
 test "slime_grid is read from the document" {
     const doc =
-        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\{"hunger_cost_normal":1,
         \\ "slime_grid":{"rows":4,"cols":12},
         \\ "player_recipes":[],"team_recipes":[]}
     ;
@@ -736,7 +765,7 @@ test "slime_grid is read from the document" {
 
 test "out-of-range slime_grid dimensions are rejected" {
     const zero =
-        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\{"hunger_cost_normal":1,
         \\ "slime_grid":{"rows":0,"cols":8},
         \\ "player_recipes":[],"team_recipes":[]}
     ;
@@ -745,7 +774,7 @@ test "out-of-range slime_grid dimensions are rejected" {
         parse(std.testing.allocator, zero, minimal_encounters),
     );
     const too_big =
-        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\{"hunger_cost_normal":1,
         \\ "slime_grid":{"rows":8,"cols":99},
         \\ "player_recipes":[],"team_recipes":[]}
     ;
@@ -758,7 +787,7 @@ test "out-of-range slime_grid dimensions are rejected" {
 test "zero casts_per_turn is rejected" {
     // A budget that can never be spent is a turn that can never end.
     const bad =
-        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\{"hunger_cost_normal":1,
         \\ "casts_per_turn":0,
         \\ "player_recipes":[],"team_recipes":[]}
     ;
@@ -770,7 +799,7 @@ test "zero casts_per_turn is rejected" {
 
 test "casts_per_turn is read from the document" {
     const doc =
-        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\{"hunger_cost_normal":1,
         \\ "casts_per_turn":7,
         \\ "player_recipes":[],"team_recipes":[]}
     ;
@@ -779,22 +808,33 @@ test "casts_per_turn is read from the document" {
     try std.testing.expectEqual(@as(u8, 7), loaded.config.balance.casts_per_turn);
 }
 
-test "retired realtime fields are rejected" {
-    // The turn loop has no buffers, locks or per-second eat rate.  Leaving a
-    // stale tunable in a config would silently do nothing, so std.json's
-    // unknown-field strictness is the intended behaviour here.
+test "retired realtime and medicine fields are rejected" {
+    // The turn loop has no buffers, locks or per-second eat rate, and medicine
+    // is gone entirely.  Leaving a stale tunable in a config would silently do
+    // nothing, so std.json's unknown-field strictness is the intended behaviour.
     for ([_][]const u8{
-        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\{"hunger_cost_normal":1,
         \\ "eat_rate_units_per_s":2.0,
         \\ "player_recipes":[],"team_recipes":[]}
         ,
-        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\{"hunger_cost_normal":1,
         \\ "cast_buffer_ms":500,
         \\ "player_recipes":[],"team_recipes":[]}
         ,
-        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\{"hunger_cost_normal":1,
         \\ "cast_lock_ms":500,
         \\ "player_recipes":[],"team_recipes":[]}
+        ,
+        // Hazards are never eaten now, so there is no extra to charge for.
+        \\{"hunger_cost_normal":1,
+        \\ "hunger_cost_hazard_extra":2,
+        \\ "player_recipes":[],"team_recipes":[]}
+        ,
+        // A recipe's medicine output has no meaning any more.
+        \\{"hunger_cost_normal":1,
+        \\ "player_recipes":[{"label":"x","pattern":["dispense"],"shape":["#"],
+        \\   "medicine":{"red":3}}],
+        \\ "team_recipes":[]}
         ,
     }) |bad| {
         try std.testing.expectError(
@@ -806,7 +846,7 @@ test "retired realtime fields are rejected" {
 
 test "unknown top-level field is rejected (typo protection)" {
     const bad =
-        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\{"hunger_cost_normal":1,
         \\ "unnits_per_slot":5,
         \\ "player_recipes":[],"team_recipes":[]}
     ;
@@ -819,8 +859,8 @@ test "unknown top-level field is rejected (typo protection)" {
 test "a removed pre-shape balance field is rejected, not ignored" {
     // Old configs are incompatible on purpose: their recipes have no shapes.
     const stale =
-        \\{"units_per_slot":5,"medicine_per_slot":3,
-        \\ "hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\{"units_per_slot":5,"reagent_per_slot":3,
+        \\ "hunger_cost_normal":1,
         \\ "player_recipes":[],"team_recipes":[]}
     ;
     try std.testing.expectError(
@@ -831,7 +871,7 @@ test "a removed pre-shape balance field is rejected, not ignored" {
 
 test "a recipe without a shape is rejected" {
     const bad =
-        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\{"hunger_cost_normal":1,
         \\ "player_recipes":[{"label":"x","pattern":["dispense"]}],
         \\ "team_recipes":[]}
     ;
@@ -841,24 +881,25 @@ test "a recipe without a shape is rejected" {
     );
 }
 
-test "team recipes carry one shared shape" {
+test "team recipes carry one shared shape and one shared cost" {
     const doc =
-        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\{"hunger_cost_normal":1,
         \\ "player_recipes":[],
-        \\ "team_recipes":[{"label":"t","patterns":[["dispense"],["medicine"]],
-        \\   "shape":["#####"],"medicine":{"yellow":3}}]}
+        \\ "team_recipes":[{"label":"t","patterns":[["dispense"],["catalyst"]],
+        \\   "shape":["#####"],"cost":3}]}
     ;
     var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
     defer loaded.deinit();
     const tr = loaded.config.balance.team_recipes[0];
     try std.testing.expectEqual(@as(usize, 2), tr.patterns.len);
     try std.testing.expectEqual(@as(usize, 5), tr.shape.size());
-    try std.testing.expectEqual(@as(u32, 3), tr.medicine.medicine[@intFromEnum(c.Tier.yellow)]);
+    // One cost for the group, not one per contributing player.
+    try std.testing.expectEqual(@as(u16, 3), tr.cost);
 }
 
 test "team recipe with zero patterns is rejected" {
     const bad =
-        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\{"hunger_cost_normal":1,
         \\ "player_recipes":[],
         \\ "team_recipes":[{"label":"t","patterns":[],"shape":["#"]}]}
     ;
@@ -882,6 +923,60 @@ test "legacy multi-zone encounters are summed into one slime total" {
     try std.testing.expectEqual(@as(u16, 4), e.slime.tiered[@intFromEnum(c.Tier.green)]);
     try std.testing.expectEqual(@as(u16, 6), e.slime.neutral);
     try std.testing.expectEqual(@as(u32, 15), e.total_units());
+}
+
+test "specials are summed from the zones and default to none" {
+    const doc =
+        \\{"default":"e1","encounters":[
+        \\ {"label":"e1","hunger_max":100,"zones":[
+        \\   {"neutral":4,"special":1},
+        \\   {"tiered":{"red":2},"special":2}]}]}
+    ;
+    var loaded = try parse(std.testing.allocator, minimal_balance, doc);
+    defer loaded.deinit();
+    const e = loaded.config.encounters.default();
+    try std.testing.expectEqual(@as(u16, 3), e.slime.special);
+    // Specials count as supply — they occupy grid cells — but not as playable
+    // slime, which is what the win condition measures.
+    try std.testing.expectEqual(@as(u32, 9), e.total_units());
+    try std.testing.expectEqual(@as(u32, 6), e.slime.non_special());
+}
+
+test "an encounter of nothing but specials is still 'slime' for validation" {
+    // Degenerate but legal: an all-objective field.  Nothing to eat, so the
+    // team wins the moment it starts — the loader's job is not to judge design.
+    const doc =
+        \\{"default":"e1","encounters":[
+        \\ {"label":"e1","hunger_max":100,"zones":[{"special":3}]}]}
+    ;
+    var loaded = try parse(std.testing.allocator, minimal_balance, doc);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u16, 3), loaded.config.encounters.default().slime.special);
+}
+
+test "encounter charges default, are read, and 0 is rejected" {
+    var defaulted = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
+    defer defaulted.deinit();
+    try std.testing.expectEqual(enc.DEFAULT_CHARGES, defaulted.config.encounters.default().charges);
+
+    const doc =
+        \\{"default":"e1","encounters":[
+        \\ {"label":"e1","hunger_max":100,"charges":7,"zones":[{"neutral":5}]}]}
+    ;
+    var loaded = try parse(std.testing.allocator, minimal_balance, doc);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u32, 7), loaded.config.encounters.default().charges);
+
+    // A team with no charges can never open a wall, so the encounter would be a
+    // trap rather than a challenge.
+    const bad =
+        \\{"default":"e1","encounters":[
+        \\ {"label":"e1","hunger_max":100,"charges":0,"zones":[{"neutral":5}]}]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidCharges,
+        parse(std.testing.allocator, minimal_balance, bad),
+    );
 }
 
 test "encounter with no slime at all is rejected" {

@@ -9,10 +9,18 @@
 //! ## Recipes
 //!
 //! A recipe is an *exact* combo pattern (same slots, same order, same
-//! length) naming a SHAPE.  Casting stamps that shape on the grid anchored at
-//! the caster's cursor: every covered hazard cell is downgraded one tier.
-//! There is no flat fallback — a combo matching no recipe fizzles, so the
-//! recipe tables are the complete move list.
+//! length) naming a SHAPE and a CHARGE COST.  Casting stamps that shape on the
+//! grid anchored at the caster's cursor: every covered hazard cell is
+//! downgraded one tier.  There is no flat fallback — a combo matching no recipe
+//! fizzles, so the recipe tables are the complete move list.
+//!
+//! ## Charges
+//!
+//! Charges are the encounter's scarce resource: ONE pool, shared by the whole
+//! team, spent across the WHOLE game and never refilled (the starting amount is
+//! per-encounter — see encounters.json).  Each recipe prices itself via
+//! `cost`, so the recipe table is also the economy: broad shapes can be made
+//! expensive and precise ones cheap.  A cast the pool cannot afford fizzles.
 //!
 //! Team recipes match sets of combos cast by distinct players in the same
 //! round.  They are checked first, greedily, in table order; each player's
@@ -67,14 +75,19 @@ pub const Shape = struct {
     }
 };
 
+/// Charges a recipe costs when `cost` is absent from its JSON entry.
+pub const DEFAULT_RECIPE_COST: u16 = 1;
+
 pub const PlayerRecipe = struct {
     label: []const u8,
     pattern: c.ActionCombo,
     /// Footprint downgraded at the caster's cursor.  Every recipe names a
-    /// shape; a pure-heal recipe carries a minimal (1×1) shape and non-zero
-    /// `medicine`.
+    /// shape — the stamp IS the cast's whole effect.
     shape: Shape,
-    medicine: c.MedicineOutput = .{},
+    /// Charges deducted from the team pool when this recipe fires.  May be 0
+    /// for a deliberately free move; a cast is refused (and fizzles) when the
+    /// pool holds less than this.
+    cost: u16 = DEFAULT_RECIPE_COST,
 };
 
 /// `patterns` — one exact combo per participating player (distinct players).
@@ -85,7 +98,11 @@ pub const TeamRecipe = struct {
     label: []const u8,
     patterns: []const c.ActionCombo,
     shape: Shape,
-    medicine: c.MedicineOutput = .{},
+    /// Charges deducted ONCE per firing of the group, regardless of how many
+    /// players contributed.  Charged when the group completes, not when the
+    /// individual halves are submitted, so a half that never finds its partner
+    /// costs the pool nothing.
+    cost: u16 = DEFAULT_RECIPE_COST,
 };
 
 /// Slime grid dimensions — a GLOBAL knob (not per-encounter), so every game
@@ -107,11 +124,10 @@ pub const DEFAULT_SLIME_GRID = SlimeGridDims{ .rows = 6, .cols = 10 };
 /// All designer-tunable balance numbers.  Loaded from `data/balance.json`
 /// (see config.zig); tests use the frozen fixture in fixtures.zig.
 pub const Balance = struct {
-    /// Hunger cost per slime unit consumed (any unit — never healable).
+    /// Hunger cost per slime unit consumed.  Only EDIBLE units are ever eaten
+    /// (neutral and defused), so this is the single hunger rate: hazards are
+    /// never swallowed, they are walls.
     hunger_cost_normal: u32,
-    /// EXTRA hunger per un-neutralized hazard unit consumed (healable portion,
-    /// healed by medicine matching the tier that was eaten).
-    hunger_cost_hazard_extra: u32,
     /// Dimensions of the slime grid.  Slime beyond `rows * cols` waits in the
     /// off-grid reservoir and refills emptied cells at the start of each turn.
     slime_grid: SlimeGridDims,
@@ -121,10 +137,22 @@ pub const Balance = struct {
     /// of 0 could never be spent, so no turn could ever end.
     ///
     /// A fizzled cast (a combo naming no recipe) does NOT spend budget; a
-    /// team half held for a partner who never arrives DOES.
+    /// team half held for a partner who never arrives DOES, and so does a cast
+    /// the charge pool could not afford — otherwise a bankrupt team could never
+    /// end a turn.
     casts_per_turn: u8,
     player_recipes: []const PlayerRecipe,
     team_recipes: []const TeamRecipe,
+
+    /// The cheapest cast in the whole move list.  A team holding fewer charges
+    /// than this can never affect the grid again, which is how the session
+    /// recognises a dead position (see session.check_end).
+    pub fn cheapest_cost(self: *const Balance) u16 {
+        var min: u16 = std.math.maxInt(u16);
+        for (self.player_recipes) |r| min = @min(min, r.cost);
+        for (self.team_recipes) |r| min = @min(min, r.cost);
+        return min;
+    }
 };
 
 /// Default per-player cast budget when `casts_per_turn` is absent.

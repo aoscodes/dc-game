@@ -4,13 +4,15 @@
     {
       "label": "slime_feast_01",
       "hunger_max": 200,
+      "charges": 180,
       "zones": [
         {
           "tiered": {
             "red": 10,
             "green": 5
           },
-          "neutral": 15
+          "neutral": 15,
+          "special": 1
         },
         {
           "tiered": {
@@ -26,20 +28,23 @@
             "yellow": 10,
             "green": 15
           },
-          "neutral": 5
+          "neutral": 5,
+          "special": 1
         }
       ]
     },
     {
       "label": "slime_feast_02",
       "hunger_max": 700,
+      "charges": 1250,
       "zones": [
         {
           "tiered": {
             "red": 10,
             "green": 5
           },
-          "neutral": 15
+          "neutral": 15,
+          "special": 1
         },
         {
           "tiered": {
@@ -55,7 +60,8 @@
             "yellow": 10,
             "green": 15
           },
-          "neutral": 5
+          "neutral": 5,
+          "special": 1
         },
         {
           "tiered": {
@@ -63,7 +69,8 @@
             "yellow": 45,
             "green": 70
           },
-          "neutral": 15
+          "neutral": 15,
+          "special": 1
         },
         {
           "tiered": {
@@ -79,7 +86,8 @@
             "yellow": 100,
             "green": 15
           },
-          "neutral": 5
+          "neutral": 5,
+          "special": 1
         },
         {
           "tiered": {
@@ -103,7 +111,8 @@
             "yellow": 10,
             "green": 15
           },
-          "neutral": 5
+          "neutral": 5,
+          "special": 1
         }
       ]
     }

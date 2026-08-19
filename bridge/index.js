@@ -211,7 +211,7 @@ function validateDataDir(dir) {
 
 /**
  * POST body: { balance: <balance.json object>,
- *              encounter: { hunger_max, zones: [...] } }
+ *              encounter: { hunger_max, charges, zones: [...] } }
  * The encounter is saved as the single default encounter labelled "custom".
  * `zones` is a legacy wire name: the Zig loader sums the entries into the one
  * slime pool this game has, so old saved configs keep working.
@@ -250,6 +250,7 @@ function handleTuneSave(req, res) {
       encounters: [{
         label: "custom",
         hunger_max: msg.encounter.hunger_max,
+        charges: msg.encounter.charges,
         zones: msg.encounter.zones,
       }],
     };

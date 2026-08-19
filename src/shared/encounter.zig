@@ -1,10 +1,11 @@
 //! Encounter *types*: the slime supply for one game.
 //!
-//! An encounter is a hunger budget plus the TOTAL slime the Lil Guys will eat.
-//! That slime starts in the off-grid reservoir; the grid (dimensions come from
-//! balance.slime_grid, a global knob) is filled from it and refilled from the
-//! top as cells are emptied.  The encounter ends when every unit is eaten or
-//! the hunger bar fills.  One encounter per game (no chaining).
+//! An encounter is a hunger budget, a CHARGE budget, and the TOTAL slime the
+//! Lil Guys will eat.  That slime starts in the off-grid reservoir; the grid
+//! (dimensions come from balance.slime_grid, a global knob) is filled from it
+//! and refilled from the top as cells are emptied.  The encounter ends when
+//! every playable unit is eaten, the hunger bar fills, or the charges run out
+//! with the field still walled off.  One encounter per game (no chaining).
 //!
 //! There is exactly ONE slime field per game — the old multi-zone/per-round
 //! split is gone.  `data/encounters.json` still lists slime in `zones` for
@@ -26,10 +27,19 @@ pub const MAX_ZONES: u8 = 16;
 /// Wire cap on the encounter label (GameStart message field).
 pub const MAX_LABEL_LEN: u8 = 32;
 
+/// Charges an encounter grants when `charges` is absent from its JSON entry.
+pub const DEFAULT_CHARGES: u32 = 30;
+
 pub const Encounter = struct {
     label: []const u8,
     /// Hunger bar capacity; encounter ends when reached.
     hunger_max: u16,
+    /// Charges the team starts with, shared by everyone and spent across the
+    /// WHOLE encounter — never refilled between turns.  This is the encounter's
+    /// sharpest difficulty knob: it caps the total number of walls the team can
+    /// ever open, so it decides how much of the field is reachable at all.
+    /// Validated > 0: a team that cannot cast cannot play.
+    charges: u32 = DEFAULT_CHARGES,
     /// All the slime in this encounter, as the reservoir starts it.
     slime: c.SlimeReservoir,
 
@@ -63,12 +73,14 @@ pub const EncounterSet = struct {
 
 const testing = std.testing;
 
-test "Encounter total_units sums every slime bucket" {
-    var slime = c.SlimeReservoir{ .neutral = 5 };
+test "Encounter total_units sums every slime bucket, specials included" {
+    var slime = c.SlimeReservoir{ .neutral = 5, .special = 2 };
     slime.tiered[@intFromEnum(c.Tier.red)] = 10;
     slime.tiered[@intFromEnum(c.Tier.green)] = 3;
     const e = Encounter{ .label = "t", .hunger_max = 100, .slime = slime };
-    try testing.expectEqual(@as(u32, 18), e.total_units());
+    // Specials occupy grid cells, so they are part of the supply even though
+    // they are never eaten.
+    try testing.expectEqual(@as(u32, 20), e.total_units());
 }
 
 test "EncounterSet default and find resolve by label" {
