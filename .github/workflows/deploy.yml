@@ -108,7 +108,8 @@ jobs:
         run: |
           mkdir -p deploy/bridge deploy/zig-out/bin
           cp zig-out/bin/client          deploy/zig-out/bin/client
-          cp bridge/index.js             deploy/bridge/index.js
+          # All bridge modules — index.js require()s session.js/controllers.js.
+          cp bridge/*.js                 deploy/bridge/
           cp bridge/package.json         deploy/bridge/package.json
           cp bridge/package-lock.json    deploy/bridge/package-lock.json
           cp -r bridge/node_modules      deploy/bridge/node_modules
