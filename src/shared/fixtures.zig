@@ -141,9 +141,9 @@ pub const test_config = config.Config{
         // 6×10 = 60 on-grid cells; the fixture encounter's 110 units mean the
         // reservoir always starts non-empty (exercises refill paths).
         .slime_grid = .{ .rows = 6, .cols = 10 },
-        .eat_rate_units_per_s = 2.0,
-        .cast_buffer_ms = 500,
-        .cast_lock_ms = 500,
+        // 3 casts per player per turn: enough for a team recipe plus a solo
+        // follow-up, so tests can exercise budget exhaustion in one turn.
+        .casts_per_turn = 3,
         .player_recipes = &player_recipes,
         .team_recipes = &team_recipes,
     },

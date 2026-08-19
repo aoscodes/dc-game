@@ -8,40 +8,41 @@
 //!   - The match PRNG: every random choice in the game comes from this one
 //!     seeded generator, so a session is reproducible from its seed.
 //!
-//! ## Slime Feast loop
+//! ## Slime Feast turn loop
 //!
 //! There is ONE slime grid per game (`slime.SlimeField`), sized by the global
 //! `balance.slime_grid`.  The encounter's slime starts in the off-grid
-//! reservoir; whatever fits is placed on the grid, and emptied cells refill
-//! from the top row.  The grid is server-authoritative and transmitted whole
-//! in `game_state`, so every client renders identical slime.
+//! reservoir; whatever fits is placed on the grid.  The grid is
+//! server-authoritative and transmitted whole in `game_state`, so every client
+//! renders identical slime.
 //!
-//! EATING.  One "Lil Guy" ECS entity exists per connected player.  Each
-//! reserves a RANDOM occupied cell and counts down a bite timer (derived from
-//! `balance.eat_rate_units_per_s`); when it expires the Lil Guy bites that
-//! cell empty, adding hunger (normal, plus healable extra for still-hazardous
-//! slime) and score (neutral + defused slime), then re-targets.  A reservation
-//! is not exclusive: if the cell emptied first (another Lil Guy got there) the
-//! bite is a miss and the Lil Guy simply re-targets.  A cast can never steal a
-//! reserved bite: downgrading REWRITES a cell, it never empties one.
+//! A TURN is: everyone spends their cast budget, then the Lil Guys eat the
+//! WHOLE FIELD at once and a fresh field arrives.  Nothing is on a clock —
+//! `tick` only drains input and broadcasts, so a session advances solely by
+//! what players do.
 //!
-//! CASTING.  Casts are explicitly SUBMITTED (`submit_spell`).  Each accepted
-//! cast gets its OWN `cast_buffer_ms` countdown and fires solo at its expiry
-//! — UNLESS a newly accepted cast COMPLETES a team recipe with pending casts:
-//! that recipe instance's members then share the joiner's expiry
-//! (`cast_grouped`) and fire together.  Expired casts convert as one batch
-//! (`cast_fired`): recipes match within the batch, medicine heals the hunger
-//! bar immediately, and each matched recipe STAMPS its shape on the grid,
-//! anchored at the caster's captured cursor.  Every covered hazard cell steps
-//! down one tier (red -> yellow -> green -> defused); coverage that falls off
-//! the grid edge, or lands on a cell with nothing left to downgrade, is wasted.
-//! Each accepted submit also starts a per-player
-//! `cast_lock_ms` cooldown: locked submits are silently ignored, and an
-//! unlocked resubmit REPLACES the player's pending cast, restarting its
-//! buffer (`cast_replaced`).
+//! CASTING.  Each player gets `balance.casts_per_turn` casts per turn.  A
+//! submit RESOLVES IMMEDIATELY:
+//!   - It matches a player recipe → the shape stamps now and its medicine heals
+//!     now.
+//!   - It completes a team recipe against teammates' HELD halves → the whole
+//!     group resolves now, anchored at the joiner's cursor.
+//!   - It is an unpaired team half → it is HELD (`cast_committed`) until a
+//!     partner completes it or the turn ends.
+//!   - It matches nothing → `cast_fizzled`, and the budget is NOT spent.
+//! Stamping downgrades every covered hazard cell one tier (red -> yellow ->
+//! green -> defused); coverage off the grid edge, or on a cell with nothing
+//! left to downgrade, is wasted.  A stamp never empties a cell.
 //!
-//! The encounter ends when all slime is consumed OR the hunger bar fills.
-//! Either way the final shared score is broadcast via game_over.
+//! TURN END.  When every connected player's budget is spent, the field is eaten
+//! in ONE bulk feast: normal hunger per unit plus healable extra per unit still
+//! hazardous, and score for neutral + defused units.  Held halves then fizzle
+//! (their budget stays spent), the grid is cleared and refilled from the
+//! reservoir, budgets reset, and `turn_ended` is broadcast.
+//!
+//! The encounter's end is checked ONLY at turn end: the hunger bar filling is a
+//! loss, an exhausted field + reservoir is a win.  Either way the final shared
+//! score is broadcast via game_over.
 
 const std = @import("std");
 const ecs = @import("ecs_zig");
@@ -54,23 +55,20 @@ const cfg_mod = shared.config;
 const slime = shared.slime;
 const dbg = @import("debug_zig");
 
-/// Profiler phases of one tick.
-pub const TickPhase = enum { drain, casts, feast, broadcast, check_end };
+/// Profiler phases of one tick.  The feast is not a tick phase: it happens at
+/// turn end, driven by input, not by elapsed time.
+pub const TickPhase = enum { drain, broadcast };
 
 pub const PlayerTeam = struct {};
-/// System over every Lil Guy entity (drives the bite loop).
-pub const LilGuyHorde = struct {};
 
 pub const GameWorld = ecs.World(
     .{
         .kind = c.Kind,
         .owner = c.Owner,
         .player_marker = c.PlayerMarker,
-        .lil_guy = c.LilGuy,
     },
     .{
         .player_team = PlayerTeam,
-        .lil_guy_horde = LilGuyHorde,
     },
 );
 
@@ -87,9 +85,6 @@ pub const PlayerSlot = struct {
     name_len: u8 = 0,
     ready: bool = false,
     entity: ecs.Entity = std.math.maxInt(ecs.Entity),
-    /// This player's Lil Guy entity (NO_ENTITY while none exists).  Lil Guys
-    /// are reconciled against connectivity every tick by `sync_lil_guys`.
-    lil_guy: ecs.Entity = NO_ENTITY,
     transport: ?shared.Transport = null,
     queue_lock: std.Thread.Mutex = .{},
     msg_queue: std.ArrayListUnmanaged(u8) = .empty,
@@ -123,32 +118,25 @@ pub const Session = struct {
     slime_total: u32 = 0,
     /// Shared team score: neutral slime units consumed.
     score: u32 = 0,
+    /// The turn now being played (1-based; 0 until the game starts).
+    turn: u16 = 0,
+    /// Casts each player has left this turn.  The turn ends when every
+    /// CONNECTED player's entry is 0, so this is the only turn-progress state.
+    casts_left: [MAX_PLAYERS]u8 = [_]u8{0} ** MAX_PLAYERS,
     /// Live combo preview per player (latest edit wins; Escape cancels).
     action_pool: [MAX_PLAYERS]?c.ActionCombo,
-    /// Each player's PENDING cast (null = none).  Cleared when the cast fires
-    /// and on game start.
-    submitted_pool: [MAX_PLAYERS]?c.ActionCombo = [_]?c.ActionCombo{null} ** MAX_PLAYERS,
-    /// Per-player countdown of the pending cast's buffer (null = no cast
-    /// pending, parallel to submitted_pool).  A cast fires when its timer
-    /// reaches 0; team-recipe grouping equalises members' timers so they
-    /// expire (and convert) together.
-    cast_fire_timers: [MAX_PLAYERS]?f32 = [_]?f32{null} ** MAX_PLAYERS,
-    /// Per-player cast-lock cooldowns (seconds remaining).
-    cast_locks: [MAX_PLAYERS]f32 = [_]f32{0} ** MAX_PLAYERS,
+    /// Each player's HELD team half: a cast that was accepted but needs a
+    /// partner to resolve (null = none).  Cleared when a partner completes the
+    /// recipe, and at turn end (where it fizzles).
+    held_pool: [MAX_PLAYERS]?c.ActionCombo = [_]?c.ActionCombo{null} ** MAX_PLAYERS,
     /// Each player's aiming cursor, as a flat grid index.  SERVER-OWNED: the
     /// client sends directions and this clamps, so a cursor is always a valid
     /// cell of the current grid and no client can aim out of bounds.
     cursors: [MAX_PLAYERS]u16 = [_]u16{0} ** MAX_PLAYERS,
-    /// Where each pending cast was aimed, captured at SUBMIT time.  A cast
-    /// lands where the player was aiming when they committed it, so moving
-    /// during the buffer cannot retarget an already-committed spell.
+    /// Where each cast was aimed, captured at SUBMIT time.  A held half lands
+    /// where the player was aiming when they committed it, so re-aiming while
+    /// waiting for a partner cannot retarget it.
     cast_anchors: [MAX_PLAYERS]u16 = [_]u16{0} ** MAX_PLAYERS,
-    /// The player whose submit most recently COMPLETED a team-recipe group.
-    /// That player aims the combined shape; cleared once the group fires.
-    last_joiner: ?u8 = null,
-    /// Whether each player has a cast pending, as sent on the wire (drives
-    /// the client's "cast used" indicator).
-    casts_used: [MAX_PLAYERS]u8 = [_]u8{0} ** MAX_PLAYERS,
     /// Tuning stats accumulated over the match; broadcast with game_over.
     /// `players` is indexed by player_id during play and compacted (dense,
     /// names filled) in end_game.
@@ -278,7 +266,6 @@ pub const Session = struct {
         self.world = try GameWorld.init(self.allocator);
         set_world_system_signatures(&self.world);
         for (&self.action_pool) |*a| a.* = @as(?c.ActionCombo, null);
-        self.casts_used = [_]u8{0} ** MAX_PLAYERS;
         self.stats = .{
             .player_recipe_count = @intCast(self.cfg.balance.player_recipes.len),
             .team_recipe_count = @intCast(self.cfg.balance.team_recipes.len),
@@ -287,11 +274,10 @@ pub const Session = struct {
 
         self.phase = .playing;
         self.current_encounter = encounter;
-        self.cast_fire_timers = [_]?f32{null} ** MAX_PLAYERS;
-        self.cast_locks = [_]f32{0} ** MAX_PLAYERS;
-        for (&self.submitted_pool) |*sp| sp.* = null;
+        for (&self.held_pool) |*hp| hp.* = null;
         self.cast_anchors = [_]u16{0} ** MAX_PLAYERS;
-        self.last_joiner = null;
+        self.turn = 1;
+        self.reset_budgets();
 
         self.hunger = .{ .current = 0, .max = encounter.hunger_max };
         self.hunger_healable = [_]u16{0} ** c.Tier.size;
@@ -310,20 +296,24 @@ pub const Session = struct {
         );
         self.cursors = [_]u16{centre} ** MAX_PLAYERS;
 
-        std.log.info("game start — encounter: {s} slime={} grid={}x{} hunger_max={}", .{
+        std.log.info("game start — encounter: {s} slime={} grid={}x{} hunger_max={} casts/turn={}", .{
             encounter.label,
             self.slime_total,
             self.field.grid.rows,
             self.field.grid.cols,
             self.hunger.max,
+            self.cfg.balance.casts_per_turn,
         });
         try self.spawn_players();
     }
 
-    /// Give every connected player their avatar entity plus a Lil Guy.
+    /// Give every connected player their avatar entity.
+    ///
+    /// The Lil Guys have no server representation: they eat the whole field at
+    /// turn end regardless of how many there are, so they are purely a client
+    /// animation of `turn_ended`.
     fn spawn_players(self: *Session) !void {
         for (&self.players) |*p| {
-            p.lil_guy = NO_ENTITY;
             if (!p.occupied or !p.connected) {
                 p.entity = NO_ENTITY;
                 continue;
@@ -334,30 +324,24 @@ pub const Session = struct {
             self.world.add_component(e, c.Owner{ .player_id = p.player_id });
             self.world.add_component(e, c.PlayerMarker{});
         }
-        self.sync_lil_guys();
     }
 
-    /// Reconcile the Lil Guy horde against who is actually connected: one Lil
-    /// Guy per connected player, each spawned with a reservation already made
-    /// so it starts eating on its first tick.  Disconnects retire their Lil
-    /// Guy, which shrinks the team's eating throughput.
-    fn sync_lil_guys(self: *Session) void {
-        for (&self.players) |*p| {
-            const wants = p.occupied and p.connected;
-            const has = p.lil_guy != NO_ENTITY;
-            if (wants and !has) {
-                const e = self.world.create_entity();
-                self.world.add_component(e, c.LilGuy{});
-                self.reserve_target(self.world.get_component(e, c.LilGuy));
-                p.lil_guy = e;
-            } else if (!wants and has) {
-                self.world.destroy_entity(p.lil_guy);
-                p.lil_guy = NO_ENTITY;
-            }
-        }
+    /// Refill every player's cast budget for a new turn.  Budgets are set for
+    /// ALL slots, connected or not: a player who joins or reconnects mid-turn
+    /// gets a usable budget rather than a stuck 0.
+    fn reset_budgets(self: *Session) void {
+        self.casts_left = [_]u8{self.cfg.balance.casts_per_turn} ** MAX_PLAYERS;
     }
 
+    /// One server tick: drain queued client input (which is what actually
+    /// advances the game) and broadcast the resulting state.
+    ///
+    /// `dt` is unused: the turn loop has no timers.  It stays in the signature
+    /// because the server's tick driver is time-based, and dropping it would
+    /// only push the same unused value up a layer.
     pub fn tick(self: *Session, dt: f32) !void {
+        _ = dt;
+
         self.profiler.begin(.drain);
         try self.drain_queues();
         self.profiler.end(.drain);
@@ -366,137 +350,196 @@ pub const Session = struct {
 
         self.tick_count += 1;
 
-        self.profiler.begin(.casts);
-        for (&self.cast_locks) |*lock| lock.* = @max(lock.* - dt, 0.0);
-        var any_expired = false;
-        for (&self.cast_fire_timers) |*t| {
-            if (t.*) |*remaining| {
-                remaining.* -= dt;
-                if (remaining.* <= 0.0) any_expired = true;
-            }
-        }
-        if (any_expired) try self.fire_expired_casts();
-        self.profiler.end(.casts);
-
-        self.profiler.begin(.feast);
-        try self.bite_tick(dt);
-        self.profiler.end(.feast);
+        // A disconnect can be what makes every REMAINING player spent, and
+        // disconnects arrive outside the cast path — so re-check here, after
+        // input is drained, rather than only on submit.
+        try self.maybe_end_turn();
+        if (self.phase != .playing) return;
 
         self.profiler.begin(.broadcast);
         try self.broadcast_game_state();
         self.profiler.end(.broadcast);
-
-        self.profiler.begin(.check_end);
-        try self.check_end();
-        self.profiler.end(.check_end);
 
         if (self.profiler.should_report(200)) {
             self.profiler.report_stderr("session tick");
         }
     }
 
-    /// Group-cast buffer length in seconds (from balance data).
-    fn cast_buffer_s(self: *const Session) f32 {
-        return @as(f32, @floatFromInt(self.cfg.balance.cast_buffer_ms)) / 1000.0;
-    }
-
-    /// Per-player cast-lock cooldown in seconds (from balance data).
-    fn cast_lock_s(self: *const Session) f32 {
-        return @as(f32, @floatFromInt(self.cfg.balance.cast_lock_ms)) / 1000.0;
-    }
-
-    /// Collect every pending cast whose buffer expired (timer <= 0) into one
-    /// batch — grouped casts share an expiry, so a team recipe's members
-    /// convert together — clearing their pool slots, timers and on-wire
-    /// submission markers (`casts_used`).  Records cast stats (here, not at
-    /// submit time, so replacements count once), broadcasts cast_fired
-    /// (before conversion, so it precedes the batch's recipe_fired /
-    /// action_result messages), then converts the batch.
-    fn fire_expired_casts(self: *Session) !void {
+    /// Resolve one submitted cast IMMEDIATELY.
+    ///
+    /// Returns whether the cast consumed a budget slot.  Three outcomes:
+    ///   - It matches something on its own (a player recipe) → resolved now.
+    ///   - It completes a team recipe against held halves → that whole group
+    ///     resolves now, anchored at this player (the joiner).
+    ///   - It is an unpaired team half → HELD (budget still spent, because the
+    ///     player did commit it).
+    /// A cast that matches nothing at all never reaches here: `submit_spell`
+    /// fizzles it and keeps the budget.
+    fn resolve_cast(self: *Session, player_id: u8, combo: c.ActionCombo) !void {
+        // Everything currently on the table: this cast plus every held half.
         var batch: [MAX_PLAYERS]logic.Cast = undefined;
         var batch_len: usize = 0;
-        var player_mask: u8 = 0;
-        for (&self.cast_fire_timers, 0..) |*t, pid| {
-            const remaining = t.* orelse continue;
-            if (remaining > 0.0) continue;
-            t.* = null;
-            const combo = self.submitted_pool[pid] orelse continue;
-            self.submitted_pool[pid] = null;
-            self.casts_used[pid] = 0;
-            batch[batch_len] = .{ .player_id = @intCast(pid), .combo = combo };
+        var joiner_index: usize = 0;
+        for (&self.held_pool, 0..) |*hp, pid| {
+            const held = hp.* orelse continue;
+            batch[batch_len] = .{ .player_id = @intCast(pid), .combo = held };
             batch_len += 1;
-            player_mask |= @as(u8, 1) << @intCast(pid);
-            self.record_cast_stats(pid);
         }
-        if (batch_len == 0) return;
-
-        var buf: [8]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        try proto.encode(fbs.writer(), .cast_fired, proto.CastFired{
-            .spell_count = @intCast(batch_len),
-            .player_mask = player_mask,
-        });
-        try self.broadcast_raw(fbs.getWritten());
-
-        // The joiner only aims the group it completed; once that group has
-        // fired the claim is spent.
-        const joiner = self.last_joiner;
-        self.last_joiner = null;
-        try self.convert_batch(batch[0..batch_len], joiner);
-    }
-
-    /// After accepting `player_id`'s cast, check whether it
-    /// COMPLETES a team recipe with the other pending casts (dry-run of the
-    /// same matcher used at fire time).  If so, equalise that recipe
-    /// INSTANCE's fire timers to the joiner's full buffer — the group fires
-    /// together at the newest joiner's expiry — and broadcast cast_grouped.
-    /// Partial matches never hold casts.
-    fn group_team_casts(self: *Session, player_id: u8) !void {
-        var pending: [MAX_PLAYERS]logic.Cast = undefined;
-        var pending_len: usize = 0;
-        var joiner_index: ?usize = null;
-        for (&self.submitted_pool, 0..) |*sp, pid| {
-            const combo = sp.* orelse continue;
-            if (pid == player_id) joiner_index = pending_len;
-            pending[pending_len] = .{ .player_id = @intCast(pid), .combo = combo };
-            pending_len += 1;
-        }
-        const ji = joiner_index orelse return;
+        joiner_index = batch_len;
+        batch[batch_len] = .{ .player_id = player_id, .combo = combo };
+        batch_len += 1;
 
         var report = logic.MatchReport{};
-        _ = logic.match_recipes(&self.cfg.balance, pending[0..pending_len], null, &report);
-        const instance = report.team_instance[ji];
-        if (instance == logic.NO_TEAM_INSTANCE) return;
+        _ = logic.match_recipes(&self.cfg.balance, batch[0..batch_len], player_id, &report);
 
-        // This player closed the circuit, so their cursor aims the combined
-        // shape when the group fires.
-        self.last_joiner = player_id;
-
-        var player_mask: u8 = 0;
-        for (pending[0..pending_len], 0..) |cast, ci| {
-            if (report.team_instance[ci] != instance) continue;
-            self.cast_fire_timers[cast.player_id] = self.cast_buffer_s();
-            player_mask |= @as(u8, 1) << @intCast(cast.player_id);
+        if (report.consumed[joiner_index] == .none) {
+            // Nothing this cast can do yet: it is a team half waiting for a
+            // partner.  (A combo that matches nothing at all was already
+            // fizzled by the caller.)
+            self.held_pool[player_id] = combo;
+            var buf: [4]u8 = undefined;
+            var fbs = std.io.fixedBufferStream(&buf);
+            try proto.encode(fbs.writer(), .cast_committed, proto.CastCommitted{
+                .player_id = player_id,
+            });
+            try self.broadcast_raw(fbs.getWritten());
+            return;
         }
 
-        var buf: [8]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        try proto.encode(fbs.writer(), .cast_grouped, proto.CastGrouped{
-            .player_mask = player_mask,
-            .fires_in_ms = self.cfg.balance.cast_buffer_ms,
-        });
-        try self.broadcast_raw(fbs.getWritten());
+        // This cast resolves.  Everything it consumed leaves the table with it;
+        // halves that contributed nothing stay held for a future partner.
+        var resolved: [MAX_PLAYERS]logic.Cast = undefined;
+        var resolved_len: usize = 0;
+        for (batch[0..batch_len], 0..) |cast, bi| {
+            if (report.consumed[bi] == .none) continue;
+            if (cast.player_id != player_id) self.held_pool[cast.player_id] = null;
+            resolved[resolved_len] = cast;
+            resolved_len += 1;
+        }
+
+        try self.convert_batch(resolved[0..resolved_len], player_id);
     }
 
-    /// CONVERT one batch of fired spells: recipes match within the batch
-    /// (team recipes = same batch only), medicine heals right away
-    /// (broadcasting a .heal action_result), and each matched recipe STAMPS
-    /// its shape on the grid at the anchoring player's cursor — downgrading
-    /// every covered hazard cell by one tier.  Each recipe fire and each
-    /// stamp is broadcast.
+    /// True once every CONNECTED player has spent their budget.  Disconnected
+    /// slots are ignored, so a player dropping out unblocks the turn instead of
+    /// stalling it forever.
     ///
-    /// `joiner` is the player whose submit completed a team group, if any;
-    /// they aim the combined team shape (see match_recipes).
+    /// An EMPTY room is never "spent": with nobody to cast, ending turns would
+    /// spin the feast every tick and eat the encounter unattended.
+    fn budgets_spent(self: *const Session) bool {
+        var connected: u8 = 0;
+        for (&self.players, 0..) |*p, pid| {
+            if (!p.occupied or !p.connected) continue;
+            connected += 1;
+            if (self.casts_left[pid] > 0) return false;
+        }
+        return connected > 0;
+    }
+
+    /// End the turn if every connected player is out of casts.
+    ///
+    /// Called after each accepted cast and whenever the connected set shrinks,
+    /// because both can make the condition true.
+    fn maybe_end_turn(self: *Session) !void {
+        if (self.phase != .playing) return;
+        if (!self.budgets_spent()) return;
+        try self.end_turn();
+    }
+
+    /// Settle the turn: the Lil Guys devour the WHOLE field, held halves
+    /// fizzle, a fresh field arrives from the reservoir, and budgets refill.
+    ///
+    /// Order matters.  The feast is priced against the field as the casts left
+    /// it, so it must happen BEFORE the refill; and the end condition is
+    /// checked after the refill, because "field cleared" means the reservoir
+    /// had nothing left to send.
+    fn end_turn(self: *Session) !void {
+        const feast = self.field.eat_all(&self.cfg.balance);
+        const hunger_added = feast.hunger_total();
+        logic.add_hunger(&self.hunger, hunger_added);
+        for (&self.hunger_healable, feast.hunger_extra) |*bucket, extra| {
+            const grown = @as(u32, bucket.*) + extra;
+            bucket.* = @intCast(@min(grown, @as(u32, std.math.maxInt(u16))));
+        }
+        self.score += feast.score;
+        self.record_feast(feast);
+
+        // The feast is the ONLY thing that adds hunger, so it is the only
+        // damage event in the game — announced pool-level (no actor), exactly
+        // like medicine's heal.  Sent even at zero so the client's damage cue
+        // is not silently conditional on the field having been dangerous.
+        try self.broadcast_action_result(.{
+            .tag = .damage,
+            .actor_entity = std.math.maxInt(u32),
+            .target_entity = std.math.maxInt(u32),
+            .value = stat_u16(hunger_added),
+        });
+
+        // Halves nobody completed are lost — and the casts they cost are NOT
+        // refunded: committing to a team play you could not finish is the risk.
+        var fizzled_mask: u8 = 0;
+        for (&self.held_pool, 0..) |*hp, pid| {
+            if (hp.* == null) continue;
+            hp.* = null;
+            fizzled_mask |= @as(u8, 1) << @intCast(pid);
+            self.stats.players[pid].fizzles +|= 1;
+        }
+        if (fizzled_mask != 0) try self.broadcast_fizzles(fizzled_mask);
+
+        var healable: [c.Tier.size]u16 = undefined;
+        for (&healable, feast.hunger_extra) |*h, extra| h.* = stat_u16(extra);
+
+        var buf: [32]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        try proto.encode(fbs.writer(), .turn_ended, proto.TurnEnded{
+            .turn = self.turn,
+            .cells_eaten = feast.cells,
+            .hunger_added = stat_u16(hunger_added),
+            .healable = healable,
+            .score_added = feast.score,
+        });
+        try self.broadcast_raw(fbs.getWritten());
+
+        // A fresh field for the next turn; an empty reservoir simply means the
+        // grid stays empty, which check_end reads as the encounter won.
+        _ = self.field.fill(self.rand());
+
+        std.log.info("turn {} ended — ate {} hunger+{} score+{} reservoir={}", .{
+            self.turn,
+            feast.cells,
+            hunger_added,
+            feast.score,
+            self.field.reservoir.total(),
+        });
+
+        try self.check_end();
+        if (self.phase != .playing) return;
+
+        self.turn +|= 1;
+        self.reset_budgets();
+    }
+
+    /// Broadcast one cast_fizzled per player in `mask`.
+    fn broadcast_fizzles(self: *Session, mask: u8) !void {
+        for (0..MAX_PLAYERS) |pid| {
+            if (mask & (@as(u8, 1) << @intCast(pid)) == 0) continue;
+            var buf: [4]u8 = undefined;
+            var fbs = std.io.fixedBufferStream(&buf);
+            try proto.encode(fbs.writer(), .cast_fizzled, proto.CastFizzled{
+                .player_id = @intCast(pid),
+            });
+            try self.broadcast_raw(fbs.getWritten());
+        }
+    }
+
+    /// CONVERT one batch of resolving casts: recipes match within the batch,
+    /// medicine heals right away (broadcasting a .heal action_result), and each
+    /// matched recipe STAMPS its shape on the grid at the anchoring player's
+    /// cursor — downgrading every covered hazard cell by one tier.  Each recipe
+    /// fire and each stamp is broadcast.
+    ///
+    /// `joiner` is the player whose submit triggered this conversion; they aim
+    /// any combined team shape (see match_recipes).
     fn convert_batch(self: *Session, batch: []const logic.Cast, joiner: ?u8) !void {
         if (batch.len == 0) return;
 
@@ -591,95 +634,20 @@ pub const Session = struct {
         try self.broadcast_raw(fbs.getWritten());
     }
 
-    /// Seconds one Lil Guy takes to eat one slime unit — the inverse of
-    /// `eat_rate_units_per_s`, which is a PER-LIL-GUY rate, so the team's
-    /// throughput scales with the horde size.
-    fn bite_interval(self: *const Session) f32 {
-        return 1.0 / self.cfg.balance.eat_rate_units_per_s;
-    }
-
-    /// Advance every Lil Guy: count its bite timer down, and when it expires
-    /// bite the reserved cell.
+    /// Fold one whole-field feast into the match tuning stats.
     ///
-    /// A reservation is NOT exclusive.  If the cell emptied first (another Lil
-    /// Guy beat it there) the bite is a MISS: no hunger, no score, and the Lil
-    /// Guy re-targets immediately.  A cast can never cause a miss — a downgrade
-    /// rewrites the cell rather than emptying it — so a reserved bite always
-    /// lands, possibly on a cheaper tier than when it was reserved.  A landed
-    /// bite adds normal hunger, healable extra hunger for still-hazardous
-    /// slime, and score for neutral/defused slime.
-    ///
-    /// After the bites, emptied cells are refilled from the reservoir (top row
-    /// first) so the grid stays as full as the remaining slime allows.
-    fn bite_tick(self: *Session, dt: f32) !void {
-        self.sync_lil_guys();
-
-        var hunger_added: u32 = 0;
-
-        const lg_arr = &self.world.component_arrays.lil_guy;
-        for (lg_arr.index_to_entity[0..lg_arr.size]) |e| {
-            const lg = self.world.get_component(e, c.LilGuy);
-
-            // Without a reservation (grid was empty last look), try again.
-            if (!lg.has_target()) {
-                self.reserve_target(lg);
-                continue;
-            }
-
-            lg.bite_timer -= dt;
-            if (lg.bite_timer > 0.0) continue;
-
-            if (self.field.bite(&self.cfg.balance, lg.target)) |out| {
-                hunger_added += out.hunger_normal + out.hunger_extra;
-                logic.add_hunger(&self.hunger, out.hunger_normal + out.hunger_extra);
-                if (out.healable_tier()) |tier| {
-                    const i = @intFromEnum(tier);
-                    const grown = @as(u32, self.hunger_healable[i]) + out.hunger_extra;
-                    self.hunger_healable[i] = @intCast(@min(grown, @as(u32, std.math.maxInt(u16))));
-                }
-                self.score += out.score;
-                self.record_bite(out);
-            }
-            // Landed or missed, this Lil Guy needs a fresh cell.
-            self.reserve_target(lg);
-        }
-
-        // Refill from the reservoir so slime keeps entering from the top.
-        _ = self.field.fill(self.rand());
-
-        if (hunger_added > 0) {
-            try self.broadcast_action_result(.{
-                .tag = .damage,
-                .actor_entity = std.math.maxInt(u32),
-                .target_entity = std.math.maxInt(u32),
-                .value = @intCast(@min(hunger_added, std.math.maxInt(u16))),
-            });
-        }
-    }
-
-    /// Reserve a fresh random cell for one Lil Guy and restart its bite timer.
-    /// An empty grid leaves it target-less (retried next tick).
-    fn reserve_target(self: *Session, lg: *c.LilGuy) void {
-        if (self.field.pick_target(self.rand())) |flat| {
-            lg.target = flat;
-            lg.bite_timer = self.bite_interval();
-        } else {
-            lg.target = c.LilGuy.NO_TARGET;
-            lg.bite_timer = 0;
-        }
-    }
-
-    /// Fold one landed bite into the match tuning stats.
-    fn record_bite(self: *Session, out: slime.BiteOutcome) void {
+    /// `neutralized` slime is deliberately NOT counted here: a defusal is
+    /// credited to the cast that achieved it (see stamp_shape), so counting it
+    /// again at the feast would double-count the same unit.
+    fn record_feast(self: *Session, feast: slime.FeastOutcome) void {
         const fs = &self.stats.feast;
-        switch (out.eaten) {
-            .empty => unreachable, // a landed bite always ate something
-            .neutral => fs.neutral_consumed +|= 1,
-            .neutralized => {}, // counted when the cast defused it
-            .tiered => |tier| fs.hazard_escaped[@intFromEnum(tier)] +|= 1,
-        }
-        fs.hunger_normal +|= stat_u16(out.hunger_normal);
-        fs.hunger_extra +|= stat_u16(out.hunger_extra);
+        fs.hunger_normal +|= stat_u16(feast.hunger_normal);
+        for (feast.hunger_extra) |extra| fs.hunger_extra +|= stat_u16(extra);
+        for (&fs.hazard_escaped, feast.escaped) |*d, e| d.* +|= e;
+        // Defused units are NOT counted here: the cast that achieved the
+        // defusal already recorded it (see stamp_shape), so counting them again
+        // would double-count the same unit.
+        fs.neutral_consumed +|= feast.neutral;
     }
 
     /// Broadcast `count` recipe_fired messages for one recipe table entry.
@@ -792,57 +760,27 @@ pub const Session = struct {
                 // messages queued after this one.
                 const p = try proto.decode_submit_spell(fbs.reader());
                 if (self.phase != .playing or player_id >= MAX_PLAYERS) return;
-                // Cast lock still cooling down: silent ignore.
-                if (self.cast_locks[player_id] > 0.0) return;
+                // Out of casts this turn: silent ignore.  The turn is waiting
+                // on someone else, and this player has nothing left to say.
+                if (self.casts_left[player_id] == 0) return;
 
-                // Zero-output combos FIZZLE without starting a lock or
-                // a cast buffer.
+                // A combo that can produce nothing FIZZLES and costs nothing:
+                // the budget only pays for casts that do something.
                 if (!logic.combo_has_output(&self.cfg.balance, p.combo)) {
                     self.stats.players[player_id].fizzles +|= 1;
-                    var fbuf: [4]u8 = undefined;
-                    var ffbs = std.io.fixedBufferStream(&fbuf);
-                    try proto.encode(ffbs.writer(), .cast_fizzled, proto.CastFizzled{
-                        .player_id = player_id,
-                    });
-                    try self.broadcast_raw(ffbs.getWritten());
+                    try self.broadcast_fizzles(@as(u8, 1) << @intCast(player_id));
                     return;
                 }
 
-                const replacing = self.submitted_pool[player_id] != null;
-                self.submitted_pool[player_id] = p.combo;
+                self.casts_left[player_id] -= 1;
                 // Freeze the aim now: this cast lands where the player was
                 // pointing when they committed it, however they move next.
                 self.cast_anchors[player_id] = self.cursors[player_id];
                 self.action_pool[player_id] = null; // clears the live preview
-                self.cast_locks[player_id] = self.cast_lock_s();
-                // The cast's own buffer: fires at expiry unless a later
-                // joiner completes a team recipe (group_team_casts).  A
-                // replacement is a NEW cast — its buffer restarts.
-                self.cast_fire_timers[player_id] = self.cast_buffer_s();
-                // On-wire submission marker, drives the client's
-                // "cast pending" indicator.
-                self.casts_used[player_id] = 1;
-
-                // New vs replace: a resubmit swaps the pending spell and
-                // announces cast_replaced (no duplicate cast_committed).
-                var buf: [4]u8 = undefined;
-                var cfbs = std.io.fixedBufferStream(&buf);
-                if (replacing) {
-                    try proto.encode(cfbs.writer(), .cast_replaced, proto.CastReplaced{
-                        .player_id = player_id,
-                    });
-                } else {
-                    try proto.encode(cfbs.writer(), .cast_committed, proto.CastCommitted{
-                        .player_id = player_id,
-                    });
-                }
-                try self.broadcast_raw(cfbs.getWritten());
-
-                // Completed a team recipe with pending casts? Group them.
-                try self.group_team_casts(player_id);
+                self.record_cast_stats(player_id);
 
                 const slot = &self.players[player_id];
-                if (slot.entity != std.math.maxInt(ecs.Entity)) {
+                if (slot.entity != NO_ENTITY) {
                     try self.broadcast_action_result(.{
                         .tag = .cast,
                         .actor_entity = slot.entity,
@@ -850,9 +788,16 @@ pub const Session = struct {
                         .value = 0,
                     });
                 }
-                std.log.debug("player {} submitted spell (realtime, {s})", .{
-                    player_id, if (replacing) "replaced" else "joined",
+
+                // Resolves now, or is held as a team half awaiting a partner.
+                try self.resolve_cast(player_id, p.combo);
+
+                std.log.debug("player {} cast ({} left this turn)", .{
+                    player_id, self.casts_left[player_id],
                 });
+
+                // Spending the last budget in the room settles the turn.
+                try self.maybe_end_turn();
             },
             .reconnect => {},
             else => {},
@@ -864,16 +809,12 @@ pub const Session = struct {
         return @intCast(@min(v, std.math.maxInt(u16)));
     }
 
-    /// Remaining countdown (seconds) → whole milliseconds on the wire,
-    /// saturated to u16 (caps at ~65s; both ms tunables are capped at 60s).
-    fn wire_ms(seconds: f32) u16 {
-        const ms = @ceil(@max(seconds, 0.0) * 1000.0);
-        return @intFromFloat(@min(ms, @as(f32, std.math.maxInt(u16))));
-    }
-
+    /// Decide whether the encounter is over.  Called ONLY from `end_turn`:
+    /// nothing between turns can move the hunger bar or the slime count, so
+    /// there is no other moment where the answer can change.
     fn check_end(self: *Session) !void {
         if (self.phase != .playing) return;
-        // Field-cleared wins ties: if the last bite fills the bar exactly,
+        // Field-cleared wins ties: if the final feast fills the bar exactly,
         // the players still ate everything.
         if (self.field.is_exhausted()) {
             std.log.info("all slime consumed — encounter over, score={}", .{self.score});
@@ -940,13 +881,13 @@ pub const Session = struct {
     }
 
     /// The game_start payload for one player: encounter label, their id, the
-    /// cast buffer length and the grid dimensions the client must render.
+    /// per-turn cast budget and the grid dimensions the client must render.
     fn game_start_msg(self: *const Session, label: []const u8, player_id: u8) proto.GameStart {
         var msg = proto.GameStart{
             .encounter_label = [_]u8{0} ** 32,
             .encounter_label_len = @intCast(@min(label.len, 32)),
             .player_id = player_id,
-            .cast_buffer_ms = self.cfg.balance.cast_buffer_ms,
+            .casts_per_turn = self.cfg.balance.casts_per_turn,
             .grid_rows = self.field.grid.rows,
             .grid_cols = self.field.grid.cols,
         };
@@ -1011,17 +952,7 @@ pub const Session = struct {
     fn broadcast_game_state(self: *Session) !void {
         var snap = proto.GameState.blank;
         snap.tick = self.tick_count;
-        // cast_timer carries the SOONEST pending cast's remaining buffer, or
-        // -1 when nothing is pending (the idle sentinel clients key off).
-        // Per-player countdowns ride on each entity's cast_ms.
-        snap.cast_timer = blk: {
-            var soonest: f32 = -1.0;
-            for (self.cast_fire_timers) |t| {
-                const remaining = @max(t orelse continue, 0.0);
-                if (soonest < 0.0 or remaining < soonest) soonest = remaining;
-            }
-            break :blk soonest;
-        };
+        snap.turn = self.turn;
         snap.hunger = .{
             .current = self.hunger.current,
             .max = self.hunger.max,
@@ -1049,14 +980,14 @@ pub const Session = struct {
                 combo.slots
             else
                 blank_slots;
-            // What the player has COMMITTED and is now buffering, so clients
-            // can keep previewing the pending effect for the whole buffer.
-            const sub_len: u8 = if (self.submitted_pool[own]) |combo| combo.len else 0;
-            const sub_slots = if (self.submitted_pool[own]) |combo|
+            // The half this player is HOLDING for a partner, so clients keep
+            // previewing what is standing by.
+            const sub_len: u8 = if (self.held_pool[own]) |combo| combo.len else 0;
+            const sub_slots = if (self.held_pool[own]) |combo|
                 combo.slots
             else
                 blank_slots;
-            const cursor = if (self.submitted_pool[own] != null)
+            const cursor = if (self.held_pool[own] != null)
                 self.cast_anchors[own]
             else
                 self.cursors[own];
@@ -1065,35 +996,18 @@ pub const Session = struct {
                 .entity = e,
                 .kind = kd.tag,
                 .owner = own,
-                .casts_used = self.casts_used[own],
-                .lock_ms = wire_ms(self.cast_locks[own]),
-                .cast_ms = wire_ms(self.cast_fire_timers[own] orelse 0.0),
+                .casts_left = self.casts_left[own],
                 .combo_len = combo_len,
                 .combo_slots = combo_slots,
                 .submitted_len = sub_len,
                 .submitted_slots = sub_slots,
-                // A cast in flight shows where it will LAND (its captured
-                // anchor); an idle player shows their live aim.  Snapshotted
-                // for every player so teammates see each other's previews.
+                // A HELD half shows where it will LAND (its captured anchor);
+                // otherwise the player's live aim.  Snapshotted for every
+                // player so teammates see each other's previews.
                 .cursor_row = self.field.grid.row_of(cursor),
                 .cursor_col = self.field.grid.col_of(cursor),
             };
             snap.entity_count += 1;
-        }
-
-        // Lil Guys: which cell each is biting and how long until it lands, so
-        // the client can walk them to the real cell and time the chomp
-        // animation against the authoritative bite.
-        const lg_arr = &self.world.component_arrays.lil_guy;
-        for (lg_arr.index_to_entity[0..lg_arr.size]) |e| {
-            if (snap.lil_guy_count >= proto.MAX_LIL_GUYS_WIRE) break;
-            const lg = self.world.get_component(e, c.LilGuy);
-            snap.lil_guys[snap.lil_guy_count] = .{
-                .entity = e,
-                .target = lg.target,
-                .bite_ms = wire_ms(lg.bite_timer),
-            };
-            snap.lil_guy_count += 1;
         }
 
         var buf: [8192]u8 = undefined;
@@ -1133,7 +1047,4 @@ fn set_world_system_signatures(world: *GameWorld) void {
     sig.set(GameWorld.component_type(c.PlayerMarker));
     world.set_system_signature(PlayerTeam, sig);
 
-    var lg_sig = @import("ecs_zig").Signature.initEmpty();
-    lg_sig.set(GameWorld.component_type(c.LilGuy));
-    world.set_system_signature(LilGuyHorde, lg_sig);
 }

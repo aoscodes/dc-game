@@ -83,9 +83,9 @@ const LAYOUT = {
   // Per-player pending-combo rows, bottom-left beside the action menu.
   comboPanel: { x: 24, y0: 652, rowH: 18, font: 13, slotW: 14, nameW: 42 },
 
-  // Lil Guys: one per connected player, walking to the grid cell the SERVER
-  // reserved for them (see tickLilGuys).  `speed` is px/s; `snap` is how
-  // close counts as arrived.
+  // Lil Guys: one per connected player, purely cosmetic — they mill about the
+  // field and pounce at the turn-end feast (see tickLilGuys).  `speed` is px/s;
+  // `snap` is how close counts as arrived.
   lilGuys: { size: 48, speed: 220, snap: 3 },
 
   actionMenu: {
@@ -241,8 +241,7 @@ async function loadBalanceData(hash = PAGE_CONFIG_HASH) {
   const res = await fetch(balanceUrl(hash));
   if (!res.ok) throw new Error(`fetch ${balanceUrl(hash)}: HTTP ${res.status}`);
   const bal = await res.json();
-  CAST_BUFFER_MS = bal.cast_buffer_ms ?? 500;
-  CAST_LOCK_MS = bal.cast_lock_ms ?? 500;
+  CASTS_PER_TURN = bal.casts_per_turn ?? 3;
   PLAYER_RECIPES = bal.player_recipes.map((r) => ({
     label: r.label,
     pattern: r.pattern.map(slotFromName),
@@ -332,7 +331,7 @@ function clearEntityState() {
   // grid silently rather than diff it against the last game's board.
   prevGrid = [];
   cellAnim.clear();
-  bittenThisFrame.clear();
+  feastThisFrame = false;
   stampedThisFrame.clear();
   lastTransientGame = null;
 }
@@ -528,14 +527,10 @@ function drawRecipeGuide() {
   text("HOW CASTING WORKS", L.guideX, y, L.guideFont + 2, C_HEADER);
   y += L.guideLineH;
   const descColor = "rgba(200,200,210,0.9)";
-  // ENTER fires a cast after its own buffer; team-recipe matches merge and
-  // fire together.
+  // The turn loop: a fixed budget of casts each, then the whole field is eaten.
   const castingLine = [
-    { str: `Press ENTER to cast — it fires ${(CAST_BUFFER_MS / 1000).toFixed(1)}s later.`, color: descColor },
-    { str: "Casts completing a team recipe in that window merge and fire together!", color: RECIPE_COLOR_TEAM },
-    ...(CAST_LOCK_MS > 0
-      ? [{ str: `${(CAST_LOCK_MS / 1000).toFixed(1)}s cooldown per cast.`, color: descColor }]
-      : []),
+    { str: `Press ENTER to cast — ${CASTS_PER_TURN} casts each per turn.`, color: descColor },
+    { str: "A team recipe needs BOTH halves — the first one waits until a partner casts theirs!", color: RECIPE_COLOR_TEAM },
   ];
   const descLines = [
     [
@@ -556,7 +551,13 @@ function drawRecipeGuide() {
       { str: "→ defused (harmless to eat).", color: descColor },
     ],
     [
-      { str: "Aim is captured when you press ENTER — re-aiming will not move a cast already in flight.", color: descColor },
+      { str: "Aim is captured when you press ENTER — re-aiming will not move a cast already made.", color: descColor },
+    ],
+    [
+      { str: "The turn ends once EVERYONE is out of casts: the Lil Guys then devour the whole field.", color: descColor },
+    ],
+    [
+      { str: "Live hazard slime is what hurts to eat — defuse it first, and a fresh field arrives.", color: descColor },
     ],
     castingLine,
   ];
@@ -660,8 +661,8 @@ function spawnCastFloaters(game) {
     const { x, y } = rowPos(i);
     spawnFloater("✦ cast", x, y, C_OWN_ROW);
   });
-  // Zero-output spells discarded at window close: show the fizzle on the
-  // caster's row (grey — nothing happened, no cast consumed).
+  // A combo that matched nothing, or a team half nobody completed: show the
+  // fizzle on the caster's row (grey — nothing happened).
   for (const pid of game.fizzles ?? []) {
     const i = (game.entities || []).findIndex((e) => e.owner === pid);
     if (i === -1) continue;
@@ -676,8 +677,8 @@ const RECIPE_COLOR_PLAYER = "rgba(255,255,140,1)";
 const RECIPE_COLOR_TEAM = "rgba(140,240,255,1)";
 
 /**
- * Big celebratory floaters when recipes fire (server broadcasts one event
- * per fire at cast-window close).  Labels are resolved by table index into
+ * Big celebratory floaters when recipes fire (the server broadcasts one event
+ * per fire, as the cast resolves).  Labels are resolved by table index into
  * the tables loaded from data/balance.json (same file the server reads, so
  * indices agree by construction).  Floaters rise from the field's center,
  * stacked when several fire at once.
@@ -743,54 +744,39 @@ function spawnStampFloaters(game) {
   });
 }
 
-/** Cast lifecycle floater color (matches the realtime cast bar). */
+/** Turn-loop floater color (matches the cast-budget gauge). */
 const CAST_EVENT_COLOR = "rgba(120,220,255,1)";
 
 /**
- * Realtime cast-loop event floaters (`game.cast_events`, transient):
- *   grouped  — a new cast completed a team recipe; members now fire together
- *   replaced — Px swapped their pending cast (its buffer restarted)
- *   fired    — expired casts converted (spell_count spells; solo fires are
- *              silent — the ✦ cast action floater already covers those)
- * Player-scoped events rise from that player's combo-panel row; group-level
- * events from the field's center (where recipe floaters appear).
+ * Turn-end floaters (`game.turn_ended`, transient): the feast, announced.
+ *
+ * The per-cell score/hunger deltas are floated separately by
+ * updateFeastTracking; this is the headline — how much was eaten, and how much
+ * of the hunger it cost is still healable with medicine.
  */
-function spawnCastEventFloaters(game) {
-  const events = game.cast_events ?? [];
-  if (events.length === 0) return;
+function spawnTurnEndedFloaters(game) {
+  const te = game.turn_ended;
+  if (!te) return;
 
-  const CP = LAYOUT.comboPanel;
-  const rowPos = (pid) => {
-    const i = (game.entities || []).findIndex((e) => e.owner === pid);
-    if (i === -1) return null;
-    return { x: CP.x + CP.nameW + 5 * CP.slotW + 24, y: CP.y0 + i * CP.rowH };
-  };
-  // Group events sit just below the recipe floaters so both stay readable.
-  const groupPos = () => {
-    const p = fieldCenter();
-    return { x: p.x, y: p.y + 28 };
-  };
+  const { x, y } = fieldCenter();
+  const STACK = LAYOUT.floater.stack + 8;
+  spawnFloater(`FEAST! ${te.cells_eaten ?? 0} units devoured`, x, y - STACK,
+    CAST_EVENT_COLOR, LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
 
-  for (const ev of events) {
-    if (ev.type === "grouped") {
-      const { x, y } = groupPos();
-      spawnFloater("team combo locked!", x, y, RECIPE_COLOR_TEAM,
-        LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
-    } else if (ev.type === "replaced") {
-      const p = rowPos(ev.player_id);
-      if (p) spawnFloater("spell replaced", p.x, p.y, "rgba(200,180,255,0.9)");
-    } else if (ev.type === "fired" && ev.spell_count > 1) {
-      const { x, y } = groupPos();
-      spawnFloater(`casts fired ×${ev.spell_count}`, x, y, CAST_EVENT_COLOR,
-        LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
-    }
+  // Healable hunger is the actionable part: it is what medicine can still undo.
+  const healable = sumTiers(te.healable);
+  if (healable > 0) {
+    spawnFloater(`${healable} hunger still healable`, x, y + 28,
+      C_BAD, LAYOUT.floater.lifetime, LAYOUT.floater.font);
   }
 }
 
 /**
  * Compact per-player pending-combo rows (bottom-left UI panel).  No player
  * sprites are rendered — combos are the only per-player element on screen.
- * The local player's row is highlighted and carries its cast countdown.
+ * The local player's row is highlighted, and every row shows how many casts
+ * that player has left this turn: the turn cannot end until they are all spent,
+ * so a row with casts left is a row the team is waiting on.
  */
 function drawComboPanel(game) {
   const CP = LAYOUT.comboPanel;
@@ -812,15 +798,18 @@ function drawComboPanel(game) {
       }
     }
 
-    // Pending-cast countdown (the matchable window for team recipes).
+    // Casts left this turn: a filled pip per remaining cast, so "who are we
+    // waiting on" is readable at a glance.
     const usedX = CP.x + CP.nameW + 5 * CP.slotW + 8;
-    const castS = (e.cast_ms ?? 0) / 1000;
-    if (castS > 0) {
-      text(`⌛${castS.toFixed(1)}`, usedX, y, CP.font, CAST_EVENT_COLOR);
+    const left = e.casts_left ?? 0;
+    if (left > 0) {
+      text("◆".repeat(left), usedX, y, CP.font, CAST_EVENT_COLOR);
+    } else {
+      text("done", usedX, y, CP.font, "rgba(120,120,140,0.7)");
     }
-    // Where this player is aiming.  While a cast buffers the server sends the
-    // captured ANCHOR here, so the row shows where the spell will actually
-    // land rather than where the player has since wandered.
+    // A held team half is aimed at its captured ANCHOR, so the row shows where
+    // a completed shape will actually land rather than where the player has
+    // since wandered.
     text(`@${e.cursor_row ?? 0},${e.cursor_col ?? 0}`, usedX + 44, y, CP.font,
       own ? C_OWN_ROW : "rgba(180,200,255,0.6)");
   });
@@ -880,9 +869,10 @@ function drawFloaters() {
 // There is NO flat fallback: an unmatched combo fizzles.  These tables are the
 // complete move list, both here and on the server.
 
-/** Group-cast buffer / per-cast cooldown (ms) from balance.json. */
-let CAST_BUFFER_MS = 500;
-let CAST_LOCK_MS = 500;
+/** Casts each player gets per turn, from balance.json.  The server announces
+ *  the same number in game_start; this copy is what the LOBBY reads, before
+ *  any game_start has arrived. */
+let CASTS_PER_TURN = 3;
 /** @typedef {{dRow: number, dCol: number}} ShapeOffset */
 /** @type {Array<{label: string, pattern: Array<object>, rows: string[],
  *   offsets: ShapeOffset[], medicine: Object<string,number>}>} */
@@ -984,12 +974,13 @@ function matchRecipes(combos) {
 }
 
 /**
- * The combo to project per player: the COMMITTED one if they have a cast
- * buffering, otherwise whatever they are currently typing.
+ * The combo to project per player: their HELD team half if they have one,
+ * otherwise whatever they are currently typing.
  *
- * Submitted wins because it is what will actually fire — and the two are
- * independent server-side (submitting clears the typing pool, but the player
- * may immediately start a new combo), so a player mid-cast who has begun
+ * The held half wins because it is what will actually fire once a partner
+ * completes it — and the two are independent server-side (submitting clears the
+ * typing pool, but the player may immediately start a new combo), so a player
+ * holding a half who has begun
  * typing again would otherwise flip the preview to a combo that is not the
  * one about to land.
  *
@@ -1081,7 +1072,7 @@ function shapePreview(game) {
  * twice would make a complete combo look identical to an incomplete one.
  *
  * Uses the TYPED buffer (`entity.combo`), never the submitted one: this is a
- * projection of keys not yet pressed, and a buffering cast has no keys left to
+ * projection of keys not yet pressed, and a held half has no keys left to
  * press.  An empty buffer yields nothing — every recipe would be a candidate,
  * which is noise, not aim.
  *
@@ -1138,9 +1129,9 @@ let lastHungerSeen = 0;
 
 /**
  * Call once per drawGame frame, AFTER tickLilGuys so `lastBitePos` already
- * points at the cell bitten on this frame.  Score and hunger only move when a
- * Lil Guy eats or medicine lands, so the deltas are floated over that cell
- * (falling back to the field center for medicine, which has no cell).
+ * points at a cell the feast just ate.  Score and hunger only move at the
+ * turn-end feast or when medicine lands, so the deltas are floated over that
+ * cell (falling back to the field center for medicine, which has no cell).
  */
 function updateFeastTracking(game) {
   const score = game.score ?? 0;
@@ -1233,8 +1224,8 @@ function sumTiers(obj) {
  * nothing to downgrade (empty / neutral / already defused).
  *
  * MIRRORS components.Tier.downgrade + slime.apply_shape: red → yellow → green
- * → defused.  Nothing is ever destroyed, so every downgrade REWRITES the cell
- * and a Lil Guy's reserved bite still lands.
+ * → defused.  Nothing is ever destroyed, so a stamp only ever changes what a
+ * cell COSTS to eat, never whether it is eaten.
  */
 function downgradeName(name) {
   if (name === "red") return "yellow";
@@ -1412,7 +1403,7 @@ function cellStyle(name) {
     : { body: "neutral", glyph: null, ring: false };
 }
 
-/** True when the cell name denotes slime a Lil Guy could bite. */
+/** True when the cell name denotes slime — anything the feast will eat. */
 function cellIsSlime(name) {
   return cellStyle(name) !== null;
 }
@@ -1528,10 +1519,10 @@ function tileSprite(name, size) {
 // grid queues nothing, which matters because frames arrive at ~20Hz while we
 // render at 60.
 //
-// Eats are the exception — they are NOT diffed.  The server refills in the same
-// tick it bites, so a bitten cell goes straight from one color to another with
-// no empty frame in between.  The Lil Guy bite-timer wrap already identifies
-// the exact cell (see tickLilGuys), and that is what drives the pop.
+// The turn-end feast is the exception — it is NOT diffed.  The server eats the
+// whole field and refills it in the same tick, so a cell goes straight from one
+// color to another with no empty frame in between.  The `turn_ended` event is
+// what identifies that frame, and that is what drives the pop.
 
 /** Previous frame's cell names, for change classification. */
 let prevGrid = [];
@@ -1541,8 +1532,10 @@ let prevGrid = [];
  *  while its replacement drops in behind it. */
 const cellAnim = new Map();
 
-/** Cells the Lil Guys resolved a bite on this frame (set by tickLilGuys). */
-const bittenThisFrame = new Set();
+/** True on the frame a `turn_ended` arrived: EVERY cell was devoured, so every
+ *  change on this frame is an eat followed by a refill rather than a plain
+ *  server-side replacement.  Set by tickLilGuys, consumed by updateGridAnims. */
+let feastThisFrame = false;
 
 /** Cells a stamp covered this frame, from `game.shape_casts`.  A covered cell
  *  that changed was DOWNGRADED by a cast, so it flashes in place rather than
@@ -1565,7 +1558,7 @@ function bobPhase(flat) {
 
 /**
  * Diff `grid` against the previous frame and queue an animation per changed
- * cell.  Must run AFTER tickLilGuys so `bittenThisFrame` is populated.
+ * cell.  Must run AFTER tickLilGuys so `feastThisFrame` is populated.
  */
 function updateGridAnims(grid) {
   for (let flat = 0; flat < grid.length; flat++) {
@@ -1578,8 +1571,8 @@ function updateGridAnims(grid) {
       // A stamp stepped this unit down a tier in place: it survived, so it
       // stays put and blooms.
       cellAnim.set(flat, { kind: "flash", t: FIELD.flashS });
-    } else if (bittenThisFrame.has(flat)) {
-      // A Lil Guy ate it; whatever is here now arrived from the reservoir.
+    } else if (feastThisFrame && was !== "empty") {
+      // The feast ate it; whatever is here now arrived from the reservoir.
       cellAnim.set(flat, { kind: "pop", t: FIELD.popS, from: was });
     } else {
       // Refilled hole, or any other server-side replacement.
@@ -1587,7 +1580,7 @@ function updateGridAnims(grid) {
     }
   }
   prevGrid = grid.slice();
-  bittenThisFrame.clear();
+  feastThisFrame = false;
   stampedThisFrame.clear();
 }
 
@@ -1760,9 +1753,9 @@ function drawGhostMark(x0, y0, inset, body, count) {
 /**
  * Draw every player's aim cursor as a corner crosshair on their cell.
  *
- * The server sends a cursor for EVERY player (and, while a cast buffers, the
- * captured anchor instead of the live cursor), so teammates can see where each
- * other are aiming and coordinate a team shape.  The local player's is thicker
+ * The server sends a cursor for EVERY player (and, while a team half is held,
+ * the captured anchor instead of the live cursor), so teammates can see where
+ * each other are aiming and coordinate a team shape.  The local player's is thicker
  * and yellow; teammates' are thinner and blue.
  *
  * A crosshair rather than a full box: a box at the socket edge would compete
@@ -1822,106 +1815,110 @@ function drawTile(name, x0, y0, cell, scale, dy, alpha) {
 }
 
 // ---------------------------------------------------------------------------
-// Lil Guys (server-driven: each walks to the grid cell the server reserved)
+// Lil Guys (purely cosmetic: the turn-end feast, dramatised)
 // ---------------------------------------------------------------------------
 //
-// The server spawns one Lil Guy ECS entity per connected player, reserves a
-// random grid cell for it, and counts down a bite timer.  Frames carry that
-// state as `game.lil_guys[] = { id, target, bite_ms }` — `id` is the server
-// entity id, and `target` is a flat grid index (null when the grid is empty and
-// no cell could be reserved).
+// The Lil Guys are NOT simulated.  The server has no Lil Guy entities: at turn
+// end it eats the whole field in one operation and tells us so with a
+// `turn_ended` event.  Everything here is animation over that single fact.
 //
-// The client is purely presentational: it interpolates each guy toward its
-// reserved cell and plays the `attack` clip when the server's timer says the
-// bite lands.  Because the reservation is not exclusive, two guys may share a
-// cell and one will miss — that is the server's outcome, and the client shows
-// it faithfully by animating the chomp either way.
+// One guy is shown per connected player (read off `game.entities`, which the
+// server already sends for the combo panel).  Between turns they mill about the
+// field; on the frame a `turn_ended` arrives they pounce on a cell that was
+// occupied, chomp, and the tile layer pops every eaten cell.
+//
+// Because they are cosmetic, a guy's chosen cell is a display choice and can be
+// picked freely — no server state depends on it.
 
 /**
  * @typedef {object} LilGuyView
  * @property {number} x        - current screen x (top-left of the sprite)
  * @property {number} y        - current screen y
  * @property {number|null} target - flat grid index it is walking to
- * @property {number} lastBiteMs  - previous frame's server bite timer, used
- *   to detect the wrap that means "the bite just landed"
  * @property {boolean} facingLeft - sprite mirror, set from the walk direction
  * @property {string|null} pendingClip - one-shot clip for the next draw
- *   ("attack" on the frame a bite resolves), consumed by drawLilGuys
+ *   ("attack" on the frame a feast lands), consumed by drawLilGuys
  * @property {number} id      - animator id (offset far above entity ids)
  */
 
-/** Server entity id → its view state.  Keyed so late joins / disconnects map
- *  to the right sprite instead of shifting everyone by one. */
+/** Player id → its view state.  Keyed so late joins / disconnects map to the
+ *  right sprite instead of shifting everyone by one. */
 const lilGuys = new Map();
 
 /** Animator ids live far above entity ids so they cannot collide. */
 const LIL_GUY_ANIM_BASE = 1_000_000;
 
 /** Screen position of the most recent chomp — the anchor for score/hunger
- *  floaters (see updateFeastTracking).  null until the first bite lands. */
+ *  floaters (see updateFeastTracking).  null until the first feast. */
 let lastBitePos = null;
 
+/** Pick a flat index of an occupied cell for a guy to stand on, or null when
+ *  the field is bare.  `nth` spreads the horde out instead of stacking it. */
+function feastCell(grid, nth) {
+  const occupied = [];
+  for (let flat = 0; flat < grid.length; flat++) {
+    if (cellIsSlime(grid[flat])) occupied.push(flat);
+  }
+  if (occupied.length === 0) return null;
+  return occupied[(nth * 7) % occupied.length];
+}
+
 /**
- * Sync the Lil Guy views with the server's horde and advance them one frame.
- * Spawns/removes views to match `game.lil_guys`, walks each toward its
- * reserved cell, and fires the chomp (attack clip + floater) on the frame the
- * server's bite timer wraps.
+ * Sync the Lil Guy views with the connected players and advance them one frame.
+ *
+ * On a `turn_ended` frame every guy chomps: the tile layer is told the whole
+ * field was eaten (`feastThisFrame`) so each cell pops, and the floater layer
+ * gets an anchor for the hunger/score deltas.
+ *
+ * `fresh` distinguishes a NEW server frame from a redraw of the one already
+ * shown: we redraw at ~60Hz over ~20Hz of frames, so the chomp and its floater
+ * must fire only on the first sight of a `turn_ended` or they arrive in triples.
+ * Walking is unaffected and advances on every redraw.
  */
-function tickLilGuys(game, dt) {
+function tickLilGuys(game, dt, fresh) {
   const G = LAYOUT.lilGuys;
   const { rows, cols } = gridDims(game);
-  const horde = game.lil_guys ?? [];
+  const grid = game.grid ?? [];
+  const players = (game.entities ?? []).filter((e) => e.owner !== undefined);
+  const feast = fresh ? (game.turn_ended ?? null) : null;
 
-  // Drop views whose server entity is gone (player disconnected).
-  const live = new Set(horde.map((lg) => lg.id));
-  for (const id of lilGuys.keys()) {
-    if (!live.has(id)) lilGuys.delete(id);
+  // Drop views whose player is gone (disconnected).
+  const live = new Set(players.map((e) => e.owner));
+  for (const pid of lilGuys.keys()) {
+    if (!live.has(pid)) lilGuys.delete(pid);
   }
 
-  for (const lg of horde) {
-    const target = lg.target ?? null;
-    let g = lilGuys.get(lg.id);
+  players.forEach((e, i) => {
+    const target = feastCell(grid, i);
+    let g = lilGuys.get(e.owner);
     if (!g) {
       // Spawn already standing on its cell: a new guy should not sprint in
       // from a stale corner of the field.
-      const at = target !== null
-        ? cellCenter(target, rows, cols)
-        : fieldCenter();
+      const at = target !== null ? cellCenter(target, rows, cols) : fieldCenter();
       g = {
         x: at.x - G.size / 2,
         y: at.y - G.size / 2,
         target,
-        lastBiteMs: lg.bite_ms ?? 0,
         facingLeft: false,
         pendingClip: null,
-        id: LIL_GUY_ANIM_BASE + lg.id,
+        id: LIL_GUY_ANIM_BASE + e.owner,
       };
-      lilGuys.set(lg.id, g);
+      lilGuys.set(e.owner, g);
     }
 
-    // A rising bite timer means the server restarted the countdown, i.e. the
-    // previous bite resolved (landed or missed) — chomp on the cell we were
-    // standing on, then walk to the freshly reserved one.
-    const biteMs = lg.bite_ms ?? 0;
-    if (biteMs > g.lastBiteMs) {
+    if (feast) {
       const at = g.target !== null
         ? cellCenter(g.target, rows, cols)
         : { x: g.x + G.size / 2, y: g.y + G.size / 2 };
       lastBitePos = at;
-      // Tell the tile layer which cell was eaten: the server refills in the
-      // same tick it bites, so this is the only signal that distinguishes an
-      // eat from a plain refill (see updateGridAnims).
-      if (g.target !== null) bittenThisFrame.add(g.target);
-      // Hand the attack clip to the animator on this frame's draw.
       g.pendingClip = "attack";
       spawnFloater("chomp", at.x, at.y - LAYOUT.floater.stack,
         "rgba(230,230,240,0.85)", 0.8); // cosmetic: exempt from 3s rule
     }
-    g.lastBiteMs = biteMs;
     g.target = target;
 
-    // Walk toward the reserved cell (no target → hold position).
-    if (target === null) continue;
+    // Walk toward the chosen cell (bare field → hold position).
+    if (target === null) return;
     const at = cellCenter(target, rows, cols);
     const tx = at.x - G.size / 2;
     const ty = at.y - G.size / 2;
@@ -1930,13 +1927,18 @@ function tickLilGuys(game, dt) {
     if (dist <= G.snap) {
       g.x = tx;
       g.y = ty;
-      continue;
+      return;
     }
     const step = Math.min(G.speed * dt, dist);
     g.x += (dx / dist) * step;
     g.y += (dy / dist) * step;
     g.facingLeft = dx < 0;
-  }
+  });
+
+  // The feast emptied every cell, so the tile layer must treat this frame's
+  // changes as eats rather than refills.  Set even with no guys on screen: the
+  // field was still devoured.
+  if (feast) feastThisFrame = true;
 }
 
 function drawLilGuys(dt) {
@@ -1977,34 +1979,32 @@ function drawActionMenu(game) {
 
   const tbw = mw - M.padX * 2;
 
-  // Every cast fires at the end of its OWN buffer (entity.cast_ms); casts
-  // completing a team recipe merge and fire together.  The bar tracks the
-  // local player's pending cast, and the cooldown after it fires.
+  // The local player's cast budget for this turn.  Casts resolve the instant
+  // they are submitted, so there is no countdown to show — what matters is how
+  // many are left, because the turn (and the feast) waits on the last one.
   {
-    const bufferS = (game.cast_buffer_ms ?? 0) / 1000;
+    const total = game.casts_per_turn ?? 0;
     const own = (game.entities ?? []).find(e => e.owner === game.player_id);
-    const ownCastS = own ? (own.cast_ms ?? 0) / 1000 : 0;
-    const lockS = own ? (own.lock_ms ?? 0) / 1000 : 0;
+    const left = own ? (own.casts_left ?? 0) : 0;
+    const frac = total > 0 ? Math.max(0, Math.min(1, left / total)) : 0;
 
-    const castFrac = ownCastS > 0 && bufferS > 0
-      ? Math.max(0, Math.min(1, ownCastS / bufferS))
-      : 0;
     rect(px, my + M.castBarDy, tbw, M.castBarH, "rgba(30,30,30,0.8)");
-    if (ownCastS > 0) {
-      rect(px, my + M.castBarDy, tbw * castFrac, M.castBarH, "rgba(120,220,255,0.9)");
+    if (left > 0) {
+      rect(px, my + M.castBarDy, tbw * frac, M.castBarH, "rgba(120,220,255,0.9)");
     }
     rectStroke(px, my + M.castBarDy, tbw, M.castBarH, 1, "rgba(255,255,255,0.3)");
 
-    let status = "Build a combo, then ENTER to cast";
-    if (ownCastS > 0) status = `Dispensing: ${ownCastS.toFixed(1)}s`;
-    else if (lockS > 0) status = `Cooldown: ${lockS.toFixed(1)}s`;
-    text(status, px, my + M.timerTextDy, M.timerTextFont, C_TEXT);
+    const status = left > 0
+      ? `Turn ${game.turn ?? 1} — ${left}/${total} casts left`
+      : `Turn ${game.turn ?? 1} — out of casts, waiting on the team`;
+    text(status, px, my + M.timerTextDy, M.timerTextFont,
+      left > 0 ? C_TEXT : "rgba(180,180,190,0.75)");
   }
 
-  // Project from committed combos in preference to typed ones, so the preview
-  // survives the cast buffer instead of blanking the instant you press ENTER.
-  // The same resolution the field preview draws, so the numbers and the
-  // highlighted cells can never disagree.
+  // Project from a HELD team half in preference to a typed combo, so the
+  // preview shows what a partner would complete rather than blanking the
+  // instant you press ENTER.  The same resolution the field preview draws, so
+  // the numbers and the highlighted cells can never disagree.
   const pv = shapePreview(game);
   const projected = pv.projected;
 
@@ -2066,22 +2066,23 @@ let lastTransientGame = null;
 function drawGame(game, dt) {
   // The render loop redraws `latestMsg` every animation frame (~60Hz) while
   // server frames arrive at ~20Hz, so the same frame is drawn ~3 times.
-  // Transient events (dispense outcomes, recipe fires, casts, fizzles) are
+  // Transient events (dispense outcomes, recipe fires, turn ends, fizzles) are
   // per-frame facts, NOT per-draw, and must be consumed exactly once or they
   // spawn triplicate floaters.
   const fresh = game !== lastTransientGame;
   lastTransientGame = game;
 
   tickFloaters(dt);
-  // Order matters: tickLilGuys resolves this frame's bite (setting lastBitePos)
-  // and updateFeastTracking floats the score/hunger deltas over that cell.
-  tickLilGuys(game, dt);
+  // Order matters: tickLilGuys reacts to this frame's feast (setting
+  // lastBitePos and feastThisFrame) and updateFeastTracking floats the
+  // score/hunger deltas over that cell.
+  tickLilGuys(game, dt, fresh);
   // Stamp outcomes must be read BEFORE the grid diff: they tell updateGridAnims
   // which cells were covered, which is how a downgraded cell is told apart from
   // one that was merely refilled.
   if (fresh) spawnStampFloaters(game);
-  // Then classify grid changes: updateGridAnims needs both the bite
-  // tickLilGuys just resolved and the covered cells above to tell an eaten
+  // Then classify grid changes: updateGridAnims needs both the feast
+  // tickLilGuys just registered and the covered cells above to tell an eaten
   // cell, a downgraded cell and a plain refill apart.
   tickGridAnims(dt);
   if (fresh) updateGridAnims(game.grid ?? []);
@@ -2089,14 +2090,15 @@ function drawGame(game, dt) {
   if (fresh) {
     spawnCastFloaters(game);
     spawnRecipeFloaters(game);
-    spawnCastEventFloaters(game);
+    spawnTurnEndedFloaters(game);
   }
 
   clear();
 
   const H = LAYOUT.headers;
   const encounter = game.encounter || "";
-  text(`Encounter: ${encounter}`, H.waveX, H.waveY, H.waveFont, C_HEADER);
+  text(`Encounter: ${encounter}   ·   Turn ${game.turn ?? 1}`,
+    H.waveX, H.waveY, H.waveFont, C_HEADER);
 
   text("SLIME FIELD", FIELD.x0, FIELD.y0 + H.labelDy, H.labelFont, C_SLIME_HDR);
 
@@ -2134,9 +2136,9 @@ function drawTierCells(x, y, font, obj) {
  * End-of-game tuning report: outcome, match-wide feast tallies, per-player
  * table, recipe fire counts, derived waste/overheal totals.
  *
- * The grid model has no rounds, so the report is a single match-wide summary:
- * how much of the field the team's stamps covered and defused, and what the Lil
- * Guys ended up eating before they could.
+ * The report is a single match-wide summary across every turn: how much of the
+ * field the team's stamps covered and defused, and how much of it was still a
+ * live hazard when the feast came for it.
  */
 function drawGameOver(msg) {
   clear();

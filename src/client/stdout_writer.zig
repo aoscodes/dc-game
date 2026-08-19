@@ -44,7 +44,7 @@ pub const Writer = struct {
         game.last_action_count = 0;
         game.fizzle_count = 0;
         game.recipe_count = 0;
-        game.cast_event_count = 0;
+        game.turn_ended = null;
         game.shape_cast_count = 0;
     }
 
@@ -71,20 +71,13 @@ pub const LobbyState = struct {
 
 pub const LastActionEntry = struct { entity: u32, anim: c.ActionAnimation };
 
-/// Cast-loop lifecycle event (transient, drained per frame).
-/// Trace: committed → (replaced | grouped)* → fired.
-pub const CastEvent = union(enum) {
-    grouped: proto.CastGrouped,
-    replaced: proto.CastReplaced,
-    fired: proto.CastFired,
-};
-
 pub const GameState = struct {
     snapshot: proto.GameState = proto.GameState.blank,
     player_id: u8 = 0xFF,
     pending_combo: inp.ComboBuffer = .{},
-    /// Per-cast buffer length in ms, as announced by the server in game_start.
-    cast_buffer_ms: u32 = 0,
+    /// Casts each player gets per turn, as announced in game_start.  Constant
+    /// for the whole encounter, so the renderer can draw a budget gauge.
+    casts_per_turn: u8 = 0,
     encounter_label: [32]u8 = [_]u8{0} ** 32,
     encounter_label_len: u8 = 0,
     /// Final score from game_over (null until the encounter ends).
@@ -100,9 +93,10 @@ pub const GameState = struct {
     /// Recipes fired since the last render write (transient).
     recipes_fired: [16]proto.RecipeFired = undefined,
     recipe_count: u8 = 0,
-    /// Cast-loop events since the last render write (transient).
-    cast_events: [16]CastEvent = undefined,
-    cast_event_count: u8 = 0,
+    /// The feast that settled the turn, if one settled since the last render
+    /// write (transient).  At most one per frame: a turn cannot end twice
+    /// without the frames in between being written.
+    turn_ended: ?proto.TurnEnded = null,
     /// Shapes stamped since the last render write (transient): the resolved
     /// footprint of each landed cast, so the renderer can flash exactly the
     /// cells the server hit without re-deriving placement.
@@ -154,9 +148,7 @@ fn write_render_inner(
             .id = e.entity,
             .kind = e.kind,
             .owner = e.owner,
-            .casts_used = e.casts_used,
-            .lock_ms = e.lock_ms,
-            .cast_ms = e.cast_ms,
+            .casts_left = e.casts_left,
             .last_action = anim,
             .combo = slot_bufs[i][0..e.combo_len],
             .submitted = sub_slot_bufs[i][0..e.submitted_len],
@@ -188,23 +180,14 @@ fn write_render_inner(
         };
     }
 
-    // Convert transient cast-loop events for JSON.
-    var cast_events_buf: [16]JsonCastEvent = undefined;
-    for (game.cast_events[0..game.cast_event_count], 0..) |ev, i| {
-        cast_events_buf[i] = switch (ev) {
-            .grouped => |g| .{
-                .type = "grouped",
-                .player_mask = g.player_mask,
-                .fires_in_ms = g.fires_in_ms,
-            },
-            .replaced => |rp| .{ .type = "replaced", .player_id = rp.player_id },
-            .fired => |f| .{
-                .type = "fired",
-                .spell_count = f.spell_count,
-                .player_mask = f.player_mask,
-            },
-        };
-    }
+    // Convert this frame's turn end (if any) for JSON.
+    const turn_ended: ?JsonTurnEnded = if (game.turn_ended) |te| .{
+        .turn = te.turn,
+        .cells_eaten = te.cells_eaten,
+        .hunger_added = te.hunger_added,
+        .healable = tiers(te.healable),
+        .score_added = te.score_added,
+    } else null;
 
     // Convert pending combo slots for JSON.
     var pending_slots_buf: [c.MAX_COMBO_LEN]JsonComboSlot = undefined;
@@ -218,16 +201,6 @@ fn write_render_inner(
     const grid_len = game.snapshot.grid_len();
     for (game.snapshot.grid[0..grid_len], 0..) |cell, i| {
         grid_buf[i] = cell_name(cell);
-    }
-
-    // Lil Guys: which flat cell index each is biting, and how soon.
-    var lil_guys_buf: [proto.MAX_LIL_GUYS_WIRE]JsonLilGuy = undefined;
-    for (game.snapshot.lil_guys[0..game.snapshot.lil_guy_count], 0..) |lg, i| {
-        lil_guys_buf[i] = .{
-            .id = lg.entity,
-            .target = if (lg.target == c.LilGuy.NO_TARGET) null else lg.target,
-            .bite_ms = lg.bite_ms,
-        };
     }
 
     // Build the game-over tuning report (per-round + per-player + recipes).
@@ -281,9 +254,9 @@ fn write_render_inner(
         .game = if (phase == .game) JsonGame{
             .encounter = game.encounter_label[0..game.encounter_label_len],
             .player_id = game.player_id,
-            .cast_buffer_ms = game.cast_buffer_ms,
+            .casts_per_turn = game.casts_per_turn,
             .pending_combo = pending_slots_buf[0..game.pending_combo.len],
-            .cast_timer = game.snapshot.cast_timer,
+            .turn = game.snapshot.turn,
             .tick = game.snapshot.tick,
             .entities = entities_buf[0..game.snapshot.entity_count],
             .hunger = .{
@@ -296,10 +269,9 @@ fn write_render_inner(
             .grid_cols = game.snapshot.grid_cols,
             .grid = grid_buf[0..grid_len],
             .reservoir = game.snapshot.reservoir,
-            .lil_guys = lil_guys_buf[0..game.snapshot.lil_guy_count],
             .fizzles = game.fizzles[0..game.fizzle_count],
             .recipes_fired = recipes_buf[0..game.recipe_count],
-            .cast_events = cast_events_buf[0..game.cast_event_count],
+            .turn_ended = turn_ended,
             .shape_casts = shape_cast_buf[0..game.shape_cast_count],
         } else null,
         .score = if (phase == .game_over) game.final_score else null,
@@ -431,23 +403,14 @@ const JsonHunger = struct {
     healable: JsonTiers,
 };
 
-/// One Lil Guy: the flat grid index it is biting (null = nothing to bite,
-/// the grid is empty) and how long until the bite lands.
-const JsonLilGuy = struct {
-    id: u32,
-    target: ?u16,
-    bite_ms: u16,
-};
-
 const JsonGame = struct {
     encounter: []const u8,
     player_id: u8,
-    /// Per-cast buffer length in ms, from game_start.
-    cast_buffer_ms: u32,
+    /// Casts each player gets per turn, from game_start.
+    casts_per_turn: u8,
     pending_combo: []const JsonComboSlot,
-    /// The SOONEST pending cast's remaining buffer, or -1 when nothing is
-    /// pending (idle).
-    cast_timer: f32,
+    /// The turn now being played, 1-based.
+    turn: u16,
     tick: u32,
     entities: []const JsonEntity,
     hunger: JsonHunger,
@@ -457,18 +420,17 @@ const JsonGame = struct {
     grid_rows: u8,
     grid_cols: u8,
     grid: []const []const u8,
-    /// Slime still waiting off-grid; it refills emptied cells from the top.
+    /// Slime still waiting off-grid; it refills the field after each feast.
     reservoir: u32,
-    /// One Lil Guy per connected player, each biting a real grid cell.
-    lil_guys: []const JsonLilGuy,
     /// Player ids whose spells fizzled since the previous frame (transient).
     fizzles: []const u8,
     /// Recipes fired since the previous frame (transient).  `index` refers
     /// to the balance recipe table for `kind` (JS resolves labels from the
     /// fetched data/balance.json, same order).
     recipes_fired: []const JsonRecipeFired,
-    /// Cast-loop events since the previous frame (transient).
-    cast_events: []const JsonCastEvent,
+    /// The feast that ended the turn, if the turn ended since the previous
+    /// frame (transient).  Absent on every other frame.
+    turn_ended: ?JsonTurnEnded,
     /// Shapes stamped since the previous frame (transient), one per landed
     /// cast.
     shape_casts: []const JsonShapeCast,
@@ -494,36 +456,34 @@ const JsonRecipeFired = struct {
     index: u8,
 };
 
-/// One cast-loop event.  `type` is "grouped" | "replaced" |
-/// "fired"; unused fields are omitted (emit_null_optional_fields=false).
-const JsonCastEvent = struct {
-    type: []const u8,
-    player_id: ?u8 = null,
-    fires_in_ms: ?u32 = null,
-    spell_count: ?u8 = null,
-    player_mask: ?u8 = null,
+/// The turn-end feast: the whole field was devoured at once.  `healable` is the
+/// part of `hunger_added` that medicine can still undo, split by the tier that
+/// caused it.  This is what drives the client's devour animation.
+const JsonTurnEnded = struct {
+    /// The turn that just ended (the frame after it carries turn + 1).
+    turn: u16,
+    cells_eaten: u16,
+    hunger_added: u16,
+    healable: JsonTiers,
+    score_added: u32,
 };
 
 const JsonEntity = struct {
     id: u32,
     kind: c.EntityKind,
     owner: u8,
-    /// 1 if this player has a cast pending, else 0.
-    casts_used: u8,
-    /// Remaining cast-lock cooldown in ms (0 = unlocked).
-    lock_ms: u16,
-    /// Remaining buffer of this player's pending cast in ms (0 = none pending).
-    cast_ms: u16,
+    /// Casts this player has left in the current turn.
+    casts_left: u8,
     last_action: ?c.ActionAnimation,
-    /// The combo being typed right now (empty while a cast buffers).
+    /// The combo being typed right now.
     combo: []const JsonComboSlot,
-    /// The committed combo currently buffering (empty when none pending).
-    /// Clients preview from this in preference to `combo`: it is what will
-    /// actually fire.
+    /// The team-recipe half this player is holding, waiting for a partner to
+    /// complete it (empty when none).  Clients preview from this in preference
+    /// to `combo`: it is what a partner would complete.
     submitted: []const JsonComboSlot,
-    /// Where this player is aiming.  While a cast buffers this is the captured
-    /// ANCHOR (where the cast will land); otherwise it is the live cursor.
-    /// Sent for every player so teammates can see each other's aim.
+    /// Where this player is aiming.  While a half is held this is the captured
+    /// ANCHOR (where the completed shape will land); otherwise it is the live
+    /// cursor.  Sent for every player so teammates can see each other's aim.
     cursor_row: u8,
     cursor_col: u8,
 };

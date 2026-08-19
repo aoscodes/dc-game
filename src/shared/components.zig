@@ -11,11 +11,15 @@
 //! (`SlimeGrid` of `SlimeCell`), plus an off-grid `SlimeReservoir` that
 //! refills emptied cells from the top row.  One grid per game.
 //!
-//! Players support a horde of "Lil Guys" (one per connected player, each a
-//! real server ECS entity — see `LilGuy`) that each pick a random occupied
-//! cell, walk to it and bite it empty.  Hazard slime (`tiered`) costs extra
-//! hunger unless players neutralize it first.  Medicine heals the hunger bar,
-//! but only the portion attributable to eating un-neutralized hazard slime.
+//! Play is TURN-BASED.  Each player gets `casts_per_turn` casts; once every
+//! connected player has spent theirs the turn ends and the ENTIRE field is
+//! eaten in one bulk feast, then refilled from the reservoir.  Hazard slime
+//! (`tiered`) costs extra hunger unless players neutralize it first.  Medicine
+//! heals the hunger bar, but only the portion attributable to eating
+//! un-neutralized hazard slime.
+//!
+//! The "Lil Guys" who do the eating are a CLIENT-SIDE animation over that bulk
+//! feast — there is no Lil Guy entity, timer or target anywhere on the server.
 //!
 //! ## Shapes and tiers
 //!
@@ -45,9 +49,8 @@ pub const Health = struct {
     max: u16,
 };
 
-/// Kind of entity on the wire's PLAYER list.  Lil Guys are server entities
-/// too, but ride their own `GameState.lil_guys` array (they carry a target
-/// cell and bite timer, not a combo), so they are not an EntityKind.
+/// Kind of entity on the wire's PLAYER list.  Players are the only entities
+/// the server simulates; the Lil Guys on screen are pure client animation.
 pub const EntityKind = enum(u8) {
     player = 0,
 };
@@ -159,7 +162,7 @@ pub const SlimeCell = union(enum) {
     neutralized,
     tiered: Tier,
 
-    /// True if this cell holds a slime unit a Lil Guy can bite.
+    /// True if this cell holds a slime unit — anything the feast will eat.
     pub fn is_slime(self: SlimeCell) bool {
         return self != .empty;
     }
@@ -295,31 +298,6 @@ pub const SlimeReservoir = struct {
 
     pub fn is_empty(self: SlimeReservoir) bool {
         return self.total() == 0;
-    }
-};
-
-/// A Lil Guy's reserved bite: the grid cell it is walking to, plus the
-/// countdown until the bite lands.
-///
-/// One Lil Guy exists per connected player as a real server ECS entity.  The
-/// target is RESERVED, not exclusive — another Lil Guy may reach the same cell
-/// first, or a neutralizing agent may destroy it, in which case the bite finds
-/// an empty cell and the Lil Guy simply re-targets (see session.bite_tick).
-///
-/// `target` is a flat `SlimeGrid` index; `NO_TARGET` means "none reserved yet"
-/// (the grid was empty when this Lil Guy last looked).
-pub const LilGuy = struct {
-    /// Flat grid index being approached, or NO_TARGET.
-    target: u16 = NO_TARGET,
-    /// Seconds until the bite lands.  Reset on every re-target.
-    bite_timer: f32 = 0,
-
-    /// Sentinel `target` value: no cell reserved.  Out of range for any grid
-    /// since MAX_GRID_CELLS is far below it.
-    pub const NO_TARGET: u16 = std.math.maxInt(u16);
-
-    pub fn has_target(self: LilGuy) bool {
-        return self.target != NO_TARGET;
     }
 };
 

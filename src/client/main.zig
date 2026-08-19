@@ -225,7 +225,7 @@ fn process_recv() void {
                 g_state.player_id = p.player_id;
                 g_state.game = .{};
                 g_state.game.player_id = p.player_id;
-                g_state.game.cast_buffer_ms = p.cast_buffer_ms;
+                g_state.game.casts_per_turn = p.casts_per_turn;
                 g_state.game.encounter_label_len = p.encounter_label_len;
                 @memcpy(g_state.game.encounter_label[0..p.encounter_label_len], p.encounter_label[0..p.encounter_label_len]);
                 g_state.phase = .game;
@@ -268,10 +268,10 @@ fn process_recv() void {
             },
             .cast_committed => {
                 const p = proto.decode_cast_committed(r) catch continue;
-                // Our pending combo was committed server-side; clear the
-                // local buffer so the next spell starts fresh, and cancel
-                // any stale in-flight combo the server may have stored after
-                // the commit (keys racing the cast_committed message).
+                // Our team-recipe half is held server-side awaiting a partner;
+                // clear the local buffer so the next spell starts fresh, and
+                // cancel any stale in-flight combo the server may have stored
+                // after the commit (keys racing the cast_committed message).
                 if (p.player_id == g_state.player_id) {
                     g_state.game.pending_combo.clear();
                     send_cancel_combo();
@@ -306,36 +306,15 @@ fn process_recv() void {
                     gs.shape_cast_count += 1;
                 }
             },
-            .cast_grouped => {
-                const p = proto.decode_cast_grouped(r) catch continue;
-                record_cast_event(.{ .grouped = p });
-            },
-            .cast_replaced => {
-                const p = proto.decode_cast_replaced(r) catch continue;
-                // Same local bookkeeping as cast_committed: the server
-                // accepted the replacement spell, so the pending buffer is
-                // stale and must clear.
-                if (p.player_id == g_state.player_id) {
-                    g_state.game.pending_combo.clear();
-                    send_cancel_combo();
-                }
-                record_cast_event(.{ .replaced = p });
-            },
-            .cast_fired => {
-                const p = proto.decode_cast_fired(r) catch continue;
-                record_cast_event(.{ .fired = p });
+            .turn_ended => {
+                const p = proto.decode_turn_ended(r) catch continue;
+                // Transient, drained per frame: the renderer plays the devour
+                // animation off this.  A later turn end in the same frame wins
+                // — it describes the field the next snapshot will show.
+                g_state.game.turn_ended = p;
             },
             else => {},
         }
-    }
-}
-
-/// Record a realtime cast-loop event for the renderer (transient, drained
-/// per frame like recipes_fired).
-fn record_cast_event(ev: sw.CastEvent) void {
-    if (g_state.game.cast_event_count < g_state.game.cast_events.len) {
-        g_state.game.cast_events[g_state.game.cast_event_count] = ev;
-        g_state.game.cast_event_count += 1;
     }
 }
 
@@ -364,8 +343,8 @@ fn update_game() void {
             send_cancel_combo();
         },
         // Explicitly submit the pending combo as a spell.  Do NOT clear
-        // locally — the server's cast_committed/cast_fizzled reply triggers
-        // the clear.
+        // locally — the server's reply (cast_committed for a held half,
+        // cast_fizzled for a combo that matched nothing) triggers the clear.
         .submitted => {
             if (gs.pending_combo.len > 0) send_submit_spell(&gs.pending_combo);
         },

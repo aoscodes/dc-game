@@ -5,9 +5,7 @@
     "rows": 6,
     "cols": 10
   },
-  "eat_rate_units_per_s": 2.0,
-  "cast_buffer_ms": 500,
-  "cast_lock_ms": 500,
+  "casts_per_turn": 3,
   "player_recipes": [
     {
       "label": "poke",

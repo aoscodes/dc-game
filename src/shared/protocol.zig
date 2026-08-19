@@ -18,10 +18,8 @@ pub const MsgTag = enum(u8) {
     cast_committed = 0x16,
     cast_fizzled = 0x17,
     recipe_fired = 0x18,
-    cast_grouped = 0x19,
-    cast_replaced = 0x1a,
-    cast_fired = 0x1b,
     shape_cast = 0x1c,
+    turn_ended = 0x1d,
 };
 
 pub const JoinLobby = struct {
@@ -84,6 +82,10 @@ pub const Reconnect = struct {
     player_id: u8,
 };
 
+/// A cast was accepted but could not resolve yet: it is one half of a team
+/// recipe, HELD until a partner completes it or the turn ends.  A cast that
+/// resolves immediately is announced by its shape_cast / recipe_fired instead,
+/// so this tag means precisely "waiting for a teammate".
 pub const CastCommitted = struct {
     player_id: u8,
 };
@@ -100,50 +102,37 @@ pub fn decode_cast_fizzled(reader: anytype) !CastFizzled {
     return .{ .player_id = try reader.readByte() };
 }
 
-/// Realtime: a newly accepted cast COMPLETED a team recipe with pending
-/// casts — the instance's members now share one fire time (the joiner's
-/// buffer expiry).  Cast-loop trace: cast_committed →
-/// [cast_replaced | cast_grouped]* → cast_fired.
-pub const CastGrouped = struct {
-    /// Bit i set = player_id i's pending cast is in the group (MAX_PLAYERS <= 8).
-    player_mask: u8,
-    /// The group fires this many ms after this event (the joiner's buffer).
-    fires_in_ms: u32,
+/// The turn's cast phase is over and the WHOLE FIELD was eaten in one go.
+///
+/// Sent after the feast is applied and the grid refilled, so a client can
+/// animate the devouring and float the resulting hunger/score without
+/// re-deriving any of it.  This is the only place hunger and score move in the
+/// turn loop: casting never feeds the Lil Guys, it only defuses what they are
+/// about to eat.
+pub const TurnEnded = struct {
+    /// The turn that just ended (1-based); the next turn is this + 1.
+    turn: u16,
+    /// Slime units eaten off the grid.
+    cells_eaten: u16,
+    /// Total hunger added by the feast (normal + hazard extra).
+    hunger_added: u16,
+    /// Of `hunger_added`, the healable extra per tier that was eaten.
+    healable: [components.Tier.size]u16,
+    /// Score added by the feast (neutral + defused units).
+    score_added: u32,
 };
 
-pub fn decode_cast_grouped(reader: anytype) !CastGrouped {
-    return .{
-        .player_mask = try reader.readByte(),
-        .fires_in_ms = try reader.readInt(u32, .little),
+pub fn decode_turn_ended(reader: anytype) !TurnEnded {
+    var p = TurnEnded{
+        .turn = try reader.readInt(u16, .little),
+        .cells_eaten = try reader.readInt(u16, .little),
+        .hunger_added = try reader.readInt(u16, .little),
+        .healable = undefined,
+        .score_added = 0,
     };
-}
-
-/// Realtime: an unlocked resubmit REPLACED the player's pending cast — its
-/// buffer restarts (no second cast_committed is sent).
-pub const CastReplaced = struct {
-    player_id: u8,
-};
-
-pub fn decode_cast_replaced(reader: anytype) !CastReplaced {
-    return .{ .player_id = try reader.readByte() };
-}
-
-/// Realtime: pending casts whose buffers expired converted as one batch —
-/// sent just before conversion (so it precedes the batch's recipe_fired /
-/// action_result messages).  Grouped casts share an expiry and fire
-/// together; a solo cast fires with spell_count = 1.
-pub const CastFired = struct {
-    /// Spells in the converting batch.
-    spell_count: u8,
-    /// Bit i set = player_id i contributed a spell (MAX_PLAYERS <= 8).
-    player_mask: u8,
-};
-
-pub fn decode_cast_fired(reader: anytype) !CastFired {
-    return .{
-        .spell_count = try reader.readByte(),
-        .player_mask = try reader.readByte(),
-    };
+    for (&p.healable) |*h| h.* = try reader.readInt(u16, .little);
+    p.score_added = try reader.readInt(u32, .little);
+    return p;
 }
 
 pub const RecipeKind = enum(u8) {
@@ -233,8 +222,9 @@ pub const GameStart = struct {
     encounter_label: [32]u8,
     encounter_label_len: u8,
     player_id: u8,
-    /// Per-cast buffer length (balance.cast_buffer_ms).
-    cast_buffer_ms: u32 = 0,
+    /// Casts each player gets per turn (balance.casts_per_turn).  Sent once at
+    /// start because it never changes mid-encounter.
+    casts_per_turn: u8 = 0,
     /// Slime grid dimensions, so the client can lay out the playfield the
     /// moment the game starts (before the first game_state arrives).
     grid_rows: u8 = 0,
@@ -245,25 +235,21 @@ pub const EntitySnapshot = struct {
     entity: u32,
     kind: components.EntityKind,
     owner: u8,
-    /// 1 = this player has a cast pending, 0 = none.  (Kept as a count for
-    /// the existing client "casts used" indicator.)
-    casts_used: u8,
-    /// Remaining cast-lock cooldown in ms (saturated to u16); 0 = may submit.
-    lock_ms: u16,
-    /// Remaining buffer of this player's PENDING cast in ms (saturated to
-    /// u16); 0 = no cast pending.
-    cast_ms: u16,
+    /// Casts this player has left this turn.  The turn ends when this reaches
+    /// 0 for every connected player, so it is both a budget readout and the
+    /// only turn-progress signal a client needs.
+    casts_left: u8,
     /// The combo this player is CURRENTLY TYPING (server `action_pool`).
-    /// Cleared on submit, so it is empty while a cast buffers.
+    /// Cleared on submit.
     combo_len: u8,
     combo_slots: [components.MAX_COMBO_LEN]components.ComboSlot,
-    /// The combo this player has COMMITTED and that is now buffering (server
-    /// `submitted_pool`), so clients can keep showing what is about to fire
-    /// for the whole cast buffer and any team-grouping extension.
+    /// The combo this player has committed that is HELD waiting for a team
+    /// partner (server `held_pool`), so clients can show a half-cast standing
+    /// by.  Empty for a cast that resolved immediately — those are gone by the
+    /// time the next snapshot is built.
     ///
-    /// Independent of `combo_*`, not a replacement for it: submitting clears
-    /// `action_pool` but the player may immediately start typing a new combo,
-    /// so both can be non-empty at once.
+    /// Independent of `combo_*`: committing clears `action_pool` but the player
+    /// may immediately start typing again, so both can be non-empty at once.
     submitted_len: u8,
     submitted_slots: [components.MAX_COMBO_LEN]components.ComboSlot,
     /// Where this player is aiming.  Server-owned and always in bounds, and
@@ -276,9 +262,7 @@ pub const EntitySnapshot = struct {
         .entity = 0,
         .kind = .player,
         .owner = 0xFF,
-        .casts_used = 0,
-        .lock_ms = 0,
-        .cast_ms = 0,
+        .casts_left = 0,
         .combo_len = 0,
         .combo_slots = [_]components.ComboSlot{.{ .action = .dispense }} ** components.MAX_COMBO_LEN,
         .submitted_len = 0,
@@ -289,36 +273,17 @@ pub const EntitySnapshot = struct {
 };
 
 pub const MAX_ENTITIES_WIRE: u16 = 64;
-/// Wire cap on the Lil Guy list — one per player, so MAX_PLAYERS suffices.
-pub const MAX_LIL_GUYS_WIRE: u8 = MAX_PLAYERS;
 
 pub const BarSummary = struct {
     current: u16,
     max: u16,
 };
 
-/// One Lil Guy on the wire: which grid cell it has reserved and how soon its
-/// bite lands, so the client can animate the walk and time the chomp to the
-/// authoritative bite.
-pub const LilGuySnapshot = struct {
-    entity: u32,
-    /// Flat grid index being approached, or components.LilGuy.NO_TARGET.
-    target: u16,
-    /// Milliseconds until the bite lands (saturated to u16).
-    bite_ms: u16,
-
-    pub const blank = LilGuySnapshot{
-        .entity = 0,
-        .target = components.LilGuy.NO_TARGET,
-        .bite_ms = 0,
-    };
-};
-
 pub const GameState = struct {
     tick: u32,
-    /// Remaining buffer of the SOONEST pending cast in seconds, or -1 when
-    /// nothing is pending (the idle sentinel).
-    cast_timer: f32,
+    /// The turn now being played (1-based).  Cast budgets refresh and the whole
+    /// field is replaced between turns, so this is the client's clock.
+    turn: u16,
     entity_count: u8,
     entities: [MAX_ENTITIES_WIRE]EntitySnapshot,
     hunger: BarSummary,
@@ -329,14 +294,13 @@ pub const GameState = struct {
     grid_rows: u8,
     grid_cols: u8,
     grid: [components.MAX_GRID_CELLS]components.SlimeCell,
-    /// Slime still waiting off-grid — drives the "incoming" indicator.
+    /// Slime still waiting off-grid — drives the "incoming" indicator, and
+    /// once it hits 0 with a cleared grid the encounter is won.
     reservoir: u32,
-    lil_guy_count: u8,
-    lil_guys: [MAX_LIL_GUYS_WIRE]LilGuySnapshot,
 
     pub const blank = GameState{
         .tick = 0,
-        .cast_timer = -1,
+        .turn = 0,
         .entity_count = 0,
         .entities = [_]EntitySnapshot{EntitySnapshot.blank} ** MAX_ENTITIES_WIRE,
         .hunger = .{ .current = 0, .max = 0 },
@@ -346,8 +310,6 @@ pub const GameState = struct {
         .grid_cols = 0,
         .grid = [_]components.SlimeCell{.empty} ** components.MAX_GRID_CELLS,
         .reservoir = 0,
-        .lil_guy_count = 0,
-        .lil_guys = [_]LilGuySnapshot{LilGuySnapshot.blank} ** MAX_LIL_GUYS_WIRE,
     };
 
     /// Live cell count of the transmitted grid.
@@ -471,14 +433,13 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
             try writer.writeByte(@intFromEnum(payload.kind));
             try writer.writeByte(payload.index);
         },
-        .cast_grouped => {
-            try writer.writeByte(payload.player_mask);
-            try writer.writeInt(u32, payload.fires_in_ms, .little);
-        },
-        .cast_replaced => try writer.writeByte(payload.player_id),
-        .cast_fired => {
-            try writer.writeByte(payload.spell_count);
-            try writer.writeByte(payload.player_mask);
+        .turn_ended => {
+            const p: TurnEnded = payload;
+            try writer.writeInt(u16, p.turn, .little);
+            try writer.writeInt(u16, p.cells_eaten, .little);
+            try writer.writeInt(u16, p.hunger_added, .little);
+            for (p.healable) |h| try writer.writeInt(u16, h, .little);
+            try writer.writeInt(u32, p.score_added, .little);
         },
 
         .lobby_update => try encode_lobby_update(writer, payload),
@@ -517,7 +478,7 @@ fn encode_game_start(w: anytype, p: GameStart) !void {
     try w.writeByte(p.encounter_label_len);
     try w.writeAll(p.encounter_label[0..p.encounter_label_len]);
     try w.writeByte(p.player_id);
-    try w.writeInt(u32, p.cast_buffer_ms, .little);
+    try w.writeByte(p.casts_per_turn);
     try w.writeByte(p.grid_rows);
     try w.writeByte(p.grid_cols);
 }
@@ -556,7 +517,7 @@ fn decode_slime_cell(byte: u8) !components.SlimeCell {
 
 fn encode_game_state(w: anytype, p: GameState) !void {
     try w.writeInt(u32, p.tick, .little);
-    try w.writeInt(u32, @bitCast(p.cast_timer), .little);
+    try w.writeInt(u16, p.turn, .little);
     try w.writeByte(p.entity_count);
     var i: u8 = 0;
     while (i < p.entity_count) : (i += 1) {
@@ -564,9 +525,7 @@ fn encode_game_state(w: anytype, p: GameState) !void {
         try w.writeInt(u32, e.entity, .little);
         try w.writeByte(@intFromEnum(e.kind));
         try w.writeByte(e.owner);
-        try w.writeByte(e.casts_used);
-        try w.writeInt(u16, e.lock_ms, .little);
-        try w.writeInt(u16, e.cast_ms, .little);
+        try w.writeByte(e.casts_left);
         try w.writeByte(e.combo_len);
         var j: u8 = 0;
         while (j < e.combo_len) : (j += 1)
@@ -585,14 +544,6 @@ fn encode_game_state(w: anytype, p: GameState) !void {
     try w.writeByte(p.grid_cols);
     for (p.grid[0..p.grid_len()]) |cell| try w.writeByte(encode_slime_cell(cell));
     try w.writeInt(u32, p.reservoir, .little);
-    try w.writeByte(p.lil_guy_count);
-    var g: u8 = 0;
-    while (g < p.lil_guy_count) : (g += 1) {
-        const lg = p.lil_guys[g];
-        try w.writeInt(u32, lg.entity, .little);
-        try w.writeInt(u16, lg.target, .little);
-        try w.writeInt(u16, lg.bite_ms, .little);
-    }
 }
 
 fn encode_u16_tiers(w: anytype, values: [components.Tier.size]u16) !void {
@@ -719,7 +670,6 @@ pub const DecodeError = error{
     InvalidRecipeKind,
     InvalidSlimeCell,
     InvalidGridDims,
-    TooManyLilGuys,
 };
 
 pub fn read_tag(reader: anytype) !MsgTag {
@@ -792,7 +742,7 @@ pub fn decode_game_start(reader: anytype) !GameStart {
     p.encounter_label_len = llen;
     _ = try reader.readAll(p.encounter_label[0..llen]);
     p.player_id = try reader.readByte();
-    p.cast_buffer_ms = try reader.readInt(u32, .little);
+    p.casts_per_turn = try reader.readByte();
     p.grid_rows = try reader.readByte();
     p.grid_cols = try reader.readByte();
     if (p.grid_rows > components.MAX_GRID_ROWS or p.grid_cols > components.MAX_GRID_COLS)
@@ -810,7 +760,7 @@ fn decode_bar_summary(reader: anytype) !BarSummary {
 pub fn decode_game_state(reader: anytype) !GameState {
     var p: GameState = undefined;
     p.tick = try reader.readInt(u32, .little);
-    p.cast_timer = @bitCast(try reader.readInt(u32, .little));
+    p.turn = try reader.readInt(u16, .little);
     p.entity_count = try reader.readByte();
     if (p.entity_count > MAX_ENTITIES_WIRE) return DecodeError.TooManyEntities;
     var i: u8 = 0;
@@ -821,9 +771,7 @@ pub fn decode_game_state(reader: anytype) !GameState {
         e.kind = std.meta.intToEnum(components.EntityKind, kind_byte) catch
             return DecodeError.InvalidKind;
         e.owner = try reader.readByte();
-        e.casts_used = try reader.readByte();
-        e.lock_ms = try reader.readInt(u16, .little);
-        e.cast_ms = try reader.readInt(u16, .little);
+        e.casts_left = try reader.readByte();
         e.combo_len = try reader.readByte();
         if (e.combo_len > components.MAX_COMBO_LEN) return DecodeError.InvalidComboLen;
         e.combo_slots = [_]components.ComboSlot{.{ .action = .dispense }} ** components.MAX_COMBO_LEN;
@@ -855,17 +803,6 @@ pub fn decode_game_state(reader: anytype) !GameState {
     for (p.grid[0..p.grid_len()]) |*cell|
         cell.* = try decode_slime_cell(try reader.readByte());
     p.reservoir = try reader.readInt(u32, .little);
-    p.lil_guy_count = try reader.readByte();
-    if (p.lil_guy_count > MAX_LIL_GUYS_WIRE) return DecodeError.TooManyLilGuys;
-    p.lil_guys = [_]LilGuySnapshot{LilGuySnapshot.blank} ** MAX_LIL_GUYS_WIRE;
-    var g: u8 = 0;
-    while (g < p.lil_guy_count) : (g += 1) {
-        p.lil_guys[g] = .{
-            .entity = try reader.readInt(u32, .little),
-            .target = try reader.readInt(u16, .little),
-            .bite_ms = try reader.readInt(u16, .little),
-        };
-    }
     return p;
 }
 
@@ -972,13 +909,13 @@ test "round-trip: join_lobby" {
     try std.testing.expectEqualSlices(u8, name, decoded.name[0..decoded.name_len]);
 }
 
-test "round-trip: game_state — hunger, score, grid, lil guys, and combo survive" {
+test "round-trip: game_state — turn, hunger, score, grid, and combos survive" {
     var buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
 
     var gs = GameState.blank;
     gs.tick = 42;
-    gs.cast_timer = 0.6;
+    gs.turn = 3;
     gs.entity_count = 1;
     gs.hunger = .{ .current = 80, .max = 200 };
     gs.hunger_healable = .{ 30, 0, 6 };
@@ -993,16 +930,11 @@ test "round-trip: game_state — hunger, score, grid, lil guys, and combo surviv
     gs.grid[4] = .neutralized;
     gs.grid[5] = .{ .tiered = .yellow };
     gs.reservoir = 44;
-    gs.lil_guy_count = 2;
-    gs.lil_guys[0] = .{ .entity = 11, .target = 4, .bite_ms = 750 };
-    gs.lil_guys[1] = .{ .entity = 12, .target = components.LilGuy.NO_TARGET, .bite_ms = 0 };
     gs.entities[0] = EntitySnapshot{
         .entity = 7,
         .kind = .player,
         .owner = 0,
-        .casts_used = 2,
-        .lock_ms = 350,
-        .cast_ms = 420,
+        .casts_left = 2,
         .combo_len = 2,
         .combo_slots = [_]components.ComboSlot{
             .{ .action = .medicine },
@@ -1011,8 +943,8 @@ test "round-trip: game_state — hunger, score, grid, lil guys, and combo surviv
             .{ .action = .dispense },
             .{ .action = .dispense },
         },
-        // A DIFFERENT combo is already committed and buffering: both pools
-        // must survive the round trip independently.
+        // A DIFFERENT combo is already committed and held for a partner: both
+        // pools must survive the round trip independently.
         .submitted_len = 3,
         .submitted_slots = [_]components.ComboSlot{
             .{ .action = .medicine },
@@ -1032,11 +964,9 @@ test "round-trip: game_state — hunger, score, grid, lil guys, and combo surviv
     const decoded = try decode_game_state(fbs.reader());
 
     try std.testing.expectEqual(@as(u32, 42), decoded.tick);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.6), decoded.cast_timer, 0.001);
+    try std.testing.expectEqual(@as(u16, 3), decoded.turn);
     try std.testing.expectEqual(@as(u8, 1), decoded.entity_count);
-    try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].casts_used);
-    try std.testing.expectEqual(@as(u16, 350), decoded.entities[0].lock_ms);
-    try std.testing.expectEqual(@as(u16, 420), decoded.entities[0].cast_ms);
+    try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].casts_left);
     try std.testing.expectEqual(@as(u16, 80), decoded.hunger.current);
     try std.testing.expectEqual(@as(u16, 200), decoded.hunger.max);
     try std.testing.expectEqual(@as(u16, 30), decoded.hunger_healable[0]);
@@ -1052,12 +982,6 @@ test "round-trip: game_state — hunger, score, grid, lil guys, and combo surviv
     // Cells beyond the live area stay empty rather than carrying stale data.
     try std.testing.expectEqual(components.SlimeCell.empty, decoded.grid[6]);
     try std.testing.expectEqual(@as(u32, 44), decoded.reservoir);
-    try std.testing.expectEqual(@as(u8, 2), decoded.lil_guy_count);
-    try std.testing.expectEqual(@as(u32, 11), decoded.lil_guys[0].entity);
-    try std.testing.expectEqual(@as(u16, 4), decoded.lil_guys[0].target);
-    try std.testing.expectEqual(@as(u16, 750), decoded.lil_guys[0].bite_ms);
-    const idle = components.LilGuy{ .target = decoded.lil_guys[1].target };
-    try std.testing.expect(!idle.has_target());
     try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].combo_len);
     try std.testing.expectEqual(components.ActionChoice.medicine, decoded.entities[0].combo_slots[0].action);
     try std.testing.expectEqual(components.ActionChoice.dispense, decoded.entities[0].combo_slots[1].action);
@@ -1109,7 +1033,7 @@ test "round-trip: game_start — grid dims and cast buffer survive" {
         .encounter_label = [_]u8{0} ** 32,
         .encounter_label_len = @intCast(label.len),
         .player_id = 3,
-        .cast_buffer_ms = 1200,
+        .casts_per_turn = 3,
         .grid_rows = 6,
         .grid_cols = 10,
     };
@@ -1121,7 +1045,7 @@ test "round-trip: game_start — grid dims and cast buffer survive" {
     const decoded = try decode_game_start(fbs.reader());
 
     try std.testing.expectEqual(@as(u8, 3), decoded.player_id);
-    try std.testing.expectEqual(@as(u32, 1200), decoded.cast_buffer_ms);
+    try std.testing.expectEqual(@as(u8, 3), decoded.casts_per_turn);
     try std.testing.expectEqual(@as(u8, 6), decoded.grid_rows);
     try std.testing.expectEqual(@as(u8, 10), decoded.grid_cols);
     try std.testing.expectEqualSlices(u8, label, decoded.encounter_label[0..decoded.encounter_label_len]);
@@ -1239,49 +1163,31 @@ test "decode_game_state: an unknown slime cell byte is rejected" {
     gs.grid_cols = 1;
     try encode(fbs.writer(), .game_state, gs);
     const written = fbs.getWritten();
-    // The last byte before reservoir+lil_guy_count is the single cell.
-    written[written.len - 6] = 0x7F;
+    // The single grid cell sits just before the u32 reservoir tail.
+    written[written.len - 5] = 0x7F;
     fbs.reset();
     _ = try read_tag(fbs.reader());
     try std.testing.expectError(DecodeError.InvalidSlimeCell, decode_game_state(fbs.reader()));
 }
 
-test "round-trip: cast_grouped carries player mask and fire delay" {
-    var buf: [16]u8 = undefined;
+test "round-trip: turn_ended carries the whole-field feast" {
+    var buf: [32]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    try encode(fbs.writer(), .cast_grouped, CastGrouped{
-        .player_mask = 0b0000_0011,
-        .fires_in_ms = 500,
+    try encode(fbs.writer(), .turn_ended, TurnEnded{
+        .turn = 7,
+        .cells_eaten = 60,
+        .hunger_added = 145,
+        .healable = .{ 30, 12, 4 },
+        .score_added = 21,
     });
     fbs.reset();
-    try std.testing.expectEqual(MsgTag.cast_grouped, try read_tag(fbs.reader()));
-    const decoded = try decode_cast_grouped(fbs.reader());
-    try std.testing.expectEqual(@as(u8, 0b0000_0011), decoded.player_mask);
-    try std.testing.expectEqual(@as(u32, 500), decoded.fires_in_ms);
-}
-
-test "round-trip: cast_replaced carries player_id" {
-    var buf: [8]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try encode(fbs.writer(), .cast_replaced, CastReplaced{ .player_id = 4 });
-    fbs.reset();
-    try std.testing.expectEqual(MsgTag.cast_replaced, try read_tag(fbs.reader()));
-    const decoded = try decode_cast_replaced(fbs.reader());
-    try std.testing.expectEqual(@as(u8, 4), decoded.player_id);
-}
-
-test "round-trip: cast_fired carries count and player mask" {
-    var buf: [8]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try encode(fbs.writer(), .cast_fired, CastFired{
-        .spell_count = 2,
-        .player_mask = 0b0000_0101,
-    });
-    fbs.reset();
-    try std.testing.expectEqual(MsgTag.cast_fired, try read_tag(fbs.reader()));
-    const decoded = try decode_cast_fired(fbs.reader());
-    try std.testing.expectEqual(@as(u8, 2), decoded.spell_count);
-    try std.testing.expectEqual(@as(u8, 0b0000_0101), decoded.player_mask);
+    try std.testing.expectEqual(MsgTag.turn_ended, try read_tag(fbs.reader()));
+    const decoded = try decode_turn_ended(fbs.reader());
+    try std.testing.expectEqual(@as(u16, 7), decoded.turn);
+    try std.testing.expectEqual(@as(u16, 60), decoded.cells_eaten);
+    try std.testing.expectEqual(@as(u16, 145), decoded.hunger_added);
+    try std.testing.expectEqual([_]u16{ 30, 12, 4 }, decoded.healable);
+    try std.testing.expectEqual(@as(u32, 21), decoded.score_added);
 }
 
 test "decode_game_state: oversized grid dimensions are rejected" {
@@ -1292,9 +1198,9 @@ test "decode_game_state: oversized grid dimensions are rejected" {
     gs.grid_cols = 1;
     try encode(fbs.writer(), .game_state, gs);
     const written = fbs.getWritten();
-    // grid_rows sits right after score: tick(4) cast_timer(4) entity_count(1)
-    // hunger(4) healable(3 tiers x 2) score(4) = offset 23 after the tag byte.
-    written[1 + 23] = components.MAX_GRID_ROWS + 1;
+    // grid_rows sits right after score: tick(4) turn(2) entity_count(1)
+    // hunger(4) healable(3 tiers x 2) score(4) = offset 21 after the tag byte.
+    written[1 + 21] = components.MAX_GRID_ROWS + 1;
     fbs.reset();
     _ = try read_tag(fbs.reader());
     try std.testing.expectError(DecodeError.InvalidGridDims, decode_game_state(fbs.reader()));
@@ -1342,8 +1248,7 @@ test "round-trip: a blank game_state (pre-start, no grid) survives" {
 
     try std.testing.expectEqual(@as(u32, 7), decoded.tick);
     try std.testing.expectEqual(@as(u16, 0), decoded.grid_len());
-    try std.testing.expectEqual(@as(u8, 0), decoded.lil_guy_count);
-    try std.testing.expectApproxEqAbs(@as(f32, -1.0), decoded.cast_timer, 0.001);
+    try std.testing.expectEqual(@as(u16, 0), decoded.turn);
 }
 
 test "round-trip: cast_committed carries player_id" {

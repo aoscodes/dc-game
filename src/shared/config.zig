@@ -57,9 +57,7 @@ pub const Loaded = struct {
 pub const ConfigError = error{
     InvalidBalanceJson,
     InvalidEncountersJson,
-    InvalidEatRate,
-    InvalidCastBuffer,
-    InvalidCastLock,
+    InvalidCastsPerTurn,
     InvalidSlimeGrid,
     TooManyRecipes,
     InvalidTeamPatternCount,
@@ -173,9 +171,8 @@ const BalanceJson = struct {
         .rows = balance.DEFAULT_SLIME_GRID.rows,
         .cols = balance.DEFAULT_SLIME_GRID.cols,
     },
-    eat_rate_units_per_s: f32 = 2.0,
-    cast_buffer_ms: u32 = 500,
-    cast_lock_ms: u32 = 500,
+    /// Defaulted so a config written before turns keeps validating.
+    casts_per_turn: u8 = balance.DEFAULT_CASTS_PER_TURN,
     player_recipes: []const PlayerRecipeJson,
     team_recipes: []const TeamRecipeJson,
 };
@@ -215,17 +212,11 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         return ConfigError.InvalidBalanceJson;
     };
 
-    if (!(raw.eat_rate_units_per_s > 0)) {
-        fail("{s}: eat_rate_units_per_s must be > 0", .{BALANCE_FILE});
-        return ConfigError.InvalidEatRate;
-    }
-    if (raw.cast_buffer_ms > 60_000) {
-        fail("{s}: cast_buffer_ms must be <= 60000", .{BALANCE_FILE});
-        return ConfigError.InvalidCastBuffer;
-    }
-    if (raw.cast_lock_ms > 60_000) {
-        fail("{s}: cast_lock_ms must be <= 60000", .{BALANCE_FILE});
-        return ConfigError.InvalidCastLock;
+    // A budget of 0 could never be spent, so the turn could never end and the
+    // encounter would hang.  Rejected at load rather than deadlocking at play.
+    if (raw.casts_per_turn < 1) {
+        fail("{s}: casts_per_turn must be >= 1", .{BALANCE_FILE});
+        return ConfigError.InvalidCastsPerTurn;
     }
     if (raw.slime_grid.rows < 1 or raw.slime_grid.rows > c.MAX_GRID_ROWS or
         raw.slime_grid.cols < 1 or raw.slime_grid.cols > c.MAX_GRID_COLS)
@@ -282,9 +273,7 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         .hunger_cost_normal = raw.hunger_cost_normal,
         .hunger_cost_hazard_extra = raw.hunger_cost_hazard_extra,
         .slime_grid = .{ .rows = raw.slime_grid.rows, .cols = raw.slime_grid.cols },
-        .eat_rate_units_per_s = raw.eat_rate_units_per_s,
-        .cast_buffer_ms = raw.cast_buffer_ms,
-        .cast_lock_ms = raw.cast_lock_ms,
+        .casts_per_turn = raw.casts_per_turn,
         .player_recipes = players,
         .team_recipes = teams,
     };
@@ -716,12 +705,13 @@ test "empty combo pattern is rejected" {
     ));
 }
 
-test "realtime fields default when absent" {
+test "casts_per_turn defaults when absent" {
     var loaded = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
     defer loaded.deinit();
-    try std.testing.expectApproxEqAbs(@as(f32, 2.0), loaded.config.balance.eat_rate_units_per_s, 0.001);
-    try std.testing.expectEqual(@as(u32, 500), loaded.config.balance.cast_buffer_ms);
-    try std.testing.expectEqual(@as(u32, 500), loaded.config.balance.cast_lock_ms);
+    try std.testing.expectEqual(
+        balance.DEFAULT_CASTS_PER_TURN,
+        loaded.config.balance.casts_per_turn,
+    );
 }
 
 test "slime_grid defaults when absent" {
@@ -765,53 +755,53 @@ test "out-of-range slime_grid dimensions are rejected" {
     );
 }
 
-test "zero eat_rate_units_per_s is rejected" {
+test "zero casts_per_turn is rejected" {
+    // A budget that can never be spent is a turn that can never end.
     const bad =
         \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
-        \\ "eat_rate_units_per_s":0,
+        \\ "casts_per_turn":0,
         \\ "player_recipes":[],"team_recipes":[]}
     ;
     try std.testing.expectError(
-        ConfigError.InvalidEatRate,
+        ConfigError.InvalidCastsPerTurn,
         parse(std.testing.allocator, bad, minimal_encounters),
     );
 }
 
-test "over-cap cast_buffer_ms is rejected" {
-    const bad =
-        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
-        \\ "cast_buffer_ms":60001,
-        \\ "player_recipes":[],"team_recipes":[]}
-    ;
-    try std.testing.expectError(
-        ConfigError.InvalidCastBuffer,
-        parse(std.testing.allocator, bad, minimal_encounters),
-    );
-}
-
-test "over-cap cast_lock_ms is rejected" {
-    const bad =
-        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
-        \\ "cast_lock_ms":60001,
-        \\ "player_recipes":[],"team_recipes":[]}
-    ;
-    try std.testing.expectError(
-        ConfigError.InvalidCastLock,
-        parse(std.testing.allocator, bad, minimal_encounters),
-    );
-}
-
-test "zero cast_buffer_ms and cast_lock_ms are valid" {
-    // Zero means "fire immediately" / "no lock", both legitimate tunings.
+test "casts_per_turn is read from the document" {
     const doc =
         \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
-        \\ "cast_buffer_ms":0,"cast_lock_ms":0,
+        \\ "casts_per_turn":7,
         \\ "player_recipes":[],"team_recipes":[]}
     ;
     var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
     defer loaded.deinit();
-    try std.testing.expectEqual(@as(u32, 0), loaded.config.balance.cast_buffer_ms);
-    try std.testing.expectEqual(@as(u32, 0), loaded.config.balance.cast_lock_ms);
+    try std.testing.expectEqual(@as(u8, 7), loaded.config.balance.casts_per_turn);
+}
+
+test "retired realtime fields are rejected" {
+    // The turn loop has no buffers, locks or per-second eat rate.  Leaving a
+    // stale tunable in a config would silently do nothing, so std.json's
+    // unknown-field strictness is the intended behaviour here.
+    for ([_][]const u8{
+        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\ "eat_rate_units_per_s":2.0,
+        \\ "player_recipes":[],"team_recipes":[]}
+        ,
+        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\ "cast_buffer_ms":500,
+        \\ "player_recipes":[],"team_recipes":[]}
+        ,
+        \\{"hunger_cost_normal":1,"hunger_cost_hazard_extra":2,
+        \\ "cast_lock_ms":500,
+        \\ "player_recipes":[],"team_recipes":[]}
+        ,
+    }) |bad| {
+        try std.testing.expectError(
+            ConfigError.InvalidBalanceJson,
+            parse(std.testing.allocator, bad, minimal_encounters),
+        );
+    }
 }
 
 test "unknown top-level field is rejected (typo protection)" {

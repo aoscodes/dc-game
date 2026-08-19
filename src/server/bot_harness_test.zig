@@ -6,15 +6,16 @@
 //! next combo as a `submit_spell`, enqueueing both into the session — exactly
 //! replicating what a real WebSocket client would send.
 //!
-//! A "cycle" is one submit + one tick past the cast buffer, which is also long
-//! enough to expire the cast lock (so the next cycle is accepted) and to fire
-//! exactly one bite per Lil Guy.
+//! A "cycle" is one submit per bot, drained in a single tick.  Casts resolve as
+//! they are accepted, so a cycle is exactly one round of casting — NOT a turn.
+//! A turn only ends once every bot has spent its whole `casts_per_turn` budget,
+//! so `casts_per_turn` cycles retire one turn (and one feast).
 //!
 //! ## Usage
 //!
 //!   var h = try BotHarness.init(allocator, &bots.team_mixed, encounter, "BOTKEY".*, .{});
 //!   defer h.deinit();
-//!   // advance one full cast cycle (inject combos + tick past the buffer):
+//!   // advance one cast cycle (inject combos + drain them):
 //!   try h.step();
 //!   // check game state via h.session ...
 
@@ -131,17 +132,9 @@ pub const BotHarness = struct {
         self.allocator.free(self.bot_states);
     }
 
-    /// Seconds that retire a cycle: past the cast buffer (casts fire) AND past
-    /// the cast lock (next cycle's submits are accepted).
-    fn cycle_dt(self: *const BotHarness) f32 {
-        const bal = &self.session.cfg.balance;
-        const longest = @max(bal.cast_buffer_ms, bal.cast_lock_ms);
-        return @as(f32, @floatFromInt(longest)) / 1000.0 + 0.001;
-    }
-
     /// Enqueue each bot's cast for this cycle as a `submit_spell`.
-    /// Call this before ticking past the cast buffer, or use step() which
-    /// does both.
+    /// Call this before the tick that drains them, or use step() which does
+    /// both.
     pub fn inject_actions(self: *BotHarness) !void {
         try self.inject_tag(.submit_spell);
     }
@@ -191,16 +184,16 @@ pub const BotHarness = struct {
     /// Advance the session by exactly one cast cycle:
     ///   1. inject_aim() then inject_actions() for every bot — aim first, so
     ///      the cast is anchored at this cycle's new cursor
-    ///   2. tick(0) so the queue drains and every cast is accepted together
-    ///   3. tick past the cast buffer: the batch fires (team recipes group),
-    ///      then each Lil Guy takes one bite
+    ///   2. tick() so the queue drains and every cast resolves
+    ///
+    /// If that drain exhausts every bot's budget, the session ends the turn
+    /// inside the same tick: the field is devoured and refilled.
     ///
     /// Increments self.cycle afterwards.
     pub fn step(self: *BotHarness) !void {
         try self.inject_aim();
         try self.inject_actions();
         try self.session.tick(0.0);
-        try self.session.tick(self.cycle_dt());
         self.cycle += 1;
     }
 
@@ -236,15 +229,13 @@ const enc_green_field = enc.Encounter{
     .slime = .{ .tiered = .{ 0, 0, 60 } },
 };
 
-/// Un-winnable hunger budget when idle; survivable when defused.  Exactly
-/// fills the 6x10 fixture grid, so every stamp is guaranteed to land on slime
-/// (a sparse field would make the comparison a coin flip).
-///
-/// Idle: each of the 60 units costs 1 normal + 2 extra, so the bar fills after
-/// 34 units.  Defused first: 1 each, so 60 total fits inside the budget.
+/// Exactly fills the 6x10 fixture grid, so every stamp is guaranteed to land on
+/// slime (a sparse field would make a coverage comparison a coin flip).  The
+/// hunger budget is roomy on purpose: this encounter is for comparing the PRICE
+/// two teams pay for the same field, not for deciding a win.
 const enc_survival = enc.Encounter{
     .label = "bot_survival",
-    .hunger_max = 100,
+    .hunger_max = 1000,
     .slime = .{ .tiered = .{ 0, 0, 60 } },
 };
 
@@ -271,11 +262,15 @@ test "sweeping bots make progress against a full hazard field" {
     try std.testing.expect(tier_total(h.session.stats.feast.cells_covered) > 0);
 }
 
-test "idle play loses a hunger budget that defusing bots can survive" {
+test "defusing before the feast is cheaper than letting the field be eaten live" {
+    // The whole field is devoured at the end of every turn no matter what, so a
+    // cast can never save a unit from being eaten — only change what eating it
+    // COSTS.  This pins that: same field, same seed, one team stamping and one
+    // not.
     const allocator = std.testing.allocator;
 
-    // Idle team: joined but never casts, so every hazard unit is eaten live
-    // (1 normal + 2 extra each) and the bar fills long before the field does.
+    // Idle side: a joined player who never casts would stall the turn forever,
+    // so its budget is retired directly.  Nothing is ever defused.
     var idle_sess = try Session.init_seeded(allocator, "BOTK01".*, TEST_CFG, 0xB07_5EED);
     defer idle_sess.deinit();
     var idle_bot: BotState = undefined;
@@ -285,30 +280,37 @@ test "idle play loses a hunger budget that defusing bots can survive" {
         return error.JoinFailed;
     try idle_sess.start_game_encounter(&enc_survival);
 
-    var ticks: u32 = 0;
-    while (idle_sess.phase == .playing and ticks < 200) : (ticks += 1) {
-        try idle_sess.tick(0.501);
+    var turns: u32 = 0;
+    while (idle_sess.phase == .playing and turns < 200) : (turns += 1) {
+        idle_sess.casts_left = [_]u8{0} ** session_mod.MAX_PLAYERS;
+        try idle_sess.tick(0.0);
     }
     try std.testing.expectEqual(session_mod.SessionPhase.lobby, idle_sess.phase);
-    try std.testing.expectEqual(proto.EndReason.hunger_full, idle_sess.stats.reason);
-    try std.testing.expect(idle_sess.hunger.current >= idle_sess.hunger.max);
-    // Live hazard slime scores nothing.
+    // Every unit was eaten as a live hazard: full price, and nothing scored.
+    try std.testing.expectEqual(proto.EndReason.field_cleared, idle_sess.stats.reason);
     try std.testing.expectEqual(@as(u32, 0), idle_sess.score);
-    try std.testing.expect(idle_sess.stats.slime_left > 0);
+    try std.testing.expectEqual(
+        @as(u16, @intCast(60 * (BAL.hunger_cost_normal + BAL.hunger_cost_hazard_extra))),
+        idle_sess.hunger.current,
+    );
 
-    // Active team: stamping defuses cells before the horde reaches them, so
-    // those units cost the normal hunger only and the budget holds.
+    // Active side: the same field, but stamped before the feast prices it.
     var h = try BotHarness.init(allocator, &bots.team_mixed, &enc_survival, "BOTK02".*, .{});
     defer h.deinit();
     _ = try h.run_to_completion(200);
 
     try std.testing.expectEqual(session_mod.SessionPhase.lobby, h.session.phase);
-    // Defusing outpaces the horde by a wide margin (3 bites/cycle vs a dozen
-    // cells stamped), so the field is cleared inside the budget.
     try std.testing.expectEqual(proto.EndReason.field_cleared, h.session.stats.reason);
+    // Same 60 units eaten either way, but the defused ones cost less and score.
+    try std.testing.expect(h.session.hunger.current < idle_sess.hunger.current);
     try std.testing.expect(h.session.score > idle_sess.score);
-    try std.testing.expect(h.session.hunger.current < h.session.hunger.max);
     try std.testing.expect(tier_total(h.session.stats.feast.cells_covered) > 0);
+    // Defusing is exactly the extra hunger avoided: 2 per cell neutralised.
+    const neutralised = tier_total(h.session.stats.feast.neutralized);
+    try std.testing.expectEqual(
+        idle_sess.hunger.current - @as(u16, @intCast(neutralised * BAL.hunger_cost_hazard_extra)),
+        h.session.hunger.current,
+    );
 }
 
 test "mixed team finishes the default encounter with a positive score" {
@@ -331,9 +333,9 @@ test "profile cycles correctly across cast cycles" {
     //
     // Injection flow: enqueue_message() places bytes in the slot's msg_queue.
     // The session only drains msg_queue during tick() via drain_queues(), so
-    // action_pool is populated only after a tick call.  Ticking with dt=0
-    // flushes the queue without advancing any cast buffer or bite timer, so
-    // the previews stay observable.
+    // action_pool is populated only after a tick call.  `choose_combo` is a
+    // preview, not a cast, so no budget is spent and no turn can end — the
+    // previews stay observable.
     const allocator = std.testing.allocator;
 
     const snake_team = bots.BotTeam{
@@ -362,7 +364,8 @@ test "profile cycles correctly across cast cycles" {
         try std.testing.expect(shared.game_logic.combos_equal(expected, got));
         h.cycle += 1;
     }
-    // No cast ever committed and no bite timer advanced: the field is intact.
+    // Previews only: no cast was ever committed, so no turn ended and the
+    // field is untouched.
     try std.testing.expectEqual(session_mod.SessionPhase.playing, h.session.phase);
     try std.testing.expectEqual(@as(u32, 6), h.session.field.remaining());
 }
@@ -407,9 +410,9 @@ test "aim injection walks the cursor and anchors casts where the bot aimed" {
     try std.testing.expectEqual(grid.row_of(start), grid.row_of(parked));
 }
 
-test "a submitted cast keeps its anchor when the bot re-aims mid-buffer" {
-    // The cast_anchors snapshot exists so an in-flight spell cannot be
-    // retargeted by moving after commit.
+test "a submitted cast is anchored where the bot aimed, not where it ends up" {
+    // The cast_anchors snapshot exists so a spell resolves at the cursor as it
+    // was WHEN SUBMITTED, even if later messages in the same drain move it.
     const allocator = std.testing.allocator;
 
     const solo = bots.BotTeam{
@@ -426,12 +429,11 @@ test "a submitted cast keeps its anchor when the bot re-aims mid-buffer" {
     defer h.deinit();
     const pid = h.bot_states[0].player_id;
 
-    try h.inject_actions();
-    try h.session.tick(0.0);
-    const anchor = h.session.cast_anchors[pid];
-    try std.testing.expectEqual(h.session.cursors[pid], anchor);
+    const aimed = h.session.cursors[pid];
 
-    // Walk away while the cast is still buffering.
+    // Submit, then walk away — all in ONE drain, so the moves are processed
+    // after the cast has already been anchored.
+    try h.inject_actions();
     for (0..3) |_| {
         var buf: [4]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
@@ -439,12 +441,13 @@ test "a submitted cast keeps its anchor when the bot re-aims mid-buffer" {
         h.session.enqueue_message(pid, fbs.getWritten());
     }
     try h.session.tick(0.0);
-    try std.testing.expect(h.session.cursors[pid] != anchor);
-    try std.testing.expectEqual(anchor, h.session.cast_anchors[pid]);
 
-    // `poke` is 1x1 and the field is all-green, so the stamp downgrades
+    try std.testing.expectEqual(aimed, h.session.cast_anchors[pid]);
+    try std.testing.expect(h.session.cursors[pid] != aimed);
+
+    // `poke` is 1x1 and the field is all-green, so the stamp downgraded
     // exactly one green cell — at the anchor, not the moved-to cursor.
-    try h.session.tick(h.cycle_dt());
+    try std.testing.expect(h.session.field.grid.get(aimed) == .neutralized);
     const covered = h.session.stats.feast.cells_covered;
     try std.testing.expectEqual(@as(u16, 1), covered[@intFromEnum(c.Tier.green)]);
     try std.testing.expectEqual(@as(u16, 1), h.session.stats.players[pid].cells_covered);

@@ -113,24 +113,19 @@ pub const Balance = struct {
     /// healed by medicine matching the tier that was eaten).
     hunger_cost_hazard_extra: u32,
     /// Dimensions of the slime grid.  Slime beyond `rows * cols` waits in the
-    /// off-grid reservoir and refills emptied cells from the top row.
+    /// off-grid reservoir and refills emptied cells at the start of each turn.
     slime_grid: SlimeGridDims,
-    /// Slime units eaten per second PER LIL GUY (one Lil Guy per connected
-    /// player) — the team eats at rate × players.  Its inverse is one Lil
-    /// Guy's per-bite interval.
-    eat_rate_units_per_s: f32,
-    /// PER-CAST buffer in milliseconds.  Each accepted
-    /// submit_spell fires solo when its own buffer expires — unless a newly
-    /// accepted cast COMPLETES a team recipe with pending casts, in which
-    /// case that recipe instance's members fire together at the newest
-    /// joiner's expiry.  0 = fire immediately (no grouping window).
-    cast_buffer_ms: u32,
-    /// Per-player cast cooldown in milliseconds, started on
-    /// each accepted submit.  While locked further submits are ignored; once
-    /// unlocked a resubmit REPLACES the player's pending cast (restarting
-    /// its buffer).  Values above cast_buffer_ms throttle overall cast
-    /// rate.  0 = no lock.
-    cast_lock_ms: u32,
+    /// Casts each player may commit per turn.  The turn ends once EVERY
+    /// connected player has spent their budget, so this is both the team's
+    /// per-turn power and the length of a turn.  Must be at least 1: a budget
+    /// of 0 could never be spent, so no turn could ever end.
+    ///
+    /// A fizzled cast (a combo naming no recipe) does NOT spend budget; a
+    /// team half held for a partner who never arrives DOES.
+    casts_per_turn: u8,
     player_recipes: []const PlayerRecipe,
     team_recipes: []const TeamRecipe,
 };
+
+/// Default per-player cast budget when `casts_per_turn` is absent.
+pub const DEFAULT_CASTS_PER_TURN: u8 = 3;

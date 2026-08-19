@@ -32,14 +32,14 @@ const MAX_SHAPE_ROWS = MAX_GRID_ROWS;
 const MAX_SHAPE_COLS = MAX_GRID_COLS;
 /** Mirrors balance.DEFAULT_SLIME_GRID (used for pre-grid configs). */
 const DEFAULT_SLIME_GRID = { rows: 6, cols: 10 };
+/** Mirrors balance.DEFAULT_CASTS_PER_TURN. */
+const DEFAULT_CASTS_PER_TURN = 3;
 
 /** Scalar balance fields: [key, label, min, max, step]. */
 const RATE_FIELDS = [
   ["hunger_cost_normal", "hunger per unit eaten", 0, 1000, 1],
   ["hunger_cost_hazard_extra", "extra hunger from hazard slime (healable)", 0, 1000, 1],
-  ["eat_rate_units_per_s", "units eaten /s per lil guy", 0.1, 100, 0.1],
-  ["cast_buffer_ms", "team recipe window (ms)", 0, 60000, 50],
-  ["cast_lock_ms", "cooldown (ms)", 0, 60000, 50],
+  ["casts_per_turn", "casts per player per turn", 1, 255, 1],
 ];
 
 /**
@@ -119,9 +119,7 @@ async function load() {
         cols: bal.slime_grid?.cols ?? DEFAULT_SLIME_GRID.cols,
       },
       // Default like the server does for older configs.
-      eat_rate_units_per_s: bal.eat_rate_units_per_s ?? 2.0,
-      cast_buffer_ms: bal.cast_buffer_ms ?? 500,
-      cast_lock_ms: bal.cast_lock_ms ?? 500,
+      casts_per_turn: bal.casts_per_turn ?? DEFAULT_CASTS_PER_TURN,
       player_recipes: bal.player_recipes.map((r) => ({
         label: r.label,
         pattern: [...r.pattern],

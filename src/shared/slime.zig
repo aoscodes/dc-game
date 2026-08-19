@@ -22,7 +22,7 @@
 //!                 every covered hazard one tier.  Deterministic: the player
 //!                 chose the cells, so nothing is random and nothing is
 //!                 destroyed — only made safer.
-//!   bite        — empty one cell, reporting the hunger/score it produced.
+//!   eat_all     — devour the whole field, reporting the hunger/score it cost.
 //!
 //! Neither the reservoir nor an off-grid unit can be neutralized: casting is a
 //! grid-only operation by construction (`SlimeReservoir` has no neutralized
@@ -151,47 +151,74 @@ pub const SlimeField = struct {
         return out;
     }
 
-    /// Pick a random occupied cell — what a Lil Guy targets.  Returns its
-    /// flat index, or null when the grid holds no slime.
-    pub fn pick_target(self: *const SlimeField, rand: std.Random) ?u16 {
-        const occupied = self.grid.occupied();
-        if (occupied == 0) return null;
-        // Choose the k-th occupied cell so every unit is equally likely
-        // regardless of how holes are distributed.
-        var k = rand.uintLessThan(u16, occupied);
+    /// Devour the ENTIRE field in one feast and empty it.
+    ///
+    /// This is the turn-end settlement: every remaining unit is eaten at once,
+    /// so casting during the turn is purely about *what condition* the slime is
+    /// in when this runs.  Ordering is irrelevant (each cell is independent),
+    /// which is why the whole grid collapses into one outcome instead of a
+    /// stream of per-cell bites.
+    ///
+    /// The grid is left empty; refilling from the reservoir is the caller's
+    /// next step so it can broadcast the feast before the new field appears.
+    pub fn eat_all(self: *SlimeField, bal: *const balance.Balance) FeastOutcome {
+        var out = FeastOutcome{};
         for (self.grid.live(), 0..) |cell, i| {
             if (!cell.is_slime()) continue;
-            if (k == 0) return @intCast(i);
-            k -= 1;
-        }
-        unreachable; // `occupied` counted the cells just walked.
-    }
-
-    /// Eat the cell at `flat`, emptying it.  Returns null if the cell was
-    /// already empty (its slime was neutralized-away or eaten by another Lil
-    /// Guy before this bite landed) — callers re-target instead of eating.
-    pub fn bite(
-        self: *SlimeField,
-        bal: *const balance.Balance,
-        flat: u16,
-    ) ?BiteOutcome {
-        const cell = self.grid.get(flat);
-        if (!cell.is_slime()) return null;
-        self.grid.put(flat, .empty);
-
-        var out = BiteOutcome{ .hunger_normal = bal.hunger_cost_normal };
-        switch (cell) {
-            .empty => unreachable, // guarded above
-            .neutral, .neutralized => {
-                out.eaten = cell;
-                out.score = 1;
-            },
-            .tiered => {
-                out.eaten = cell;
-                out.hunger_extra = bal.hunger_cost_hazard_extra;
-            },
+            out.cells += 1;
+            out.hunger_normal += bal.hunger_cost_normal;
+            switch (cell) {
+                .empty => unreachable, // guarded above
+                .neutral => {
+                    out.neutral += 1;
+                    out.score += 1;
+                },
+                .neutralized => {
+                    out.defused += 1;
+                    out.score += 1;
+                },
+                .tiered => |tier| {
+                    // A live hazard hurts the same whatever its tier: the tier
+                    // only says how many casts it needed, and it decides which
+                    // medicine can heal the damage afterwards.
+                    out.hunger_extra[@intFromEnum(tier)] += bal.hunger_cost_hazard_extra;
+                    out.escaped[@intFromEnum(tier)] += 1;
+                },
+            }
+            self.grid.put(@intCast(i), .empty);
         }
         return out;
+    }
+};
+
+/// What one whole-field feast produced.
+///
+/// Hunger is split so healing stays honest: `hunger_normal` is the unavoidable
+/// cost of the Lil Guys eating at all, while `hunger_extra` is the punishment
+/// for leaving hazards live — bucketed by the tier that was eaten, because only
+/// medicine of that same tier can heal it.
+pub const FeastOutcome = struct {
+    /// Slime units eaten.
+    cells: u16 = 0,
+    /// Of those, units that were never hazardous.
+    neutral: u16 = 0,
+    /// Of those, units a cast had taken all the way to defused.
+    defused: u16 = 0,
+    /// Units eaten while STILL hazardous, per tier — the ones the team failed
+    /// to defuse in time.
+    escaped: [c.Tier.size]u16 = [_]u16{0} ** c.Tier.size,
+    /// Hunger from eating units at all — never healable.
+    hunger_normal: u32 = 0,
+    /// Healable extra hunger, indexed by the tier of the hazard eaten.
+    hunger_extra: [c.Tier.size]u32 = [_]u32{0} ** c.Tier.size,
+    /// Score: 1 per neutral or defused unit, 0 per live hazard.
+    score: u32 = 0,
+
+    /// Total hunger the feast added.
+    pub fn hunger_total(self: FeastOutcome) u32 {
+        var n: u32 = self.hunger_normal;
+        for (self.hunger_extra) |e| n += e;
+        return n;
     }
 };
 
@@ -218,28 +245,6 @@ pub const ShapeOutcome = struct {
     /// Covered cells the cast achieved nothing on.
     pub fn wasted(self: ShapeOutcome) u16 {
         return self.off_grid + self.inert;
-    }
-};
-
-/// What one bite produced.  `hunger_extra` is healable by medicine matching
-/// the eaten cell's tier; `hunger_normal` never is.
-pub const BiteOutcome = struct {
-    /// The cell that was eaten (never `.empty`).
-    eaten: c.SlimeCell = .neutral,
-    /// Hunger from eating a unit at all.
-    hunger_normal: u32 = 0,
-    /// Extra hunger, non-zero only for un-neutralized hazard slime.
-    hunger_extra: u32 = 0,
-    /// Score: 1 for neutral/neutralized slime, 0 for a live hazard.
-    score: u32 = 0,
-
-    /// The tier whose medicine can heal `hunger_extra`, or null when this
-    /// bite produced no healable hunger.
-    pub fn healable_tier(self: BiteOutcome) ?c.Tier {
-        return switch (self.eaten) {
-            .tiered => |tier| tier,
-            else => null,
-        };
     }
 };
 
@@ -513,82 +518,57 @@ test "apply_shape is deterministic — the same aim gives the same field" {
     try testing.expectEqualSlices(c.SlimeCell, a.grid.live(), b.grid.live());
 }
 
-test "pick_target returns an occupied cell and null on an empty grid" {
-    var rng = prng(10);
-    var field = SlimeField.init(.{ .rows = 2, .cols = 3 }, .{ .neutral = 2 }, rng.random());
-
-    for (0..16) |_| {
-        const flat = field.pick_target(rng.random()).?;
-        try testing.expect(field.grid.get(flat).is_slime());
-    }
-
-    for (0..field.grid.len()) |i| field.grid.put(@intCast(i), .empty);
-    try testing.expectEqual(@as(?u16, null), field.pick_target(rng.random()));
-}
-
-test "pick_target reaches every occupied cell across draws" {
-    var rng = prng(11);
-    var field = SlimeField.init(.{ .rows = 1, .cols = 4 }, .{ .neutral = 4 }, rng.random());
-    field.grid.set(0, 1, .empty);
-
-    var hit = [_]bool{false} ** 4;
-    for (0..200) |_| hit[field.pick_target(rng.random()).?] = true;
-    try testing.expect(hit[0] and hit[2] and hit[3]);
-    try testing.expect(!hit[1]);
-}
-
-test "bite empties the cell and reports hunger and score per cell kind" {
+test "eat_all empties the field and prices every cell kind" {
     var field = empty_field(1, 3);
     field.grid.put(0, .neutral);
     field.grid.put(1, .{ .tiered = .red });
     field.grid.put(2, .neutralized);
 
-    const neutral = field.bite(test_bal, 0).?;
-    try testing.expectEqual(test_bal.hunger_cost_normal, neutral.hunger_normal);
-    try testing.expectEqual(@as(u32, 0), neutral.hunger_extra);
-    try testing.expectEqual(@as(u32, 1), neutral.score);
-    try testing.expectEqual(@as(?c.Tier, null), neutral.healable_tier());
-    try testing.expectEqual(c.SlimeCell.empty, field.grid.at(0, 0));
+    const feast = field.eat_all(test_bal);
 
-    // A live hazard: costs extra hunger, scores nothing, and the extra is
-    // healable by medicine matching the tier that was eaten.
-    const hazard = field.bite(test_bal, 1).?;
-    try testing.expectEqual(test_bal.hunger_cost_normal, hazard.hunger_normal);
-    try testing.expectEqual(test_bal.hunger_cost_hazard_extra, hazard.hunger_extra);
-    try testing.expectEqual(@as(u32, 0), hazard.score);
-    try testing.expectEqual(c.Tier.red, hazard.healable_tier().?);
-
-    const defused = field.bite(test_bal, 2).?;
-    try testing.expectEqual(test_bal.hunger_cost_normal, defused.hunger_normal);
-    try testing.expectEqual(@as(u32, 0), defused.hunger_extra);
-    try testing.expectEqual(@as(u32, 1), defused.score);
-    try testing.expectEqual(@as(?c.Tier, null), defused.healable_tier());
-
+    try testing.expectEqual(@as(u16, 3), feast.cells);
+    try testing.expectEqual(3 * test_bal.hunger_cost_normal, feast.hunger_normal);
+    // Only the live red hazard adds extra, and it lands in the red bucket.
+    try testing.expectEqual(test_bal.hunger_cost_hazard_extra, feast.hunger_extra[ti(.red)]);
+    try testing.expectEqual(@as(u32, 0), feast.hunger_extra[ti(.yellow)]);
+    try testing.expectEqual(@as(u32, 0), feast.hunger_extra[ti(.green)]);
+    // Neutral and defused both score; the hazard does not.
+    try testing.expectEqual(@as(u32, 2), feast.score);
     try testing.expect(field.is_exhausted());
 }
 
-test "every tier costs the same to eat while it is still a hazard" {
+test "eat_all skips empty cells and reports an empty field as a no-op feast" {
+    var field = empty_field(2, 2);
+    field.grid.put(3, .neutral);
+
+    const some = field.eat_all(test_bal);
+    try testing.expectEqual(@as(u16, 1), some.cells);
+
+    // Nothing left: a second feast costs nothing rather than being an error.
+    const none = field.eat_all(test_bal);
+    try testing.expectEqual(@as(u16, 0), none.cells);
+    try testing.expectEqual(@as(u32, 0), none.hunger_total());
+    try testing.expectEqual(@as(u32, 0), none.score);
+}
+
+test "every tier costs the same to eat, but heals from its own bucket" {
     // Difficulty is how many casts a unit needs, NOT how badly it hurts:
     // the eating penalty is identical for red, yellow and green.
     for ([_]c.Tier{ .red, .yellow, .green }) |tier| {
         var field = empty_field(1, 1);
         field.grid.put(0, .{ .tiered = tier });
-        const out = field.bite(test_bal, 0).?;
-        try testing.expectEqual(test_bal.hunger_cost_hazard_extra, out.hunger_extra);
-        try testing.expectEqual(@as(u32, 0), out.score);
-        try testing.expectEqual(tier, out.healable_tier().?);
+        const feast = field.eat_all(test_bal);
+        try testing.expectEqual(
+            test_bal.hunger_cost_hazard_extra,
+            feast.hunger_extra[ti(tier)],
+        );
+        try testing.expectEqual(test_bal.hunger_cost_hazard_extra, feast.hunger_total() -
+            feast.hunger_normal);
+        try testing.expectEqual(@as(u32, 0), feast.score);
     }
 }
 
-test "bite on an already-empty cell returns null" {
-    var rng = prng(13);
-    var field = SlimeField.init(.{ .rows = 1, .cols = 2 }, .{ .neutral = 1 }, rng.random());
-    try testing.expect(field.bite(test_bal, 0) != null);
-    try testing.expectEqual(@as(?BiteOutcome, null), field.bite(test_bal, 0));
-    try testing.expectEqual(@as(?BiteOutcome, null), field.bite(test_bal, 1));
-}
-
-test "eating the whole field totals hunger and score over every unit" {
+test "feasting turn after turn totals hunger and score over every unit" {
     var rng = prng(14);
     var res = c.SlimeReservoir{ .neutral = 7 };
     res.tiered[ti(.red)] = 10;
@@ -600,16 +580,13 @@ test "eating the whole field totals hunger and score over every unit" {
     var hunger_normal: u32 = 0;
     var hunger_extra: u32 = 0;
     var score: u32 = 0;
+    // One iteration = one turn with no casts: feast, then refill.
     while (!field.is_exhausted()) {
-        const flat = field.pick_target(rng.random()) orelse {
-            _ = field.fill(rng.random());
-            continue;
-        };
-        const outcome = field.bite(test_bal, flat).?;
-        eaten += 1;
-        hunger_normal += outcome.hunger_normal;
-        hunger_extra += outcome.hunger_extra;
-        score += outcome.score;
+        const feast = field.eat_all(test_bal);
+        eaten += feast.cells;
+        hunger_normal += feast.hunger_normal;
+        hunger_extra += feast.hunger_total() - feast.hunger_normal;
+        score += feast.score;
         _ = field.fill(rng.random());
     }
 
@@ -620,23 +597,16 @@ test "eating the whole field totals hunger and score over every unit" {
     try testing.expectEqual(@as(u32, 7), score);
 }
 
-test "defusing before eating removes the extra hunger and earns the score" {
+test "defusing before the feast removes the extra hunger and earns the score" {
     var field = empty_field(3, 3);
     paint(&field, .{ .tiered = .green });
 
     // One cast over the whole 3x3 defuses all nine.
     _ = field.apply_shape(SQUARE_3X3, 1, 1);
 
-    var rng = prng(15);
-    var hunger_extra: u32 = 0;
-    var score: u32 = 0;
-    while (field.pick_target(rng.random())) |flat| {
-        const outcome = field.bite(test_bal, flat).?;
-        hunger_extra += outcome.hunger_extra;
-        score += outcome.score;
-    }
-    try testing.expectEqual(@as(u32, 0), hunger_extra);
-    try testing.expectEqual(@as(u32, 9), score);
+    const feast = field.eat_all(test_bal);
+    try testing.expectEqual(feast.hunger_normal, feast.hunger_total());
+    try testing.expectEqual(@as(u32, 9), feast.score);
 }
 
 test "field ops are reproducible for a given seed" {
@@ -647,8 +617,7 @@ test "field ops are reproducible for a given seed" {
             res.tiered[ti(.red)] = 10;
             var field = SlimeField.init(.{ .rows = 3, .cols = 4 }, res, rng.random());
             _ = field.apply_shape(PLUS, 1, 1);
-            const flat = field.pick_target(rng.random()).?;
-            _ = field.bite(test_bal, flat);
+            _ = field.eat_all(test_bal);
             _ = field.fill(rng.random());
             return field;
         }

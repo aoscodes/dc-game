@@ -2,10 +2,10 @@
 //! WebSocket, play through the default Slime Feast encounter, assert the
 //! game ends with a positive shared score.
 //!
-//! This exercises the whole real-time stack: the server-authoritative slime
-//! grid and aim cursors, the reservoir refill, one Lil Guy per player biting on
-//! its own timer, shape stamping at each caster's captured anchor, and
-//! team-recipe grouping across two independent WebSocket clients.
+//! This exercises the whole turn-based stack: the server-authoritative slime
+//! grid and aim cursors, the per-player cast budget, the turn-end feast and the
+//! reservoir refill that follows it, shape stamping at each caster's captured
+//! anchor, and team-recipe pairing across two independent WebSocket clients.
 //!
 //! Run with:  zig build e2e
 //!
@@ -25,9 +25,6 @@ const c = shared.components;
 const PORT: u16 = 19001;
 const SERVER_STARTUP_TIMEOUT_MS: u64 = 3000;
 const BOT_TIMEOUT_MS: u32 = 30_000;
-/// game_state frames to skip between submits, so each cast lands after the
-/// previous one's lock has expired.
-const CAST_INTERVAL_TICKS: u32 = 30;
 /// Cursor steps sent per cast cycle.  Walking before every cast sweeps the
 /// stamp across the field instead of grinding the same cells, and proves the
 /// server's cursor is authoritative and clamped (the bots deliberately walk
@@ -46,8 +43,16 @@ const BotResult = struct {
     /// Grid dimensions announced in game_start — proves the client is told how
     /// to lay the field out.
     grid_cells: u16 = 0,
-    /// Lil Guys seen in the last game_state: one per connected player.
-    lil_guys: u8 = 0,
+    /// Highest turn number seen in a game_state — proves the turn loop
+    /// advanced rather than the match resolving inside turn 1.
+    max_turn: u16 = 0,
+    /// `turn_ended` broadcasts seen: the wire proof that feasts happened.
+    turn_ends: u32 = 0,
+    /// Cast budget announced in game_start.
+    casts_per_turn: u8 = 0,
+    /// Lowest `casts_left` this bot ever saw for itself.  Starts above any
+    /// possible budget so the first snapshot always lowers it.
+    min_casts_left: u16 = std.math.maxInt(u16),
     stats_neutralized: u32 = 0,
     casts_total: u16 = 0,
     /// Hazard cells the team's stamps downgraded, summed over all tiers.
@@ -159,9 +164,30 @@ pub fn main() !void {
             failed = true;
             continue;
         }
-        if (ctx.result.lil_guys < 2) {
-            std.debug.print("[e2e] FAIL {s}: saw {} Lil Guys, want one per player\n", .{
-                ctx.name, ctx.result.lil_guys,
+        if (ctx.result.max_turn < 2) {
+            std.debug.print("[e2e] FAIL {s}: reached turn {}, want the loop to advance\n", .{
+                ctx.name, ctx.result.max_turn,
+            });
+            failed = true;
+            continue;
+        }
+        if (ctx.result.turn_ends == 0) {
+            std.debug.print("[e2e] FAIL {s}: no turn_ended broadcasts seen\n", .{ctx.name});
+            failed = true;
+            continue;
+        }
+        if (ctx.result.casts_per_turn == 0) {
+            std.debug.print("[e2e] FAIL {s}: game_start carried no cast budget\n", .{ctx.name});
+            failed = true;
+            continue;
+        }
+        // A budget that never dips below its maximum would mean casts were
+        // free.  Zero itself is NOT required: the last spend in the room ends
+        // the turn and refills every budget inside the same drain, so an empty
+        // budget need never appear in a broadcast snapshot.
+        if (ctx.result.min_casts_left >= ctx.result.casts_per_turn) {
+            std.debug.print("[e2e] FAIL {s}: budget never spent down (min {} of {})\n", .{
+                ctx.name, ctx.result.min_casts_left, ctx.result.casts_per_turn,
             });
             failed = true;
             continue;
@@ -192,12 +218,13 @@ pub fn main() !void {
             failed = true;
             continue;
         }
-        std.debug.print("[e2e] OK   {s}: score={}, {} hunger events, {}-cell grid, {} lil guys, {} casts, {} covered, {} defused, {} stamps, cursor col {}\n", .{
+        std.debug.print("[e2e] OK   {s}: score={}, {} hunger events, {}-cell grid, {} turns, {} feasts, {} casts, {} covered, {} defused, {} stamps, cursor col {}\n", .{
             ctx.name,                  ctx.result.score,
             ctx.result.hunger_events,  ctx.result.grid_cells,
-            ctx.result.lil_guys,       ctx.result.casts_total,
-            ctx.result.stats_covered,  ctx.result.stats_neutralized,
-            ctx.result.shape_casts,    ctx.result.max_cursor_col,
+            ctx.result.max_turn,       ctx.result.turn_ends,
+            ctx.result.casts_total,    ctx.result.stats_covered,
+            ctx.result.stats_neutralized, ctx.result.shape_casts,
+            ctx.result.max_cursor_col,
         });
     }
 
@@ -244,10 +271,6 @@ fn run_bot_inner(ctx: *BotCtx) !void {
     // Our player id, from game_start — needed to pick our own entity (and so
     // our own cursor) out of each snapshot.
     var my_player_id: u8 = 0xFF;
-    // Ticks to wait between casts.  The server rejects submits while a
-    // player's cast lock is cooling, so we pace ourselves rather than
-    // spamming every frame.
-    var ticks_until_cast: u32 = 0;
 
     while (true) {
         const msg = try client.read() orelse continue;
@@ -289,8 +312,10 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                 my_player_id = start.player_id;
                 ctx.result.grid_cells =
                     @as(u16, start.grid_rows) * @as(u16, start.grid_cols);
-                std.debug.print("[e2e] {s} game_start: {}x{} grid, player {}\n", .{
-                    ctx.name, start.grid_rows, start.grid_cols, start.player_id,
+                ctx.result.casts_per_turn = start.casts_per_turn;
+                std.debug.print("[e2e] {s} game_start: {}x{} grid, player {}, {} casts/turn\n", .{
+                    ctx.name,          start.grid_rows, start.grid_cols,
+                    start.player_id,   start.casts_per_turn,
                 });
             },
 
@@ -299,24 +324,23 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                 const gs = proto.decode_game_state(fbs.reader()) catch continue;
                 if (!in_game) continue;
 
-                ctx.result.lil_guys = @max(ctx.result.lil_guys, gs.lil_guy_count);
+                ctx.result.max_turn = @max(ctx.result.max_turn, gs.turn);
 
-                // Track our own cursor as the server reports it.  While a cast
-                // buffers the server sends the captured ANCHOR here, so this
+                // Track our own cursor and budget as the server reports them.
+                // A HELD team half is reported at its captured ANCHOR, so this
                 // also proves anchors are snapshotted.
                 for (gs.entities[0..gs.entity_count]) |e| {
                     if (e.owner != my_player_id) continue;
                     ctx.result.max_cursor_col =
                         @max(ctx.result.max_cursor_col, e.cursor_col);
+                    ctx.result.min_casts_left =
+                        @min(ctx.result.min_casts_left, @as(u16, e.casts_left));
                 }
 
-                if (ticks_until_cast > 0) {
-                    ticks_until_cast -= 1;
-                    continue;
-                }
-                ticks_until_cast = CAST_INTERVAL_TICKS;
-
-                // Aim first, then cast: the server captures the cursor at
+                // Submit every frame: casts resolve immediately, and submits
+                // past the budget are harmlessly ignored, so the bots simply
+                // spend their whole allowance as fast as the server will take
+                // it.  Aim first, then cast: the server captures the cursor at
                 // SUBMIT time, so the walk must land before the submit.
                 // Clamping makes the sweep safe to run forever — a bot that
                 // reaches the edge simply stops advancing.
@@ -338,6 +362,12 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                 if (ar.tag == .damage) {
                     ctx.result.hunger_events += 1;
                 }
+            },
+
+            .turn_ended => {
+                var fbs = std.io.fixedBufferStream(payload);
+                _ = proto.decode_turn_ended(fbs.reader()) catch continue;
+                ctx.result.turn_ends += 1;
             },
 
             .shape_cast => {
