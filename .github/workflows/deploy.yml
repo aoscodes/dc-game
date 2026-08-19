@@ -27,7 +27,11 @@ jobs:
         id: filter
         with:
           filters: |
+            # The workflow file itself is a dependency of every artifact: it
+            # owns the build flags and the bundling/packaging steps, so a
+            # change to it must invalidate all of them.
             server:
+              - '.github/workflows/deploy.yml'
               - 'src/server/**'
               - 'src/shared/**'
               - 'src/debug/**'
@@ -36,6 +40,7 @@ jobs:
               - 'build.zig.zon'
               - 'data/**'
             client:
+              - '.github/workflows/deploy.yml'
               - 'src/client/**'
               - 'src/shared/**'
               - 'src/root.zig'
@@ -44,9 +49,11 @@ jobs:
               - 'bridge/**'
               - 'data/**'
             web:
+              - '.github/workflows/deploy.yml'
               - 'web/**'
               - 'data/**'
             setup:
+              - '.github/workflows/deploy.yml'
               - 'scripts/vps-setup.sh'
 
   build-server:
