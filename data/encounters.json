@@ -3,116 +3,17 @@
   "encounters": [
     {
       "label": "slime_feast_01",
-      "hunger_max": 200,
-      "charges": 180,
+      "hunger_max": 60,
+      "charges": 30,
       "zones": [
         {
           "tiered": {
-            "red": 10,
-            "green": 5
-          },
-          "neutral": 15,
-          "special": 1
-        },
-        {
-          "tiered": {
-            "red": 10,
-            "yellow": 5,
-            "green": 10
-          },
-          "neutral": 10
-        },
-        {
-          "tiered": {
-            "red": 15,
-            "yellow": 10,
-            "green": 15
-          },
-          "neutral": 5,
-          "special": 1
-        }
-      ]
-    },
-    {
-      "label": "slime_feast_02",
-      "hunger_max": 700,
-      "charges": 1250,
-      "zones": [
-        {
-          "tiered": {
-            "red": 10,
-            "green": 5
-          },
-          "neutral": 15,
-          "special": 1
-        },
-        {
-          "tiered": {
-            "red": 10,
-            "yellow": 5,
-            "green": 10
-          },
-          "neutral": 10
-        },
-        {
-          "tiered": {
-            "red": 15,
-            "yellow": 10,
-            "green": 15
-          },
-          "neutral": 5,
-          "special": 1
-        },
-        {
-          "tiered": {
-            "red": 30,
-            "yellow": 45,
-            "green": 70
-          },
-          "neutral": 15,
-          "special": 1
-        },
-        {
-          "tiered": {
-            "red": 20,
-            "yellow": 15,
-            "green": 60
-          },
-          "neutral": 10
-        },
-        {
-          "tiered": {
-            "red": 15,
+            "red": 100,
             "yellow": 100,
-            "green": 15
+            "green": 100
           },
-          "neutral": 5,
-          "special": 1
-        },
-        {
-          "tiered": {
-            "red": 20,
-            "yellow": 20,
-            "green": 60
-          },
-          "neutral": 15
-        },
-        {
-          "tiered": {
-            "red": 10,
-            "yellow": 15,
-            "green": 20
-          },
-          "neutral": 10
-        },
-        {
-          "tiered": {
-            "red": 15,
-            "yellow": 10,
-            "green": 15
-          },
-          "neutral": 5,
-          "special": 1
+          "neutral": 0,
+          "special": 3
         }
       ]
     }

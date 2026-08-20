@@ -4,7 +4,7 @@
     "rows": 6,
     "cols": 10
   },
-  "casts_per_turn": 3,
+  "casts_per_turn": 1,
   "player_recipes": [
     {
       "label": "poke",
@@ -18,7 +18,7 @@
       "shape": [
         "###"
       ],
-      "cost": 2
+      "cost": 3
     },
     {
       "label": "column",
@@ -27,62 +27,55 @@
         "#",
         "#"
       ],
+      "cost": 3
+    },
+    {
+      "label": "hook",
+      "shape": [
+        "#..",
+        ".#.",
+        "..#"
+      ],
+      "cost": 3
+    },
+    {
+      "label": "slice",
+      "shape": [
+        "..#",
+        ".#.",
+        "#.."
+      ],
       "cost": 2
-    },
-    {
-      "label": "block",
-      "shape": [
-        "###",
-        "###",
-        "###"
-      ],
-      "cost": 5
-    },
-    {
-      "label": "wedge",
-      "shape": [
-        "###",
-        ".#."
-      ],
-      "cost": 2
-    },
-    {
-      "label": "breach",
-      "shape": [
-        "#",
-        "#"
-      ],
-      "cost": 1
     }
   ],
   "team_recipes": [
     {
-      "label": "twin_bloom",
+      "label": "cross",
       "moves": [
-        "poke",
-        "poke"
+        "sweep",
+        "column"
       ],
       "shape": [
         "..#..",
-        ".###.",
+        "..#..",
         "#####",
-        ".###.",
+        "..#..",
         "..#.."
       ],
       "cost": 6
     },
     {
-      "label": "crossfire",
+      "label": "slash",
       "moves": [
-        "poke",
-        "sweep"
+        "hook",
+        "slash"
       ],
       "shape": [
+        "#...#",
+        ".#.#.",
         "..#..",
-        "..#..",
-        "#####",
-        "..#..",
-        "..#.."
+        ".#.#.",
+        "#...#"
       ],
       "cost": 6
     }
