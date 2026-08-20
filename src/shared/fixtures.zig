@@ -147,6 +147,18 @@ pub const encounters = [_]enc.Encounter{
     },
 };
 
+/// The priced move table: `player_recipes` without the free `trickle` (and
+/// without `deluge`, which follows it).
+///
+/// `trickle` costs 0, so under `test_config` the cheapest move is free and the
+/// team can ALWAYS act — which is exactly why the fixture has it, and exactly
+/// why `out_of_charges` can never fire there.  Tests about running the pool dry
+/// need a table with a floor above zero, and this is it.
+///
+/// The indices POKE..WEDGE are unchanged, so the group table (which names
+/// components by index) is shared verbatim.
+pub const priced_recipes = player_recipes[0 .. WEDGE + 1];
+
 pub const test_config = config.Config{
     .balance = .{
         .hunger_cost_normal = 1,
@@ -157,6 +169,23 @@ pub const test_config = config.Config{
         // follow-up, so tests can exercise budget exhaustion in one turn.
         .casts_per_turn = 3,
         .player_recipes = &player_recipes,
+        .team_recipes = &team_recipes,
+    },
+    .encounters = .{
+        .encounters = &encounters,
+        .default_index = 0,
+    },
+};
+
+/// `test_config` with a floor under the move table: identical in every other
+/// respect, so a test can swap it in and change exactly one thing about the
+/// world — whether the team can act on an empty pool.
+pub const priced_config = config.Config{
+    .balance = .{
+        .hunger_cost_normal = test_config.balance.hunger_cost_normal,
+        .slime_grid = test_config.balance.slime_grid,
+        .casts_per_turn = test_config.balance.casts_per_turn,
+        .player_recipes = priced_recipes,
         .team_recipes = &team_recipes,
     },
     .encounters = .{

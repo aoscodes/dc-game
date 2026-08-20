@@ -215,7 +215,14 @@ fn write_render_inner(
             .ready = lobby.ready,
             .players = players_buf[0..lobby.update.player_count],
         } else null,
-        .game = if (phase == .game) JsonGame{
+        // Carried in `game_over` too, not just `game`.  The renderer plays the
+        // closing feast as its outro, and that needs the same payload a normal
+        // turn end gets: the post-feast board plus the `turn_ended` that
+        // describes it.  Both are already on the snapshot — the server sends a
+        // final `game_state` before `game_over` for exactly this — so it costs
+        // nothing but the bytes.  `turn_ended` is cleared after one write, so
+        // the outro starts once and the frames after it are static.
+        .game = if (phase == .game or phase == .game_over) JsonGame{
             .encounter = game.encounter_label[0..game.encounter_label_len],
             .player_id = game.player_id,
             .casts_per_turn = game.casts_per_turn,

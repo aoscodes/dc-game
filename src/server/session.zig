@@ -30,8 +30,8 @@
 //! (`encounter.charges`).  Nothing ever refills them.  Every recipe has a
 //! `cost`, so the pool is the real resource: the team is not asked "what can
 //! you do this turn?" but "what is this play worth out of everything you will
-//! ever have?".  Running the pool dry with slime still walled off is a loss
-//! (`out_of_charges`) — see check_end.
+//! ever have?".  Running the pool dry is a loss (`out_of_charges`) the moment
+//! the team can no longer afford its cheapest move — see check_end.
 //!
 //! SELECTING.  Each player holds ONE selected move: an index into
 //! `balance.player_recipes` that they step around with `cycle_shape` and fire
@@ -76,9 +76,11 @@
 //! reset, and `turn_ended` is broadcast.
 //!
 //! The encounter's end is checked ONLY at turn end: the hunger bar filling is a
-//! loss, a dead position (nothing eaten and nothing affordable) is a loss, and
-//! a field holding nothing but specials is a win.  Either way the final shared
-//! score is broadcast via game_over.
+//! loss, a pool that can no longer afford the cheapest move is a loss (however
+//! well the feast just went), and a field holding nothing but specials is a
+//! win.  Either way the settled board is broadcast FIRST and the final shared
+//! score follows via game_over, so the client can play the closing feast out
+//! before it shows the report.
 
 const std = @import("std");
 const ecs = @import("ecs_zig");
@@ -522,6 +524,21 @@ pub const Session = struct {
         }
     }
 
+    /// Strand every remaining cast once the pool cannot afford the cheapest
+    /// move.
+    ///
+    /// A broke turn is already over in fact: every cast still owed would fizzle,
+    /// spending budget for nothing and asking players to press keys to no
+    /// effect.  Zeroing the budgets makes it over in form, so the feast plays
+    /// and `check_end` calls the game on this turn rather than the next one.
+    ///
+    /// A zero-cost move config never reaches this: `cheapest_cost` is 0, so the
+    /// pool can always afford something.
+    fn strand_budgets_if_broke(self: *Session) void {
+        if (self.charges >= self.cfg.balance.cheapest_cost()) return;
+        for (&self.casts_left) |*n| n.* = 0;
+    }
+
     /// True once every CONNECTED player has spent their budget.  Disconnected
     /// slots are ignored, so a player dropping out unblocks the turn instead of
     /// stalling it forever.
@@ -609,7 +626,7 @@ pub const Session = struct {
             self.field.reservoir.total(),
         });
 
-        try self.check_end(feast);
+        try self.check_end();
         if (self.phase != .playing) return;
 
         self.turn +|= 1;
@@ -834,6 +851,8 @@ pub const Session = struct {
                     player_id, self.casts_left[player_id],
                 });
 
+                self.strand_budgets_if_broke();
+
                 // Spending the last budget in the room settles the turn.
                 try self.maybe_end_turn();
             },
@@ -848,9 +867,9 @@ pub const Session = struct {
     }
 
     /// Decide whether the encounter is over.  Called ONLY from `end_turn`:
-    /// nothing between turns can move the hunger bar or the slime count, so
-    /// there is no other moment where the answer can change.
-    fn check_end(self: *Session, feast: slime.FeastOutcome) !void {
+    /// nothing between turns can move the hunger bar, the slime count or the
+    /// charge pool, so there is no other moment where the answer can change.
+    fn check_end(self: *Session) !void {
         if (self.phase != .playing) return;
         // Field-cleared wins ties: if the final feast fills the bar exactly,
         // the players still ate everything they could.
@@ -864,21 +883,36 @@ pub const Session = struct {
             try self.end_game(.hunger_full);
             return;
         }
-        // DEAD POSITION.  Slime is left, the Lil Guys reached none of it, and
-        // the pool cannot afford even the cheapest recipe — so no future turn
-        // can differ from this one.  Called it here rather than letting the
-        // room spin turns forever with nothing to show for them.
+        // OUT OF ENERGY.  Slime is left and the pool cannot afford even the
+        // cheapest move, so no future turn can differ from this one: every
+        // remaining cast would fizzle and every remaining feast would eat
+        // whatever the Lil Guys can already reach.  Ending here beats letting
+        // the room spin turns that no input can change.
         //
-        // A config with a zero-cost recipe can never trip this: there is always
+        // Note this does NOT require the feast to have eaten nothing.  A team
+        // that is broke but still feeding the Lil Guys is not in a stalemate,
+        // but it has no decisions left either — the rest is bookkeeping, and
+        // playing it out turn by turn is not a game.
+        //
+        // A config with a zero-cost move can never trip this: there is always
         // a move, so the game always has somewhere to go.  That is intentional.
-        if (feast.cells == 0 and self.charges < self.cfg.balance.cheapest_cost()) {
-            std.log.info("charges exhausted with slime unreachable — encounter over, score={}", .{self.score});
+        if (self.charges < self.cfg.balance.cheapest_cost()) {
+            std.log.info("charges exhausted — encounter over, score={}", .{self.score});
             try self.end_game(.out_of_charges);
         }
     }
 
     fn end_game(self: *Session, reason: proto.EndReason) !void {
         std.log.info("game over — score: {} reason: {s}", .{ self.score, @tagName(reason) });
+
+        // The final board, before the phase flips.  `tick` stops broadcasting
+        // state the moment the session leaves `.playing`, so without this the
+        // last state clients ever saw is the one from BEFORE the closing feast:
+        // they would be told the game ended on a board that still holds the
+        // slime it just ate.  Clients replay that feast as their outro, and
+        // they need the board it lands on to do it.
+        try self.broadcast_game_state();
+
         self.phase = .lobby;
         // Reset ready flags so players must opt-in to the next game.
         for (&self.players) |*p| p.ready = false;

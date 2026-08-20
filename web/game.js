@@ -139,8 +139,17 @@ const LAYOUT = {
   },
 
   // Default floater lifetime ≥ 3s so feedback is readable; cosmetic chomps
-  // are exempt (see tickLilGuys).  Recipe floaters render larger.
-  floater: { font: 16, drift: 40, jitter: 40, stack: 22, lifetime: 3.0, recipeFont: 24 },
+  // are exempt (see tickLilGuys).  Recipe floaters render larger, and the
+  // end-of-match verdict larger still — it is the only thing on the board
+  // worth reading at that point.
+  floater: {
+    font: 16, drift: 40, jitter: 40, stack: 22, lifetime: 3.0,
+    // The verdict sits ABOVE field centre: the feast tally lands at centre
+    // (-30) and the sheltered line just below it (+28), and a 56px headline
+    // dropped between them would sit on both.  Everything drifts up together
+    // afterwards, so clearing them once clears them for good.
+    recipeFont: 24, verdictFont: 56, verdictDy: -70,
+  },
 
   preLobby: {
     titleX: 40, titleY: 60, titleFont: 32,
@@ -1733,7 +1742,7 @@ function drawSlimeField(game) {
   // Cells the wheel selections would cover if everyone cast now, and what
   // each becomes.  Exact, not a guess: placement is a pure function of
   // (shape, cursor).  Computed once per frame.
-  const preview = replay ? new Map() : shapePreview(game).cells;
+  const preview = replay || playSuspended() ? new Map() : shapePreview(game).cells;
   const pulse = preview.size > 0
     ? FIELD.previewAlphaMin + (FIELD.previewAlphaMax - FIELD.previewAlphaMin) *
       (0.5 + 0.5 * Math.sin(t * Math.PI * 2 * FIELD.previewPulseHz))
@@ -2184,6 +2193,21 @@ function cinematicBoard() {
 /** True while the feast is being replayed — the window in which input is dead. */
 function cinematicActive() {
   return cinematic !== null;
+}
+
+/**
+ * True while the board is on screen but not playable: the feast replay, or the
+ * end-of-match outro behind it (see `outroActive`).
+ *
+ * Every affordance the board offers — the cast preview, the cells it would
+ * cover, the casts-left line — is a promise that pressing a key will do
+ * something.  In both of these windows nothing will, so the promise has to come
+ * off the screen rather than be quietly broken.  The keydown handler drops the
+ * same two cases, and that is not a coincidence: this predicate is the visible
+ * half of that one.
+ */
+function playSuspended() {
+  return cinematicActive() || outroActive();
 }
 
 /**
@@ -2640,15 +2664,25 @@ function drawActionMenu(game) {
   rectStroke(mx, my, mw, mh, 2, C_MENU_BORDER);
 
   const px = mx + M.padX;
+
+  // The key rows are a contract: press this, get that.  The feast replay
+  // suspends it for a second and then hands it back, so those keys are still
+  // worth showing in their own colours.  The outro never hands it back — the
+  // match is decided — so the rows go grey rather than advertise a cast that
+  // can no longer happen.
+  const dead = outroActive();
+  const DEAD_KEY = "rgba(130,130,145,0.65)";
+  const keyColor = (live) => (dead ? DEAD_KEY : live);
+
   const aRowY = my + M.padTopY + M.actionRowDy;
-  text("[1] Next shape", px + M.actionCols[0], aRowY, M.actionFont, WHEEL_COLOR.forward);
-  text("[2] Back", px + M.actionCols[1], aRowY, M.actionFont, WHEEL_COLOR.backward);
+  text("[1] Next shape", px + M.actionCols[0], aRowY, M.actionFont, keyColor(WHEEL_COLOR.forward));
+  text("[2] Back", px + M.actionCols[1], aRowY, M.actionFont, keyColor(WHEEL_COLOR.backward));
 
   // Aim row: the arrow keys move the cursor the shape is stamped on.
   const own0 = (game.entities ?? []).find(e => e.owner === game.player_id);
   const aimY = my + M.padTopY + M.aimRowDy;
   text(`[← ↑ ↓ →] Aim  @${own0?.cursor_row ?? 0},${own0?.cursor_col ?? 0}`,
-    px, aimY, M.aimFont, C_OWN_ROW);
+    px, aimY, M.aimFont, keyColor(C_OWN_ROW));
 
   // What ENTER would cast right now: the wheel position, its cost, and where
   // it sits in the wheel.  Selection is server-authoritative and persists
@@ -2661,7 +2695,7 @@ function drawActionMenu(game) {
       ? `  (${(sel % PLAYER_RECIPES.length) + 1}/${PLAYER_RECIPES.length})`
       : "";
     text(`[Enter] Cast  ${move?.label ?? "-"}  \u26a1${move?.cost ?? 0}${wheel}`,
-      px, my + M.padTopY + M.selectedRowDy, M.selectedFont, RECIPE_COLOR_PLAYER);
+      px, my + M.padTopY + M.selectedRowDy, M.selectedFont, keyColor(RECIPE_COLOR_PLAYER));
   }
 
   const tbw = mw - M.padX * 2;
@@ -2681,15 +2715,18 @@ function drawActionMenu(game) {
     }
     rectStroke(px, my + M.castBarDy, tbw, M.castBarH, 1, "rgba(255,255,255,0.3)");
 
-    // While the feast plays out, keys are dropped on the floor, so the panel
-    // says so rather than inviting a cast that will not be sent.
-    const status = cinematicActive()
-      ? "The Lil Guys are eating — hold on"
-      : left > 0
-        ? `Turn ${game.turn ?? 1} — ${left}/${total} casts left`
-        : `Turn ${game.turn ?? 1} — out of casts, waiting on the team`;
-    text(status, px, my + M.timerTextDy, M.timerTextFont,
-      cinematicActive() ? CAST_EVENT_COLOR : left > 0 ? C_TEXT : "rgba(180,180,190,0.75)");
+    // While the feast plays out — and afterwards, if that feast ended the
+    // match — keys are dropped on the floor, so the panel says so rather than
+    // inviting a cast that will not be sent.
+    const spent = "rgba(180,180,190,0.75)";
+    const [status, statusColor] = cinematicActive()
+      ? ["The Lil Guys are eating — hold on", CAST_EVENT_COLOR]
+      : outroActive()
+        ? ["Encounter over", spent]
+        : left > 0
+          ? [`Turn ${game.turn ?? 1} — ${left}/${total} casts left`, C_TEXT]
+          : [`Turn ${game.turn ?? 1} — out of casts, waiting on the team`, spent];
+    text(status, px, my + M.timerTextDy, M.timerTextFont, statusColor);
   }
 
   // What the whole team's wheel selections would do if everyone cast now,
@@ -2699,8 +2736,9 @@ function drawActionMenu(game) {
   // The replay suppresses the field's preview, so it suppresses these
   // numbers too — they are read off the SERVER's board, which is several stages
   // ahead of the one on screen, and would describe cells the player cannot see
-  // yet.  The status line above already explains the wait.
-  if (cinematicActive()) return;
+  // yet.  The outro suppresses them for the plainer reason that there is no
+  // next cast.  The status line above already explains the wait.
+  if (playSuspended()) return;
 
   const pv = shapePreview(game);
   const projected = pv.projected;
@@ -2959,6 +2997,80 @@ function drawGameOver(msg) {
 }
 
 // ---------------------------------------------------------------------------
+// End-of-match outro
+// ---------------------------------------------------------------------------
+//
+// The server ends the match on the turn that fills the hunger bar, clears the
+// field or empties the charge pool — all of which happen at the END of a turn,
+// after the closing feast has already been eaten.  Cutting to the report there
+// would throw away the best moment in the game: the bite that ended it.
+//
+// So the board is HELD.  The game_over frame carries the same payload a turn
+// end does (post-feast grid + turn_ended), the feast replays exactly as any
+// other turn's does, and only once it has landed does the verdict float up.
+// The report waits behind it.  Input is dead for the duration — see the keydown
+// handler — because there is nothing to decide and a stray keypress would
+// otherwise skip straight past the payoff.
+
+/** Seconds the verdict floater holds the board before the report replaces it. */
+const OUTRO_HOLD_S = 3.0;
+
+/** Reason → what the players are told, and in what colour. */
+const VERDICT = {
+  field_cleared: { text: "FIELD CLEARED!", color: C_SLIME_HDR },
+  hunger_full: { text: "GAME OVER", color: C_BAD },
+  out_of_charges: { text: "GAME OVER", color: C_BAD },
+};
+const VERDICT_DEFAULT = { text: "GAME OVER", color: C_BAD };
+
+/**
+ * @typedef {object} Outro
+ * @property {object} msg        - the game_over frame the outro plays from, held
+ *                                 by identity so later frames cannot restart it
+ * @property {number|null} age   - seconds since the verdict floated; null while
+ *                                 the closing feast is still being eaten
+ * @property {boolean} done      - outro finished; the report owns the screen
+ */
+
+/** @type {Outro|null} */
+let outro = null;
+
+/** True while the outro still owns the screen. */
+function outroActive() {
+  return outro !== null && !outro.done;
+}
+
+/**
+ * Advance the outro one frame.  Called AFTER the board is drawn, so the feast
+ * replay has already been ticked and `cinematicActive()` is the answer for this
+ * frame rather than the last one.
+ */
+function tickOutro(dt) {
+  if (!outroActive()) return;
+  // Eat first, talk after.  A verdict over a board still mid-chew reads as a
+  // bug, and the tally floaters the replay lands with need the room.
+  if (outro.age === null) {
+    if (cinematicActive()) return;
+    const { x, y } = fieldCenter();
+    const v = VERDICT[outro.msg.stats?.reason] ?? VERDICT_DEFAULT;
+    spawnFloater(v.text, x, y + LAYOUT.floater.verdictDy, v.color,
+      OUTRO_HOLD_S, LAYOUT.floater.verdictFont);
+    outro.age = 0;
+    return;
+  }
+  outro.age += dt;
+  // Held for the floater's whole life, so the verdict fades out rather than
+  // being cut off by the report.
+  if (outro.age < OUTRO_HOLD_S) return;
+  outro.done = true;
+  // The board is finished with.  Nothing downstream clears it for us: the
+  // report is drawn from the game_over phase this outro has been standing in
+  // since it started, so the usual leaving-the-game-phase hook already fired
+  // (and did nothing) frames ago.
+  clearEntityState();
+}
+
+// ---------------------------------------------------------------------------
 // Render loop
 // ---------------------------------------------------------------------------
 
@@ -2967,7 +3079,39 @@ let lastTs = null;
 let lastPhase = null;
 
 function renderFrame(msg, dt) {
-  // Clear per-entity state whenever we leave the game phase.
+  // A game_over frame without a board is nothing to replay: the outro is
+  // skipped and the report drawn immediately, exactly as before.
+  //
+  // `outro === null` is the whole guard, and it is enough for both jobs: a
+  // finished outro is kept (as `done`) rather than cleared, so the frames still
+  // arriving behind it cannot start a second one, and the record is only torn
+  // down when the phase changes below.  Gating on `lastPhase` instead would
+  // wedge the fallback case — one boardless frame would mark the phase as seen
+  // and no later frame, board or not, could ever open the outro.
+  if (msg.phase === "game_over" && msg.game && outro === null) {
+    outro = { msg, age: null, done: false };
+  }
+  if (msg.phase !== "game_over" && outro !== null) {
+    // Left game_over — either the outro finished and the player dismissed the
+    // report, or the room moved on under us (a paired board can dismiss for
+    // everyone).  An outro cut short still has a board and floaters on screen;
+    // a finished one already cleared them.
+    if (!outro.done) clearEntityState();
+    outro = null;
+  }
+
+  if (outroActive()) {
+    lastPhase = msg.phase;
+    // Drawn from the held frame, not the live one: the outro must not be
+    // restarted, re-diffed or re-floated by the frames still arriving behind
+    // it, and drawGame keys all of that off frame identity.
+    drawGame(outro.msg.game, dt);
+    tickOutro(dt);
+    return;
+  }
+
+  // Clear per-entity state whenever we leave the game phase.  An outro leaves
+  // it by way of game_over instead, and clears on its own way out.
   if (lastPhase === "game" && msg.phase !== "game") clearEntityState();
   lastPhase = msg.phase;
 
@@ -3078,7 +3222,11 @@ document.addEventListener("keydown", (e) => {
   // neither aiming at it nor casting into it would mean anything.  Keys are
   // dropped rather than queued — a cast the player cannot see land is worse
   // than one they have to press again.
-  if (cinematicActive()) return;
+  //
+  // The outro is the same pause with nothing behind it: the match is already
+  // decided, and the only key the Zig client still answers to is the one that
+  // dismisses the report — which must not be spent before the report is up.
+  if (cinematicActive() || outroActive()) return;
   sendKey(e.key);
 });
 

@@ -1,6 +1,6 @@
 # Slime Feast
 
-Co-op round-based support game. Up to 6 players help a horde of Lil Guys devour a slime field: dispense color-matched Neutralizing Agents to purify Modified Slime before each zone is eaten, and Medicine to heal the shared Hunger bar. Score = neutral slime consumed.
+Co-op turn-based support game. Up to 6 players help a horde of Lil Guys devour a slime field: cast shapes to break down the hazards walling the field off, then watch the Lil Guys flood in from the left and eat everything they can reach. Every bite scores but also costs hunger, so the shared Hunger bar is the clock. Score = slime consumed.
 
 Authoritative Zig server. Browser canvas renderer. Zig headless client ↔ Node bridge ↔ browser.
 
@@ -113,11 +113,11 @@ Until you have a domain, the game is playable over plain `http://`.
 
 All designer-tunable data lives in two JSON files:
 
-- `data/balance.json` — conversion rates, hunger costs, casts per turn, and the
+- `data/balance.json` — grid size, hunger cost per unit eaten, casts per turn, and the
   move + group tables (a move has a `shape` and a `cost`; a group names its
   component moves by label, e.g. `"moves": ["poke","sweep"]`).
-- `data/encounters.json` — encounters (zones, slime amounts per color,
-  hunger budget) plus which encounter is the default.
+- `data/encounters.json` — encounters (the reservoir's zones and what slime
+  each holds, charge pool, hunger budget) plus which encounter is the default.
 
 The server loads both at process start (`--data-dir`, default `data/`) and
 the browser fetches `data/balance.json` directly, so there is a single
@@ -131,10 +131,10 @@ can't silently default.  Caps enforced by the loader: 64 recipes per table,
 
 ### /tune — in-browser config editor
 
-Open **`/tune`** for a form with every knob: rates/costs, casts per round,
-round duration, moves and groups (add/remove, paint shapes, pick a group's
-component moves) and the encounter (add/remove rounds,
-per-color slime, hunger budget).  Saving POSTs to `/api/tune/save`:
+Open **`/tune`** for a form with every knob: grid and costs, casts per turn,
+moves and groups (add/remove, paint shapes, pick a group's component moves)
+and the encounter (add/remove reservoir zones, the slime each holds, charge
+pool, hunger budget).  Saving POSTs to `/api/tune/save`:
 
 - The bridge content-addresses the config (`sha256` prefix) into
   `custom-configs/{hash}/` and validates it with `server --validate` —
@@ -170,26 +170,53 @@ Selection is **server-authoritative** and persists across casts and turns
 (there is no client-side selection state to disagree with the server), so
 every player's current pick is visible to the whole team.
 
-At round end the current zone is consumed in its entirety:
+A cast **stamps** its shape onto the field, downgrading every covered hazard
+cell one tier (red → yellow → green → defused).  Coverage off the grid edge, or
+on a cell with nothing left to downgrade, is wasted; a stamp never empties a
+cell outright.
 
-- Matching-color agent units neutralize Modified Slime (`min(agents, slime)`;
-  excess and wrong-color agents are wasted).
-- Every unit costs normal hunger; un-neutralized modified units cost extra
-  hunger, and only that extra portion is healable by Medicine.
-- Score += neutralized + naturally-neutral units.
+Once every connected player's budget is spent the field settles in three
+ordered steps, and the order is the whole mechanic:
+
+1. **Eat** — the Lil Guys enter from the **left** edge and flood through empty
+   cells and edible slime.  Live hazards are walls: everything behind them is
+   **sheltered** and survives.  Opening a path is the point of a cast.
+2. **Collapse** — survivors fall straight down into the holes the feast left.
+3. **Fill** — the reservoir tops the field up from above.
+
+Every unit eaten scores a point **and** costs hunger (`hunger_cost_normal`), so
+the Hunger bar is really a budget on how much this horde can eat before it has
+to stop.  Sheltered food is the loss that hurts: it scores nothing, and the
+reservoir keeps refilling the field above it.  Clearing the field outright
+before the bar fills is the win.
 
 Casting also composes: when 2+ **distinct** players cast a **group**'s
 component moves on the **same square** within one turn, the group fires at the
 completing player's square, for the group's cost, and consumes its whole bag —
 contributors included, so a grouped cast is not also billed as a solo move.
 
-The encounter ends when all zones are consumed or the Hunger bar fills; the
-final shared score is broadcast either way.
+The encounter ends **at turn end**, on the first of:
+
+| Reason | Condition |
+| --- | --- |
+| `field_cleared` | the field and the reservoir are both empty — a win, and it beats the other two on a tie |
+| `hunger_full` | the Hunger bar filled |
+| `out_of_charges` | the shared pool can no longer afford the cheapest move |
+
+The final shared score and a match report are broadcast either way. Going
+broke mid-turn also strands the casts still owed: every one of them could only
+fizzle, so the turn settles immediately rather than asking for input that
+cannot matter. A config with a zero-cost move never runs out of charges — the
+economy has a floor, and the team always has something to do.
+
+The board is **held** after the server calls it: the closing feast plays out in
+full, the verdict floats over it for three seconds, and only then does the
+report replace it.
 
 ## Architecture
 
 ```
-shared/      pure Zig: ECS components, recipe/zone resolution math, wire protocol, data-file loader
+shared/      pure Zig: ECS components, slime-field + recipe math, wire protocol, data-file loader
 client/      headless Zig stdio binary — game logic + UI state, no window/GPU
 server/      authoritative game loop, lobby state machine, round resolution, broadcasts
 bridge/      Node.js: spawns client, owns both WebSocket connections, serves web/ + data/
@@ -235,8 +262,8 @@ src/
   root.zig               ECS core (Austin Morlan-style, comptime)
   shared/
     shared.zig           module root
-    components.zig       component types + wheel/zone/agent model
-    game_logic.zig       wheel cycling, group matching, zone/hunger resolution
+    components.zig       component types + slime tier/wheel model
+    game_logic.zig       wheel cycling, group matching, hunger/score helpers
     balance.zig          balance/recipe types (values in data/balance.json)
     config.zig           data-file loader: JSON parse + validation
     fixtures.zig         frozen fixture config for tests
@@ -250,7 +277,7 @@ src/
     input.zig            key name → cursor step / wheel turn / cast
   server/
     main.zig             server entry point
-    session.zig          Session: lobby, round timer, zone resolution, broadcasts
+    session.zig          Session: lobby, turn/cast handling, feast resolution, broadcasts
     session_test.zig     in-process integration tests (no network)
     bot_harness_test.zig bot-driven session tests
   e2e/
@@ -264,8 +291,8 @@ web/
   game.js                canvas renderer: connecting / lobby / game / game_over phases
   tune.html, tune.js     /tune config editor
 data/
-  balance.json           rates, costs, recipes
-  encounters.json        encounters (zones per round, hunger budget)
+  balance.json           grid, costs, recipes
+  encounters.json        encounters (reservoir zones, charges, hunger budget)
 custom-configs/          saved /tune configs (gitignored, content-addressed)
 scripts/
   vps-setup.sh           one-time VPS provisioning (Nginx, Node.js, systemd, deploy user)

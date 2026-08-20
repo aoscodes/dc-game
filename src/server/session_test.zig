@@ -29,8 +29,9 @@
 //!     a joint purchase), and the fizzle-but-spend rule when the pool cannot pay
 //!   - hunger accounting: a flat cost per unit EATEN, and nothing else
 //!   - score = units eaten (all of which are neutral or defused)
-//!   - end conditions: field cleared / hunger bar full / dead position with an
-//!     empty pool, all checked at turn end
+//!   - end conditions: field cleared / hunger bar full / a pool too empty for
+//!     the cheapest move, all checked at turn end — plus the closing broadcast
+//!     order, which clients replay their outro from
 //!   - wire contents: grid, reservoir, turn, cursors, selections, cast budgets,
 //!     charges
 
@@ -359,13 +360,25 @@ fn init_two_player_session_seeded(
     allocator: std.mem.Allocator,
     seed: u64,
 ) !void {
+    return init_two_player_session_cfg(self, allocator, seed, TEST_CFG);
+}
+
+/// As `init_two_player_session_seeded`, but on an explicit config — for the
+/// tests about running the pool dry, which need a move table without the
+/// fixture's free `trickle` (see fixtures.priced_config).
+fn init_two_player_session_cfg(
+    self: *TwoPlayerSession,
+    allocator: std.mem.Allocator,
+    seed: u64,
+    cfg: *const shared.config.Config,
+) !void {
     self.allocator = allocator;
     self.p[0].buf = .empty;
     self.p[1].buf = .empty;
     self.p[0].init(allocator);
     self.p[1].init(allocator);
 
-    self.sess = try Session.init_seeded(allocator, "TSTKEY".*, TEST_CFG, seed);
+    self.sess = try Session.init_seeded(allocator, "TSTKEY".*, cfg, seed);
 
     const pid0 = self.sess.join(self.p[0].transport(), "") orelse return error.JoinFailed;
     const pid1 = self.sess.join(self.p[1].transport(), "") orelse return error.JoinFailed;
@@ -2423,6 +2436,185 @@ test "field_cleared wins the tie when the last bite fills the bar" {
     try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
     const go = try game_over_msg(try drain(s.p[0].buf.items, arena));
     try std.testing.expectEqual(proto.EndReason.field_cleared, go.stats.reason);
+}
+
+// ---------------------------------------------------------------------------
+// Running the pool dry
+//
+// These use `priced_config`, whose cheapest move costs 1.  The default fixture
+// has the free `trickle`, so its `cheapest_cost` is 0 and a team there can
+// never be unable to act — which is deliberate, and which makes these tests
+// impossible to write against it.
+// ---------------------------------------------------------------------------
+
+/// A pair on the priced table, mid-encounter, with a pool the test sets itself.
+fn init_priced_session(s: *TwoPlayerSession, allocator: std.mem.Allocator) !void {
+    try init_two_player_session_cfg(s, allocator, SEED, &fixtures.priced_config);
+}
+
+test "an empty pool ends the game even when the feast is still eating" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_priced_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_neutral_only); // 40 neutral, roomy bar
+
+    // Plenty of food left and plenty of room to eat it — the ONLY thing wrong
+    // is that the team cannot cast.  A feast that eats is not a reprieve: with
+    // no charges there are no decisions left to make, so the encounter is over.
+    set_field(&s.sess, .{ .neutral = {} }, 10);
+    s.sess.field.reservoir = .{ .neutral = 5 }; // field cannot clear
+    s.sess.charges = 0;
+
+    s.p[0].clear();
+    try end_turn_idly(&s.sess);
+
+    try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
+    const msgs = try drain(s.p[0].buf.items, arena);
+    const te_msg = find_tag(msgs, .turn_ended) orelse return error.NoTurnEnded;
+    var te_fbs = std.io.fixedBufferStream(te_msg.payload);
+    const te = try proto.decode_turn_ended(te_fbs.reader());
+    try std.testing.expect(te.cells_eaten > 0); // the closing feast DID eat
+
+    const go = try game_over_msg(msgs);
+    try std.testing.expectEqual(proto.EndReason.out_of_charges, go.stats.reason);
+    try std.testing.expect(go.stats.slime_left > 0);
+}
+
+test "a pool that can still afford the cheapest move keeps the game going" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_priced_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_neutral_only);
+    set_field(&s.sess, .{ .neutral = {} }, 10);
+    s.sess.field.reservoir = .{ .neutral = 5 };
+
+    // One charge, and `poke` costs exactly one: the team has a move, so it has
+    // a game.  This is the boundary the end condition is written against.
+    s.sess.charges = fixtures.priced_config.balance.cheapest_cost();
+    try end_turn_idly(&s.sess);
+
+    try std.testing.expectEqual(session_mod.SessionPhase.playing, s.sess.phase);
+}
+
+test "going broke mid-turn strands the casts still owed and settles the turn" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_priced_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_neutral_only);
+    set_field(&s.sess, .{ .neutral = {} }, 10);
+    s.sess.field.reservoir = .{ .neutral = 5 };
+
+    // Exactly one poke's worth.  Alice spends it; Bob's three casts and Alice's
+    // remaining two could then only fizzle, so the turn must not wait on them.
+    s.sess.charges = 1;
+    try std.testing.expectEqual(BUDGET, s.sess.casts_left[s.p[1].pid]);
+
+    s.p[0].clear();
+    aim_at(&s.sess, s.p[0].pid, 0, 0);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try flush(&s.sess);
+
+    // Settled in the same drain as the cast: no second flush, and Bob was never
+    // asked for input he had no way to spend.
+    try std.testing.expectEqual(@as(u32, 0), s.sess.charges);
+    try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+    try std.testing.expect(find_tag(msgs, .turn_ended) != null);
+    // Stranded, not fizzled: the casts were never attempted, so nobody is told
+    // their spell failed.
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_fizzled));
+
+    const go = try game_over_msg(msgs);
+    try std.testing.expectEqual(proto.EndReason.out_of_charges, go.stats.reason);
+    try std.testing.expectEqual(@as(u16, 0), go.stats.players[0].fizzles);
+    try std.testing.expectEqual(@as(u16, 0), go.stats.players[1].fizzles);
+}
+
+test "a free move keeps a bankrupt team playing" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator); // fixture table: trickle is free
+    defer s.deinit();
+    try start(&s, &enc_neutral_only);
+    set_field(&s.sess, .{ .neutral = {} }, 10);
+    s.sess.field.reservoir = .{ .neutral = 5 };
+    s.sess.charges = 0;
+
+    // `cheapest_cost` is 0, so "cannot afford anything" is not a state this
+    // config can reach — the economy has a floor and the game always has
+    // somewhere to go.
+    try end_turn_idly(&s.sess);
+
+    try std.testing.expectEqual(session_mod.SessionPhase.playing, s.sess.phase);
+    try std.testing.expectEqual(BUDGET, s.sess.casts_left[s.p[0].pid]);
+}
+
+// ---------------------------------------------------------------------------
+// The closing broadcast
+// ---------------------------------------------------------------------------
+
+test "the game-ending turn sends the post-feast board before game_over" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_paper_stomach); // one feast overfills the bar
+    s.sess.field.grid.put(8, .empty);
+    s.sess.field.reservoir = .{ .neutral = 1 };
+
+    s.p[0].clear();
+    try end_turn_idly(&s.sess);
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+
+    // ORDER IS THE POINT.  `tick` stops broadcasting state once the session
+    // leaves `.playing`, so without the explicit send in `end_game` the last
+    // board a client ever sees is the one from before the closing feast: it
+    // would be told the game ended on a board still holding the slime that
+    // ended it.  Clients replay that feast as their outro and need the board it
+    // lands on.
+    var saw_turn_ended = false;
+    var saw_state_after = false;
+    var saw_game_over = false;
+    for (msgs) |m| switch (m.tag) {
+        .turn_ended => saw_turn_ended = true,
+        .game_state => if (saw_turn_ended and !saw_game_over) {
+            saw_state_after = true;
+        },
+        .game_over => saw_game_over = true,
+        else => {},
+    };
+    try std.testing.expect(saw_turn_ended);
+    try std.testing.expect(saw_state_after);
+    try std.testing.expect(saw_game_over);
+
+    // And it is the FINAL board, not a stale one: what the wire carried is what
+    // the field holds now that the feast, the collapse and the refill are done.
+    const gs = try last_game_state(msgs);
+    try std.testing.expectEqual(s.sess.field.grid.rows, gs.grid_rows);
+    try std.testing.expectEqual(s.sess.field.grid.cols, gs.grid_cols);
+    for (s.sess.field.grid.live(), gs.grid[0..gs.grid_len()]) |have, sent| {
+        try std.testing.expect(std.meta.eql(have, sent));
+    }
+    try std.testing.expectEqual(s.sess.hunger.current, gs.hunger.current);
 }
 
 test "game over resets ready flags" {
