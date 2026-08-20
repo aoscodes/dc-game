@@ -1503,7 +1503,7 @@ const TILE_RGB = {
 function cellStyle(name) {
   if (!name || name === "empty") return null;
   if (name === "neutral") return { body: "neutral", glyph: null, ring: false };
-  if (name === "defused") return { body: "neutral", glyph: null, ring: true };
+  if (name === "defused") return { body: "neutral", glyph: null, ring: false };
   if (name === "special") return { body: "special", glyph: "\u2605", ring: false };
   return TIER_NAMES.includes(name)
     ? { body: name, glyph: TIER_CHAR[name], ring: false }
