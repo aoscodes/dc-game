@@ -721,11 +721,11 @@ function spawnCastFloaters(game) {
     x: CP.x + CP.nameW + CP.labelW + 24,
     y: CP.y0 + i * CP.rowH,
   });
-  (game.entities || []).forEach((e, i) => {
-    if (!e.last_action) return;
-    const { x, y } = rowPos(i);
-    spawnFloater("✦ cast", x, y, C_OWN_ROW);
-  });
+  //  (game.entities || []).forEach((e, i) => {
+  //    if (!e.last_action) return;
+  //    const { x, y } = rowPos(i);
+  //    spawnFloater("✦ cast", x, y, C_OWN_ROW);
+  //  });
   // A cast the shared pool could not pay for: show the fizzle on the caster's
   // row (grey — the budget was spent, but nothing landed).
   for (const pid of game.fizzles ?? []) {
@@ -2242,7 +2242,7 @@ function startFeastCinematic(game) {
 
   const before = prevGrid;
   if (before.length !== target.length || target.length !== rows * cols) {
-    spawnFeastTallyFloaters(tally);
+    //spawnFeastTallyFloaters(tally);
     return false;
   }
 
@@ -2333,16 +2333,20 @@ function startFeastCinematic(game) {
     tally,
   };
 
-  const { x, y } = fieldCenter();
-  spawnFloater("Lil Guys Eating!", x, y - LAYOUT.floater.stack - 8,
-    CAST_EVENT_COLOR, LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
-
   // Nothing to walk, or nobody to walk it (every player gone the moment the turn
   // ended): the field was still devoured, so take it and go straight to the fall.
+  // No headline in either case: it announces an eat stage, and none is played —
+  // the cells are taken in this frame and the board drops.  Saying "Eating!" over
+  // a meal the screen never shows is the one thing worse than showing nothing.
   if (order.length === 0 || guys.length === 0) {
     for (const flat of order) bite(flat, null);
     beginCollapse();
+    return true;
   }
+
+  const { x, y } = fieldCenter();
+  spawnFloater("Lil Guys Eating!", x, y - LAYOUT.floater.stack - 8,
+    CAST_EVENT_COLOR, LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
   return true;
 }
 
@@ -2624,7 +2628,7 @@ function endCinematic() {
   // must still be diffed and animated on the next frame rather than adopted
   // silently here.
   prevGrid = c.target.slice();
-  spawnFeastTallyFloaters(c.tally);
+  //spawnFeastTallyFloaters(c.tally);
   // Casts held during the replay, released now that the board they describe is
   // the one on screen.  Stacked after the tally so the headline reads first.
   c.deferred.stamps.forEach((ev, i) => floatStampOutcome(ev, i + 1, c.rows, c.cols));
@@ -2725,7 +2729,7 @@ function drawActionMenu(game) {
         ? ["Encounter over", spent]
         : left > 0
           ? [`Turn ${game.turn ?? 1} — ${left}/${total} casts left`, C_TEXT]
-          : [`Turn ${game.turn ?? 1} — out of casts, waiting on the team`, spent];
+          : [`Turn ${game.turn ?? 1} — out of neutralizer`, spent];
     text(status, px, my + M.timerTextDy, M.timerTextFont, statusColor);
   }
 
@@ -2840,7 +2844,7 @@ function drawGame(game, dt) {
   // downgrades from refills.
   if (fresh && !cinematicActive() && !startedReplay) updateGridAnims(game.grid ?? []);
   if (fresh) {
-    //spawnCastFloaters(game);
+    spawnCastFloaters(game);
     //spawnRecipeFloaters(game);
   }
 

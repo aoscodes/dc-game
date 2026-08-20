@@ -68,7 +68,7 @@
       "label": "slash",
       "moves": [
         "hook",
-        "slash"
+        "slice"
       ],
       "shape": [
         "#...#",
