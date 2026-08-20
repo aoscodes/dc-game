@@ -2851,8 +2851,7 @@ function drawGame(game, dt) {
   clear();
 
   const H = LAYOUT.headers;
-  const encounter = game.encounter || "";
-  text(`Encounter: ${encounter}   ·   Turn ${game.turn ?? 1}`,
+  text(`Turn ${game.turn ?? 1}`,
     H.waveX, H.waveY, H.waveFont, C_HEADER);
 
   text("SLIME FIELD", FIELD.x0, FIELD.y0 + H.labelDy, H.labelFont, C_SLIME_HDR);
