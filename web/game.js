@@ -1745,7 +1745,7 @@ function drawSlimeField(game) {
   const preview = replay || playSuspended() ? new Map() : shapePreview(game).cells;
   const pulse = preview.size > 0
     ? FIELD.previewAlphaMin + (FIELD.previewAlphaMax - FIELD.previewAlphaMin) *
-      (0.5 + 0.5 * Math.sin(t * Math.PI * 2 * FIELD.previewPulseHz))
+    (0.5 + 0.5 * Math.sin(t * Math.PI * 2 * FIELD.previewPulseHz))
     : 0;
 
   // Who eats and who watches, on THIS board and on the board the pending cast
@@ -2809,7 +2809,7 @@ function drawGame(game, dt) {
   // Stamp outcomes are read first: they tell the grid diff which cells were
   // covered (a downgrade blooms in place; a replacement drops in), and the feast
   // replay below starts from the board those same stamps produced.
-  if (fresh) spawnStampFloaters(game);
+  //if (fresh) spawnStampFloaters(game);
 
   // A turn end starts the feast replay, which then owns the board and the Lil
   // Guys until it lands.  It must start BEFORE anything reads the board, and its
@@ -2840,8 +2840,8 @@ function drawGame(game, dt) {
   // downgrades from refills.
   if (fresh && !cinematicActive() && !startedReplay) updateGridAnims(game.grid ?? []);
   if (fresh) {
-    spawnCastFloaters(game);
-    spawnRecipeFloaters(game);
+    //spawnCastFloaters(game);
+    //spawnRecipeFloaters(game);
   }
 
   clear();
