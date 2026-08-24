@@ -41,28 +41,37 @@
 //! snapshotted for everyone, so a team can see what each other is holding and
 //! agree on a group before spending anything.
 //!
-//! CASTING.  Every cast RESOLVES IMMEDIATELY — there is no held state and
-//! nothing to wait for:
-//!   - It completes a GROUP against casts teammates already made on the SAME
-//!     square this turn → it stamps the group's shape and pays the group's
-//!     price instead of its own.  The priors it consumed have already stamped
-//!     and paid for themselves; they leave the log so they cannot be counted
-//!     into a second group.
-//!   - Otherwise → it stamps its own move's shape for its own cost.
-//!   - The pool cannot pay for the group → it falls back to the plain move.
-//!     The player cast something legal; downgrading beats refusing.
-//!   - The pool cannot pay even for that → `cast_fizzled`, and the budget IS
-//!     spent.  A bankrupt team still burns through turns, so the game keeps
-//!     moving to its conclusion instead of hanging.
-//! Stamping downgrades every covered hazard cell one tier (red -> yellow ->
-//! green -> defused); coverage off the grid edge, or on a cell with nothing
-//! left to downgrade, is wasted.  A stamp never empties a cell.
+//! CASTING.  A cast is LOCKED IN, not resolved: it joins the turn's pending
+//! list, and nothing is charged and nothing touches the grid until the whole
+//! team has committed.  Locking in spends a CAST, which is what moves the turn
+//! along; it spends no CHARGES.
 //!
-//! Because every cast pays as it lands, a group is a DISCOUNT ON THE LAST
-//! CONTRIBUTION, not a joint purchase: coordinating turns the completing
-//! player's small move into the group's big one for the group's price.
+//! A pending cast can be taken back (`cancel_cast`), which returns the cast
+//! budget it spent.  A player cancels their OWN most recent pending, one per
+//! press — so a turn is a proposal the team can revise until the last player
+//! commits.
 //!
-//! TURN END.  When every connected player's budget is spent, the field settles
+//! PRICING IS QUOTED FOR THE WHOLE TURN.  `game_logic.resolve_batch` reads the
+//! pending list and answers with the stamps it produces and the single price
+//! they cost together: same-square casts by DISTINCT players collapse into the
+//! group moves they spell, and only the group's price is charged for them.  So
+//! a group is a JOINT PURCHASE — its contributors never pay for their own moves
+//! — rather than a discount on whoever happened to cast last.
+//!
+//! Every lock-in re-quotes the turn, and one that would take the quote past the
+//! pool is REFUSED: the cast never joins the list, its budget is not spent, and
+//! the player is told `over_budget`.  The turn simply stays open, so the team
+//! can cancel something, aim somewhere cheaper, or spell a group that costs
+//! less than its parts.
+//!
+//! RESOLUTION.  The moment every connected player's budget is spent, the
+//! pending list is resolved: the quoted price is debited ONCE and each stamp is
+//! applied at its own square, groups before plain moves.  Stamping downgrades
+//! every covered hazard cell one tier (red -> yellow -> green -> defused);
+//! coverage off the grid edge, or on a cell with nothing left to downgrade, is
+//! wasted.  A stamp never empties a cell.
+//!
+//! TURN END.  Resolution runs straight into the feast, and the field settles
 //! in three ordered steps (see slime.zig):
 //!   1. EAT — the Lil Guys enter from the LEFT edge and flood through empty
 //!      cells and edible slime.  Live hazards and specials are walls: what is
@@ -71,8 +80,8 @@
 //!   2. COLLAPSE — survivors fall straight down into the holes the feast left.
 //!   3. FILL — the reservoir tops the field up from the row the collapse
 //!      cleared.
-//! The turn's cast log is then cleared — groups form WITHIN a turn only, so a
-//! contribution nobody joined is simply a move that already landed — budgets
+//! The pending list is then cleared — groups form WITHIN a turn only, so a
+//! contribution nobody joined is simply a move that landed on its own — budgets
 //! reset, and `turn_ended` is broadcast.
 //!
 //! The encounter's end is checked ONLY at turn end: the hunger bar filling is a
@@ -170,13 +179,14 @@ pub const Session = struct {
     /// client sends directions and this clamps, so a cursor is always a valid
     /// cell of the current grid and no client can aim out of bounds.
     cursors: [MAX_PLAYERS]u16 = [_]u16{0} ** MAX_PLAYERS,
-    /// Every cast made THIS TURN that is still available to a group, in cast
-    /// order — the pool a group is completed against (see
-    /// logic.complete_group).  Casts a group consumed are REMOVED, so one
-    /// contribution can never count toward two groups.  Cleared at turn end:
-    /// groups form within a turn only.
-    turn_casts: [logic.MAX_CASTS]logic.TurnCast = undefined,
-    turn_cast_count: usize = 0,
+    /// Casts locked in THIS TURN and not yet resolved, in lock-in order.
+    ///
+    /// This is the turn: it is what `logic.resolve_batch` is quoted against,
+    /// what the clients preview, and what a cancel pops from.  Nothing in it
+    /// has been charged or stamped.  Emptied at turn end, because groups form
+    /// within a turn only.
+    pending: [logic.MAX_CASTS]logic.TurnCast = undefined,
+    pending_count: usize = 0,
     /// Tuning stats accumulated over the match; broadcast with game_over.
     /// `players` is indexed by player_id during play and compacted (dense,
     /// names filled) in end_game.
@@ -312,7 +322,7 @@ pub const Session = struct {
 
         self.phase = .playing;
         self.current_encounter = encounter;
-        self.turn_cast_count = 0;
+        self.pending_count = 0;
         // Everyone opens on the first move in the table: the encounter is a
         // fresh start, so a selection carried over from a previous game would
         // be state the players never chose here.
@@ -407,135 +417,96 @@ pub const Session = struct {
         }
     }
 
-    /// Resolve one cast IMMEDIATELY: pick its stamp, pay for it, land it.
-    ///
-    /// The cast's own move is the baseline.  If it completes a GROUP against
-    /// this turn's earlier casts on the same square it is upgraded to the
-    /// group's shape at the group's price — the coordination payoff.
-    ///
-    /// Pricing is a two-step fallback, from best to worst, because a player who
-    /// pressed cast deserves the most the pool can actually buy:
-    ///   1. the group, if one completed and the pool can pay for it;
-    ///   2. the plain move, if the pool can pay for that;
-    ///   3. nothing — the cast fizzles (`false`), with the budget already gone.
-    ///
-    /// A group that fires consumes its WHOLE bag — the contributing priors AND
-    /// the cast that completed it — so no cast is ever counted into two groups.
-    /// Leaving the trigger behind would let two players alternate contributions
-    /// and collect a group on every press after the first, which is a chain, not
-    /// a coordination.  Consumed casts are NOT refunded: each prior already
-    /// stamped and paid for itself when it landed, and the trigger paid the
-    /// group price.
-    ///
-    /// Returns false only for case 3, so the caller can announce the fizzle.
-    fn resolve_cast(self: *Session, player_id: u8, square: u16) !bool {
-        const bal = &self.cfg.balance;
-        const move = self.selected[player_id];
-        const cast = logic.TurnCast{
-            .player_id = player_id,
-            .move = move,
-            .square = square,
-        };
-
-        const priors = self.turn_casts[0..self.turn_cast_count];
-        const group = logic.complete_group(bal, priors, cast);
-
-        // The group is only worth having if the pool can pay for it; otherwise
-        // the plain move still stands.
-        const stamp = blk: {
-            if (group) |hit| {
-                const gs = logic.group_stamp(bal, hit, player_id);
-                if (gs.cost <= self.charges) break :blk gs;
-                std.log.debug("group '{s}' costs {} charges, pool holds {} — falling back to '{s}'", .{
-                    bal.team_recipes[hit.recipe_index].label,
-                    gs.cost,
-                    self.charges,
-                    bal.player_recipes[move].label,
-                });
-            }
-            break :blk logic.move_stamp(bal, move, player_id);
-        };
-
-        if (stamp.cost > self.charges) {
-            std.log.debug("'{s}' costs {} charges, pool holds {} — fizzled", .{
-                bal.player_recipes[move].label, stamp.cost, self.charges,
-            });
-            // The cast is still logged: it did happen, and a teammate may yet
-            // build a group on the square even though this stamp never landed.
-            self.log_turn_cast(cast);
-            return false;
+    /// What the turn's pending casts, plus `extra` if given, would cost the
+    /// shared pool — the quote a lock-in is judged against.
+    fn quote(self: *const Session, extra: ?logic.TurnCast) u32 {
+        var casts: [logic.MAX_CASTS]logic.TurnCast = undefined;
+        const n = @min(self.pending_count, logic.MAX_CASTS);
+        @memcpy(casts[0..n], self.pending[0..n]);
+        var len = n;
+        if (extra) |e| {
+            if (len >= logic.MAX_CASTS) return std.math.maxInt(u32);
+            casts[len] = e;
+            len += 1;
         }
-
-        // A group swallows its whole bag: the priors it matched, and this cast.
-        // Otherwise only the plain move landed, and this cast joins the log as a
-        // component a teammate can still build on.
-        if (stamp.is_team) {
-            if (group) |hit| self.consume_priors(hit.spent());
-        } else {
-            self.log_turn_cast(cast);
-        }
-
-        self.charges -= stamp.cost;
-        self.stats.feast.charges_spent +|= stat_u16(stamp.cost);
-        const kind: proto.RecipeKind = if (stamp.is_team) .team else .player;
-        if (stamp.is_team) {
-            self.stats.team_recipe_hits[stamp.recipe_index] +|= 1;
-        } else {
-            self.stats.player_recipe_hits[stamp.recipe_index] +|= 1;
-        }
-        self.stats.players[player_id].recipe_casts +|= 1;
-        try self.broadcast_recipe_fired(kind, stamp.recipe_index, 1);
-
-        try self.stamp_shape(stamp, square);
-        return true;
+        return logic.resolve_batch(&self.cfg.balance, casts[0..len]).total_cost;
     }
 
-    /// Append a cast to this turn's log, dropping it if the log is full.
+    /// Take back a player's most recent pending cast, refunding the budget it
+    /// spent.  Does nothing if they have none.
     ///
-    /// Overflow needs no ceremony: MAX_CASTS covers every player spending every
-    /// cast of a turn with headroom, so a full log means a pathological config,
-    /// and the only consequence is that a late cast cannot anchor a group.
-    fn log_turn_cast(self: *Session, cast: logic.TurnCast) void {
-        if (self.turn_cast_count >= logic.MAX_CASTS) return;
-        self.turn_casts[self.turn_cast_count] = cast;
-        self.turn_cast_count += 1;
-    }
-
-    /// Remove the casts a group consumed from this turn's log.
-    ///
-    /// `indices` are into the log as it stood when the group was matched, so
-    /// removal walks HIGH to LOW: taking a lower index first would shift the
-    /// higher ones and delete the wrong casts.
-    fn consume_priors(self: *Session, indices: []const u8) void {
-        var sorted: [shared.balance.MAX_TEAM_COMPONENTS]u8 = undefined;
-        const n = @min(indices.len, sorted.len);
-        @memcpy(sorted[0..n], indices[0..n]);
-        std.mem.sort(u8, sorted[0..n], {}, std.sort.desc(u8));
-        for (sorted[0..n]) |idx| {
-            if (idx >= self.turn_cast_count) continue;
-            // Order-preserving: the log is matched oldest-first, so shuffling
-            // it would change which cast a later group picks up.
+    /// NEWEST FIRST, one per press: a player revising a plan undoes it in the
+    /// order they made it, and each press is one visible step.  Only their OWN
+    /// casts are reachable — a teammate's commitment is not yours to withdraw.
+    fn cancel_pending(self: *Session, player_id: u8) bool {
+        var i = self.pending_count;
+        while (i > 0) {
+            i -= 1;
+            if (self.pending[i].player_id != player_id) continue;
             std.mem.copyForwards(
                 logic.TurnCast,
-                self.turn_casts[idx .. self.turn_cast_count - 1],
-                self.turn_casts[idx + 1 .. self.turn_cast_count],
+                self.pending[i .. self.pending_count - 1],
+                self.pending[i + 1 .. self.pending_count],
             );
-            self.turn_cast_count -= 1;
+            self.pending_count -= 1;
+            self.casts_left[player_id] +|= 1;
+            return true;
         }
+        return false;
     }
 
-    /// Strand every remaining cast once the pool cannot afford the cheapest
-    /// move.
+    /// Resolve the whole turn: debit the quoted price ONCE, then land every
+    /// stamp it bought.
     ///
-    /// A broke turn is already over in fact: every cast still owed would fizzle,
-    /// spending budget for nothing and asking players to press keys to no
-    /// effect.  Zeroing the budgets makes it over in form, so the feast plays
-    /// and `check_end` calls the game on this turn rather than the next one.
+    /// Public only as a test seam: in play this runs from `maybe_end_turn`, an
+    /// instant before the feast, and a test that wants to look at the board the
+    /// casts made needs to stop between the two.
     ///
-    /// A zero-cost move config never reaches this: `cheapest_cost` is 0, so the
-    /// pool can always afford something.
+    /// Called only when the lock-in phase is over, so the quote is final.  It is
+    /// affordable by construction — every lock-in that would have taken it past
+    /// the pool was refused — so there is no price check and no fallback here:
+    /// the team was quoted this turn and the team is buying it.
+    pub fn resolve_pending(self: *Session) !void {
+        const bal = &self.cfg.balance;
+        const batch = logic.resolve_batch(bal, self.pending[0..self.pending_count]);
+
+        self.charges -= @min(batch.total_cost, self.charges);
+        self.stats.feast.charges_spent +|= stat_u16(batch.total_cost);
+
+        for (batch.slice()) |b| {
+            const stamp = b.stamp;
+            if (stamp.is_team) {
+                self.stats.team_recipe_hits[stamp.recipe_index] +|= 1;
+            } else {
+                self.stats.player_recipe_hits[stamp.recipe_index] +|= 1;
+            }
+            self.stats.players[stamp.anchor_player].recipe_casts +|= 1;
+            const kind: proto.RecipeKind = if (stamp.is_team) .team else .player;
+            try self.broadcast_recipe_fired(kind, stamp.recipe_index, 1);
+            try self.stamp_shape(stamp, b.square);
+        }
+
+        self.pending_count = 0;
+    }
+
+    /// Close the lock-in phase early once the pool cannot afford anything more.
+    ///
+    /// Whatever headroom the quote leaves is all the turn has left to spend, so
+    /// once it is under the cheapest move in the table every further lock-in
+    /// could only be refused — leaving the turn waiting on players who have no
+    /// legal move to make.  Zeroing the remaining budgets settles the turn on
+    /// what is already committed instead of hanging on what cannot be.
+    ///
+    /// This is also how the game ends: the headroom that stranded the turn is
+    /// exactly the pool that will be left after it resolves, so `check_end`
+    /// calls `out_of_charges` on this turn rather than the next one.
+    ///
+    /// A zero-cost move config never reaches this: `cheapest_cost` is 0, so
+    /// there is always something the team can still add.
     fn strand_budgets_if_broke(self: *Session) void {
-        if (self.charges >= self.cfg.balance.cheapest_cost()) return;
+        const committed = self.quote(null);
+        const headroom = if (committed >= self.charges) 0 else self.charges - committed;
+        if (headroom >= self.cfg.balance.cheapest_cost()) return;
         for (&self.casts_left) |*n| n.* = 0;
     }
 
@@ -555,18 +526,24 @@ pub const Session = struct {
         return connected > 0;
     }
 
-    /// End the turn if every connected player is out of casts.
+    /// Settle the turn once every connected player has locked in: resolve the
+    /// pending casts, then run the feast over the board they left.
     ///
-    /// Called after each accepted cast and whenever the connected set shrinks,
-    /// because both can make the condition true.
+    /// Called after each lock-in and whenever the connected set shrinks,
+    /// because both can make the condition true.  Casts locked in by a player
+    /// who has since dropped still resolve: they committed, and the team priced
+    /// the turn around them.
     fn maybe_end_turn(self: *Session) !void {
         if (self.phase != .playing) return;
         if (!self.budgets_spent()) return;
+        try self.resolve_pending();
         try self.end_turn();
     }
 
-    /// Settle the turn: eat, collapse, refill, then fizzle held halves and
-    /// refill budgets.
+    /// Settle the turn: eat, collapse, refill, then refill budgets.
+    ///
+    /// The turn's stamps have already landed (see `resolve_pending`), so the
+    /// board this reads is the one the team bought.
     ///
     /// Order matters and is the whole mechanic.  `eat_all` is priced against
     /// the field exactly as the casts left it, `collapse` drags the survivors
@@ -592,10 +569,10 @@ pub const Session = struct {
             .value = stat_u16(hunger_added),
         });
 
-        // Groups form within a turn only: a contribution nobody joined was
-        // still a move that landed and paid, so there is nothing to fizzle —
-        // clearing the log is the whole of it.
-        self.turn_cast_count = 0;
+        // Groups form within a turn only.  Resolution already emptied this;
+        // clearing it again costs nothing and keeps the invariant local to the
+        // turn boundary that owns it.
+        self.pending_count = 0;
 
         // Gravity, THEN the refill: survivors settle to the bottom of their
         // column first so the new slime has the cleared top rows to land in.
@@ -633,17 +610,20 @@ pub const Session = struct {
         self.reset_budgets();
     }
 
-    /// Broadcast one cast_fizzled per player in `mask`.
-    fn broadcast_fizzles(self: *Session, mask: u8) !void {
-        for (0..MAX_PLAYERS) |pid| {
-            if (mask & (@as(u8, 1) << @intCast(pid)) == 0) continue;
-            var buf: [4]u8 = undefined;
-            var fbs = std.io.fixedBufferStream(&buf);
-            try proto.encode(fbs.writer(), .cast_fizzled, proto.CastFizzled{
-                .player_id = @intCast(pid),
-            });
-            try self.broadcast_raw(fbs.getWritten());
-        }
+    /// Tell one player their cast was refused, and by how much.
+    ///
+    /// Sent to the caster alone: nothing about the turn changed, so there is
+    /// nothing for anyone else to redraw.
+    fn send_over_budget(self: *Session, player_id: u8, needed: u32) !void {
+        const slot = &self.players[player_id];
+        const t = slot.transport orelse return;
+        var buf: [16]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        try proto.encode(fbs.writer(), .over_budget, proto.OverBudget{
+            .needed = needed,
+            .have = self.charges,
+        });
+        t.send(fbs.getWritten()) catch {};
     }
 
     /// Apply one shape to the grid at `anchor` (a flat grid index), then
@@ -820,14 +800,37 @@ pub const Session = struct {
                 // Out of casts this turn: silent ignore.  The turn is waiting
                 // on someone else, and this player has nothing left to say.
                 if (self.casts_left[player_id] == 0) return;
-                // Every selection names a real move, so unlike the old combo
-                // buffer there is no "this spells nothing" case: a cast always
-                // has something to attempt.
+                // The list is capped well above any real turn, so a full one
+                // means a pathological config rather than a play worth
+                // reporting.
+                if (self.pending_count >= logic.MAX_CASTS) return;
+                // Every selection names a real move, so there is no "this
+                // spells nothing" case: a cast always has something to lock in.
 
+                const cast = logic.TurnCast{
+                    .player_id = player_id,
+                    .move = self.selected[player_id],
+                    // Freeze the aim now: this cast lands where the player was
+                    // pointing when they pressed it, however they move next.
+                    .square = self.cursors[player_id],
+                };
+
+                // Re-quote the turn WITH this cast.  Refused rather than
+                // downgraded: the team is spending one pooled budget, and the
+                // player who tripped it is the one who can still choose
+                // differently.
+                const needed = self.quote(cast);
+                if (needed > self.charges) {
+                    std.log.debug("player {} cast refused — turn would cost {}, pool holds {}", .{
+                        player_id, needed, self.charges,
+                    });
+                    try self.send_over_budget(player_id, needed);
+                    return;
+                }
+
+                self.pending[self.pending_count] = cast;
+                self.pending_count += 1;
                 self.casts_left[player_id] -= 1;
-                // Freeze the aim now: this cast lands where the player was
-                // pointing when they pressed it, however they move next.
-                const square = self.cursors[player_id];
                 self.record_cast_stats(player_id);
 
                 const slot = &self.players[player_id];
@@ -840,21 +843,26 @@ pub const Session = struct {
                     });
                 }
 
-                // Lands as a group if one completed, else as the plain move.
-                // Only a pool too empty for either fizzles, budget already gone.
-                if (!try self.resolve_cast(player_id, square)) {
-                    self.stats.players[player_id].fizzles +|= 1;
-                    try self.broadcast_fizzles(@as(u8, 1) << @intCast(player_id));
-                }
-
-                std.log.debug("player {} cast ({} left this turn)", .{
-                    player_id, self.casts_left[player_id],
+                std.log.debug("player {} locked in '{s}' ({} left this turn, turn quoted at {})", .{
+                    player_id,
+                    self.cfg.balance.player_recipes[cast.move].label,
+                    self.casts_left[player_id],
+                    needed,
                 });
 
                 self.strand_budgets_if_broke();
 
                 // Spending the last budget in the room settles the turn.
                 try self.maybe_end_turn();
+            },
+            .cancel_cast => {
+                if (self.phase != .playing or player_id >= MAX_PLAYERS) return;
+                // Nothing of their own to take back: silent, because a player
+                // pressing undo on an empty plan has made no mistake.
+                if (!self.cancel_pending(player_id)) return;
+                std.log.debug("player {} cancelled a cast ({} left this turn)", .{
+                    player_id, self.casts_left[player_id],
+                });
             },
             .reconnect => {},
             else => {},
@@ -885,7 +893,7 @@ pub const Session = struct {
         }
         // OUT OF ENERGY.  Slime is left and the pool cannot afford even the
         // cheapest move, so no future turn can differ from this one: every
-        // remaining cast would fizzle and every remaining feast would eat
+        // remaining cast would be refused and every remaining feast would eat
         // whatever the Lil Guys can already reach.  Ending here beats letting
         // the room spin turns that no input can change.
         //
@@ -1052,6 +1060,18 @@ pub const Session = struct {
         snap.grid_cols = self.field.grid.cols;
         @memcpy(snap.grid[0..self.field.grid.len()], self.field.grid.cells[0..self.field.grid.len()]);
         snap.reservoir = self.field.reservoir.total();
+
+        // The turn as it stands.  Sent to everyone: a player deciding what to
+        // add needs to see what is already committed, and the client previews
+        // the turn from this list plus its own live aim.
+        snap.pending_count = @intCast(@min(self.pending_count, proto.MAX_PENDING_WIRE));
+        for (self.pending[0..snap.pending_count], 0..) |pc, i| {
+            snap.pending[i] = .{
+                .player_id = pc.player_id,
+                .move = pc.move,
+                .square = pc.square,
+            };
+        }
 
         const pm_arr = &self.world.component_arrays.player_marker;
         for (pm_arr.index_to_entity[0..pm_arr.size]) |e| {

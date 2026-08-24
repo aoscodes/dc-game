@@ -9,12 +9,13 @@ pub const MsgTag = enum(u8) {
     cycle_shape = 0x07,
     cast = 0x09,
     move_cursor = 0x0a,
+    cancel_cast = 0x0b,
     lobby_update = 0x10,
     game_start = 0x11,
     game_state = 0x12,
     action_result = 0x13,
     game_over = 0x15,
-    cast_fizzled = 0x17,
+    over_budget = 0x19,
     recipe_fired = 0x18,
     shape_cast = 0x1c,
     turn_ended = 0x1d,
@@ -75,12 +76,25 @@ pub const Reconnect = struct {
     player_id: u8,
 };
 
-pub const CastFizzled = struct {
-    player_id: u8,
+/// A cast was refused because the turn's locked-in casts, WITH it, would cost
+/// more than the shared pool holds.
+///
+/// Sent only to the player who tried it: nobody else did anything, and the turn
+/// is unchanged — their cast simply never locked in.  The two numbers are the
+/// whole explanation, so the client can say what it would have cost and what is
+/// actually left without deriving either.
+pub const OverBudget = struct {
+    /// What the turn would have cost with this cast included.
+    needed: u32,
+    /// What the shared pool holds right now.
+    have: u32,
 };
 
-pub fn decode_cast_fizzled(reader: anytype) !CastFizzled {
-    return .{ .player_id = try reader.readByte() };
+pub fn decode_over_budget(reader: anytype) !OverBudget {
+    return .{
+        .needed = try reader.readInt(u32, .little),
+        .have = try reader.readInt(u32, .little),
+    };
 }
 
 /// The turn's cast phase is over and the feast has eaten its way in from the
@@ -260,6 +274,26 @@ pub const EntitySnapshot = struct {
 
 pub const MAX_ENTITIES_WIRE: u16 = 64;
 
+/// Cap on the pending-cast list carried in a `GameState`.  Matches
+/// `game_logic.MAX_CASTS`, which is itself max players x casts each with
+/// headroom; it is restated here because protocol.zig knows nothing of the
+/// game's resolution logic.
+pub const MAX_PENDING_WIRE: u16 = 64;
+
+/// One cast a player has LOCKED IN this turn but which has not resolved yet.
+///
+/// Sent to everyone: the whole team needs to see what is already committed to
+/// decide what to add, and the client previews the turn from this list plus the
+/// viewer's own live aim.  Nothing here has been charged or stamped — a pending
+/// cast is a promise, and it can still be taken back (see `cancel_cast`).
+pub const PendingCast = struct {
+    player_id: u8,
+    /// Index into balance.player_recipes — the move that was locked in.
+    move: u8,
+    /// Flat grid index it is aimed at, frozen at lock-in.
+    square: u16,
+};
+
 pub const BarSummary = struct {
     current: u16,
     max: u16,
@@ -285,6 +319,9 @@ pub const GameState = struct {
     /// Slime still waiting off-grid — drives the "incoming" indicator.  The win
     /// needs this AND the grid to hold nothing but specials.
     reservoir: u32,
+    /// Casts locked in this turn and not yet resolved, in lock-in order.
+    pending_count: u8,
+    pending: [MAX_PENDING_WIRE]PendingCast,
 
     pub const blank = GameState{
         .tick = 0,
@@ -298,6 +335,8 @@ pub const GameState = struct {
         .grid_cols = 0,
         .grid = [_]components.SlimeCell{.empty} ** components.MAX_GRID_CELLS,
         .reservoir = 0,
+        .pending_count = 0,
+        .pending = [_]PendingCast{.{ .player_id = 0, .move = 0, .square = 0 }} ** MAX_PENDING_WIRE,
     };
 
     /// Live cell count of the transmitted grid.
@@ -360,7 +399,6 @@ pub const PlayerStats = struct {
     cells_covered: u16 = 0,
     cells_neutralized: u16 = 0,
     recipe_casts: u16 = 0,
-    fizzles: u16 = 0,
 };
 
 pub const MatchStats = struct {
@@ -406,7 +444,11 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
         .reconnect => try writer.writeByte(payload.player_id),
         .cycle_shape => try writer.writeByte(@intFromEnum(payload.dir)),
         .cast => {},
-        .cast_fizzled => try writer.writeByte(payload.player_id),
+        .cancel_cast => {},
+        .over_budget => {
+            try writer.writeInt(u32, payload.needed, .little);
+            try writer.writeInt(u32, payload.have, .little);
+        },
         .move_cursor => try writer.writeByte(@intFromEnum(payload.dir)),
         .shape_cast => {
             const p: ShapeCast = payload;
@@ -532,6 +574,12 @@ fn encode_game_state(w: anytype, p: GameState) !void {
     try w.writeByte(p.grid_cols);
     for (p.grid[0..p.grid_len()]) |cell| try w.writeByte(encode_slime_cell(cell));
     try w.writeInt(u32, p.reservoir, .little);
+    try w.writeByte(p.pending_count);
+    for (p.pending[0..p.pending_count]) |pc| {
+        try w.writeByte(pc.player_id);
+        try w.writeByte(pc.move);
+        try w.writeInt(u16, pc.square, .little);
+    }
 }
 
 fn encode_u16_tiers(w: anytype, values: [components.Tier.size]u16) !void {
@@ -575,7 +623,6 @@ fn encode_player_stats(w: anytype, ps: PlayerStats) !void {
     try w.writeInt(u16, ps.cells_covered, .little);
     try w.writeInt(u16, ps.cells_neutralized, .little);
     try w.writeInt(u16, ps.recipe_casts, .little);
-    try w.writeInt(u16, ps.fizzles, .little);
 }
 
 fn decode_player_stats(r: anytype) !PlayerStats {
@@ -587,7 +634,6 @@ fn decode_player_stats(r: anytype) !PlayerStats {
     ps.cells_covered = try r.readInt(u16, .little);
     ps.cells_neutralized = try r.readInt(u16, .little);
     ps.recipe_casts = try r.readInt(u16, .little);
-    ps.fizzles = try r.readInt(u16, .little);
     return ps;
 }
 
@@ -652,6 +698,7 @@ pub const DecodeError = error{
     InvalidActionResultTag,
     NameTooLong,
     TooManyEntities,
+    TooManyPending,
     InvalidEndReason,
     TooManyRecipes,
     InvalidRecipeKind,
@@ -756,6 +803,14 @@ pub fn decode_game_state(reader: anytype) !GameState {
     for (p.grid[0..p.grid_len()]) |*cell|
         cell.* = try decode_slime_cell(try reader.readByte());
     p.reservoir = try reader.readInt(u32, .little);
+    p.pending_count = try reader.readByte();
+    if (p.pending_count > MAX_PENDING_WIRE) return DecodeError.TooManyPending;
+    p.pending = [_]PendingCast{.{ .player_id = 0, .move = 0, .square = 0 }} ** MAX_PENDING_WIRE;
+    for (p.pending[0..p.pending_count]) |*pc| {
+        pc.player_id = try reader.readByte();
+        pc.move = try reader.readByte();
+        pc.square = try reader.readInt(u16, .little);
+    }
     return p;
 }
 
@@ -805,7 +860,7 @@ test "round-trip: game_over carries score and match stats" {
         .charges_left = 13,
     };
     go.stats.player_count = 2;
-    go.stats.players[0] = .{ .casts = 3, .cells_covered = 27, .cells_neutralized = 6, .recipe_casts = 2, .fizzles = 1 };
+    go.stats.players[0] = .{ .casts = 3, .cells_covered = 27, .cells_neutralized = 6, .recipe_casts = 2 };
     @memcpy(go.stats.players[0].name[0..5], "Alice");
     go.stats.players[0].name_len = 5;
     go.stats.players[1] = .{ .casts = 2, .cells_covered = 4 };
@@ -839,7 +894,6 @@ test "round-trip: game_over carries score and match stats" {
     try std.testing.expectEqual(@as(u16, 27), d.stats.players[0].cells_covered);
     try std.testing.expectEqual(@as(u16, 6), d.stats.players[0].cells_neutralized);
     try std.testing.expectEqual(@as(u16, 2), d.stats.players[0].recipe_casts);
-    try std.testing.expectEqual(@as(u16, 1), d.stats.players[0].fizzles);
     try std.testing.expectEqual(@as(u16, 4), d.stats.players[1].cells_covered);
     try std.testing.expectEqual(@as(u8, 6), d.stats.player_recipe_count);
     try std.testing.expectEqual(@as(u8, 2), d.stats.team_recipe_count);
@@ -1059,8 +1113,10 @@ test "decode_game_state: an unknown slime cell byte is rejected" {
     gs.grid_cols = 1;
     try encode(fbs.writer(), .game_state, gs);
     const written = fbs.getWritten();
-    // The single grid cell sits just before the u32 reservoir tail.
-    written[written.len - 5] = 0x7F;
+    // The single grid cell sits just before the tail: the u32 reservoir and
+    // the pending-cast count, which is 0 here so no entries follow it.
+    const tail = @sizeOf(u32) + 1;
+    written[written.len - tail - 1] = 0x7F;
     fbs.reset();
     _ = try read_tag(fbs.reader());
     try std.testing.expectError(DecodeError.InvalidSlimeCell, decode_game_state(fbs.reader()));
@@ -1123,15 +1179,16 @@ test "round-trip: a blank game_state (pre-start, no grid) survives" {
     try std.testing.expectEqual(@as(u16, 0), decoded.turn);
 }
 
-test "round-trip: cast_fizzled carries player_id" {
-    var buf: [4]u8 = undefined;
+test "round-trip: over_budget carries the quote and the pool" {
+    var buf: [16]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    try encode(fbs.writer(), .cast_fizzled, CastFizzled{ .player_id = 4 });
+    try encode(fbs.writer(), .over_budget, OverBudget{ .needed = 11, .have = 4 });
     fbs.reset();
     const tag = try read_tag(fbs.reader());
-    try std.testing.expectEqual(MsgTag.cast_fizzled, tag);
-    const decoded = try decode_cast_fizzled(fbs.reader());
-    try std.testing.expectEqual(@as(u8, 4), decoded.player_id);
+    try std.testing.expectEqual(MsgTag.over_budget, tag);
+    const decoded = try decode_over_budget(fbs.reader());
+    try std.testing.expectEqual(@as(u32, 11), decoded.needed);
+    try std.testing.expectEqual(@as(u32, 4), decoded.have);
 }
 
 test "round-trip: recipe_fired carries kind and table index" {

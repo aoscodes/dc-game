@@ -71,9 +71,13 @@ pub const Drained = struct {
     steps: [MAX_CURSOR_STEPS]protocol.CursorDir = undefined,
     turn_count: usize = 0,
     turns: [MAX_CYCLE_TURNS]c.CycleDir = undefined,
-    /// Enter was pressed: fire whatever the server has selected.  At most one
-    /// per drain, because `drain` returns as soon as it sees one.
+    /// Enter was pressed: lock in whatever the server has selected.  At most
+    /// one per drain, because `drain` returns as soon as it sees one.
     cast: bool = false,
+    /// Escape presses: each takes back one of this player's pending casts,
+    /// newest first.  Counted rather than flagged, so holding undo walks back
+    /// through a plan one step per press instead of collapsing to one.
+    cancels: u8 = 0,
 
     pub fn cursor_steps(self: *const Drained) []const protocol.CursorDir {
         return self.steps[0..self.step_count];
@@ -84,11 +88,12 @@ pub const Drained = struct {
     }
 };
 
-/// Drain the key queue into wheel turns, cursor steps, and at most one cast.
+/// Drain the key queue into wheel turns, cursor steps, cancels, and at most
+/// one cast.
 ///
 /// A cast stops the drain so the caller sees exactly one per call, but any
-/// turns and steps pressed BEFORE it are still returned — they are what chose
-/// and aimed the cast being fired.
+/// turns, steps and cancels pressed BEFORE it are still returned — they are
+/// what chose and aimed the cast being fired.
 pub fn drain(queue: *KeyQueue) Drained {
     var out = Drained{};
     while (queue.pop()) |key| {
@@ -97,10 +102,10 @@ pub fn drain(queue: *KeyQueue) Drained {
                 out.cast = true;
                 return out;
             },
-            // Escape had a job when a cast was something you typed and could
-            // therefore mistype.  A wheel has no half-finished state to throw
-            // away, so in-game it does nothing; the lobby still uses it.
-            .escape => {},
+            // Undo: a cast is locked in, not fired, so it can be taken back
+            // right up until the last player commits.  Saturates rather than
+            // wrapping; nobody has more pending casts than a u8 can count.
+            .escape => out.cancels +|= 1,
             // 1 = next shape, 2 = previous.
             .one, .two => {
                 const dir: c.CycleDir = switch (key) {

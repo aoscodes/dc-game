@@ -45,7 +45,11 @@ const fs          = require("fs");
 const path        = require("path");
 const { WebSocketServer, WebSocket } = require("ws");
 const { PlayerSession } = require("./session");
-const { ControllerManager, shapeFromRender } = require("./controllers");
+const {
+  ControllerManager,
+  shapeFromRender,
+  finalScoreFromRender,
+} = require("./controllers");
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -492,6 +496,8 @@ class TabSession extends PlayerSession {
     this.tabWs          = tabWs;
     /** Paired hardware controller (managed by ControllerManager). */
     this.controller     = null;
+    /** msg.phase of the last render frame (game-over edge detection). */
+    this.lastPhase      = null;
   }
 
   // ---- PlayerSession hooks --------------------------------------------------
@@ -499,11 +505,15 @@ class TabSession extends PlayerSession {
   onZigFrame(msg, line) {
     if (msg.tag === "render") {
       if (this.tabWs.readyState === WebSocket.OPEN) this.tabWs.send(line);
+      const score = finalScoreFromRender(msg, this.lastPhase);
+      this.lastPhase = msg.phase;
       // Mirror the selected shape to a paired hardware controller's e-paper.
       if (this.controller !== null) {
         this.controller.sendShape(
           shapeFromRender(msg, moveLabelsFor(this.room ? this.room.configHash : null)),
         );
+        // Game just ended: bank the final team score on the board.
+        if (score !== null) this.controller.sendScore(score);
       }
     } else {
       console.warn("[bridge] unknown Zig frame tag:", msg.tag);

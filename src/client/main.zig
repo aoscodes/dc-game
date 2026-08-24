@@ -178,11 +178,20 @@ fn send_cycle_shape(dir: c.CycleDir) void {
     emit_send(fbs.getWritten());
 }
 
-/// Fire the server's current selection at the server's current cursor.  There
-/// is nothing to send BUT the trigger: both are server state.
+/// Lock in the server's current selection at the server's current cursor.
+/// There is nothing to send BUT the trigger: both are server state.
 fn send_cast() void {
     var fbs = std.io.fixedBufferStream(&g_state.send_buf);
     proto.encode(fbs.writer(), .cast, {}) catch return;
+    emit_send(fbs.getWritten());
+}
+
+/// Take back this player's most recent pending cast.  Carries no payload for
+/// the same reason `cast` does not: the server knows whose casts are whose and
+/// which of them is newest.
+fn send_cancel_cast() void {
+    var fbs = std.io.fixedBufferStream(&g_state.send_buf);
+    proto.encode(fbs.writer(), .cancel_cast, {}) catch return;
     emit_send(fbs.getWritten());
 }
 
@@ -265,13 +274,10 @@ fn process_recv() void {
                     }
                 }
             },
-            .cast_fizzled => {
-                const p = proto.decode_cast_fizzled(r) catch continue;
+            .over_budget => {
+                const p = proto.decode_over_budget(r) catch continue;
                 // Record for the renderer (transient, drained per frame).
-                if (g_state.game.fizzle_count < g_state.game.fizzles.len) {
-                    g_state.game.fizzles[g_state.game.fizzle_count] = p.player_id;
-                    g_state.game.fizzle_count += 1;
-                }
+                g_state.game.over_budget = p;
             },
             .recipe_fired => {
                 const p = proto.decode_recipe_fired(r) catch continue;
@@ -320,6 +326,10 @@ fn update_game() void {
     // at the stale cursor — or is the stale shape.
     for (drained.cursor_steps()) |dir| send_move_cursor(dir);
     for (drained.cycle_turns()) |dir| send_cycle_shape(dir);
+    // Cancels before the cast: undoing a plan and then adding to it is the
+    // order the keys were pressed in, and the server prices each in turn.
+    var undone: u8 = 0;
+    while (undone < drained.cancels) : (undone += 1) send_cancel_cast();
     if (drained.cast) send_cast();
 }
 

@@ -8,8 +8,13 @@
  *   board  -> bridge:  CTRL:HELLO v=1          link accept (reply to GAME:HELLO)
  *                      CTRL:HB                 1s keepalive
  *                      CTRL:BTN <name> <D|U>   button press/release edges
+ *                      CTRL:SCORE_ACK g=<u32>  score banked to flash (sent
+ *                                              AFTER the save; re-sent on retries)
  *   bridge -> board:   GAME:HELLO v=1          link request (repeated until acked)
  *                      GAME:HB                 1s keepalive
+ *                      GAME:SCORE s=<u32> g=<u32>  final team score of a finished
+ *                                              game (g = per-game id; retried
+ *                                              every 1s until acked, bounded)
  *                      FB:SHAPE <label|->      selected-shape feedback (e-paper)
  *
  * Unknown lines in either direction are ignored (the board emits unrelated
@@ -46,6 +51,12 @@ const HB_INTERVAL_MS = 1000;
 const LINK_TIMEOUT_MS = 3000;
 // Headless player survives this long after its board unplugs.
 const PLAYER_GRACE_MS = 30_000;
+// GAME:SCORE retry cadence and cap. The board's flash save takes ~100ms+
+// (it parks its renderer around the erase), so the ack is never instant;
+// five attempts comfortably outlives any transient CDC hiccup while still
+// giving up long before the next game could end.
+const SCORE_RETRY_MS = 1000;
+const SCORE_RETRY_MAX = 5;
 
 // Board button -> browser KeyboardEvent.key (the Zig client's KEY: protocol).
 // D-pad = aim, face buttons = shape wheel + cast (see src/client/input.zig).
@@ -77,6 +88,31 @@ function shapeFromRender(msg, labels) {
   return labels[mine.selected_shape] ?? "-";
 }
 
+/**
+ * Final team score on the frame that ENTERS game_over, else null. Callers
+ * track prevPhase per session so repeated game_over frames (the Zig client
+ * re-renders the board while it holds) fire the score exactly once per game.
+ * @param {object} msg  a "render" frame from the Zig client
+ * @param {string | null} prevPhase  msg.phase of the previous frame
+ * @returns {number | null}
+ */
+function finalScoreFromRender(msg, prevPhase) {
+  if (msg.phase !== "game_over" || prevPhase === "game_over") return null;
+  if (typeof msg.score !== "number") return null;
+  return msg.score >>> 0;
+}
+
+// Per-report id for the board's dedupe (it remembers the last BANKED id per
+// power cycle). Wall-clock seeded and monotonically bumped, so neither a
+// bridge restart nor several boards reported in the same millisecond can
+// reissue an id a board already banked.
+let lastScoreId = 0;
+function nextScoreId() {
+  const t = Date.now() >>> 0;
+  lastScoreId = t > lastScoreId ? t : (lastScoreId + 1) >>> 0;
+  return lastScoreId;
+}
+
 /** One physical board on a serial port. */
 class Controller {
   /**
@@ -98,6 +134,9 @@ class Controller {
     this.lastShape = null; // last FB:SHAPE payload sent (dedupe)
     this.helloTimer = null;
     this.hbTimer = null;
+    /** In-flight GAME:SCORE ({ line, gid, attempts }), or null. */
+    this.scorePending = null;
+    this.scoreTimer = null;
     this.closed = false;
   }
 
@@ -178,6 +217,17 @@ class Controller {
       }
       return;
     }
+
+    if (line.startsWith("CTRL:SCORE_ACK ")) {
+      // Banked on the board (the ack is sent after its flash save): stop
+      // retrying. Stale acks (an earlier report's retries) are ignored.
+      const arg = line.slice("CTRL:SCORE_ACK ".length).trim();
+      if (this.scorePending !== null && arg === `g=${this.scorePending.gid}`) {
+        console.log(`[ctrl] score banked (uid=${this.uid}, ${arg})`);
+        this.clearScoreRetry();
+      }
+      return;
+    }
     // CTRL:HB and future extensions: keepalive only (lastRxMs above).
   }
 
@@ -188,10 +238,50 @@ class Controller {
     this.write(`FB:SHAPE ${shape}`);
   }
 
+  /**
+   * Report a finished game's final team score for the board to bank into
+   * its flash lifetime total: GAME:SCORE retried until CTRL:SCORE_ACK (or
+   * the bounded attempts run out). The board dedupes by the id, so retries
+   * - and a replay across a relink - can never double-bank.
+   * @param {number} score  final team score (u32)
+   */
+  sendScore(score) {
+    if (!this.linked) return;
+    const gid = nextScoreId();
+    this.clearScoreRetry(); // a newer game's report supersedes any in flight
+    this.scorePending = {
+      line: `GAME:SCORE s=${score >>> 0} g=${gid}`,
+      gid,
+      attempts: 0,
+    };
+    const attempt = () => {
+      const p = this.scorePending;
+      if (p === null) return;
+      if (p.attempts >= SCORE_RETRY_MAX) {
+        console.warn(
+          `[ctrl] score never acked (uid=${this.uid}, g=${p.gid}); giving up`,
+        );
+        this.clearScoreRetry();
+        return;
+      }
+      p.attempts++;
+      this.write(p.line);
+    };
+    this.scoreTimer = setInterval(attempt, SCORE_RETRY_MS);
+    attempt();
+  }
+
+  clearScoreRetry() {
+    if (this.scoreTimer !== null) clearInterval(this.scoreTimer);
+    this.scoreTimer = null;
+    this.scorePending = null;
+  }
+
   close() {
     this.closed = true;
     if (this.helloTimer !== null) clearInterval(this.helloTimer);
     if (this.hbTimer !== null) clearInterval(this.hbTimer);
+    this.clearScoreRetry();
     this.helloTimer = null;
     this.hbTimer = null;
     if (this.port && this.port.isOpen) {
@@ -222,6 +312,8 @@ class ControllerSession extends PlayerSession {
     this.graceTimer = null;
     this.room = room;
     this.started = true;
+    /** msg.phase of the last render frame (game-over edge detection). */
+    this.lastPhase = null;
   }
 
   start() {
@@ -243,10 +335,14 @@ class ControllerSession extends PlayerSession {
 
   onZigFrame(msg, _line) {
     if (msg.tag === "render") {
+      const score = finalScoreFromRender(msg, this.lastPhase);
+      this.lastPhase = msg.phase;
       if (this.controller !== null) {
         this.controller.sendShape(
           shapeFromRender(msg, this.manager.moveLabels(this.room.configHash)),
         );
+        // Game just ended: bank the final team score on the board.
+        if (score !== null) this.controller.sendScore(score);
       }
     } else {
       console.warn(`[bridge] unknown Zig frame tag (${this.label}):`, msg.tag);
@@ -505,4 +601,10 @@ class ControllerManager {
   }
 }
 
-module.exports = { ControllerManager, ControllerSession, shapeFromRender };
+module.exports = {
+  Controller,
+  ControllerManager,
+  ControllerSession,
+  shapeFromRender,
+  finalScoreFromRender,
+};

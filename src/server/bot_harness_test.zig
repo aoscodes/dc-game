@@ -490,6 +490,10 @@ test "a cast lands where the bot aimed, not where it ends up" {
 
     try std.testing.expect(h.session.cursors[pid] != aimed);
 
+    // Land the lock-in without ending the turn: the feast would eat the very
+    // cell this test is about.
+    try h.session.resolve_pending();
+
     // `poke` is 1x1 and the field is all-green, so the stamp downgraded
     // exactly one green cell — at the anchor, not the moved-to cursor.
     try std.testing.expect(h.session.field.grid.get(aimed) == .neutralized);

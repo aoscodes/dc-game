@@ -22,7 +22,7 @@ pub const Writer = struct {
         const out = std.fs.File.stdout();
         out.writeAll(w.buffered()) catch return;
         game.last_action_count = 0;
-        game.fizzle_count = 0;
+        game.over_budget = null;
         game.recipe_count = 0;
         game.turn_ended = null;
         game.shape_cast_count = 0;
@@ -65,10 +65,11 @@ pub const GameState = struct {
     final_stats: ?proto.MatchStats = null,
     last_action_count: u8 = 0,
     last_actions: [proto.MAX_ENTITIES_WIRE]LastActionEntry = undefined,
-    /// Player ids whose spells fizzled since the last render write
-    /// (transient, drained per frame like last_actions).
-    fizzles: [proto.MAX_PLAYERS]u8 = undefined,
-    fizzle_count: u8 = 0,
+    /// The refusal this player's last cast earned, if it earned one since the
+    /// last render write (transient, drained per frame like last_actions).
+    /// At most one per frame: a refused cast changes nothing, so a second in
+    /// the same frame would say the same thing about the same turn.
+    over_budget: ?proto.OverBudget = null,
     /// Recipes fired since the last render write (transient).
     recipes_fired: [16]proto.RecipeFired = undefined,
     recipe_count: u8 = 0,
@@ -122,6 +123,16 @@ fn write_render_inner(
             .selected_shape = e.selected_shape,
             .cursor_row = e.cursor_row,
             .cursor_col = e.cursor_col,
+        };
+    }
+
+    // The turn as it stands: every cast locked in and still unresolved.
+    var pending_buf: [proto.MAX_PENDING_WIRE]JsonPending = undefined;
+    for (game.snapshot.pending[0..game.snapshot.pending_count], 0..) |pc, i| {
+        pending_buf[i] = .{
+            .player_id = pc.player_id,
+            .move = pc.move,
+            .square = pc.square,
         };
     }
 
@@ -179,7 +190,6 @@ fn write_render_inner(
                     .cells_covered = ps.cells_covered,
                     .cells_neutralized = ps.cells_neutralized,
                     .recipe_casts = ps.recipe_casts,
-                    .fizzles = ps.fizzles,
                 };
             }
             json_stats = .{
@@ -239,7 +249,11 @@ fn write_render_inner(
             .grid_cols = game.snapshot.grid_cols,
             .grid = grid_buf[0..grid_len],
             .reservoir = game.snapshot.reservoir,
-            .fizzles = game.fizzles[0..game.fizzle_count],
+            .pending = pending_buf[0..game.snapshot.pending_count],
+            .over_budget = if (game.over_budget) |ob|
+                JsonOverBudget{ .needed = ob.needed, .have = ob.have }
+            else
+                null,
             .recipes_fired = recipes_buf[0..game.recipe_count],
             .turn_ended = turn_ended,
             .shape_casts = shape_cast_buf[0..game.shape_cast_count],
@@ -335,7 +349,6 @@ const JsonPlayerStats = struct {
     cells_covered: u16,
     cells_neutralized: u16,
     recipe_casts: u16,
-    fizzles: u16,
 };
 
 /// End-of-game tuning report.  Recipe hit arrays are in balance table order;
@@ -398,8 +411,14 @@ const JsonGame = struct {
     grid: []const []const u8,
     /// Slime still waiting off-grid; it refills the field after each feast.
     reservoir: u32,
-    /// Player ids whose spells fizzled since the previous frame (transient).
-    fizzles: []const u8,
+    /// Casts locked in this turn and not yet resolved, in lock-in order.  This
+    /// IS the turn as it stands: the renderer marks each one on the board and
+    /// previews the whole list plus the viewer's own live aim.
+    pending: []const JsonPending,
+    /// The refusal the viewer's last cast earned, if any (transient).  Absent
+    /// on every other frame, and never sent to anyone else — it is about a
+    /// cast that never happened.
+    over_budget: ?JsonOverBudget,
     /// Recipes fired since the previous frame (transient).  `index` refers
     /// to the balance recipe table for `kind` (JS resolves labels from the
     /// fetched data/balance.json, same order).
@@ -430,6 +449,21 @@ const JsonShapeCast = struct {
 const JsonRecipeFired = struct {
     kind: proto.RecipeKind,
     index: u8,
+};
+
+/// One cast locked in but not yet resolved.  `square` is a flat grid index
+/// (row * grid_cols + col), frozen when the cast was locked in.
+const JsonPending = struct {
+    player_id: u8,
+    move: u8,
+    square: u16,
+};
+
+/// A cast refused for price: what the turn would have cost with it, against
+/// what the shared pool actually holds.
+const JsonOverBudget = struct {
+    needed: u32,
+    have: u32,
 };
 
 /// The turn-end feast: everything the Lil Guys could REACH from the left edge

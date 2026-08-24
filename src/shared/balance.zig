@@ -25,7 +25,8 @@
 //! team, spent across the WHOLE game and never refilled (the starting amount is
 //! per-encounter — see encounters.json).  Each move prices itself via `cost`,
 //! so the move table is also the economy: broad shapes can be made expensive
-//! and precise ones cheap.  A cast the pool cannot afford fizzles.
+//! and precise ones cheap.  A cast that would take the TURN over the pool is
+//! refused outright — nothing is spent and nothing lands.
 //!
 //! ## Group moves
 //!
@@ -103,8 +104,8 @@ pub const PlayerRecipe = struct {
     /// shape — the stamp IS the cast's whole effect.
     shape: Shape,
     /// Charges deducted from the team pool when this move fires.  May be 0
-    /// for a deliberately free move; a cast is refused (and fizzles) when the
-    /// pool holds less than this.
+    /// for a deliberately free move.  A lock-in is refused when the whole
+    /// turn's quote, this move included, exceeds what the pool holds.
     cost: u16 = DEFAULT_RECIPE_COST,
 };
 
@@ -156,9 +157,10 @@ pub const Balance = struct {
     /// per-turn power and the length of a turn.  Must be at least 1: a budget
     /// of 0 could never be spent, so no turn could ever end.
     ///
-    /// Selection cannot be wrong, so the only way a cast fails is price: a cast
-    /// the charge pool cannot afford fizzles and DOES spend budget — otherwise a
-    /// bankrupt team could never end a turn.
+    /// Selection cannot be wrong, so the only way a cast fails is price — and
+    /// a refused cast costs nothing, budget included.  A team too poor to add
+    /// anything has its remaining budgets stranded instead (see
+    /// session.strand_budgets_if_broke), so a turn always ends.
     casts_per_turn: u8,
     player_recipes: []const PlayerRecipe,
     team_recipes: []const TeamRecipe,

@@ -53,6 +53,14 @@ const LAYOUT = {
     previewFillAlpha: 0.16,
     previewWashAlpha: 0.3, // scaled by the pulse, so the wash breathes too
 
+    // --- Locked-in casts --------------------------------------------------
+    //
+    // A cast that has been committed is a FACT, so it is drawn as solid pips
+    // rather than as another pulsing outline: the pulse means "if you press
+    // ENTER", and these have already been pressed.
+    pendingDotFrac: 0.09,  // pip radius, as a fraction of the cell
+    pendingDotGap: 0.06,   // gap between pips on one square, ditto
+
     // --- Sheltered food ---------------------------------------------------
     //
     // Hatch strength for food the feast cannot reach, and for the brighter
@@ -130,7 +138,7 @@ const LAYOUT = {
   actionMenu: {
     w: 340, h: 126, marginBottom: 128,
     padX: 10, padTopY: 14,
-    actionRowDy: 16, actionFont: 16, actionCols: [0, 150],
+    actionRowDy: 16, actionFont: 16, actionCols: [0, 130, 205],
     aimRowDy: 34, aimFont: 13,
     selectedRowDy: 48, selectedFont: 12,
     castBarDy: 56, castBarH: 16,
@@ -177,7 +185,7 @@ const LAYOUT = {
     feastY: 150,
     // Match-wide feast tallies (one row per measure, label + colored cells).
     fcols: { label: 40, cells: 260 },
-    pcols: { name: 40, casts: 190, covered: 250, defused: 420, recipes: 590, fizzles: 760 },
+    pcols: { name: 40, casts: 190, covered: 250, defused: 420, recipes: 590 },
     hintFont: 14,
   },
 };
@@ -571,10 +579,11 @@ function drawRecipeGuide() {
   text("HOW CASTING WORKS", L.guideX, y, L.guideFont + 2, C_HEADER);
   y += L.guideLineH;
   const descColor = "rgba(200,200,210,0.9)";
-  // The turn loop: a fixed budget of casts each, then the whole field is eaten.
+  // The turn loop: a fixed budget of casts each, all of them resolving
+  // together once the last player has chosen, then the whole field is eaten.
   const castingLine = [
-    { str: `Press ENTER to cast — ${CASTS_PER_TURN} casts each per turn.`, color: descColor },
-    { str: "A GROUP fires when two of you cast its moves on the SAME square in one turn!", color: RECIPE_COLOR_TEAM },
+    { str: `Press ENTER to LOCK IN — ${CASTS_PER_TURN} cast${CASTS_PER_TURN === 1 ? "" : "s"} each per turn.`, color: descColor },
+    { str: "A GROUP fires when two of you lock in its moves on the SAME square in one turn!", color: RECIPE_COLOR_TEAM },
   ];
   const descLines = [
     [
@@ -598,10 +607,14 @@ function drawRecipeGuide() {
       { str: "→ defused (harmless to eat).", color: descColor },
     ],
     [
-      { str: "Aim is captured when you press ENTER — re-aiming will not move a cast already made.", color: descColor },
+      { str: "Aim is captured when you press ENTER — re-aiming will not move a cast already locked in.", color: descColor },
     ],
     [
-      { str: "The turn ends once EVERYONE is out of casts: the Lil Guys then pour in from the LEFT.", color: descColor },
+      { str: "Nothing lands until the turn resolves, so you can see the whole plan first.", color: descColor },
+      { str: "ESC takes back your last lock-in.", color: C_BAD },
+    ],
+    [
+      { str: "The turn ends once EVERYONE has locked in: every cast lands at once, then the Lil Guys pour in from the LEFT.", color: descColor },
     ],
     [
       { str: "They only eat what they can WALK to. Live hazard slime is a wall — everything behind it survives.", color: descColor },
@@ -612,7 +625,7 @@ function drawRecipeGuide() {
     [
       { str: "Every cast spends from ONE shared pool", color: descColor },
       { str: "\u26a1", color: C_CHARGE },
-      { str: "that lasts the WHOLE encounter and never refills. Spend it where it opens a road.", color: descColor },
+      { str: "that lasts the WHOLE encounter and never refills. A cast the turn cannot afford is REFUSED, costing nothing.", color: descColor },
     ],
     castingLine,
   ];
@@ -711,29 +724,19 @@ function drawSprite(id, kind, cx, cy, cw, ch, lastAction, dt, flip) {
 }
 
 /**
- * Server marks casters via action_result .cast → entity.last_action for one
- * render frame.  With no player sprites, visualise the cast as a floater
- * rising from the caster's wheel-panel row.
+ * The one thing a cast can do other than land: be refused for price.
+ *
+ * Sent only to the player who tried, and only on the frame they tried, so it
+ * is a floater rather than anything persistent — nothing changed, and the
+ * numbers it quotes are already on screen in the turn readout.  Loud and
+ * central because it explains a key press that otherwise did nothing at all.
  */
-function spawnCastFloaters(game) {
-  const CP = LAYOUT.wheelPanel;
-  const rowPos = (i) => ({
-    x: CP.x + CP.nameW + CP.labelW + 24,
-    y: CP.y0 + i * CP.rowH,
-  });
-  //  (game.entities || []).forEach((e, i) => {
-  //    if (!e.last_action) return;
-  //    const { x, y } = rowPos(i);
-  //    spawnFloater("✦ cast", x, y, C_OWN_ROW);
-  //  });
-  // A cast the shared pool could not pay for: show the fizzle on the caster's
-  // row (grey — the budget was spent, but nothing landed).
-  for (const pid of game.fizzles ?? []) {
-    const i = (game.entities || []).findIndex((e) => e.owner === pid);
-    if (i === -1) continue;
-    const { x, y } = rowPos(i);
-    spawnFloater("fizzle…", x, y, "rgba(150,150,160,0.9)");
-  }
+function spawnRefusalFloater(game) {
+  const ob = game.over_budget;
+  if (!ob) return;
+  const { x, y } = fieldCenter();
+  spawnFloater(`Too expensive! \u26a1${ob.needed} needed, \u26a1${ob.have} left`,
+    x, y, C_BAD, LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
 }
 
 /** Player-recipe floater color (matches the recipe label color elsewhere). */
@@ -860,18 +863,25 @@ function drawWheelPanel(game) {
       own ? RECIPE_COLOR_PLAYER : "rgba(180,200,255,0.75)");
 
     // Casts left this turn: a filled pip per remaining cast, so "who are we
-    // waiting on" is readable at a glance.
+    // waiting on" is readable at a glance.  A player with none left has LOCKED
+    // IN — the turn resolves the moment the last of them does.
     const usedX = CP.x + CP.nameW + CP.labelW;
     const left = e.casts_left ?? 0;
     if (left > 0) {
       text("◆".repeat(left), usedX, y, CP.font, CAST_EVENT_COLOR);
     } else {
-      text("done", usedX, y, CP.font, "rgba(120,120,140,0.7)");
+      text("locked in", usedX, y, CP.font, SHAPE_COLOR);
     }
-    // Where that player is aimed: a cast lands on the cursor at the moment
-    // ENTER is pressed, and a group needs two players on the SAME square, so
-    // the coordinates are how you coordinate one.
-    text(`@${e.cursor_row ?? 0},${e.cursor_col ?? 0}`, usedX + 44, y, CP.font,
+    // Where that player is aimed.  Once they have locked in, their cursor is
+    // just a cursor: show the square their last commitment is actually ON,
+    // because that is the one a group has to be aimed at.
+    const mine = (game.pending ?? []).filter((pc) => pc.player_id === e.owner);
+    const last = mine.length > 0 ? mine[mine.length - 1] : null;
+    const cols = gridDims(game).cols;
+    const at = last !== null && left === 0
+      ? `!${Math.floor(last.square / cols)},${last.square % cols}`
+      : `@${e.cursor_row ?? 0},${e.cursor_col ?? 0}`;
+    text(at, usedX + 60, y, CP.font,
       own ? C_OWN_ROW : "rgba(180,200,255,0.6)");
   });
 }
@@ -963,48 +973,55 @@ function addOutput(sum, recipe, anchor) {
 }
 
 /**
- * What every player currently has on the wheel, and where they are aimed.
+ * The turn as the viewer can best guess it: every cast already LOCKED IN, plus
+ * the viewer's own live aim if they still have a cast to spend.
  *
- * ONE ENTRY PER OWNER, mirroring the server: casts fire out of a pid-indexed
- * pool, and a group requires DISTINCT players, so deduplicating by owner here
- * keeps that rule true of the projection even if a snapshot ever carried two
- * entities for one player — otherwise a lone player could see a group falsely
- * projected off their own selection.
+ * Locked-in casts are facts — the server froze their square and move — so they
+ * are taken verbatim and in order.  A teammate who has NOT locked in yet is
+ * deliberately absent: their wheel and cursor are still moving, and projecting
+ * a group off them would promise a shape nobody has committed to.  The
+ * viewer's own aim is the exception, because that is the choice the preview
+ * exists to answer ("what happens if I press ENTER here").
  *
- * @returns {Array<{owner: number, move: number, row: number, col: number}>}
+ * @returns {Array<{owner: number, move: number, row: number, col: number,
+ *   pending: boolean}>} in lock-in order, own live aim last.
  */
 function projectedCasts(game) {
-  const byOwner = new Map();
-  for (const e of game.entities ?? []) {
-    if (byOwner.has(e.owner)) continue;
-    byOwner.set(e.owner, {
-      owner: e.owner,
-      move: e.selected_shape ?? 0,
-      row: e.cursor_row ?? 0,
-      col: e.cursor_col ?? 0,
+  const { cols } = gridDims(game);
+  const casts = (game.pending ?? []).map((pc) => ({
+    owner: pc.player_id,
+    move: pc.move,
+    row: Math.floor(pc.square / cols),
+    col: pc.square % cols,
+    pending: true,
+  }));
+
+  const own = (game.entities ?? []).find((e) => e.owner === game.player_id);
+  if (own !== undefined && (own.casts_left ?? 0) > 0) {
+    casts.push({
+      owner: own.owner,
+      move: own.selected_shape ?? 0,
+      row: own.cursor_row ?? 0,
+      col: own.cursor_col ?? 0,
+      pending: false,
     });
   }
-  return [...byOwner.values()];
+  return casts;
 }
 
 /**
- * Project "what lands if everyone casts right now" from the wheel selections.
- * Mirrors session.resolve_cast + game_logic.complete_group: a group fires when
- * its component moves are cast by DISTINCT players on the SAME square, and it
- * consumes its whole bag (contributors included), so a grouped player does NOT
- * also stamp their own move.
+ * Resolve a list of casts into the stamps and the price the turn would buy.
  *
- * Grouping is per square, greedy over the group table in file order and
- * repeatable — the same rule the server applies to the turn's cast log.
+ * MIRROR OF game_logic.resolve_batch — keep the two in step.  Per square, in
+ * first-appearance order, each group in table order fires as many times as its
+ * component bag can be filled from the casts still unconsumed on that square,
+ * each component from a DISTINCT player.  A group consumes its whole bag, so a
+ * contributor does not also stamp their own move.  Whatever is left over
+ * stamps itself, in lock-in order.  The total is what the pool is charged: a
+ * group is priced at the group, never at its parts.
  *
- * A group's anchor is NOT a guess: every
- * contributor is aimed at the same square by definition, so the group stamps
- * there regardless of who completes it.
- *
- * This is a projection of SIMULTANEOUS casts, which is not how a turn actually
- * plays out (casts are sequential, and a group consumes only casts already
- * logged this turn).  It answers "if we all pressed ENTER now", which is the
- * question a player aiming a group is asking.
+ * The last entry may be the viewer's own uncommitted aim (see projectedCasts),
+ * which is what makes this a preview rather than a readout.
  *
  * @returns {{stamps: Array<{offsets: ShapeOffset[], label: string,
  *   anchor: {row: number, col: number}}>, cost: number, labels: string[]}}
@@ -1012,40 +1029,41 @@ function projectedCasts(game) {
 function projectBatch(game) {
   const sum = { stamps: [], cost: 0, labels: [] };
   const casts = projectedCasts(game);
+  const consumed = new Array(casts.length).fill(false);
 
-  // Bucket by aimed square: only same-square casts can ever group.
-  const bySquare = new Map();
-  for (const c of casts) {
-    const key = `${c.row},${c.col}`;
-    const bucket = bySquare.get(key);
-    if (bucket === undefined) bySquare.set(key, [c]); else bucket.push(c);
-  }
+  casts.forEach((head, hi) => {
+    // One hunt per square: a later cast on a square already searched would
+    // only re-run the same search over the same remaining casts.
+    const seen = casts.slice(0, hi)
+      .some((e) => e.row === head.row && e.col === head.col);
+    if (seen) return;
 
-  const consumed = new Set();
-  for (const [, bucket] of bySquare) {
-    if (bucket.length < 2) continue; // a group always needs 2+ players
     for (const tr of TEAM_RECIPES) {
+      if ((tr.components ?? []).length === 0) continue;
       for (; ;) {
         const picks = [];
-        for (const componentMove of tr.components) {
-          const hit = bucket.find((c) =>
-            !consumed.has(c.owner) && !picks.includes(c) && c.move === componentMove);
-          if (hit === undefined) break;
-          picks.push(hit);
+        for (const comp of tr.components) {
+          const found = casts.findIndex((cand, ci) =>
+            !consumed[ci] &&
+            cand.row === head.row && cand.col === head.col &&
+            cand.move === comp &&
+            !picks.some((pi) => casts[pi].owner === cand.owner));
+          if (found === -1) break;
+          picks.push(found);
         }
         if (picks.length < tr.components.length) break;
-        for (const c of picks) consumed.add(c.owner);
-        addOutput(sum, tr, { row: bucket[0].row, col: bucket[0].col });
+        for (const pi of picks) consumed[pi] = true;
+        addOutput(sum, tr, { row: head.row, col: head.col });
       }
     }
-  }
+  });
 
-  for (const c of casts) {
-    if (consumed.has(c.owner)) continue;
+  casts.forEach((c, ci) => {
+    if (consumed[ci]) return;
     const move = PLAYER_RECIPES[c.move];
-    if (move === undefined) continue;
+    if (move === undefined) return;
     addOutput(sum, move, { row: c.row, col: c.col });
-  }
+  });
 
   return sum;
 }
@@ -1850,9 +1868,13 @@ function drawSlimeField(game) {
     }
   }
 
-  // Cursors last, so aim is never buried under a tile.  Hidden during the
-  // replay: nobody can aim while the feast plays out.
-  if (!replay) drawCursors(game, g, cols);
+  // Locked-in casts, then cursors, so aim is never buried under a tile.
+  // Both hidden during the replay: nobody can aim while the feast plays out,
+  // and the pending list is already empty by then.
+  if (!replay) {
+    drawPendingMarks(game, g, cols);
+    drawCursors(game, g, cols);
+  }
 
   rectStroke(FIELD.x0, FIELD.y0, FIELD.x1 - FIELD.x0, FIELD.y1 - FIELD.y0, 1,
     FIELD.border);
@@ -1936,6 +1958,41 @@ function drawCursors(game, g, cols) {
   }
   for (const o of own) {
     drawCrosshair(o.x0, o.y0, g.cell, FIELD.cursorWidth, C_OWN_ROW);
+  }
+}
+
+/**
+ * Mark every square with a cast LOCKED IN on it: one solid pip per cast, in a
+ * row along the bottom of the cell.
+ *
+ * This is the turn's only public record before it resolves — the whole reason
+ * a teammate can plan a group at all — so it is drawn for every player's
+ * casts, not just the viewer's, and it is deliberately unlike the cursor: a
+ * cursor is where somebody is looking, a pip is what they have already done.
+ */
+function drawPendingMarks(game, g, cols) {
+  const bySquare = new Map();
+  for (const pc of game.pending ?? []) {
+    const list = bySquare.get(pc.square);
+    if (list === undefined) bySquare.set(pc.square, [pc]); else list.push(pc);
+  }
+
+  const r = g.cell * FIELD.pendingDotFrac;
+  const gap = g.cell * FIELD.pendingDotGap;
+  for (const [square, list] of bySquare) {
+    const cx = g.x0 + (square % cols) * g.cell + g.cell / 2;
+    const cy = g.y0 + Math.floor(square / cols) * g.cell + g.cell - r * 2;
+    const span = list.length * r * 2 + (list.length - 1) * gap;
+    let x = cx - span / 2 + r;
+    for (const pc of list) {
+      ctx.save();
+      ctx.fillStyle = pc.player_id === game.player_id ? C_OWN_ROW : C_HEADER;
+      ctx.beginPath();
+      ctx.arc(x, cy, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      x += r * 2 + gap;
+    }
   }
 }
 
@@ -2681,6 +2738,14 @@ function drawActionMenu(game) {
   const aRowY = my + M.padTopY + M.actionRowDy;
   text("[1] Next shape", px + M.actionCols[0], aRowY, M.actionFont, keyColor(WHEEL_COLOR.forward));
   text("[2] Back", px + M.actionCols[1], aRowY, M.actionFont, keyColor(WHEEL_COLOR.backward));
+  // Undo is only offered when there is something of the viewer's OWN to take
+  // back — Escape reaches nobody else's commitment, and a key that does
+  // nothing is worse than a key that is not advertised.
+  {
+    const mine = (game.pending ?? []).some((pc) => pc.player_id === game.player_id);
+    text("[Esc] Undo", px + M.actionCols[2], aRowY, M.actionFont,
+      mine ? keyColor(C_BAD) : DEAD_KEY);
+  }
 
   // Aim row: the arrow keys move the cursor the shape is stamped on.
   const own0 = (game.entities ?? []).find(e => e.owner === game.player_id);
@@ -2698,15 +2763,15 @@ function drawActionMenu(game) {
     const wheel = PLAYER_RECIPES.length > 0
       ? `  (${(sel % PLAYER_RECIPES.length) + 1}/${PLAYER_RECIPES.length})`
       : "";
-    text(`[Enter] Cast  ${move?.label ?? "-"}  \u26a1${move?.cost ?? 0}${wheel}`,
+    text(`[Enter] Lock in  ${move?.label ?? "-"}  \u26a1${move?.cost ?? 0}${wheel}`,
       px, my + M.padTopY + M.selectedRowDy, M.selectedFont, keyColor(RECIPE_COLOR_PLAYER));
   }
 
   const tbw = mw - M.padX * 2;
 
-  // The local player's cast budget for this turn.  Casts resolve the instant
-  // they are submitted, so there is no countdown to show — what matters is how
-  // many are left, because the turn (and the feast) waits on the last one.
+  // The local player's cast budget for this turn.  A lock-in spends a slot
+  // without resolving anything, so what matters is how many are left: the
+  // turn (and the feast) waits on the last one in the room.
   {
     const total = game.casts_per_turn ?? 0;
     const own = (game.entities ?? []).find(e => e.owner === game.player_id);
@@ -2765,20 +2830,21 @@ function drawActionMenu(game) {
   if (pv.opened > 0) {
     parts.push({ str: `opens ${pv.opened} food`, color: C_SLIME_HDR });
   }
-  // The price, and whether the pool can actually pay it.  Shown even at zero
-  // cost, and shown in red when unaffordable: a cast the team cannot afford
-  // still burns a turn slot, so this is a warning, not a footnote.
+  // The price of the WHOLE turn as it stands, and whether the pool can pay
+  // it.  Shown even at zero cost, and in red when it cannot: a cast that takes
+  // the turn over budget is refused outright, so this is the warning that says
+  // why ENTER is about to do nothing.
   if (projected.cost > 0 || projected.labels.length > 0) {
     const affordable = (game.charges ?? 0) >= projected.cost;
     parts.push({
-      str: `\u26a1${projected.cost}${affordable ? "" : " CAN'T AFFORD"}`,
+      str: `\u26a1${projected.cost}${affordable ? "" : " OVER BUDGET"}`,
       color: affordable ? C_CHARGE : C_BAD,
     });
   }
 
   let dx = px;
   const pvY = my + M.previewDy;
-  text("Team:", dx, pvY, M.previewFont, "rgba(180,200,255,0.85)");
+  text("Turn:", dx, pvY, M.previewFont, "rgba(180,200,255,0.85)");
   dx += 52;
   if (parts.length === 0) {
     text("—", dx, pvY, M.previewFont, "rgba(120,120,140,0.7)");
@@ -2802,7 +2868,7 @@ let lastTransientGame = null;
 function drawGame(game, dt) {
   // The render loop redraws `latestMsg` every animation frame (~60Hz) while
   // server frames arrive at ~20Hz, so the same frame is drawn ~3 times.
-  // Transient events (dispense outcomes, recipe fires, turn ends, fizzles) are
+  // Transient events (dispense outcomes, recipe fires, turn ends, refusals) are
   // per-frame facts, NOT per-draw, and must be consumed exactly once or they
   // spawn triplicate floaters.
   const fresh = game !== lastTransientGame;
@@ -2844,7 +2910,7 @@ function drawGame(game, dt) {
   // downgrades from refills.
   if (fresh && !cinematicActive() && !startedReplay) updateGridAnims(game.grid ?? []);
   if (fresh) {
-    spawnCastFloaters(game);
+    spawnRefusalFloater(game);
     //spawnRecipeFloaters(game);
   }
 
@@ -2964,7 +3030,6 @@ function drawGameOver(msg) {
   text("CELLS HIT", P.covered, y, L.sectionFont, C_HEADER);
   text("DEFUSED", P.defused, y, L.sectionFont, C_HEADER);
   text("RECIPES", P.recipes, y, L.sectionFont, C_HEADER);
-  text("FIZZLES", P.fizzles, y, L.sectionFont, C_HEADER);
   y += L.rowH;
   for (const p of stats.players ?? []) {
     text(p.name || "(anon)", P.name, y, L.rowFont, C_TEXT);
@@ -2972,8 +3037,6 @@ function drawGameOver(msg) {
     text(String(p.cells_covered ?? 0), P.covered, y, L.rowFont, C_SLIME_HDR);
     text(String(p.cells_neutralized ?? 0), P.defused, y, L.rowFont, SHAPE_COLOR);
     text(`${p.recipe_casts}/${p.casts}`, P.recipes, y, L.rowFont, "rgba(255,255,140,0.9)");
-    text(String(p.fizzles ?? 0), P.fizzles, y, L.rowFont,
-      (p.fizzles ?? 0) > 0 ? "rgba(255,120,120,0.9)" : "rgba(120,120,140,0.7)");
     y += L.rowH;
   }
   y += 14;
@@ -3193,8 +3256,9 @@ function connect() {
 // ---------------------------------------------------------------------------
 
 const FORWARDED_KEYS = new Set([
-  // Enter = cast (game) / ready toggle (lobby) / dismiss (game over).
-  // Escape is forwarded but inert in game; the lobby and menus still use it.
+  // Enter = lock in a cast (game) / ready toggle (lobby) / dismiss (game over).
+  // Escape = take back your newest lock-in, one per press; the lobby and menus
+  // use it as a plain "back".
   "Enter", "Escape",
   // Shape wheel: 1 turns forward, 2 turns back.  Selection lives on the
   // server, so these are the whole of the client's part in it.
