@@ -24,11 +24,15 @@ pub fn parse_key_name(name: []const u8) ?RawKey {
     if (std.mem.eql(u8, name, "ArrowDown")) return .down;
     if (std.mem.eql(u8, name, "ArrowLeft")) return .left;
     if (std.mem.eql(u8, name, "ArrowRight")) return .right;
+    // Seat control: p asks for a player slot, Shift+P gives it up.  Case is
+    // the whole distinction, exactly as KeyboardEvent.key reports it.
+    if (std.mem.eql(u8, name, "p")) return .take_seat;
+    if (std.mem.eql(u8, name, "P")) return .leave_seat;
 
     return null;
 }
 
-pub const RawKey = enum { enter, escape, one, two, up, down, left, right };
+pub const RawKey = enum { enter, escape, one, two, up, down, left, right, take_seat, leave_seat };
 
 pub const KeyQueue = struct {
     buf: [64]RawKey = undefined,
@@ -78,6 +82,11 @@ pub const Drained = struct {
     /// newest first.  Counted rather than flagged, so holding undo walks back
     /// through a plan one step per press instead of collapsing to one.
     cancels: u8 = 0,
+    /// p was pressed: ask the server for a player seat (silently ignored when
+    /// the game is full, or when this connection already holds one).
+    take_seat: bool = false,
+    /// Shift+P was pressed: give the seat up and go back to observing.
+    leave_seat: bool = false,
 
     pub fn cursor_steps(self: *const Drained) []const protocol.CursorDir {
         return self.steps[0..self.step_count];
@@ -106,6 +115,11 @@ pub fn drain(queue: *KeyQueue) Drained {
             // right up until the last player commits.  Saturates rather than
             // wrapping; nobody has more pending casts than a u8 can count.
             .escape => out.cancels +|= 1,
+            // Seat control is a flag, not a count: taking a seat twice in one
+            // frame is the same request twice, and the server ignores repeats
+            // anyway.
+            .take_seat => out.take_seat = true,
+            .leave_seat => out.leave_seat = true,
             // 1 = next shape, 2 = previous.
             .one, .two => {
                 const dir: c.CycleDir = switch (key) {
@@ -296,4 +310,20 @@ test "parse_key_name maps the d-pad and rejects the old color keys" {
     // Colors are difficulty tiers now, not input.
     try std.testing.expectEqual(@as(?RawKey, null), parse_key_name("q"));
     try std.testing.expectEqual(@as(?RawKey, null), parse_key_name("r"));
+}
+
+test "parse_key_name: seat control is case-sensitive p vs P" {
+    try std.testing.expectEqual(RawKey.take_seat, parse_key_name("p").?);
+    try std.testing.expectEqual(RawKey.leave_seat, parse_key_name("P").?);
+}
+
+test "drain: seat keys surface as flags and block nothing" {
+    var queue = KeyQueue{};
+    queue.push(.take_seat);
+    queue.push(.left);
+    queue.push(.leave_seat);
+    const out = drain(&queue);
+    try std.testing.expect(out.take_seat);
+    try std.testing.expect(out.leave_seat);
+    try std.testing.expectEqualSlices(protocol.CursorDir, &.{.left}, out.cursor_steps());
 }

@@ -10,7 +10,6 @@
 const std = @import("std");
 const ws = @import("websocket");
 const shared = @import("shared");
-const proto = shared.protocol;
 const cfg_mod = shared.config;
 const dbg = @import("debug_zig");
 
@@ -35,9 +34,13 @@ var g_loaded: cfg_mod.Loaded = undefined;
 var session: ?Session = null;
 var session_lock: std.Thread.Mutex = .{};
 
+/// Sentinel for a handler that never registered with the session (the
+/// connection registry was full).
+const NO_CONN: usize = std.math.maxInt(usize);
+
 const Handler = struct {
     conn: *ws.Conn,
-    player_id: u8 = 0xFF,
+    conn_id: usize = NO_CONN,
 
     pub fn init(hs: *ws.Handshake, conn: *ws.Conn, _: void) !Handler {
         _ = hs;
@@ -51,62 +54,39 @@ const Handler = struct {
         const sess = &(session orelse return error.NoSession);
         const t = ws_server.conn_transport(self.conn);
 
-        if (sess.join(t, "")) |pid| {
-            self.player_id = pid;
-            std.log.info("player {} connected (slot reserved)", .{pid});
-            // Don't broadcast lobby_update to in-game clients — it would reset
-            // their phase to lobby.  The late joiner gets game_start after
-            // they send join_lobby (name), which is the correct entry point.
-            if (sess.phase == .lobby) {
-                sess.broadcast_lobby_update() catch {};
-            }
+        // Every connection starts as an OBSERVER of the running game; the
+        // session answers with a game_start (player_id = NO_PLAYER).  A seat
+        // is only taken by an explicit take_slot.
+        if (sess.connect(t)) |conn_id| {
+            self.conn_id = conn_id;
+            std.log.info("connection {} attached (observer)", .{conn_id});
         } else {
-            std.log.warn("session full, rejecting connection", .{});
+            std.log.warn("connection registry full, rejecting connection", .{});
             self.conn.close(.{}) catch {};
         }
     }
 
     pub fn clientMessage(self: *Handler, data: []u8) !void {
-        if (data.len == 0) return;
-
-        var fbs_peek = std.io.fixedBufferStream(data);
-        const tag = proto.read_tag(fbs_peek.reader()) catch return;
-
-        if (tag == .reconnect) {
-            const p = proto.decode_reconnect(fbs_peek.reader()) catch return;
-            session_lock.lock();
-            defer session_lock.unlock();
-            const sess = &(session orelse return);
-            const t = ws_server.conn_transport(self.conn);
-            if (sess.reconnect(p.player_id, t)) {
-                if (self.player_id != p.player_id) {
-                    sess.disconnect(self.player_id);
-                }
-                self.player_id = p.player_id;
-                std.log.info("player {} reconnected", .{p.player_id});
-                sess.broadcast_lobby_update() catch {};
-            }
-            return;
-        }
-
+        if (data.len == 0 or self.conn_id == NO_CONN) return;
         session_lock.lock();
         const sess_ptr = if (session) |*s| s else {
             session_lock.unlock();
             return;
         };
-        sess_ptr.enqueue_message(self.player_id, data);
+        sess_ptr.enqueue_message(self.conn_id, data);
         session_lock.unlock();
     }
 
     pub fn close(self: *Handler) void {
+        if (self.conn_id == NO_CONN) return;
         session_lock.lock();
         defer session_lock.unlock();
         const sess = &(session orelse return);
-        const joined = self.player_id < session_mod.MAX_PLAYERS and
-            sess.players[self.player_id].name_len > 0;
-        sess.disconnect(self.player_id);
-        std.log.info("player {} disconnected", .{self.player_id});
-        if (joined) sess.broadcast_lobby_update() catch {};
+        // Releases the connection's seat (if any): shares go back to the
+        // group and play continues — the remaining players learn of the
+        // shrunken bar/pool from the ordinary game_state tick.
+        sess.disconnect(self.conn_id);
+        std.log.info("connection {} closed", .{self.conn_id});
     }
 };
 
@@ -220,6 +200,11 @@ pub fn main() !void {
 
     session = try Session.init(allocator, join_code, &g_loaded.config);
     defer if (session) |*s| s.deinit();
+
+    // A game is ALWAYS running: launch the default encounter immediately.
+    // With no players seated the game idles (turns need a seated player to
+    // end), so nothing is consumed until someone takes a slot.
+    if (session) |*s| try s.start_game(g_loaded.config.encounters.default().label);
 
     std.log.info("Room code: {s}", .{join_code});
     std.log.info("Listening on port {d}", .{port});

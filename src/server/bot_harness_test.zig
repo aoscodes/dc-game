@@ -87,9 +87,8 @@ pub const BotHarness = struct {
 
     /// Initialise the harness.
     ///
-    /// - Joins each bot from `team` as an occupied, connected PlayerSlot.
-    /// - Starts the game against `encounter` directly, bypassing the lobby
-    ///   ready flow.
+    /// - Connects each bot from `team` and seats it in a PlayerSlot.
+    /// - Starts the game against `encounter` directly.
     ///
     /// Asserts:
     ///   - team.bots.len >= 1
@@ -119,7 +118,7 @@ pub const BotHarness = struct {
 
         for (team.bots, 0..) |entry, i| {
             bot_states[i].init(allocator, 0xFF, entry.profile);
-            const pid = sess.join(bot_states[i].transport(), entry.name) orelse {
+            const pid = seat_bot(&sess, bot_states[i].transport()) orelse {
                 // Free already-initialised BotStates before returning the error.
                 for (bot_states[0..i]) |*bs| bs.deinit(allocator);
                 allocator.free(bot_states);
@@ -214,17 +213,25 @@ pub const BotHarness = struct {
         self.cycle += 1;
     }
 
-    /// Convenience: run up to `max_cycles` steps, stopping early when the
-    /// session leaves the playing phase (game over).
+    /// Convenience: run up to `max_cycles` steps, stopping early once an
+    /// encounter has ended (a restart is pending).
     /// Returns the number of cycles actually run.
     pub fn run_to_completion(self: *BotHarness, max_cycles: u32) !u32 {
         var r: u32 = 0;
-        while (r < max_cycles and self.session.phase == .playing) : (r += 1) {
+        while (r < max_cycles and !self.session.restart_pending) : (r += 1) {
             try self.step();
         }
         return r;
     }
 };
+
+/// Connect `transport` and seat it, bot-style: connection ids and seat ids
+/// both count up from 0.  Returns the seat id, or null when the game is full.
+fn seat_bot(sess: *Session, transport: shared.Transport) ?u8 {
+    const conn_id = sess.connect(transport) orelse return null;
+    sess.take_slot(conn_id, 0) catch return null;
+    return sess.connections[conn_id].player_id;
+}
 
 /// Fixture-table index of a move label, or null if the fixture has no such
 /// move.  Bots name moves by label (see bots.zig), and this is the one place
@@ -277,6 +284,8 @@ test "sweeping bots eat their way into a field that starts completely walled" {
     var h = try BotHarness.init(allocator, &bots.team_mixed, &enc_green_field, "BOTKEY".*, .{});
     defer h.deinit();
 
+    // The seeded pool, grown once per seat past the first (three bots here).
+    const pool_start = h.session.charges;
     _ = try h.run_to_completion(400);
 
     // `stats.slime_total` is only finalised by end_game, and a walled field may
@@ -293,9 +302,9 @@ test "sweeping bots eat their way into a field that starts completely walled" {
     try std.testing.expect(tier_total(h.session.stats.feast.cells_covered) > 0);
     try std.testing.expect(h.session.score > 0);
     // Charges are spent, never conjured.
-    try std.testing.expect(h.session.charges <= enc_green_field.charges);
+    try std.testing.expect(h.session.charges <= pool_start);
     try std.testing.expectEqual(
-        enc_green_field.charges - h.session.charges,
+        pool_start - h.session.charges,
         @as(u32, h.session.stats.feast.charges_spent),
     );
 }
@@ -314,12 +323,12 @@ test "a live wall feeds nobody: only casting turns slime into score" {
     var idle_bot: BotState = undefined;
     idle_bot.init(allocator, 0xFF, &bots.profile_sweeper);
     defer idle_bot.deinit(allocator);
-    idle_bot.player_id = idle_sess.join(idle_bot.transport(), "Idle") orelse
+    idle_bot.player_id = seat_bot(&idle_sess, idle_bot.transport()) orelse
         return error.JoinFailed;
     try idle_sess.start_game_encounter(&enc_survival);
 
     var turns: u32 = 0;
-    while (idle_sess.phase == .playing and turns < 200) : (turns += 1) {
+    while (!idle_sess.restart_pending and turns < 200) : (turns += 1) {
         idle_sess.casts_left = [_]u8{0} ** session_mod.MAX_PLAYERS;
         try idle_sess.tick(0.0);
     }
@@ -327,20 +336,22 @@ test "a live wall feeds nobody: only casting turns slime into score" {
     // no hunger to fill the bar, no slime eaten to clear the field, and a full
     // charge pool so it is not a dead position either.  A stalemate is the
     // honest outcome of refusing to play.
-    try std.testing.expectEqual(session_mod.SessionPhase.playing, idle_sess.phase);
+    try std.testing.expect(!idle_sess.restart_pending);
     try std.testing.expectEqual(@as(u32, 0), idle_sess.score);
     try std.testing.expectEqual(@as(u16, 0), idle_sess.hunger.current);
+    // A solo seat holds the bare seed: nothing grew it, nothing spent it.
     try std.testing.expectEqual(enc_survival.charges, idle_sess.charges);
     try std.testing.expectEqual(@as(u32, 60), idle_sess.field.remaining());
 
     // Active side: the same field, but cast at.
     var h = try BotHarness.init(allocator, &bots.team_mixed, &enc_survival, "BOTK02".*, .{});
     defer h.deinit();
+    const pool_start = h.session.charges;
     _ = try h.run_to_completion(200);
 
     try std.testing.expect(h.session.score > 0);
     try std.testing.expect(h.session.hunger.current > 0);
-    try std.testing.expect(h.session.charges < enc_survival.charges);
+    try std.testing.expect(h.session.charges < pool_start);
     try std.testing.expect(tier_total(h.session.stats.feast.cells_covered) > 0);
     // Hunger is now exactly one point per unit eaten — no hazard surcharge, and
     // score counts the same units, so the two readings must agree.
@@ -408,7 +419,7 @@ test "profile cycles correctly across cast cycles" {
     }
     // Selection only: no cast was ever committed, so no turn ended and the
     // field is untouched.
-    try std.testing.expectEqual(session_mod.SessionPhase.playing, h.session.phase);
+    try std.testing.expect(!h.session.restart_pending);
     try std.testing.expectEqual(@as(u32, 6), h.session.field.remaining());
 }
 

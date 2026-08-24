@@ -3,14 +3,20 @@ const components = @import("components.zig");
 const balance = @import("balance.zig");
 
 pub const MsgTag = enum(u8) {
-    join_lobby = 0x01,
-    ready_up = 0x03,
-    reconnect = 0x05,
+    // 0x01 was join_lobby, 0x03 was ready_up, 0x05 was reconnect: the lobby
+    // is gone — a game is always running, connections observe by default and
+    // take a player slot explicitly.
+    take_slot = 0x02,
+    leave_slot = 0x04,
+    /// Start the next encounter from the end screen.  Sent by browser-tab
+    /// clients when the report's button is CLICKED (never a key press);
+    /// ignored while a game is running.
+    restart = 0x06,
     cycle_shape = 0x07,
     cast = 0x09,
     move_cursor = 0x0a,
     cancel_cast = 0x0b,
-    lobby_update = 0x10,
+    // 0x10 was lobby_update.
     game_start = 0x11,
     game_state = 0x12,
     action_result = 0x13,
@@ -21,14 +27,19 @@ pub const MsgTag = enum(u8) {
     turn_ended = 0x1d,
 };
 
-pub const JoinLobby = struct {
-    name: [16]u8,
-    name_len: u8,
+/// The `player_id` a connection holds while it is only OBSERVING: it receives
+/// every broadcast but owns no player slot, no entity and no shares.
+pub const NO_PLAYER: u8 = 0xFF;
+
+/// A connection asks to become a player in the running game.  SILENTLY
+/// ignored when all MAX_PLAYERS slots are taken — the connection simply stays
+/// an observer.  A granted slot is confirmed by a personalized `game_start`
+/// (player_id != NO_PLAYER).
+pub const TakeSlot = struct {
     /// The joining player's appetite stat — the board's persistent flash
     /// counter, forwarded through the bridge.  0 for players with no board
-    /// (browsers, bots), which is also the safe default for old clients.
-    /// The server folds it into the hunger bar's capacity via
-    /// game_logic.player_hunger.
+    /// (browsers, bots).  The server folds it into the hunger bar's capacity
+    /// via game_logic.player_hunger.
     appetite: u32 = 0,
 };
 
@@ -77,10 +88,6 @@ pub fn decode_move_cursor(reader: anytype) !MoveCursor {
         return DecodeError.InvalidCursorDir;
     return .{ .dir = dir };
 }
-
-pub const Reconnect = struct {
-    player_id: u8,
-};
 
 /// A cast was refused because the turn's locked-in casts, WITH it, would cost
 /// more than the shared pool holds.
@@ -209,33 +216,21 @@ pub fn decode_shape_cast(reader: anytype) !ShapeCast {
     return p;
 }
 
-pub const MAX_PLAYERS: u8 = 6;
+/// Hard cap on simultaneous PLAYERS in a game.  Connections beyond this can
+/// only observe: a take_slot with all slots taken is silently ignored.
+pub const MAX_PLAYERS: u8 = 4;
 
-// CastWaveFired.player_mask packs one bit per player.
-comptime {
-    std.debug.assert(MAX_PLAYERS <= 8);
-}
-
-pub const PlayerInfo = struct {
-    player_id: u8,
-    name: [16]u8,
-    name_len: u8,
-    kind: components.EntityKind,
-    ready: bool,
-    connected: bool,
-};
-
-pub const LobbyUpdate = struct {
-    join_code: [6]u8,
-    player_count: u8,
-    players: [MAX_PLAYERS]PlayerInfo,
-    player_id: u8,
-};
-
+/// Sent to every connection the moment it connects (a game is ALWAYS
+/// running), and again personalized whenever its slot binding changes or a
+/// fresh encounter auto-starts.
 pub const GameStart = struct {
     encounter_label: [32]u8,
     encounter_label_len: u8,
+    /// The receiver's player slot, or NO_PLAYER when it is observing.
     player_id: u8,
+    /// The session's join code — the game id, shown by clients so others can
+    /// join or observe.
+    join_code: [6]u8 = [_]u8{'-'} ** 6,
     /// Casts each player gets per turn (balance.casts_per_turn).  Sent once at
     /// start because it never changes mid-encounter.
     casts_per_turn: u8 = 0,
@@ -398,8 +393,6 @@ pub const FeastStats = struct {
 };
 
 pub const PlayerStats = struct {
-    name: [16]u8 = [_]u8{0} ** 16,
-    name_len: u8 = 0,
     casts: u16 = 0,
     /// Cells this player's shapes covered, and cells taken to defused.
     cells_covered: u16 = 0,
@@ -445,9 +438,9 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
     if (T == void) return;
 
     switch (tag) {
-        .join_lobby => try encode_join_lobby(writer, payload),
-        .ready_up => {},
-        .reconnect => try writer.writeByte(payload.player_id),
+        .take_slot => try writer.writeInt(u32, payload.appetite, .little),
+        .leave_slot => {},
+        .restart => {},
         .cycle_shape => try writer.writeByte(@intFromEnum(payload.dir)),
         .cast => {},
         .cancel_cast => {},
@@ -482,7 +475,6 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
             try writer.writeInt(u32, p.charges_left, .little);
         },
 
-        .lobby_update => try encode_lobby_update(writer, payload),
         .game_start => try encode_game_start(writer, payload),
         .game_state => try encode_game_state(writer, payload),
         .action_result => try encode_action_result(writer, payload),
@@ -493,32 +485,11 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
     }
 }
 
-fn encode_join_lobby(w: anytype, p: JoinLobby) !void {
-    try w.writeByte(p.name_len);
-    try w.writeAll(p.name[0..p.name_len]);
-    try w.writeInt(u32, p.appetite, .little);
-}
-
-fn encode_lobby_update(w: anytype, p: LobbyUpdate) !void {
-    try w.writeAll(&p.join_code);
-    try w.writeByte(p.player_count);
-    try w.writeByte(p.player_id);
-    var i: u8 = 0;
-    while (i < p.player_count) : (i += 1) {
-        const pl = p.players[i];
-        try w.writeByte(pl.player_id);
-        try w.writeByte(pl.name_len);
-        try w.writeAll(pl.name[0..pl.name_len]);
-        try w.writeByte(@intFromEnum(pl.kind));
-        try w.writeByte(if (pl.ready) 1 else 0);
-        try w.writeByte(if (pl.connected) 1 else 0);
-    }
-}
-
 fn encode_game_start(w: anytype, p: GameStart) !void {
     try w.writeByte(p.encounter_label_len);
     try w.writeAll(p.encounter_label[0..p.encounter_label_len]);
     try w.writeByte(p.player_id);
+    try w.writeAll(&p.join_code);
     try w.writeByte(p.casts_per_turn);
     try w.writeInt(u32, p.charges, .little);
     try w.writeByte(p.grid_rows);
@@ -624,8 +595,6 @@ fn decode_feast_stats(r: anytype) !FeastStats {
 }
 
 fn encode_player_stats(w: anytype, ps: PlayerStats) !void {
-    try w.writeByte(ps.name_len);
-    try w.writeAll(ps.name[0..ps.name_len]);
     try w.writeInt(u16, ps.casts, .little);
     try w.writeInt(u16, ps.cells_covered, .little);
     try w.writeInt(u16, ps.cells_neutralized, .little);
@@ -634,9 +603,6 @@ fn encode_player_stats(w: anytype, ps: PlayerStats) !void {
 
 fn decode_player_stats(r: anytype) !PlayerStats {
     var ps = PlayerStats{};
-    ps.name_len = try r.readByte();
-    if (ps.name_len > 16) return DecodeError.NameTooLong;
-    _ = try r.readAll(ps.name[0..ps.name_len]);
     ps.casts = try r.readInt(u16, .little);
     ps.cells_covered = try r.readInt(u16, .little);
     ps.cells_neutralized = try r.readInt(u16, .little);
@@ -718,49 +684,19 @@ pub fn read_tag(reader: anytype) !MsgTag {
     return std.meta.intToEnum(MsgTag, byte) catch return DecodeError.UnknownTag;
 }
 
-pub fn decode_join_lobby(reader: anytype) !JoinLobby {
-    const len = try reader.readByte();
-    if (len == 0 or len > 16) return DecodeError.NameTooLong;
-    var p = JoinLobby{ .name = [_]u8{0} ** 16, .name_len = len };
-    _ = try reader.readAll(p.name[0..len]);
-    p.appetite = try reader.readInt(u32, .little);
-    return p;
-}
-
-pub fn decode_reconnect(reader: anytype) !Reconnect {
-    return .{ .player_id = try reader.readByte() };
-}
-
-pub fn decode_lobby_update(reader: anytype) !LobbyUpdate {
-    var p: LobbyUpdate = undefined;
-    _ = try reader.readAll(&p.join_code);
-    p.player_count = try reader.readByte();
-    p.player_id = try reader.readByte();
-    if (p.player_count > MAX_PLAYERS) return DecodeError.TooManyEntities;
-    var i: u8 = 0;
-    while (i < p.player_count) : (i += 1) {
-        p.players[i].player_id = try reader.readByte();
-        const nlen = try reader.readByte();
-        if (nlen > 16) return DecodeError.NameTooLong;
-        p.players[i].name = [_]u8{0} ** 16;
-        p.players[i].name_len = nlen;
-        _ = try reader.readAll(p.players[i].name[0..nlen]);
-        const kind_byte = try reader.readByte();
-        p.players[i].kind = std.meta.intToEnum(components.EntityKind, kind_byte) catch
-            return DecodeError.InvalidKind;
-        p.players[i].ready = (try reader.readByte()) != 0;
-        p.players[i].connected = (try reader.readByte()) != 0;
-    }
-    return p;
+pub fn decode_take_slot(reader: anytype) !TakeSlot {
+    return .{ .appetite = try reader.readInt(u32, .little) };
 }
 
 pub fn decode_game_start(reader: anytype) !GameStart {
     var p: GameStart = undefined;
     const llen = try reader.readByte();
+    if (llen > 32) return DecodeError.NameTooLong;
     p.encounter_label = [_]u8{0} ** 32;
     p.encounter_label_len = llen;
     _ = try reader.readAll(p.encounter_label[0..llen]);
     p.player_id = try reader.readByte();
+    _ = try reader.readAll(&p.join_code);
     p.casts_per_turn = try reader.readByte();
     p.charges = try reader.readInt(u32, .little);
     p.grid_rows = try reader.readByte();
@@ -841,10 +777,13 @@ pub fn decode_game_over(reader: anytype) !GameOver {
     };
 }
 
-test "read_tag: retired choose_action byte (0x04) is UnknownTag" {
-    var buf: [1]u8 = .{0x04};
-    var fbs = std.io.fixedBufferStream(&buf);
-    try std.testing.expectError(DecodeError.UnknownTag, read_tag(fbs.reader()));
+test "read_tag: retired lobby-era tags are UnknownTag" {
+    // 0x01 join_lobby, 0x03 ready_up, 0x05 reconnect, 0x10 lobby_update: the
+    // lobby is gone — games run from the moment the session exists.
+    for ([_]u8{ 0x01, 0x03, 0x05, 0x10 }) |byte| {
+        var fbs = std.io.fixedBufferStream(&[_]u8{byte});
+        try std.testing.expectError(DecodeError.UnknownTag, read_tag(fbs.reader()));
+    }
 }
 
 test "round-trip: game_over carries score and match stats" {
@@ -869,8 +808,6 @@ test "round-trip: game_over carries score and match stats" {
     };
     go.stats.player_count = 2;
     go.stats.players[0] = .{ .casts = 3, .cells_covered = 27, .cells_neutralized = 6, .recipe_casts = 2 };
-    @memcpy(go.stats.players[0].name[0..5], "Alice");
-    go.stats.players[0].name_len = 5;
     go.stats.players[1] = .{ .casts = 2, .cells_covered = 4 };
     go.stats.player_recipe_count = 6;
     go.stats.team_recipe_count = 2;
@@ -897,7 +834,6 @@ test "round-trip: game_over carries score and match stats" {
     try std.testing.expectEqual(@as(u32, 27), d.stats.feast.charges_spent);
     try std.testing.expectEqual(@as(u32, 13), d.stats.feast.charges_left);
     try std.testing.expectEqual(@as(u8, 2), d.stats.player_count);
-    try std.testing.expectEqualSlices(u8, "Alice", d.stats.players[0].name[0..d.stats.players[0].name_len]);
     try std.testing.expectEqual(@as(u16, 3), d.stats.players[0].casts);
     try std.testing.expectEqual(@as(u16, 27), d.stats.players[0].cells_covered);
     try std.testing.expectEqual(@as(u16, 6), d.stats.players[0].cells_neutralized);
@@ -910,21 +846,33 @@ test "round-trip: game_over carries score and match stats" {
     try std.testing.expectEqual(@as(u16, 5), d.stats.casts_total);
 }
 
-test "round-trip: join_lobby carries the name and the appetite stat" {
-    var buf: [32]u8 = undefined;
+test "round-trip: take_slot carries the appetite stat" {
+    var buf: [16]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
 
-    const name = "Alice";
-    var p = JoinLobby{ .name = [_]u8{0} ** 16, .name_len = @intCast(name.len), .appetite = 17 };
-    @memcpy(p.name[0..name.len], name);
-
-    try encode(fbs.writer(), .join_lobby, p);
+    try encode(fbs.writer(), .take_slot, TakeSlot{ .appetite = 17 });
     fbs.reset();
-    _ = try read_tag(fbs.reader());
-    const decoded = try decode_join_lobby(fbs.reader());
-    try std.testing.expectEqual(p.name_len, decoded.name_len);
-    try std.testing.expectEqualSlices(u8, name, decoded.name[0..decoded.name_len]);
+    try std.testing.expectEqual(MsgTag.take_slot, try read_tag(fbs.reader()));
+    const decoded = try decode_take_slot(fbs.reader());
     try std.testing.expectEqual(@as(u32, 17), decoded.appetite);
+}
+
+test "round-trip: leave_slot carries no payload" {
+    var buf: [8]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try encode(fbs.writer(), .leave_slot, {});
+    try std.testing.expectEqual(@as(usize, 1), fbs.pos);
+    fbs.reset();
+    try std.testing.expectEqual(MsgTag.leave_slot, try read_tag(fbs.reader()));
+}
+
+test "round-trip: restart carries no payload" {
+    var buf: [8]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try encode(fbs.writer(), .restart, {});
+    try std.testing.expectEqual(@as(usize, 1), fbs.pos);
+    fbs.reset();
+    try std.testing.expectEqual(MsgTag.restart, try read_tag(fbs.reader()));
 }
 
 test "round-trip: game_state — turn, hunger, score, grid, and selection survive" {
@@ -992,36 +940,7 @@ test "round-trip: game_state — turn, hunger, score, grid, and selection surviv
     try std.testing.expectEqual(@as(u8, 5), decoded.entities[0].cursor_col);
 }
 
-test "round-trip: lobby_update — roster survives" {
-    var buf: [512]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-
-    var lu = LobbyUpdate{
-        .join_code = "ABCDEF".*,
-        .player_count = 1,
-        .players = [_]PlayerInfo{std.mem.zeroes(PlayerInfo)} ** MAX_PLAYERS,
-        .player_id = 0,
-    };
-    lu.players[0] = PlayerInfo{
-        .player_id = 0,
-        .name = [_]u8{0} ** 16,
-        .name_len = 3,
-        .kind = .player,
-        .ready = false,
-        .connected = true,
-    };
-    @memcpy(lu.players[0].name[0..3], "Bob");
-
-    try encode(fbs.writer(), .lobby_update, lu);
-    fbs.reset();
-    _ = try read_tag(fbs.reader());
-    const decoded = try decode_lobby_update(fbs.reader());
-
-    try std.testing.expectEqual(@as(u8, 0), decoded.player_id);
-    try std.testing.expectEqual(@as(u8, 1), decoded.player_count);
-}
-
-test "round-trip: game_start — grid dims and cast buffer survive" {
+test "round-trip: game_start — join code, grid dims and cast buffer survive" {
     var buf: [64]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
 
@@ -1030,7 +949,9 @@ test "round-trip: game_start — grid dims and cast buffer survive" {
         .encounter_label = [_]u8{0} ** 32,
         .encounter_label_len = @intCast(label.len),
         .player_id = 3,
+        .join_code = "ABCDEF".*,
         .casts_per_turn = 3,
+        .charges = 40,
         .grid_rows = 6,
         .grid_cols = 10,
     };
@@ -1042,10 +963,28 @@ test "round-trip: game_start — grid dims and cast buffer survive" {
     const decoded = try decode_game_start(fbs.reader());
 
     try std.testing.expectEqual(@as(u8, 3), decoded.player_id);
+    try std.testing.expectEqualSlices(u8, "ABCDEF", &decoded.join_code);
     try std.testing.expectEqual(@as(u8, 3), decoded.casts_per_turn);
+    try std.testing.expectEqual(@as(u32, 40), decoded.charges);
     try std.testing.expectEqual(@as(u8, 6), decoded.grid_rows);
     try std.testing.expectEqual(@as(u8, 10), decoded.grid_cols);
     try std.testing.expectEqualSlices(u8, label, decoded.encounter_label[0..decoded.encounter_label_len]);
+}
+
+test "round-trip: an observer game_start carries NO_PLAYER" {
+    var buf: [64]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var gs = GameStart{
+        .encounter_label = [_]u8{0} ** 32,
+        .encounter_label_len = 1,
+        .player_id = NO_PLAYER,
+    };
+    gs.encounter_label[0] = 'x';
+    try encode(fbs.writer(), .game_start, gs);
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    const decoded = try decode_game_start(fbs.reader());
+    try std.testing.expectEqual(NO_PLAYER, decoded.player_id);
 }
 
 test "round-trip: cycle_shape carries the direction" {

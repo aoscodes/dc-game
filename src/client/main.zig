@@ -7,12 +7,10 @@ const inp = @import("input.zig");
 const sw = @import("stdout_writer.zig");
 
 const ClientPhaseTag = sw.ClientPhaseTag;
-const LobbyState = sw.LobbyState;
 const GameState = sw.GameState;
 
 const WIRE_PREFIX = "WIRE:";
 const KEY_PREFIX  = "KEY:";
-const NAME_PREFIX = "NAME:";
 /// Player stats fed in from hardware, e.g. "STAT:appetite=7" — the board's
 /// persistent appetite counter, forwarded by the bridge (controllers.js).
 const STAT_APPETITE_PREFIX = "STAT:appetite=";
@@ -86,9 +84,9 @@ const MsgQueue = struct {
 
 const ClientState = struct {
     phase: ClientPhaseTag = .connecting,
-    lobby: LobbyState = .{},
     game: GameState = .{},
-    player_id: u8 = 0xFF,
+    /// The seat this connection holds, or NO_PLAYER while observing.
+    player_id: u8 = proto.NO_PLAYER,
     send_buf: [512]u8 = undefined,
     recv_queue: MsgQueue = .{},
     recv_scratch: [4096]u8 = undefined,
@@ -97,17 +95,9 @@ const ClientState = struct {
 var g_state: ClientState = .{};
 var g_key_queue: inp.KeyQueue = .{};
 
-// Display name for JoinLobby, set via the NAME: stdio line (e.g. hardware
-// controller sessions send "NAME:Board-1" before READY). Written and read
-// only on the stdin thread (send_join runs in the READY handler), so no
-// synchronisation is needed. Capacity matches proto.JoinLobby.name.
-var g_name_buf: [16]u8 = undefined;
-var g_name_len: usize = 0;
-
-// Appetite stat for JoinLobby, set via the STAT:appetite= stdio line before
-// READY (same thread discipline as g_name_buf).  A STAT line arriving AFTER
-// the join re-sends join_lobby so the server picks the value up — join_lobby
-// is idempotent server-side (name refresh in lobby, no-op entity mid-game).
+// Appetite stat for take_slot, set via the STAT:appetite= stdio line BEFORE
+// the JOIN line (hardware controller sessions send it right after spawn).
+// Written and read only on the stdin thread, so no synchronisation needed.
 var g_appetite: u32 = 0;
 
 var g_stdout_mu: std.Thread.Mutex = .{};
@@ -132,8 +122,21 @@ fn stdin_reader(_: void) void {
         const trimmed = std.mem.trimRight(u8, line, "\r");
 
         if (std.mem.eql(u8, trimmed, "READY")) {
+            // The bridge's server socket is open.  Nothing to send: every
+            // connection starts as an observer and the server has already
+            // answered with a game_start.
             g_ready.store(true, .release);
-            send_join();
+        } else if (std.mem.eql(u8, trimmed, "JOIN")) {
+            // The bridge asks this client to take a player seat (hardware
+            // controller sessions send it right after READY).  Silently
+            // ignored by the server when the game is full.
+            send_take_slot();
+        } else if (std.mem.eql(u8, trimmed, "RESTART")) {
+            // The browser tab's report-screen button was clicked: the ONLY
+            // way a next round starts.  It arrives as its own stdio line —
+            // never a KEY: — so no keyboard mash can trigger it, and board
+            // sessions (which have no button) can never send it.
+            send_restart();
         } else if (std.mem.startsWith(u8, trimmed, WIRE_PREFIX)) {
             const hex = trimmed[WIRE_PREFIX.len..];
             const decoded = std.fmt.hexToBytes(&hex_buf, hex) catch |err| {
@@ -146,20 +149,12 @@ fn stdin_reader(_: void) void {
             if (inp.parse_key_name(key_name)) |key| {
                 g_key_queue.push(key);
             }
-        } else if (std.mem.startsWith(u8, trimmed, NAME_PREFIX)) {
-            const name = trimmed[NAME_PREFIX.len..];
-            g_name_len = @min(name.len, g_name_buf.len);
-            @memcpy(g_name_buf[0..g_name_len], name[0..g_name_len]);
         } else if (std.mem.startsWith(u8, trimmed, STAT_APPETITE_PREFIX)) {
             const value = trimmed[STAT_APPETITE_PREFIX.len..];
             g_appetite = std.fmt.parseInt(u32, value, 10) catch {
                 std.log.warn("bad appetite stat line: {s}", .{trimmed});
                 continue;
             };
-            // A board pairing after the join (or updating its stat) must
-            // still reach the server: re-join carries the new appetite and is
-            // idempotent server-side.
-            if (g_ready.load(.acquire)) send_join_lobby();
         }
     }
 }
@@ -168,35 +163,29 @@ fn emit_send(bytes: []const u8) void {
     stdout_writer().write_send(bytes);
 }
 
-fn send_join() void {
-    if (g_state.player_id != 0xFF) {
-        var fbs = std.io.fixedBufferStream(&g_state.send_buf);
-        proto.encode(fbs.writer(), .reconnect, proto.Reconnect{ .player_id = g_state.player_id }) catch return;
-        emit_send(fbs.getWritten());
-    } else {
-        send_join_lobby();
-    }
-}
-
-/// Send join_lobby with the current name and appetite.  Also used to refresh
-/// the appetite after a late STAT: line — the server treats a repeated
-/// join_lobby as a stat/name update, never as a second player.
-fn send_join_lobby() void {
+/// Ask for a player seat, carrying the appetite stat (0 for browsers).  The
+/// server grants it with a personalized game_start, or silently ignores the
+/// request when all seats are taken — either way this connection keeps
+/// receiving the game.
+fn send_take_slot() void {
     var fbs = std.io.fixedBufferStream(&g_state.send_buf);
-    const name: []const u8 = if (g_name_len > 0) g_name_buf[0..g_name_len] else "Player";
-    var p = proto.JoinLobby{
-        .name = [_]u8{0} ** 16,
-        .name_len = @intCast(name.len),
-        .appetite = g_appetite,
-    };
-    @memcpy(p.name[0..name.len], name);
-    proto.encode(fbs.writer(), .join_lobby, p) catch return;
+    proto.encode(fbs.writer(), .take_slot, proto.TakeSlot{ .appetite = g_appetite }) catch return;
     emit_send(fbs.getWritten());
 }
 
-fn send_ready_up() void {
+/// Give the seat up and observe.  The server confirms with a game_start
+/// carrying NO_PLAYER.
+fn send_leave_slot() void {
     var fbs = std.io.fixedBufferStream(&g_state.send_buf);
-    proto.encode(fbs.writer(), .ready_up, {}) catch return;
+    proto.encode(fbs.writer(), .leave_slot, {}) catch return;
+    emit_send(fbs.getWritten());
+}
+
+/// Ask the server to start the next encounter from the end screen.  Ignored
+/// server-side while a game is running.
+fn send_restart() void {
+    var fbs = std.io.fixedBufferStream(&g_state.send_buf);
+    proto.encode(fbs.writer(), .restart, {}) catch return;
     emit_send(fbs.getWritten());
 }
 
@@ -242,31 +231,22 @@ fn process_recv() void {
             continue;
         };
         switch (tag) {
-            .lobby_update => {
-                const p = proto.decode_lobby_update(r) catch |err| {
-                    std.log.err("decode lobby_update: {}", .{err});
-                    continue;
-                };
-                if (p.player_id != 0xFF) {
-                    g_state.player_id = p.player_id;
-                }
-                g_state.lobby.update = p;
-                g_state.lobby.player_id = g_state.player_id;
-                // The server broadcasts a lobby_update right after game_over
-                // (ready flags reset).  Keep showing the outcome screen; the
-                // stored lobby state is used once the player presses a key.
-                if (g_state.phase != .game_over) {
-                    g_state.phase = .lobby;
-                }
-            },
             .game_start => {
+                // Arrives on connect, on every fresh encounter, and whenever
+                // this connection's standing changes (seat granted or given
+                // up).  The snapshot is deliberately KEPT: the next game_state
+                // tick replaces it, and blanking here would flash an empty
+                // board on a mere standing change.
                 const p = proto.decode_game_start(r) catch continue;
                 g_state.player_id = p.player_id;
-                g_state.game = .{};
                 g_state.game.player_id = p.player_id;
+                g_state.game.join_code = p.join_code;
                 g_state.game.casts_per_turn = p.casts_per_turn;
                 g_state.game.encounter_label_len = p.encounter_label_len;
                 @memcpy(g_state.game.encounter_label[0..p.encounter_label_len], p.encounter_label[0..p.encounter_label_len]);
+                // A fresh outro must not survive into the next encounter.
+                g_state.game.final_score = null;
+                g_state.game.final_stats = null;
                 g_state.phase = .game;
             },
             .game_state => {
@@ -277,9 +257,6 @@ fn process_recv() void {
                 const p = proto.decode_game_over(r) catch continue;
                 g_state.game.final_score = p.score;
                 g_state.game.final_stats = p.stats;
-                // Server resets ready flags at game end; mirror locally so the
-                // lobby prompt is correct when the player returns.
-                g_state.lobby.ready = false;
                 g_state.phase = .game_over;
             },
             .action_result => {
@@ -339,19 +316,12 @@ fn process_recv() void {
     }
 }
 
-fn update_lobby() void {
-    const key = g_key_queue.pop() orelse return;
-    switch (key) {
-        .enter => {
-            g_state.lobby.ready = !g_state.lobby.ready;
-            send_ready_up();
-        },
-        else => {},
-    }
-}
-
 fn update_game() void {
     const drained = inp.drain(&g_key_queue);
+    // Seat control first: everything else this frame only matters if the
+    // server considers us seated, and the server processes in order.
+    if (drained.take_seat) send_take_slot();
+    if (drained.leave_seat) send_leave_slot();
     // Aim and choose FIRST: a step or a turn pressed before the trigger must
     // reach the server before the cast it was setting up, or the shape lands
     // at the stale cursor — or is the stale shape.
@@ -378,16 +348,18 @@ pub fn main() !void {
 
         switch (g_state.phase) {
             .connecting => {},
-            .lobby => update_lobby(),
             .game => update_game(),
             .game_over => {
-                if (g_key_queue.pop() != null) {
-                    g_state.phase = .lobby;
-                }
+                // The end screen holds until a browser tab CLICKS the
+                // report's button (the RESTART stdio line); keys do nothing
+                // here, they are only drained so presses made at the buzzer
+                // cannot leak into the next round.  The phase flips when the
+                // server answers with a fresh game_start.
+                _ = g_key_queue.pop();
             },
         }
 
-        out.write_render(g_state.phase, &g_state.lobby, &g_state.game);
+        out.write_render(g_state.phase, &g_state.game);
 
         next_tick += TICK_NS;
         const now = std.time.nanoTimestamp();

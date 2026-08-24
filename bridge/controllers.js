@@ -2,7 +2,7 @@
 
 /**
  * Hardware game-controller support: discovers dc_rp2040 boards on USB serial
- * (CDC), links them with a line protocol, and turns each into player input.
+ * (CDC), links them with a line protocol, and turns each into a player.
  *
  * Line protocol (newline-terminated both ways):
  *   board  -> bridge:  CTRL:HELLO v=1          link accept (reply to GAME:HELLO)
@@ -15,6 +15,13 @@
  *                                              AFTER the save; re-sent on retries)
  *   bridge -> board:   GAME:HELLO v=1          link request (repeated until acked)
  *                      GAME:HB                 1s keepalive
+ *                      GAME:PHASE <game|over>  session phase edge: "game" while
+ *                                              an encounter is actively running,
+ *                                              "over" otherwise (endgame hold,
+ *                                              connecting, no room). Deduped;
+ *                                              sent whenever it changes so the
+ *                                              board only parks on its
+ *                                              controller screen mid-game.
  *                      GAME:SCORE s=<u32> g=<u32>  final team score of a finished
  *                                              game (g = per-game id; retried
  *                                              every 1s until acked, bounded)
@@ -23,19 +30,16 @@
  * Unknown lines in either direction are ignored (the board emits unrelated
  * sibling-link chatter like "dev cnt=..." until the link is established).
  *
- * Hybrid player model — a linked board is assigned by this ladder:
- *   1. Sticky UID (the board's USB serial number = RP2040 flash unique ID):
- *      return to its previous tab pairing or headless player session.
- *   2. Pair with the oldest started TabSession that has no controller —
- *      the board drives that tab's player.
- *   3. Become its own player: spawn a headless ControllerSession (dedicated
- *      Zig client, named Board-N) in the active lobby (single room, else the
- *      newest; see the pickRoom hook).
- *   4. No room yet: wait; the ladder re-runs on every state change.
+ * Player model: every linked board IS a player — it gets its own headless
+ * ControllerSession (dedicated Zig client + server connection) in the active
+ * lobby, which takes one of the game's four seats (JOIN after READY).  A
+ * full game means the board connects as a mere observer: its buttons do
+ * nothing until a seat frees up and it relinks.
  *
- * Unplugging a headless board starts a 30s grace timer on its session —
- * replug inside the window re-attaches to the same player (the Zig process,
- * and thus the player identity, never died). Expiry tears the player down.
+ * Unplugging a board makes its player leave IMMEDIATELY — the server gives
+ * the leaver's hunger/charge shares back to the group and play continues for
+ * everyone else.  A replugged board is a NEW player: the same controller can
+ * never rejoin a game it left.
  */
 
 const { SerialPort } = require("serialport");
@@ -52,8 +56,6 @@ const HELLO_INTERVAL_MS = 1000;
 const HB_INTERVAL_MS = 1000;
 // Link drops after this much CTRL: silence (board sends CTRL:HB every 1s).
 const LINK_TIMEOUT_MS = 3000;
-// Headless player survives this long after its board unplugs.
-const PLAYER_GRACE_MS = 30_000;
 // GAME:SCORE retry cadence and cap. The board's flash save takes ~100ms+
 // (it parks its renderer around the erase), so the ack is never instant;
 // five attempts comfortably outlives any transient CDC hiccup while still
@@ -72,16 +74,16 @@ const KEY_MAP = {
   RIGHT: "ArrowRight",
   A: "1", // shape wheel forward
   B: "2", // shape wheel backward
-  C: "Enter", // cast (realtime) / ready toggle (lobby)
-  D: "Escape", // inert in game; lobby/menu back
+  C: "Enter", // cast (realtime) / dismiss (game over)
+  D: "Escape", // take back the newest lock-in
 };
 
 /**
  * Label of the move this board's player currently has selected, for the
  * e-paper: the wheel is server-authoritative, so the render frame carries an
  * index (`entities[own].selected_shape`) into the balance move table and the
- * caller resolves it against that room's config.  "-" when unknown (lobby,
- * pre-join, or a table that shrank under a stale frame).
+ * caller resolves it against that room's config.  "-" when unknown (observer,
+ * pre-connect, or a table that shrank under a stale frame).
  */
 function shapeFromRender(msg, labels) {
   const game = msg.game;
@@ -129,17 +131,16 @@ class Controller {
     this.manager = manager;
     this.port = null;
     this.linked = false;
-    /** Paired TabSession (board drives that tab's player), or null. */
-    this.session = null;
-    /** Owned headless ControllerSession (board IS the player), or null. */
+    /** Owned headless ControllerSession (the board IS the player), or null. */
     this.playerSession = null;
     this.lastRxMs = 0;
     /** Appetite stat reported by the board (CTRL:STAT), 0 until it arrives.
-     *  Forwarded to whichever player this board drives — it scales that
-     *  player's share of the game's hunger bar (see the Zig server's
-     *  game_logic.player_hunger). */
+     *  Forwarded to the board's player — it scales that player's share of
+     *  the game's hunger bar (see the Zig server's game_logic.player_hunger). */
     this.appetite = 0;
     this.lastShape = null; // last FB:SHAPE payload sent (dedupe)
+    /** Last GAME:PHASE activity sent (boolean), or null before the first. */
+    this.lastActive = null;
     this.helloTimer = null;
     this.hbTimer = null;
     /** In-flight GAME:SCORE ({ line, gid, attempts }), or null. */
@@ -218,9 +219,7 @@ class Controller {
         console.warn(`[ctrl] unknown button '${name}' from ${this.path}`);
         return;
       }
-      if (this.session !== null) {
-        this.manager.onKey(this.session, key);
-      } else if (this.playerSession !== null) {
+      if (this.playerSession !== null) {
         this.playerSession.writeToZig(`KEY:${key}\n`);
       }
       return;
@@ -235,7 +234,11 @@ class Controller {
         return;
       }
       this.appetite = Number(m[1]) >>> 0;
-      this.manager.pushAppetite(this);
+      // Forward to the player; the stat only counts if it lands before the
+      // seat is taken (the server freezes the share at count time).
+      if (this.playerSession !== null) {
+        this.playerSession.writeToZig(`STAT:appetite=${this.appetite}\n`);
+      }
       return;
     }
 
@@ -250,6 +253,18 @@ class Controller {
       return;
     }
     // CTRL:HB and future extensions: keepalive only (lastRxMs above).
+  }
+
+  /**
+   * Push the session phase to the board (deduped): true while an encounter
+   * is actively running, false for endgame hold / connecting / no room. The
+   * board uses this to decide whether to park on its controller screen.
+   * @param {boolean} active
+   */
+  sendPhase(active) {
+    if (!this.linked || active === this.lastActive) return;
+    this.lastActive = active;
+    this.write(`GAME:PHASE ${active ? "game" : "over"}`);
   }
 
   /** Push selected-shape feedback to the board's e-paper (deduped). */
@@ -313,24 +328,21 @@ class Controller {
 }
 
 /**
- * A headless player owned by a hardware controller: dedicated Zig client in
- * a room, no browser. Render frames drive the board's shape feedback.
+ * A player owned by a hardware controller: dedicated Zig client in a room,
+ * no browser. Render frames drive the board's shape feedback.
  */
 class ControllerSession extends PlayerSession {
   /**
    * @param {object} opts
    * @param {string} opts.clientBin
-   * @param {string} opts.name         player name ("Board-1", ...)
    * @param {object} opts.room         LobbyRoom to join
    * @param {Controller} opts.controller
    * @param {ControllerManager} opts.manager
    */
-  constructor({ clientBin, name, room, controller, manager }) {
-    super({ clientBin, label: name });
-    this.name = name;
+  constructor({ clientBin, room, controller, manager }) {
+    super({ clientBin, label: `board-${controller.uid}` });
     this.manager = manager;
     this.controller = controller;
-    this.graceTimer = null;
     this.room = room;
     this.started = true;
     /** msg.phase of the last render frame (game-over edge detection). */
@@ -350,13 +362,17 @@ class ControllerSession extends PlayerSession {
   // ---- PlayerSession hooks --------------------------------------------------
 
   onZigSpawned() {
-    // Before READY (sent on server WS open) so JoinLobby carries the name
-    // and the board's appetite.  A CTRL:STAT that lands later still gets
-    // through: the Zig client re-sends join_lobby on a late STAT line.
-    this.writeToZig(`NAME:${this.name}\n`);
+    // Before READY/JOIN so the take_slot carries the board's appetite.
     if (this.controller !== null) {
       this.writeToZig(`STAT:appetite=${this.controller.appetite}\n`);
     }
+  }
+
+  onServerReady() {
+    // A board IS a player: ask for a seat the moment the connection stands.
+    // Silently ignored by the server when the game is full — the board then
+    // just observes (its buttons do nothing).
+    this.writeToZig("JOIN\n");
   }
 
   onZigFrame(msg, _line) {
@@ -364,6 +380,7 @@ class ControllerSession extends PlayerSession {
       const score = finalScoreFromRender(msg, this.lastPhase);
       this.lastPhase = msg.phase;
       if (this.controller !== null) {
+        this.controller.sendPhase(msg.phase === "game");
         this.controller.sendShape(
           shapeFromRender(msg, this.manager.moveLabels(this.room.configHash)),
         );
@@ -388,41 +405,13 @@ class ControllerSession extends PlayerSession {
     return true;
   }
 
-  // ---- Board attachment -----------------------------------------------------
-
-  /** Board re-linked within the grace window: same player carries on. */
-  attach(controller) {
-    if (this.graceTimer !== null) {
-      clearTimeout(this.graceTimer);
-      this.graceTimer = null;
-    }
-    this.controller = controller;
-    // The stat may have moved while the board was away (it banks appetite on
-    // its own); refresh the player's copy.
-    this.writeToZig(`STAT:appetite=${controller.appetite}\n`);
-    console.log(`[ctrl] ${this.name} re-attached (uid=${controller.uid})`);
-  }
-
-  /** Board unplugged: keep the player alive for PLAYER_GRACE_MS. */
-  detach() {
-    this.controller = null;
-    if (this.closed || this.graceTimer !== null) return;
-    console.log(`[ctrl] ${this.name} board unplugged; dropping player in ${PLAYER_GRACE_MS / 1000}s unless it returns`);
-    this.graceTimer = setTimeout(() => {
-      this.graceTimer = null;
-      this.destroy("grace expired");
-    }, PLAYER_GRACE_MS);
-  }
-
   destroy(reason) {
     if (this.closed) return;
     this.closed = true;
-    if (this.graceTimer !== null) {
-      clearTimeout(this.graceTimer);
-      this.graceTimer = null;
-    }
     this.closeShared();
     if (this.controller !== null) {
+      // No player, no frames: whatever game the board was in is over for it.
+      this.controller.sendPhase(false);
       this.controller.playerSession = null;
       this.controller = null;
     }
@@ -435,14 +424,8 @@ class ControllerManager {
   /**
    * @param {object} hooks
    * @param {string} hooks.clientBin  path to the Zig client binary
-   * @param {() => Iterable<object>} hooks.getSessions  active TabSessions in
-   *   creation order (each gets a `.controller` property managed here)
-   * @param {(session: object, key: string) => void} hooks.onKey  deliver one
-   *   key press to a tab session
-   * @param {(session: object, appetite: number) => void} hooks.onStat  deliver
-   *   a board's appetite stat to a tab session's Zig client
-   * @param {() => object | null} hooks.pickRoom  room for a new headless
-   *   player (null = none available)
+   * @param {() => object | null} hooks.pickRoom  room for a new board player
+   *   (null = none available)
    * @param {(room: object) => void} hooks.roomJoined  occupancy up
    * @param {(room: object) => void} hooks.roomLeft    occupancy down
    * @param {(room: object) => boolean} hooks.isRoomAlive
@@ -450,11 +433,8 @@ class ControllerManager {
    *   labels in balance-file order for a room's config (index space of
    *   `selected_shape`)
    */
-  constructor({ clientBin, getSessions, onKey, onStat, pickRoom, roomJoined, roomLeft, isRoomAlive, moveLabels }) {
+  constructor({ clientBin, pickRoom, roomJoined, roomLeft, isRoomAlive, moveLabels }) {
     this.clientBin = clientBin;
-    this.getSessions = getSessions;
-    this.onKey = onKey;
-    this.onStat = onStat;
     this.pickRoom = pickRoom;
     this.roomJoined = roomJoined;
     this.roomLeft = roomLeft;
@@ -462,12 +442,6 @@ class ControllerManager {
     this.moveLabels = moveLabels;
     /** @type {Map<string, Controller>} port path -> controller */
     this.controllers = new Map();
-    /** @type {Map<string, object>} uid -> TabSession (sticky tab pairing) */
-    this.uidToSession = new Map();
-    /** @type {Map<string, ControllerSession>} uid -> headless player */
-    this.uidToPlayer = new Map();
-    /** @type {Map<string, number>} uid -> Board-N number (bridge lifetime) */
-    this.uidToNumber = new Map();
     this.scanTimer = null;
   }
 
@@ -495,152 +469,65 @@ class ControllerManager {
     this.assign();
   }
 
-  /** Stable per-UID player name for the bridge's lifetime. */
-  nameFor(uid) {
-    let n = this.uidToNumber.get(uid);
-    if (n === undefined) {
-      const used = new Set(this.uidToNumber.values());
-      n = 1;
-      while (used.has(n)) n++;
-      this.uidToNumber.set(uid, n);
-    }
-    return `Board-${n}`;
-  }
-
   /**
-   * Assignment ladder for every linked, unassigned controller (see module
-   * doc). Safe to call on any state change; no-ops when nothing applies.
+   * Give every linked, unassigned board its own player session in the active
+   * lobby (single room, else the newest; see the pickRoom hook).  With no
+   * room yet the board waits; this re-runs on every state change.
    */
   assign() {
     for (const ctrl of this.controllers.values()) {
-      if (!ctrl.linked || ctrl.session !== null || ctrl.playerSession !== null) continue;
-
-      // 1a. Sticky tab pairing: while the previous tab is alive the claim
-      //     holds — the board waits for it rather than serving another tab.
-      const prevTab = this.uidToSession.get(ctrl.uid);
-      if (prevTab !== undefined && !prevTab.closed) {
-        if (prevTab.started && prevTab.controller === null) this.pair(ctrl, prevTab);
-        continue;
-      }
-
-      // 1b. Sticky headless player: replug within the grace window.
-      const prevPlayer = this.uidToPlayer.get(ctrl.uid);
-      if (prevPlayer !== undefined && !prevPlayer.closed) {
-        prevPlayer.attach(ctrl);
-        ctrl.playerSession = prevPlayer;
-        continue;
-      }
-
-      // 2. Pair with the oldest started tab session lacking a controller.
-      let paired = false;
-      for (const session of this.getSessions()) {
-        if (session.started && session.controller === null) {
-          this.pair(ctrl, session);
-          paired = true;
-          break;
-        }
-      }
-      if (paired) continue;
-
-      // 3. Become an independent player in the active lobby.
+      if (!ctrl.linked || ctrl.playerSession !== null) continue;
       const room = this.pickRoom();
-      if (room !== null) {
-        this.makePlayer(ctrl, room);
-        continue;
-      }
-
-      // 4. No room yet: wait for the next state change.
-    }
-  }
-
-  pair(ctrl, session) {
-    ctrl.session = session;
-    session.controller = ctrl;
-    this.uidToSession.set(ctrl.uid, session);
-    this.uidToPlayer.delete(ctrl.uid); // pairing modes are exclusive per uid
-    // Force a fresh shape push for the new pairing.
-    ctrl.lastShape = null;
-    ctrl.sendShape("-");
-    // The board's appetite applies to the tab's player from now on.
-    this.pushAppetite(ctrl);
-    console.log(`[ctrl] paired uid=${ctrl.uid} to a tab session`);
-  }
-
-  /** Forward a board's appetite stat to whichever player it drives. */
-  pushAppetite(ctrl) {
-    if (ctrl.session !== null) {
-      this.onStat(ctrl.session, ctrl.appetite);
-    } else if (ctrl.playerSession !== null) {
-      ctrl.playerSession.writeToZig(`STAT:appetite=${ctrl.appetite}\n`);
+      if (room === null) continue;
+      this.makePlayer(ctrl, room);
     }
   }
 
   makePlayer(ctrl, room) {
-    const name = this.nameFor(ctrl.uid);
     const player = new ControllerSession({
       clientBin: this.clientBin,
-      name,
       room,
       controller: ctrl,
       manager: this,
     });
     ctrl.playerSession = player;
-    this.uidToPlayer.set(ctrl.uid, player);
-    this.uidToSession.delete(ctrl.uid); // pairing modes are exclusive per uid
     ctrl.lastShape = null;
     player.start();
-    console.log(`[ctrl] uid=${ctrl.uid} joined room ${room.code} as ${name}`);
+    console.log(`[ctrl] uid=${ctrl.uid} joined room ${room.code}`);
   }
 
-  /** A tab session started in a room: boards may pair or join its lobby. */
+  /** A room appeared or changed: waiting boards may now get a player. */
   sessionStarted() {
     this.assign();
   }
 
-  /**
-   * A tab session left its room or closed: detach its controller. Sticky UID
-   * mapping is kept only while the session can come back (still open).
-   * @param {object} session
-   * @param {{ forget?: boolean }} [opts]  forget: drop the sticky mapping too
-   */
-  releaseSession(session, { forget = false } = {}) {
-    const ctrl = session.controller;
-    if (ctrl) {
-      ctrl.session = null;
-      session.controller = null;
-    }
-    if (forget) {
-      for (const [uid, s] of this.uidToSession) {
-        if (s === session) this.uidToSession.delete(uid);
-      }
-    }
-    this.assign();
-  }
-
-  /** A headless player died (grace expiry, dead room, spawn failure). */
+  /** A board player died (board unplug, dead room, spawn failure). */
   playerDestroyed(player, reason) {
-    for (const [uid, p] of this.uidToPlayer) {
-      if (p === player) this.uidToPlayer.delete(uid);
-    }
-    console.log(`[ctrl] player ${player.name} destroyed (${reason})`);
+    console.log(`[ctrl] player ${player.label} destroyed (${reason})`);
     // Its board may still be linked (e.g. room died) — reassign it.
     this.assign();
   }
 
-  /** Serial port gone or link dead: tear down and allow re-discovery. */
+  /**
+   * Serial port gone or link dead: the board's player leaves IMMEDIATELY.
+   * Closing the player's server WS is what tells the game server (its
+   * Handler.close → Session.disconnect gives the leaver's hunger/charge
+   * shares back to the group); a replugged board is a brand-new player.
+   *
+   * The controller is closed and deregistered BEFORE the session teardown:
+   * teardown re-runs the assignment pass, which must not see this board.
+   */
   dropController(ctrl) {
     if (ctrl.closed) return;
-    if (ctrl.session) {
-      ctrl.session.controller = null;
-      ctrl.session = null;
-    }
-    if (ctrl.playerSession) {
-      ctrl.playerSession.detach(); // grace window starts
-      ctrl.playerSession = null;
-    }
+    const player = ctrl.playerSession;
+    ctrl.playerSession = null;
     ctrl.close();
     this.controllers.delete(ctrl.path);
     console.log(`[ctrl] dropped ${ctrl.path} (uid=${ctrl.uid})`);
+    if (player) {
+      player.controller = null;
+      player.destroy("controller disconnected");
+    }
   }
 }
 

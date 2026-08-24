@@ -205,13 +205,12 @@ fn drain(raw: []const u8, arena: std.mem.Allocator) ![]Msg {
 /// Returns false if decoding fails (truncated stream).
 fn consume_payload(tag: proto.MsgTag, r: anytype) bool {
     return switch (tag) {
-        .join_lobby => if (proto.decode_join_lobby(r)) |_| true else |_| false,
-        .reconnect => if (proto.decode_reconnect(r)) |_| true else |_| false,
-        .ready_up => true, // zero-payload
+        .take_slot => if (proto.decode_take_slot(r)) |_| true else |_| false,
+        .leave_slot => true, // zero-payload
+        .restart => true, // zero-payload
         .cycle_shape => if (proto.decode_cycle_shape(r)) |_| true else |_| false,
         .cast => true, // zero-payload
         .cancel_cast => true, // zero-payload
-        .lobby_update => if (proto.decode_lobby_update(r)) |_| true else |_| false,
         .game_start => if (proto.decode_game_start(r)) |_| true else |_| false,
         .game_state => if (proto.decode_game_state(r)) |_| true else |_| false,
         .action_result => if (proto.decode_action_result(r)) |_| true else |_| false,
@@ -259,11 +258,13 @@ fn game_over_msg(msgs: []const Msg) !proto.GameOver {
 // Session setup helpers
 // ---------------------------------------------------------------------------
 
-fn enqueue_msg(sess: *Session, pid: u8, comptime tag: proto.MsgTag, payload: anytype) !void {
+/// Queue one wire message on a connection.  Harness sessions seat players in
+/// connection order, so a TestPlayer's pid doubles as its connection id.
+fn enqueue_msg(sess: *Session, conn_id: usize, comptime tag: proto.MsgTag, payload: anytype) !void {
     var buf: [256]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     try proto.encode(fbs.writer(), tag, payload);
-    sess.enqueue_message(pid, fbs.getWritten());
+    sess.enqueue_message(conn_id, fbs.getWritten());
 }
 
 /// Turn `pid`'s wheel one step.  Selection is server state, so tests steer it
@@ -392,18 +393,24 @@ fn init_two_player_session_cfg(
 
     self.sess = try Session.init_seeded(allocator, "TSTKEY".*, cfg, seed);
 
-    const pid0 = self.sess.join(self.p[0].transport(), "") orelse return error.JoinFailed;
-    const pid1 = self.sess.join(self.p[1].transport(), "") orelse return error.JoinFailed;
+    // Connect two transports and seat both — directly, not over the wire,
+    // because seating over the wire needs a tick and the encounter has not
+    // started yet.  Connection ids and seat ids both count up from 0, so a
+    // TestPlayer's pid doubles as its connection id everywhere below.
+    const pid0 = try seat_player(&self.sess, self.p[0].transport(), 0);
+    const pid1 = try seat_player(&self.sess, self.p[1].transport(), 0);
     self.p[0].pid = pid0;
     self.p[1].pid = pid1;
+}
 
-    const slot0 = &self.sess.players[pid0];
-    @memcpy(slot0.name[0..5], "Alice");
-    slot0.name_len = 5;
-
-    const slot1 = &self.sess.players[pid1];
-    @memcpy(slot1.name[0..3], "Bob");
-    slot1.name_len = 3;
+/// Connect `transport` and take a seat with `appetite`.  Returns the seat id,
+/// which equals the connection id for sessions built strictly this way.
+fn seat_player(sess: *Session, transport: shared.Transport, appetite: u32) !u8 {
+    const conn_id = sess.connect(transport) orelse return error.JoinFailed;
+    try sess.take_slot(conn_id, appetite);
+    const pid = sess.connections[conn_id].player_id orelse return error.JoinFailed;
+    std.debug.assert(@as(usize, pid) == conn_id);
+    return pid;
 }
 
 /// Start `encounter` with the pinned seed.
@@ -425,14 +432,6 @@ fn HungerBase(comptime base: u16) type {
             .encounters = fixtures.test_config.encounters,
         };
     };
-}
-
-/// Join one more player into an already-built session, for the few tests about
-/// groups that need MORE than a pair.  The extra player has no TestPlayer, so
-/// its outbound bytes go to the session's own sink and are not inspected —
-/// these tests assert on session state, not on what the newcomer was told.
-fn join_extra(s: *TwoPlayerSession, name: []const u8) !u8 {
-    return s.sess.join(s.p[0].transport(), name) orelse error.JoinFailed;
 }
 
 /// Overwrite the whole grid with one cell value — the deterministic setup for
@@ -478,10 +477,10 @@ fn set_block_field(sess: *Session, cell: c.SlimeCell, row: u8, col: u8) void {
 }
 
 // ---------------------------------------------------------------------------
-// Lobby
+// Connections, seats and observers
 // ---------------------------------------------------------------------------
 
-test "join sets name in lobby_update" {
+test "a new connection is an observer and is told so by game_start" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -490,21 +489,23 @@ test "join sets name in lobby_update" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
+    try start(&s, &enc_fifty_green);
 
-    s.p[0].clear();
-    try s.sess.broadcast_lobby_update();
+    var watcher = TestPlayer{};
+    watcher.init(allocator);
+    defer watcher.deinit(allocator);
+    _ = s.sess.connect(watcher.transport()) orelse return error.JoinFailed;
 
-    const msgs0 = try drain(s.p[0].buf.items, arena);
-    const lu_msg = find_tag(msgs0, .lobby_update) orelse return error.NoLobbyUpdate;
-    var fbs = std.io.fixedBufferStream(lu_msg.payload);
-    const lu = try proto.decode_lobby_update(fbs.reader());
-
-    try std.testing.expectEqual(@as(u8, 2), lu.player_count);
-    try std.testing.expectEqualSlices(u8, "Alice", lu.players[0].name[0..lu.players[0].name_len]);
-    try std.testing.expectEqualSlices(u8, "Bob", lu.players[1].name[0..lu.players[1].name_len]);
+    const msgs = try drain(watcher.buf.items, arena);
+    const gs_msg = find_tag(msgs, .game_start) orelse return error.NoGameStart;
+    var fbs = std.io.fixedBufferStream(gs_msg.payload);
+    const gs = try proto.decode_game_start(fbs.reader());
+    try std.testing.expectEqual(proto.NO_PLAYER, gs.player_id);
+    // The game id travels with it, so the observer can show who to tell.
+    try std.testing.expectEqualSlices(u8, "TSTKEY", &gs.join_code);
 }
 
-test "lobby_update carries correct player_id" {
+test "an observer receives game_state broadcasts but its game input is ignored" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -513,21 +514,31 @@ test "lobby_update carries correct player_id" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
+    try start(&s, &enc_fifty_green);
 
-    s.p[0].clear();
-    s.p[1].clear();
-    try s.sess.broadcast_lobby_update();
+    var watcher = TestPlayer{};
+    watcher.init(allocator);
+    defer watcher.deinit(allocator);
+    const conn_id = s.sess.connect(watcher.transport()) orelse return error.JoinFailed;
 
-    inline for (.{ 0, 1 }) |i| {
-        const msgs = try drain(s.p[i].buf.items, arena);
-        const m = find_tag(msgs, .lobby_update) orelse return error.NoLobbyUpdate;
-        var fbs = std.io.fixedBufferStream(m.payload);
-        const lu = try proto.decode_lobby_update(fbs.reader());
-        try std.testing.expectEqual(s.p[i].pid, lu.player_id);
-    }
+    // A whole turn's worth of gameplay input from a seatless connection: the
+    // stream stays in sync (the cycle decodes) and nothing changes.
+    const pending_before = s.sess.pending_count;
+    var buf: [16]u8 = undefined;
+    var wfbs = std.io.fixedBufferStream(&buf);
+    try proto.encode(wfbs.writer(), .cycle_shape, proto.CycleShape{ .dir = .forward });
+    try proto.encode(wfbs.writer(), .cast, {});
+    s.sess.enqueue_message(conn_id, wfbs.getWritten());
+    watcher.clear();
+    try flush(&s.sess);
+    try std.testing.expectEqual(pending_before, s.sess.pending_count);
+
+    // But the broadcasts flow: observers watch the same game.
+    const msgs = try drain(watcher.buf.items, arena);
+    try std.testing.expect(find_tag(msgs, .game_state) != null);
 }
 
-test "ready flow starts the default encounter with the configured grid" {
+test "the session starts its encounter with the configured grid and seats sum the bar" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -537,14 +548,9 @@ test "ready flow starts the default encounter with the configured grid" {
     try init_two_player_session(&s, allocator);
     defer s.deinit();
 
-    try enqueue_msg(&s.sess, s.p[0].pid, .ready_up, {});
-    try flush(&s.sess);
-    try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
-
     s.p[0].clear();
-    try enqueue_msg(&s.sess, s.p[1].pid, .ready_up, {});
-    try flush(&s.sess);
-    try std.testing.expectEqual(session_mod.SessionPhase.playing, s.sess.phase);
+    try s.sess.start_game(DEFAULT_ENC.label);
+    try s.sess.broadcast_game_start(DEFAULT_ENC.label);
 
     const msgs = try drain(s.p[0].buf.items, arena);
     const gs_msg = find_tag(msgs, .game_start) orelse return error.NoGameStart;
@@ -555,16 +561,73 @@ test "ready flow starts the default encounter with the configured grid" {
         DEFAULT_ENC.label,
         gs.encounter_label[0..gs.encounter_label_len],
     );
+    // A seated receiver is addressed by seat, not as an observer.
+    try std.testing.expectEqual(s.p[0].pid, gs.player_id);
     // The client needs the grid dimensions and the cast budget up front.
     try std.testing.expectEqual(BAL.slime_grid.rows, gs.grid_rows);
     try std.testing.expectEqual(BAL.slime_grid.cols, gs.grid_cols);
     try std.testing.expectEqual(BAL.casts_per_turn, gs.casts_per_turn);
+    try std.testing.expectEqual(s.sess.charges, gs.charges);
 
     // The bar is the players' appetite contributions summed — two appetite-0
     // players here, so twice the base.
     try std.testing.expectEqual(2 * logic.player_hunger(BAL, 0), s.sess.hunger.max);
     try std.testing.expectEqual(@as(u16, 0), s.sess.hunger.current);
     try std.testing.expectEqual(DEFAULT_ENC.total_units(), s.sess.slime_total);
+}
+
+test "the fifth take_slot is silently ignored" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+
+    // Fill the remaining seats (MAX_PLAYERS = 4; two are taken).
+    var extra_conns: [3]usize = undefined;
+    for (&extra_conns) |*cid| {
+        cid.* = s.sess.connect(s.p[0].transport()) orelse return error.JoinFailed;
+    }
+    try s.sess.take_slot(extra_conns[0], 0);
+    try s.sess.take_slot(extra_conns[1], 0);
+    try std.testing.expectEqual(@as(u8, 4), s.sess.seated_players());
+
+    // The fifth asker: no error, no seat, still an observer.
+    const bar_before = s.sess.hunger.max;
+    const charges_before = s.sess.charges;
+    try s.sess.take_slot(extra_conns[2], 0);
+    try std.testing.expectEqual(@as(u8, 4), s.sess.seated_players());
+    try std.testing.expectEqual(@as(?u8, null), s.sess.connections[extra_conns[2]].player_id);
+    try std.testing.expectEqual(bar_before, s.sess.hunger.max);
+    try std.testing.expectEqual(charges_before, s.sess.charges);
+}
+
+test "leave_slot frees the seat, keeps the connection observing" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+
+    s.p[1].clear();
+    try enqueue_msg(&s.sess, s.p[1].pid, .leave_slot, {});
+    try flush(&s.sess);
+
+    try std.testing.expectEqual(@as(u8, 1), s.sess.seated_players());
+    try std.testing.expectEqual(@as(?u8, null), s.sess.connections[@as(usize, s.p[1].pid)].player_id);
+    // The connection stays: it is told it now observes, and keeps receiving
+    // the game.
+    const msgs = try drain(s.p[1].buf.items, arena);
+    const gs_msg = find_tag(msgs, .game_start) orelse return error.NoGameStart;
+    var fbs = std.io.fixedBufferStream(gs_msg.payload);
+    const gs = try proto.decode_game_start(fbs.reader());
+    try std.testing.expectEqual(proto.NO_PLAYER, gs.player_id);
+    try std.testing.expect(find_tag(msgs, .game_state) != null);
 }
 
 // ---------------------------------------------------------------------------
@@ -613,7 +676,7 @@ test "every player starts the first turn with a full cast budget" {
 
     try std.testing.expectEqual(@as(u16, 1), s.sess.turn);
     for (&s.sess.players, 0..) |*slot, pid| {
-        if (!slot.connected) continue;
+        if (!slot.occupied) continue;
         try std.testing.expectEqual(BUDGET, s.sess.casts_left[pid]);
     }
 }
@@ -788,6 +851,7 @@ test "a cast fires the selected move" {
     paint_grid(&s.sess, tiered(.green));
 
     const pid = s.p[0].pid;
+    const pool_before = s.sess.charges;
     aim_at(&s.sess, pid, 3, 3);
     try enqueue_cast_as(&s.sess, pid, SWEEP);
     try flush_and_resolve(&s.sess);
@@ -797,7 +861,7 @@ test "a cast fires the selected move" {
     try std.testing.expectEqual(@as(u16, 3), count_defused(&s.sess));
     try std.testing.expectEqual(
         BAL.player_recipes[SWEEP].cost,
-        enc_fifty_green.charges - s.sess.charges,
+        pool_before - s.sess.charges,
     );
 }
 
@@ -2112,7 +2176,7 @@ test "a group broadcasts one shape_cast and one team recipe fire" {
     // pokes that bought it.
     try std.testing.expectEqual(@as(u16, 13), count_defused(&s.sess));
     try std.testing.expectEqual(@as(u16, 1), s.sess.stats.team_recipe_hits[TWIN_BLOOM]);
-    try std.testing.expectEqual(session_mod.SessionPhase.playing, s.sess.phase);
+    try std.testing.expect(!s.sess.restart_pending);
 
     // Each player was charged exactly one cast slot: a group is one purchase
     // made together, not an extra one.
@@ -2262,24 +2326,26 @@ const enc_thin_pool = enc.Encounter{
     .slime = .{ .tiered = .{ 0, 0, 50 } },
 };
 
-test "the pool starts at the encounter's charges and is not refilled by a turn" {
+test "the pool starts at the seed grown per seat and is not refilled by a turn" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
     try start(&s, &enc_thin_pool);
-    try std.testing.expectEqual(@as(u32, 10), s.sess.charges);
+    // The encounter seeds 10; the second seat grows it by its proportion
+    // (see logic.grow_charges), so the pair opens with 20.
+    try std.testing.expectEqual(@as(u32, 20), s.sess.charges);
 
     aim_at(&s.sess, s.p[0].pid, 2, 5);
     try enqueue_cast_as(&s.sess, s.p[0].pid, BLOCK); // costs the default 1
     try flush_and_resolve(&s.sess);
-    try std.testing.expectEqual(@as(u32, 9), s.sess.charges);
+    try std.testing.expectEqual(@as(u32, 19), s.sess.charges);
 
     // Crossing a turn boundary must NOT hand the charge back: the pool is the
     // budget for the whole encounter, not for the turn.
     try end_turn_mid_game(&s.sess);
-    try std.testing.expectEqual(@as(u32, 9), s.sess.charges);
+    try std.testing.expectEqual(@as(u32, 19), s.sess.charges);
 }
 
 test "each recipe debits its own cost, and a free recipe debits nothing" {
@@ -2291,6 +2357,7 @@ test "each recipe debits its own cost, and a free recipe debits nothing" {
     try start(&s, &enc_thin_pool);
     paint_grid(&s.sess, tiered(.green));
     s.sess.field.reservoir = .{};
+    s.sess.charges = 10; // pin the pool; growth is covered elsewhere
 
     aim_at(&s.sess, s.p[0].pid, 2, 5);
     try enqueue_cast_as(&s.sess, s.p[0].pid, TRICKLE); // cost 0
@@ -2318,6 +2385,7 @@ test "a cast the pool cannot afford changes nothing at all" {
     try start(&s, &enc_thin_pool);
     paint_grid(&s.sess, tiered(.green));
     s.sess.field.reservoir = .{};
+    s.sess.charges = 10; // pin the pool; growth is covered elsewhere
 
     // Drain the pool to 1 with one deluge.
     aim_at(&s.sess, s.p[0].pid, 2, 2);
@@ -2376,6 +2444,7 @@ test "a group is charged the group cost INSTEAD of its components' costs" {
     try start(&s, &enc_thin_pool);
     paint_grid(&s.sess, tiered(.green));
     s.sess.field.reservoir = .{};
+    s.sess.charges = 10; // pin the pool; growth is covered elsewhere
 
     // A lock-in reserves nothing on its own: the pool is untouched until the
     // whole turn is priced.
@@ -2438,7 +2507,7 @@ test "eating everything ends the game with reason field_cleared" {
     // One feast eats all 40 and the reservoir has nothing to send back.
     try end_turn_idly(&s.sess);
 
-    try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
+    try std.testing.expect(s.sess.restart_pending);
     try std.testing.expectEqual(@as(u32, 40), s.sess.score); // every neutral unit scores
     try std.testing.expect(s.sess.field.is_exhausted());
 
@@ -2469,7 +2538,7 @@ test "a full hunger bar ends the game with slime left over" {
     s.p[0].clear();
     try end_turn_idly(&s.sess);
 
-    try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
+    try std.testing.expect(s.sess.restart_pending);
     try std.testing.expectEqual(@as(u16, 6), s.sess.hunger.current); // clamped at max
 
     const go = try game_over_msg(try drain(s.p[0].buf.items, arena));
@@ -2526,7 +2595,7 @@ test "field_cleared wins the tie when the last bite fills the bar" {
     s.p[0].clear();
     try end_turn_idly(&s.sess); // the feast eats 2 units for 2 hunger
 
-    try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
+    try std.testing.expect(s.sess.restart_pending);
     const go = try game_over_msg(try drain(s.p[0].buf.items, arena));
     try std.testing.expectEqual(proto.EndReason.field_cleared, go.stats.reason);
 }
@@ -2566,7 +2635,7 @@ test "an empty pool ends the game even when the feast is still eating" {
     s.p[0].clear();
     try end_turn_idly(&s.sess);
 
-    try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
+    try std.testing.expect(s.sess.restart_pending);
     const msgs = try drain(s.p[0].buf.items, arena);
     const te_msg = find_tag(msgs, .turn_ended) orelse return error.NoTurnEnded;
     var te_fbs = std.io.fixedBufferStream(te_msg.payload);
@@ -2593,7 +2662,7 @@ test "a pool that can still afford the cheapest move keeps the game going" {
     s.sess.charges = fixtures.priced_config.balance.cheapest_cost();
     try end_turn_idly(&s.sess);
 
-    try std.testing.expectEqual(session_mod.SessionPhase.playing, s.sess.phase);
+    try std.testing.expect(!s.sess.restart_pending);
 }
 
 test "going broke mid-turn strands the casts still owed and settles the turn" {
@@ -2623,7 +2692,7 @@ test "going broke mid-turn strands the casts still owed and settles the turn" {
     // Settled in the same drain as the cast: no second flush, and Bob was never
     // asked for input he had no way to spend.
     try std.testing.expectEqual(@as(u32, 0), s.sess.charges);
-    try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
+    try std.testing.expect(s.sess.restart_pending);
 
     const msgs = try drain(s.p[0].buf.items, arena);
     try std.testing.expect(find_tag(msgs, .turn_ended) != null);
@@ -2651,7 +2720,7 @@ test "a free move keeps a bankrupt team playing" {
     // somewhere to go.
     try end_turn_idly(&s.sess);
 
-    try std.testing.expectEqual(session_mod.SessionPhase.playing, s.sess.phase);
+    try std.testing.expect(!s.sess.restart_pending);
     try std.testing.expectEqual(BUDGET, s.sess.casts_left[s.p[0].pid]);
 }
 
@@ -2710,21 +2779,90 @@ test "the game-ending turn sends the post-feast board before game_over" {
     try std.testing.expectEqual(s.sess.hunger.current, gs.hunger.current);
 }
 
-test "game over resets ready flags" {
+test "the end screen holds — no new game, no broadcasts — until a restart arrives" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_neutral_only);
+    s.sess.hunger.current = 7; // some progress, to prove the later reset
+    try end_turn_idly(&s.sess); // eats everything -> field_cleared
+    try std.testing.expect(s.sess.restart_pending);
+
+    // Ticks pass; nothing moves and nothing is sent — the final board and the
+    // report already went out, and the room is waiting on a human.
+    s.p[0].clear();
+    try flush(&s.sess);
+    try flush(&s.sess);
+    try std.testing.expect(s.sess.restart_pending);
+    try std.testing.expectEqual(@as(usize, 0), s.p[0].buf.items.len);
+
+    // A restart (any connection — in play it is the browser tab) begins the
+    // config's default encounter; nobody re-joins.
+    try enqueue_msg(&s.sess, s.p[0].pid, .restart, {});
+    try flush(&s.sess);
+    try std.testing.expect(!s.sess.restart_pending);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.turn);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.hunger.current);
+    try std.testing.expectEqual(@as(u8, 2), s.sess.seated_players());
+    try std.testing.expectEqual(2 * logic.player_hunger(BAL, 0), s.sess.hunger.max);
+    try std.testing.expectEqual(DEFAULT_ENC.total_units(), s.sess.slime_total);
+    // The pool re-seeds exactly as if the pair had taken fresh seats one by
+    // one: seed, grown once for the second player.
+    var want_pool: u32 = DEFAULT_ENC.charges;
+    logic.grow_charges(&want_pool, 1);
+    try std.testing.expectEqual(want_pool, s.sess.charges);
+
+    // Everyone is told, from their own standing.
+    const msgs = try drain(s.p[0].buf.items, arena);
+    const gs_msg = find_tag(msgs, .game_start) orelse return error.NoGameStart;
+    var fbs = std.io.fixedBufferStream(gs_msg.payload);
+    const gs = try proto.decode_game_start(fbs.reader());
+    try std.testing.expectEqual(s.p[0].pid, gs.player_id);
+    try std.testing.expectEqualSlices(u8, DEFAULT_ENC.label, gs.encounter_label[0..gs.encounter_label_len]);
+}
+
+test "a restart mid-game is a stray key and changes nothing" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    s.sess.players[s.p[0].pid].ready = true;
-    s.sess.players[s.p[1].pid].ready = true;
+    try start(&s, &enc_fifty_green);
+    const turn_before = s.sess.turn;
+    const field_before = s.sess.field.remaining();
+
+    try enqueue_msg(&s.sess, s.p[0].pid, .restart, {});
+    try flush(&s.sess);
+
+    try std.testing.expect(!s.sess.restart_pending);
+    try std.testing.expectEqual(turn_before, s.sess.turn);
+    try std.testing.expectEqual(field_before, s.sess.field.remaining());
+}
+
+test "an observer's restart works at the end screen" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
     try start(&s, &enc_neutral_only);
-
     try end_turn_idly(&s.sess);
+    try std.testing.expect(s.sess.restart_pending);
 
-    try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
-    try std.testing.expect(!s.sess.players[s.p[0].pid].ready);
-    try std.testing.expect(!s.sess.players[s.p[1].pid].ready);
+    // The room's display is an observer connection; its key starts the round.
+    var watcher = TestPlayer{};
+    watcher.init(allocator);
+    defer watcher.deinit(allocator);
+    const conn_id = s.sess.connect(watcher.transport()) orelse return error.JoinFailed;
+    try enqueue_msg(&s.sess, conn_id, .restart, {});
+    try flush(&s.sess);
+    try std.testing.expect(!s.sess.restart_pending);
+    try std.testing.expectEqual(@as(u16, 1), s.sess.turn);
 }
 
 // ---------------------------------------------------------------------------
@@ -2803,20 +2941,19 @@ test "match stats: feast tallies, players and recipes are reported" {
     // nothing is the report's most useful number, so it is tracked on its own.
     try std.testing.expectEqual(@as(u16, 3), st.feast.sheltered);
     try std.testing.expectEqual(@as(u16, @intCast(8 * BAL.hunger_cost_normal)), st.feast.hunger_normal);
-    // Two casts at the fixture default of 1 charge each, out of a pool of 50.
+    // Two casts at the fixture default of 1 charge each, out of a pool of
+    // 100 (the encounter's 50, grown once for the second seat).
     try std.testing.expectEqual(@as(u16, 2), st.feast.charges_spent);
-    try std.testing.expectEqual(@as(u32, 48), st.feast.charges_left);
+    try std.testing.expectEqual(@as(u32, 98), st.feast.charges_left);
     // Score = every unit eaten, defused or neutral alike.
     try std.testing.expectEqual(@as(u32, 8), go.score);
 
-    // Players: dense, named, coverage attribution + recipe participation.
+    // Players: dense, coverage attribution + recipe participation.
     try std.testing.expectEqual(@as(u8, 2), st.player_count);
-    try std.testing.expectEqualSlices(u8, "Alice", st.players[0].name[0..st.players[0].name_len]);
     try std.testing.expectEqual(@as(u16, 1), st.players[0].casts);
     try std.testing.expectEqual(@as(u16, 1), st.players[0].cells_covered);
     try std.testing.expectEqual(@as(u16, 1), st.players[0].cells_neutralized);
     try std.testing.expectEqual(@as(u16, 1), st.players[0].recipe_casts);
-    try std.testing.expectEqualSlices(u8, "Bob", st.players[1].name[0..st.players[1].name_len]);
     try std.testing.expectEqual(@as(u16, 3), st.players[1].cells_covered);
     try std.testing.expectEqual(@as(u16, 1), st.players[1].recipe_casts);
 
@@ -3035,6 +3172,7 @@ test "game_state carries the shared charge pool as it drains" {
     try start(&s, &enc_thin_pool);
     paint_grid(&s.sess, tiered(.green));
     s.sess.field.reservoir = .{};
+    s.sess.charges = 10; // pin the pool; growth is covered elsewhere
 
     s.p[0].clear();
     try flush(&s.sess);
@@ -3117,30 +3255,34 @@ test "a late joiner gets game_start with the grid dimensions and an entity" {
     var late = TestPlayer{};
     late.init(allocator);
     defer late.deinit(allocator);
-    const late_pid = s.sess.join(late.transport(), "Zed") orelse return error.JoinFailed;
+    const conn_id = s.sess.connect(late.transport()) orelse return error.JoinFailed;
+
+    try enqueue_msg(&s.sess, conn_id, .take_slot, proto.TakeSlot{});
+    try flush(&s.sess);
+    const late_pid = s.sess.connections[conn_id].player_id orelse return error.JoinFailed;
     late.pid = late_pid;
 
-    var name = proto.JoinLobby{ .name = [_]u8{0} ** 16, .name_len = 3 };
-    @memcpy(name.name[0..3], "Zed");
-    try enqueue_msg(&s.sess, late_pid, .join_lobby, name);
-    try flush(&s.sess);
-
     const msgs = try drain(late.buf.items, arena);
-    const gs_msg = find_tag(msgs, .game_start) orelse return error.NoGameStart;
-    var fbs = std.io.fixedBufferStream(gs_msg.payload);
-    const start_msg = try proto.decode_game_start(fbs.reader());
-    try std.testing.expectEqual(BAL.slime_grid.rows, start_msg.grid_rows);
-    try std.testing.expectEqual(BAL.slime_grid.cols, start_msg.grid_cols);
-    try std.testing.expectEqual(late_pid, start_msg.player_id);
+    // Two game_starts: the observer one from connect, then the seat grant.
+    var start_msg: ?proto.GameStart = null;
+    for (msgs) |m| {
+        if (m.tag != .game_start) continue;
+        var fbs = std.io.fixedBufferStream(m.payload);
+        start_msg = try proto.decode_game_start(fbs.reader());
+    }
+    const granted = start_msg orelse return error.NoGameStart;
+    try std.testing.expectEqual(BAL.slime_grid.rows, granted.grid_rows);
+    try std.testing.expectEqual(BAL.slime_grid.cols, granted.grid_cols);
+    try std.testing.expectEqual(late_pid, granted.player_id);
     try std.testing.expect(s.sess.players[late_pid].entity != session_mod.NO_ENTITY);
 
     // The joiner arrives with a full budget for the turn already in progress,
     // and holds it open until they have cast.
-    try std.testing.expectEqual(BAL.casts_per_turn, start_msg.casts_per_turn);
+    try std.testing.expectEqual(BAL.casts_per_turn, granted.casts_per_turn);
     try std.testing.expectEqual(BUDGET, s.sess.casts_left[late_pid]);
 }
 
-test "a repeated join_lobby does not duplicate the player's entity" {
+test "a repeated take_slot does not duplicate the player's entity" {
     // One player MUST own exactly one player_marker entity: snapshots are built
     // by walking that array, and both the client's batch projection and the
     // group matcher treat one entity as one caster.  A duplicate would project
@@ -3155,23 +3297,21 @@ test "a repeated join_lobby does not duplicate the player's entity" {
     var late = TestPlayer{};
     late.init(allocator);
     defer late.deinit(allocator);
-    const late_pid = s.sess.join(late.transport(), "Zed") orelse return error.JoinFailed;
-    late.pid = late_pid;
-
-    var name = proto.JoinLobby{ .name = [_]u8{0} ** 16, .name_len = 3 };
-    @memcpy(name.name[0..3], "Zed");
+    const conn_id = s.sess.connect(late.transport()) orelse return error.JoinFailed;
 
     const before = s.sess.world.component_arrays.player_marker.size;
-    try enqueue_msg(&s.sess, late_pid, .join_lobby, name);
+    try enqueue_msg(&s.sess, conn_id, .take_slot, proto.TakeSlot{});
     try flush(&s.sess);
     const after_first = s.sess.world.component_arrays.player_marker.size;
     try std.testing.expectEqual(before + 1, after_first);
 
-    // A client that re-sends its name (reconnect handshake, retry, duplicate
-    // input) must not gain a second body.
-    try enqueue_msg(&s.sess, late_pid, .join_lobby, name);
+    // A client that re-asks for a seat (retry, duplicate input) must not gain
+    // a second body — nor a second seat.
+    const seated_before = s.sess.seated_players();
+    try enqueue_msg(&s.sess, conn_id, .take_slot, proto.TakeSlot{});
     try flush(&s.sess);
     try std.testing.expectEqual(after_first, s.sess.world.component_arrays.player_marker.size);
+    try std.testing.expectEqual(seated_before, s.sess.seated_players());
 
     // ...and no two player entities may report the same owner.
     const pm = &s.sess.world.component_arrays.player_marker;
@@ -3183,17 +3323,23 @@ test "a repeated join_lobby does not duplicate the player's entity" {
     }
 }
 
-test "disconnect in the lobby frees the slot" {
+test "a closed connection frees its seat and entity" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
+    try start(&s, &enc_fifty_green);
 
-    try std.testing.expectEqual(@as(u8, 2), s.sess.player_count);
-    s.sess.disconnect(s.p[1].pid);
-    try std.testing.expectEqual(@as(u8, 1), s.sess.player_count);
+    try std.testing.expectEqual(@as(u8, 2), s.sess.seated_players());
+    const entity = s.sess.players[s.p[1].pid].entity;
+    try std.testing.expect(entity != session_mod.NO_ENTITY);
+
+    s.sess.disconnect(@as(usize, s.p[1].pid));
+    try std.testing.expectEqual(@as(u8, 1), s.sess.seated_players());
     try std.testing.expect(!s.sess.players[s.p[1].pid].occupied);
+    try std.testing.expect(!s.sess.connections[@as(usize, s.p[1].pid)].active);
+    try std.testing.expectEqual(session_mod.NO_ENTITY, s.sess.players[s.p[1].pid].entity);
 }
 
 // ---------------------------------------------------------------------------
@@ -3229,25 +3375,13 @@ test "the same seed replays the same field; a different seed diverges" {
 }
 
 // ---------------------------------------------------------------------------
-// Appetite → hunger capacity
+// Appetite → hunger capacity, and the pools on join/leave
 //
-// The bar's capacity is the SUM of every present player's contribution,
+// The bar's capacity is the SUM of every seated player's contribution,
 // min(hunger_base + appetite * appetite_scale, hunger_player_cap) each — see
-// game_logic.player_hunger.  Appetite arrives with join_lobby (a board's
+// game_logic.player_hunger.  Appetite arrives with take_slot (a board's
 // persistent flash stat, forwarded by the bridge); everyone else is 0.
 // ---------------------------------------------------------------------------
-
-/// Send `pid`'s join_lobby carrying `appetite` — the wire path a board-backed
-/// player's stat actually takes.
-fn enqueue_join(sess: *Session, pid: u8, name: []const u8, appetite: u32) !void {
-    var p = proto.JoinLobby{
-        .name = [_]u8{0} ** 16,
-        .name_len = @intCast(name.len),
-        .appetite = appetite,
-    };
-    @memcpy(p.name[0..name.len], name);
-    try enqueue_msg(sess, pid, .join_lobby, p);
-}
 
 test "the hunger bar sums each player's appetite contribution" {
     const allocator = std.testing.allocator;
@@ -3256,10 +3390,10 @@ test "the hunger bar sums each player's appetite contribution" {
     try init_two_player_session(&s, allocator);
     defer s.deinit();
 
-    // Alice joins with a board that has banked an appetite of 4; Bob has none.
-    try enqueue_join(&s.sess, s.p[0].pid, "Alice", 4);
-    try enqueue_join(&s.sess, s.p[1].pid, "Bob", 0);
-    try flush(&s.sess);
+    // Alice's board banked an appetite of 4; Bob has none.  The start
+    // recounts from the seats, so setting the slot stat directly is the same
+    // as having seated with it.
+    s.sess.players[s.p[0].pid].appetite = 4;
 
     try start(&s, &enc_fifty_green);
 
@@ -3269,25 +3403,26 @@ test "the hunger bar sums each player's appetite contribution" {
     try std.testing.expectEqual(@as(u16, 220), s.sess.hunger.max);
 }
 
-test "a repeated join_lobby cannot inflate the bar" {
+test "a repeated take_slot cannot inflate the bar" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try enqueue_join(&s.sess, s.p[0].pid, "Alice", 4);
-    try flush(&s.sess);
     try start(&s, &enc_fifty_green);
     const before = s.sess.hunger.max;
+    const pool_before = s.sess.charges;
 
-    // The Zig client re-sends join_lobby when a stat line lands late; the
-    // share is frozen at count time, so nothing may move.
-    try enqueue_join(&s.sess, s.p[0].pid, "Alice", 9);
+    // A duplicate ask from a connection that already holds a seat: the share
+    // is frozen at count time, so nothing may move — not the bar, not the
+    // pool.
+    try enqueue_msg(&s.sess, s.p[0].pid, .take_slot, proto.TakeSlot{ .appetite = 9 });
     try flush(&s.sess);
     try std.testing.expectEqual(before, s.sess.hunger.max);
+    try std.testing.expectEqual(pool_before, s.sess.charges);
 }
 
-test "a mid-game joiner grows the bar by their own contribution" {
+test "a mid-game joiner grows the bar by their contribution and the pool by their proportion" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -3295,21 +3430,25 @@ test "a mid-game joiner grows the bar by their own contribution" {
     defer s.deinit();
     try start(&s, &enc_fifty_green);
     const before = s.sess.hunger.max; // 200: two appetite-0 players
+    s.sess.charges = 60; // two players hold 30 each
 
     var late = TestPlayer{};
     late.init(allocator);
     defer late.deinit(allocator);
-    const late_pid = s.sess.join(late.transport(), "Zed") orelse return error.JoinFailed;
-    try enqueue_join(&s.sess, late_pid, "Zed", 2);
+    const conn_id = s.sess.connect(late.transport()) orelse return error.JoinFailed;
+    try enqueue_msg(&s.sess, conn_id, .take_slot, proto.TakeSlot{ .appetite = 2 });
     try flush(&s.sess);
 
     try std.testing.expectEqual(
         before + logic.player_hunger(BAL, 2),
         s.sess.hunger.max,
     );
+    // The pool grows by the joiner's proportion of what remains: 60/2 = 30,
+    // so all three now hold 30 each (see logic.grow_charges).
+    try std.testing.expectEqual(@as(u32, 90), s.sess.charges);
 }
 
-test "a mid-game leave gives back the leaver's UNUSED share; a rejoin brings it all back" {
+test "a mid-game leave gives back the leaver's UNUSED hunger share and 1/n of the charges" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -3317,31 +3456,95 @@ test "a mid-game leave gives back the leaver's UNUSED share; a rejoin brings it 
     defer s.deinit();
     try start(&s, &enc_fifty_green); // bar 200 (100 each)
 
-    // Half the bar already eaten when Bob leaves: half of his 100 was still
-    // unused, so exactly 50 comes off — and nothing already eaten moves.
+    // Half the bar already eaten and part of the pool already spent when Bob
+    // leaves.  Half of his 100 hunger was still unused, so exactly 50 comes
+    // off; charges are pooled, so as one of two counted players he takes half
+    // of what REMAINS — what the team spent stays spent.
     s.sess.hunger.current = 100;
-    s.sess.disconnect(s.p[1].pid);
+    s.sess.charges = 30;
+    s.sess.disconnect(@as(usize, s.p[1].pid));
     try std.testing.expectEqual(@as(u16, 150), s.sess.hunger.max);
     try std.testing.expectEqual(@as(u16, 100), s.sess.hunger.current);
+    try std.testing.expectEqual(@as(u32, 15), s.sess.charges);
 
-    // Bob returns: his FULL share rejoins the bar (the asymmetry is the
-    // deliberate price of leaving), and a second reconnect changes nothing.
-    try std.testing.expect(s.sess.reconnect(s.p[1].pid, s.p[1].transport()));
-    try std.testing.expectEqual(@as(u16, 250), s.sess.hunger.max);
-    try std.testing.expect(s.sess.reconnect(s.p[1].pid, s.p[1].transport()));
-    try std.testing.expectEqual(@as(u16, 250), s.sess.hunger.max);
+    // The game rolls on for whoever stayed.
+    try std.testing.expect(!s.sess.restart_pending);
 }
 
-test "a lobby disconnect does not touch hunger accounting" {
+test "an observer's disconnect touches neither pool" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-
-    // Still in the lobby: the slot simply empties; the next start recomputes
-    // the bar from whoever is present.
-    s.sess.disconnect(s.p[1].pid);
     try start(&s, &enc_fifty_green);
-    try std.testing.expectEqual(logic.player_hunger(BAL, 0), s.sess.hunger.max);
+
+    // A transport connects mid-game but never takes a seat: no share of
+    // either pool, so its disconnect gives nothing back.
+    var lurker = TestPlayer{};
+    lurker.init(allocator);
+    defer lurker.deinit(allocator);
+    const conn_id = s.sess.connect(lurker.transport()) orelse return error.JoinFailed;
+
+    const hunger_before = s.sess.hunger.max;
+    const charges_before = s.sess.charges;
+    s.sess.disconnect(conn_id);
+    try std.testing.expectEqual(hunger_before, s.sess.hunger.max);
+    try std.testing.expectEqual(charges_before, s.sess.charges);
+    try std.testing.expect(!s.sess.restart_pending);
+}
+
+test "the last player out leaves the pool in trust for the next taker" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    s.sess.charges = 24;
+
+    // Both leave.  The first takes their half; the LAST takes nothing — a
+    // pool that went to 0 here would greet the next joiner with an
+    // unplayable game (the first joiner inherits the pool as their seed).
+    s.sess.disconnect(@as(usize, s.p[0].pid));
+    try std.testing.expectEqual(@as(u32, 12), s.sess.charges);
+    s.sess.disconnect(@as(usize, s.p[1].pid));
+    try std.testing.expectEqual(@as(u32, 12), s.sess.charges);
+    try std.testing.expectEqual(@as(u8, 0), s.sess.seated_players());
+
+    // The next taker inherits it unchanged.
+    var next = TestPlayer{};
+    next.init(allocator);
+    defer next.deinit(allocator);
+    const conn_id = s.sess.connect(next.transport()) orelse return error.JoinFailed;
+    try s.sess.take_slot(conn_id, 0);
+    try std.testing.expectEqual(@as(u32, 12), s.sess.charges);
+}
+
+test "a freed seat can be taken by a NEW connection, which counts in fresh" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green); // bar 200, two seats
+    s.sess.charges = 40;
+
+    // Bob leaves: bar 100 (his unused share gone), pool 20.
+    s.sess.disconnect(@as(usize, s.p[1].pid));
+    try std.testing.expectEqual(@as(u16, 100), s.sess.hunger.max);
+    try std.testing.expectEqual(@as(u32, 20), s.sess.charges);
+
+    // A newcomer takes the freed seat: their FULL share joins the bar and
+    // the pool grows by their proportion of what remains.
+    var next = TestPlayer{};
+    next.init(allocator);
+    defer next.deinit(allocator);
+    const conn_id = s.sess.connect(next.transport()) orelse return error.JoinFailed;
+    try enqueue_msg(&s.sess, conn_id, .take_slot, proto.TakeSlot{});
+    try flush(&s.sess);
+
+    try std.testing.expectEqual(@as(u8, 2), s.sess.seated_players());
+    try std.testing.expectEqual(@as(u16, 200), s.sess.hunger.max);
+    try std.testing.expectEqual(@as(u32, 40), s.sess.charges);
 }

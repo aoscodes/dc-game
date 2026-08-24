@@ -8,7 +8,6 @@ pub const Writer = struct {
     pub fn write_render(
         self: Writer,
         phase: ClientPhaseTag,
-        lobby: *const LobbyState,
         game: *GameState,
     ) void {
         self.mu.lock();
@@ -17,7 +16,7 @@ pub const Writer = struct {
         // strings plus the full entity/stats payload.
         var frame_buf: [32768]u8 = undefined;
         var w = std.io.Writer.fixed(&frame_buf);
-        write_render_inner(&w, phase, lobby, game) catch return;
+        write_render_inner(&w, phase, game) catch return;
         w.writeByte('\n') catch return;
         const out = std.fs.File.stdout();
         out.writeAll(w.buffered()) catch return;
@@ -41,19 +40,16 @@ pub const Writer = struct {
     }
 };
 
-pub const ClientPhaseTag = enum { connecting, lobby, game, game_over };
-
-pub const LobbyState = struct {
-    update: proto.LobbyUpdate = std.mem.zeroes(proto.LobbyUpdate),
-    player_id: u8 = 0xFF,
-    ready: bool = false,
-};
+pub const ClientPhaseTag = enum { connecting, game, game_over };
 
 pub const LastActionEntry = struct { entity: u32, anim: c.ActionAnimation };
 
 pub const GameState = struct {
     snapshot: proto.GameState = proto.GameState.blank,
-    player_id: u8 = 0xFF,
+    /// The seat this connection holds, or NO_PLAYER while observing.
+    player_id: u8 = proto.NO_PLAYER,
+    /// The session's join code — the game id, from game_start.
+    join_code: [6]u8 = [_]u8{'-'} ** 6,
     /// Casts each player gets per turn, as announced in game_start.  Constant
     /// for the whole encounter, so the renderer can draw a budget gauge.
     casts_per_turn: u8 = 0,
@@ -87,23 +83,8 @@ pub const GameState = struct {
 fn write_render_inner(
     w: *std.io.Writer,
     phase: ClientPhaseTag,
-    lobby: *const LobbyState,
     game: *const GameState,
 ) !void {
-    const jc_end = std.mem.indexOfScalar(u8, &lobby.update.join_code, 0) orelse lobby.update.join_code.len;
-
-    var players_buf: [proto.MAX_PLAYERS]JsonPlayer = undefined;
-    for (0..lobby.update.player_count) |i| {
-        const p = lobby.update.players[i];
-        players_buf[i] = .{
-            .id = p.player_id,
-            .name = p.name[0..p.name_len],
-            .kind = p.kind,
-            .ready = p.ready,
-            .connected = p.connected,
-        };
-    }
-
     var entities_buf: [proto.MAX_ENTITIES_WIRE]JsonEntity = undefined;
     for (0..game.snapshot.entity_count) |i| {
         const e = &game.snapshot.entities[i];
@@ -185,7 +166,6 @@ fn write_render_inner(
         if (game.final_stats) |*ms| {
             for (ms.players[0..ms.player_count], 0..) |ps, i| {
                 pstats_buf[i] = .{
-                    .name = ps.name[0..ps.name_len],
                     .casts = ps.casts,
                     .cells_covered = ps.cells_covered,
                     .cells_neutralized = ps.cells_neutralized,
@@ -219,12 +199,6 @@ fn write_render_inner(
     const frame = JsonRenderFrame{
         .tag = "render",
         .phase = phase,
-        .lobby = if (phase == .lobby) JsonLobby{
-            .join_code = lobby.update.join_code[0..jc_end],
-            .player_id = lobby.update.player_id,
-            .ready = lobby.ready,
-            .players = players_buf[0..lobby.update.player_count],
-        } else null,
         // Carried in `game_over` too, not just `game`.  The renderer plays the
         // closing feast as its outro, and that needs the same payload a normal
         // turn end gets: the post-feast board plus the `turn_ended` that
@@ -234,7 +208,9 @@ fn write_render_inner(
         // the outro starts once and the frames after it are static.
         .game = if (phase == .game or phase == .game_over) JsonGame{
             .encounter = game.encounter_label[0..game.encounter_label_len],
+            .join_code = &game.join_code,
             .player_id = game.player_id,
+            .observer = game.player_id == proto.NO_PLAYER,
             .casts_per_turn = game.casts_per_turn,
             .turn = game.snapshot.turn,
             .tick = game.snapshot.tick,
@@ -313,7 +289,6 @@ const HexBytes = struct {
 const JsonRenderFrame = struct {
     tag: []const u8,
     phase: ClientPhaseTag,
-    lobby: ?JsonLobby,
     game: ?JsonGame,
     score: ?u32,
     stats: ?JsonMatchStats,
@@ -342,7 +317,6 @@ const JsonFeastStats = struct {
 };
 
 const JsonPlayerStats = struct {
-    name: []const u8,
     casts: u16,
     /// Hazard cells this player's stamps downgraded, and how many of those
     /// went all the way to defused.
@@ -367,21 +341,6 @@ const JsonMatchStats = struct {
     casts_total: u16,
 };
 
-const JsonLobby = struct {
-    join_code: []const u8,
-    player_id: u8,
-    ready: bool,
-    players: []const JsonPlayer,
-};
-
-const JsonPlayer = struct {
-    id: u8,
-    name: []const u8,
-    kind: c.EntityKind,
-    ready: bool,
-    connected: bool,
-};
-
 /// Hunger bar: current fills toward max, one point per unit eaten, and never
 /// falls.  Nothing in the game undoes hunger — the only question is whether the
 /// team clears the field before the bar does.
@@ -392,7 +351,12 @@ const JsonHunger = struct {
 
 const JsonGame = struct {
     encounter: []const u8,
+    /// The session's join code — the game id, shown so others can join.
+    join_code: []const u8,
+    /// The viewer's seat, or 0xFF when observing.
     player_id: u8,
+    /// True while this connection holds no seat: input is P-to-join only.
+    observer: bool,
     /// Casts each player gets per turn, from game_start.
     casts_per_turn: u8,
     /// The turn now being played, 1-based.

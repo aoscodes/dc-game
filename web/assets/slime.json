@@ -1,0 +1,14 @@
+{
+  "frame_w": 20,
+  "frame_h": 20,
+  "frames": {
+    "hard": 0,
+    "medium": 1,
+    "soft": 2,
+    "goo": 3,
+    "hard_invert": 4,
+    "medium_invert": 5,
+    "soft_invert": 6,
+    "goo_invert": 7
+  }
+}

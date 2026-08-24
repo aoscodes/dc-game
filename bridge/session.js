@@ -6,17 +6,23 @@
  * server (with reconnect backoff).  The server sees each PlayerSession as a
  * distinct player.
  *
+ * Every connection starts as an OBSERVER of the room's always-running game;
+ * taking one of the four player seats is an explicit protocol step (the
+ * browser's P key, or the JOIN stdio line for boards).
+ *
  * Two kinds extend it:
  *   - TabSession        (index.js)       browser tab: renders frames to the
  *                                        tab WebSocket, keys come from the
- *                                        browser (and a paired controller)
+ *                                        browser
  *   - ControllerSession (controllers.js) headless hardware-controller player:
  *                                        no browser, render frames feed the
  *                                        board's e-paper shape feedback
  *
  * Stdio protocol with the Zig client (see README):
  *   stdin  <- WIRE:<hex>\n  raw server bytes    stdin <- KEY:<name>\n
- *   stdin  <- NAME:<name>\n display name        stdin <- READY\n
+ *   stdin  <- READY\n       server WS is open   stdin <- JOIN\n  take a seat
+ *   stdin  <- STAT:appetite=<n>\n board flash stat
+ *   stdin  <- RESTART\n     start the next round (tab button click)
  *   stdout -> {"tag":"render",...}\n            stdout -> {"tag":"send","bytes":"<hex>"}\n
  */
 
@@ -60,6 +66,13 @@ class PlayerSession {
   onZigSpawnError(_err) {}
 
   /**
+   * The server WS just opened (READY was sent to the Zig client).  Fires on
+   * every (re)connect — a reconnected socket is a brand-new observer to the
+   * server, so anything standing-related must be re-asked here.
+   */
+  onServerReady() {}
+
+  /**
    * Server WS dropped (not by teardown). Return true to run the reconnect
    * backoff loop; false if the subclass took over (e.g. dead room teardown).
    */
@@ -99,6 +112,7 @@ class PlayerSession {
       this.serverConnected = true;
       this.reconnectDelay  = RECONNECT_INITIAL_MS;
       this.writeToZig("READY\n");
+      this.onServerReady();
     });
 
     ws.on("message", (data) => {

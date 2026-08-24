@@ -1,10 +1,23 @@
-//! Game session: lobby management + authoritative Slime Feast game loop.
+//! Game session: the authoritative Slime Feast game loop.
 //!
-//! One Session instance per active game room.  The session owns:
-//!   - The ECS World (player entities + Lil Guy entities)
+//! One Session instance per active game room.  A game is ALWAYS either
+//! running or holding at its end screen: the session starts its first
+//! encounter the moment it is created, and a finished encounter waits on a
+//! `restart` message (a browser tab clicking the report's button) before
+//! the next one begins.  There is no lobby.
+//!
+//! CONNECTIONS and PLAYERS are decoupled.  Every websocket is a Connection:
+//! it receives every broadcast (the game is a spectator sport by default)
+//! and holds no game state.  A connection becomes a player by sending
+//! `take_slot`, which binds it to one of MAX_PLAYERS PlayerSlots — silently
+//! ignored when all slots are taken.  `leave_slot` (or the socket closing)
+//! releases the slot: the leaver's hunger/charge shares go back to the
+//! group and play continues for everyone else.
+//!
+//! The session owns:
+//!   - The connection registry (transports + per-connection input queues)
+//!   - The ECS World (player entities)
 //!   - The authoritative slime field (grid + reservoir)
-//!   - The per-player connection transports
-//!   - The state machine (lobby → playing → ended)
 //!   - The match PRNG: every random choice in the game comes from this one
 //!     seeded generator, so a session is reproducible from its seed.
 //!
@@ -121,28 +134,41 @@ pub const GameWorld = ecs.World(
 
 pub const MAX_PLAYERS = proto.MAX_PLAYERS;
 
+/// Connection registry size.  Comfortably above the bridge's tab cap plus
+/// every board that could plausibly plug in; a connection beyond this is
+/// refused outright.
+pub const MAX_CONNECTIONS = 16;
+
 /// "No entity" sentinel for slot references.
 pub const NO_ENTITY: ecs.Entity = std.math.maxInt(ecs.Entity);
 
-pub const PlayerSlot = struct {
-    occupied: bool = false,
-    connected: bool = false,
-    player_id: u8,
-    name: [16]u8 = [_]u8{0} ** 16,
-    name_len: u8 = 0,
-    /// The player's appetite stat, from join_lobby: a board's persistent
-    /// flash counter, or 0 for browsers/bots.  Read when the player is folded
-    /// into the hunger bar (game start or mid-game join).
-    appetite: u32 = 0,
-    ready: bool = false,
-    entity: ecs.Entity = std.math.maxInt(ecs.Entity),
+/// One websocket attached to the session.  Pure transport + input queue:
+/// game state lives on the PlayerSlot a connection may (or may not) hold.
+pub const Connection = struct {
+    active: bool = false,
     transport: ?shared.Transport = null,
+    /// The player slot this connection holds, or null while observing.
+    player_id: ?u8 = null,
     queue_lock: std.Thread.Mutex = .{},
     msg_queue: std.ArrayListUnmanaged(u8) = .empty,
     allocator: std.mem.Allocator = undefined,
 };
 
-pub const SessionPhase = enum { lobby, playing };
+/// One of the MAX_PLAYERS seats in the game.  Bound to a connection while
+/// occupied; everything a player IS (entity, shares, budgets) hangs off the
+/// slot index, so releasing the seat is what makes a player leave.
+pub const PlayerSlot = struct {
+    occupied: bool = false,
+    player_id: u8,
+    /// The player's appetite stat, from take_slot: a board's persistent
+    /// flash counter, or 0 for browsers/bots.  Read when the player is folded
+    /// into the hunger bar.
+    appetite: u32 = 0,
+    entity: ecs.Entity = std.math.maxInt(ecs.Entity),
+    /// Index into the session's connection registry; meaningful only while
+    /// occupied.
+    conn: usize = 0,
+};
 
 pub const Session = struct {
     allocator: std.mem.Allocator,
@@ -150,9 +176,14 @@ pub const Session = struct {
     /// Loaded balance + encounter data; owned by the caller and must outlive
     /// the session.
     cfg: *const cfg_mod.Config,
+    connections: [MAX_CONNECTIONS]Connection,
     players: [MAX_PLAYERS]PlayerSlot,
-    player_count: u8 = 0,
-    phase: SessionPhase = .lobby,
+    /// An encounter just ended: the session is holding at the END SCREEN.
+    /// Turn machinery and state broadcasts pause (the final board already
+    /// went out with game_over); input still drains, because the `restart`
+    /// that starts the next encounter — and seat changes — arrive through
+    /// it.  Cleared by start_game.
+    restart_pending: bool = false,
     world: GameWorld,
     tick_count: u32 = 0,
     current_encounter: ?*const enc.Encounter = null,
@@ -202,8 +233,8 @@ pub const Session = struct {
     pending: [logic.MAX_CASTS]logic.TurnCast = undefined,
     pending_count: usize = 0,
     /// Tuning stats accumulated over the match; broadcast with game_over.
-    /// `players` is indexed by player_id during play and compacted (dense,
-    /// names filled) in end_game.
+    /// `players` is indexed by player_id during play and compacted (dense)
+    /// in end_game.
     stats: proto.MatchStats = .{},
     /// The ONE source of randomness for the match: cell placement, target
     /// selection and neutralize subsets all draw from it, so a session
@@ -214,6 +245,11 @@ pub const Session = struct {
     /// `seed` pins the match PRNG.  Callers that want reproducible games
     /// (tests, replays) pass a fixed value; production passes a clock seed
     /// via `init`.
+    ///
+    /// The session is returned BEFORE its first encounter runs: callers must
+    /// follow up with `start_game` (a game is always running from then on).
+    /// Split this way because the encounter machinery needs the session at
+    /// its final address.
     pub fn init_seeded(
         allocator: std.mem.Allocator,
         join_code: [6]u8,
@@ -222,10 +258,11 @@ pub const Session = struct {
     ) !Session {
         var players: [MAX_PLAYERS]PlayerSlot = undefined;
         for (&players, 0..) |*p, i| {
-            p.* = PlayerSlot{
-                .player_id = @intCast(i),
-                .allocator = allocator,
-            };
+            p.* = PlayerSlot{ .player_id = @intCast(i) };
+        }
+        var connections: [MAX_CONNECTIONS]Connection = undefined;
+        for (&connections) |*conn| {
+            conn.* = Connection{ .allocator = allocator };
         }
         var world = try GameWorld.init(allocator);
         set_world_system_signatures(&world);
@@ -233,6 +270,7 @@ pub const Session = struct {
             .allocator = allocator,
             .join_code = join_code,
             .cfg = cfg,
+            .connections = connections,
             .players = players,
             .world = world,
             // Sized properly at game start; a 1x1 empty field until then.
@@ -257,72 +295,94 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session) void {
         self.world.deinit();
-        for (&self.players) |*p| {
-            p.queue_lock.lock();
-            p.msg_queue.deinit(p.allocator);
-            p.queue_lock.unlock();
+        for (&self.connections) |*conn| {
+            conn.queue_lock.lock();
+            conn.msg_queue.deinit(conn.allocator);
+            conn.queue_lock.unlock();
         }
     }
 
-    pub fn join(self: *Session, transport: shared.Transport, name: []const u8) ?u8 {
-        for (&self.players) |*p| {
-            if (!p.occupied) {
-                p.occupied = true;
-                p.connected = true;
-                p.transport = transport;
-                const n = @min(name.len, 16);
-                @memcpy(p.name[0..n], name[0..n]);
-                p.name_len = @intCast(n);
-                p.ready = false;
-                self.player_count += 1;
-                return p.player_id;
-            }
+    /// Register a new websocket as an observer and send it a personalized
+    /// game_start (player_id = NO_PLAYER) so its client can render the game
+    /// that is already running.  Returns the connection id, or null when the
+    /// registry is full.
+    pub fn connect(self: *Session, transport: shared.Transport) ?usize {
+        for (&self.connections, 0..) |*conn, i| {
+            if (conn.active) continue;
+            conn.active = true;
+            conn.transport = transport;
+            conn.player_id = null;
+            self.send_game_start_to_conn(i) catch {};
+            return i;
         }
         return null;
     }
 
-    pub fn reconnect(self: *Session, player_id: u8, transport: shared.Transport) bool {
-        if (player_id >= MAX_PLAYERS) return false;
-        const p = &self.players[player_id];
-        if (!p.occupied) {
-            if (self.phase != .lobby) return false;
-            p.occupied = true;
-            self.player_count += 1;
-        }
-        p.connected = true;
-        p.transport = transport;
-        // Rejoining a live game counts them back into the bar.  Their FULL
-        // share, not the sliver their departure gave back: a returning eater
-        // brings a whole appetite, and the asymmetry is deliberate.
-        if (self.phase == .playing) self.count_hunger_share(player_id);
-        return true;
+    /// A websocket closed: release its player slot (if it held one) and drop
+    /// the connection.  Play continues for everyone else.
+    pub fn disconnect(self: *Session, conn_id: usize) void {
+        if (conn_id >= MAX_CONNECTIONS) return;
+        const conn = &self.connections[conn_id];
+        if (!conn.active) return;
+        if (conn.player_id) |pid| self.release_slot(pid);
+        conn.active = false;
+        conn.transport = null;
+        conn.player_id = null;
+        conn.queue_lock.lock();
+        conn.msg_queue.clearRetainingCapacity();
+        conn.queue_lock.unlock();
     }
 
-    pub fn disconnect(self: *Session, player_id: u8) void {
+    /// A player gives up their seat: their unused hunger share and their
+    /// proportion of the remaining charges go back to the group, their
+    /// entity disappears, and the seat opens up.  Only a COUNTED player
+    /// (non-zero hunger share) takes anything with them.
+    fn release_slot(self: *Session, player_id: u8) void {
         if (player_id >= MAX_PLAYERS) return;
-        const p = &self.players[player_id];
-        p.connected = false;
-        p.transport = null;
-        if (self.phase == .lobby) {
-            p.occupied = false;
-            p.ready = false;
-            p.name_len = 0;
-            self.player_count -= 1;
-        } else {
-            // Mid-game: the bar gives back this player's unused share.
-            self.uncount_hunger_share(player_id);
+        const slot = &self.players[player_id];
+        if (!slot.occupied) return;
+        if (self.hunger_share[player_id] != 0) {
+            // The leaver's proportion is 1/n of the REMAINING pool, where n
+            // includes them.  The LAST player out takes nothing: the pool is
+            // left in trust for whoever sits down next (the first joiner
+            // inherits it as their seed, see take_slot/grow_charges), so an
+            // empty game never becomes an unplayable one.
+            const n = self.counted_players();
+            if (n > 1) {
+                const before = self.charges;
+                logic.shrink_charges(&self.charges, n);
+                std.log.info("player {} left — charges {} -> {} ({} players counted)", .{
+                    player_id, before, self.charges, n,
+                });
+            }
         }
+        self.uncount_hunger_share(player_id);
+        if (slot.entity != NO_ENTITY) {
+            self.world.destroy_entity(slot.entity);
+            slot.entity = NO_ENTITY;
+        }
+        slot.occupied = false;
+        slot.appetite = 0;
+        self.connections[slot.conn].player_id = null;
     }
 
-    pub fn all_ready(self: *const Session) bool {
-        var connected: u8 = 0;
-        var ready: u8 = 0;
-        for (&self.players) |*p| {
-            if (!p.connected) continue;
-            connected += 1;
-            if (p.ready) ready += 1;
+    /// How many players currently hold a share of the pools (see
+    /// `hunger_share`: non-zero exactly for counted players).
+    fn counted_players(self: *const Session) u32 {
+        var n: u32 = 0;
+        for (&self.hunger_share) |share| {
+            if (share != 0) n += 1;
         }
-        return connected > 0 and connected == ready;
+        return n;
+    }
+
+    /// How many seats are taken.
+    pub fn seated_players(self: *const Session) u8 {
+        var n: u8 = 0;
+        for (&self.players) |*p| {
+            if (p.occupied) n += 1;
+        }
+        return n;
     }
 
     pub fn start_game(self: *Session, encounter_label: []const u8) !void {
@@ -341,7 +401,7 @@ pub const Session = struct {
         };
         self.tick_count = 0;
 
-        self.phase = .playing;
+        self.restart_pending = false;
         self.current_encounter = encounter;
         self.pending_count = 0;
         // Everyone opens on the first move in the table: the encounter is a
@@ -351,16 +411,24 @@ pub const Session = struct {
         self.turn = 1;
         self.reset_budgets();
 
-        // The bar's capacity is the SUM of every present player's
+        // The bar's capacity is the SUM of every seated player's
         // appetite-derived contribution — there is no per-encounter budget
         // any more, so a bigger or hungrier team simply has more room to eat.
         self.hunger = .{ .current = 0, .max = 0 };
         self.hunger_share = [_]u16{0} ** MAX_PLAYERS;
         for (&self.players) |*p| {
-            if (!p.occupied or !p.connected) continue;
+            if (!p.occupied) continue;
             self.count_hunger_share(p.player_id);
         }
+        // The pool a seated team opens with is exactly what it would hold had
+        // they taken their seats one by one into a fresh game: the encounter's
+        // seed, grown once per player past the first (see logic.grow_charges).
+        // An EMPTY game holds the bare seed until someone sits down.
         self.charges = encounter.charges;
+        var grown: u32 = 1;
+        while (grown < self.counted_players()) : (grown += 1) {
+            logic.grow_charges(&self.charges, grown);
+        }
         self.score = 0;
         self.slime_total = encounter.total_units();
         self.field = slime.SlimeField.init(
@@ -390,9 +458,8 @@ pub const Session = struct {
 
     /// Fold one player into the hunger bar's capacity.  IDEMPOTENT: a player
     /// already counted (share non-zero) is left alone, so a repeated
-    /// join_lobby or reconnect can never inflate the bar.  The share is
-    /// FROZEN at count time — a later appetite update changes nothing until
-    /// the next game.
+    /// take_slot can never inflate the bar.  The share is FROZEN at count
+    /// time — a later appetite update changes nothing until the next game.
     fn count_hunger_share(self: *Session, player_id: u8) void {
         if (player_id >= MAX_PLAYERS) return;
         if (self.hunger_share[player_id] != 0) return;
@@ -401,7 +468,7 @@ pub const Session = struct {
         self.hunger.max +|= share;
     }
 
-    /// A counted player left mid-game: give back their share of the UNUSED
+    /// A counted player left the game: give back their share of the UNUSED
     /// capacity only (see game_logic.shrink_hunger_max).  What was already
     /// eaten stays eaten, so the bar never drops below `current`; a departure
     /// that leaves it exactly full ends the game through the ordinary
@@ -412,19 +479,19 @@ pub const Session = struct {
         if (share == 0) return;
         self.hunger_share[player_id] = 0;
         logic.shrink_hunger_max(&self.hunger, share);
-        std.log.info("player {} left mid-game — hunger bar now {}/{}", .{
+        std.log.info("player {} left — hunger bar now {}/{}", .{
             player_id, self.hunger.current, self.hunger.max,
         });
     }
 
-    /// Give every connected player their avatar entity.
+    /// Give every seated player their avatar entity.
     ///
     /// The Lil Guys have no server representation: they eat the whole field at
     /// turn end regardless of how many there are, so they are purely a client
     /// animation of `turn_ended`.
     fn spawn_players(self: *Session) !void {
         for (&self.players) |*p| {
-            if (!p.occupied or !p.connected) {
+            if (!p.occupied) {
                 p.entity = NO_ENTITY;
                 continue;
             }
@@ -437,8 +504,8 @@ pub const Session = struct {
     }
 
     /// Refill every player's cast budget for a new turn.  Budgets are set for
-    /// ALL slots, connected or not: a player who joins or reconnects mid-turn
-    /// gets a usable budget rather than a stuck 0.
+    /// ALL slots, seated or not: a player who takes a seat mid-turn gets a
+    /// usable budget rather than a stuck 0.
     fn reset_budgets(self: *Session) void {
         self.casts_left = [_]u8{self.cfg.balance.casts_per_turn} ** MAX_PLAYERS;
     }
@@ -456,15 +523,19 @@ pub const Session = struct {
         try self.drain_queues();
         self.profiler.end(.drain);
 
-        if (self.phase != .playing) return;
+        // Holding at the end screen: the board is final and already
+        // broadcast, so nothing below has anything to add.  The drain above
+        // is what lets a `restart` (or a seat change) through — a restart
+        // clears the flag inside the drain and play resumes this same tick.
+        if (self.restart_pending) return;
 
         self.tick_count += 1;
 
-        // A disconnect can be what makes every REMAINING player spent, and
-        // disconnects arrive outside the cast path — so re-check here, after
-        // input is drained, rather than only on submit.
+        // A leave can be what makes every REMAINING player spent, and leaves
+        // arrive outside the cast path — so re-check here, after input is
+        // drained, rather than only on submit.
         try self.maybe_end_turn();
-        if (self.phase != .playing) return;
+        if (self.restart_pending) return;
 
         self.profiler.begin(.broadcast);
         try self.broadcast_game_state();
@@ -568,31 +639,32 @@ pub const Session = struct {
         for (&self.casts_left) |*n| n.* = 0;
     }
 
-    /// True once every CONNECTED player has spent their budget.  Disconnected
-    /// slots are ignored, so a player dropping out unblocks the turn instead of
-    /// stalling it forever.
+    /// True once every SEATED player has spent their budget.  Released seats
+    /// are ignored, so a player leaving unblocks the turn instead of stalling
+    /// it forever.
     ///
-    /// An EMPTY room is never "spent": with nobody to cast, ending turns would
-    /// spin the feast every tick and eat the encounter unattended.
+    /// An EMPTY game is never "spent": with nobody to cast, ending turns
+    /// would spin the feast every tick and eat the encounter unattended — so
+    /// a game with no players simply idles until someone takes a seat.
     fn budgets_spent(self: *const Session) bool {
-        var connected: u8 = 0;
+        var seated: u8 = 0;
         for (&self.players, 0..) |*p, pid| {
-            if (!p.occupied or !p.connected) continue;
-            connected += 1;
+            if (!p.occupied) continue;
+            seated += 1;
             if (self.casts_left[pid] > 0) return false;
         }
-        return connected > 0;
+        return seated > 0;
     }
 
-    /// Settle the turn once every connected player has locked in: resolve the
+    /// Settle the turn once every seated player has locked in: resolve the
     /// pending casts, then run the feast over the board they left.
     ///
-    /// Called after each lock-in and whenever the connected set shrinks,
-    /// because both can make the condition true.  Casts locked in by a player
-    /// who has since dropped still resolve: they committed, and the team priced
-    /// the turn around them.
+    /// Called after each lock-in and whenever the seated set shrinks, because
+    /// both can make the condition true.  Casts locked in by a player who has
+    /// since left still resolve: they committed, and the team priced the turn
+    /// around them.
     fn maybe_end_turn(self: *Session) !void {
-        if (self.phase != .playing) return;
+        if (self.restart_pending) return;
         if (!self.budgets_spent()) return;
         try self.resolve_pending();
         try self.end_turn();
@@ -662,7 +734,7 @@ pub const Session = struct {
         });
 
         try self.check_end();
-        if (self.phase != .playing) return;
+        if (self.restart_pending) return;
 
         self.turn +|= 1;
         self.reset_budgets();
@@ -674,7 +746,8 @@ pub const Session = struct {
     /// nothing for anyone else to redraw.
     fn send_over_budget(self: *Session, player_id: u8, needed: u32) !void {
         const slot = &self.players[player_id];
-        const t = slot.transport orelse return;
+        if (!slot.occupied) return;
+        const t = self.connections[slot.conn].transport orelse return;
         var buf: [16]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
         try proto.encode(fbs.writer(), .over_budget, proto.OverBudget{
@@ -768,74 +841,65 @@ pub const Session = struct {
     }
 
     fn drain_queues(self: *Session) !void {
-        for (&self.players) |*p| {
-            if (!p.connected) continue;
-            p.queue_lock.lock();
-            const data = p.msg_queue.items;
+        for (&self.connections, 0..) |*conn, conn_id| {
+            if (!conn.active) continue;
+            conn.queue_lock.lock();
+            const data = conn.msg_queue.items;
             if (data.len == 0) {
-                p.queue_lock.unlock();
+                conn.queue_lock.unlock();
                 continue;
             }
             var local_buf: [16384]u8 = undefined;
             const len = @min(data.len, local_buf.len);
             @memcpy(local_buf[0..len], data[0..len]);
-            p.msg_queue.clearRetainingCapacity();
-            p.queue_lock.unlock();
+            conn.msg_queue.clearRetainingCapacity();
+            conn.queue_lock.unlock();
 
             var fbs = std.io.fixedBufferStream(local_buf[0..len]);
             while (fbs.pos < len) {
                 const tag = proto.read_tag(fbs.reader()) catch break;
-                self.handle_client_message(p.player_id, tag, &fbs) catch {};
+                self.handle_client_message(conn_id, tag, &fbs) catch {};
             }
         }
     }
 
     fn handle_client_message(
         self: *Session,
-        player_id: u8,
+        conn_id: usize,
         tag: proto.MsgTag,
         fbs: *std.io.FixedBufferStream([]u8),
     ) !void {
+        // Gameplay messages need a seat; slot messages do not.  EVERY arm
+        // decodes its payload before deciding anything, so an ignored message
+        // (observer input, mid-restart input) still leaves the stream in sync
+        // for whatever is queued behind it.
+        const seat: ?u8 = self.connections[conn_id].player_id;
         switch (tag) {
-            .join_lobby => {
-                const p = try proto.decode_join_lobby(fbs.reader());
-                const slot = &self.players[player_id];
-                const n = @min(p.name_len, 16);
-                @memcpy(slot.name[0..n], p.name[0..n]);
-                slot.name_len = @intCast(n);
-                slot.appetite = p.appetite;
-                std.log.info("player {} name set: {s} (appetite {})", .{
-                    player_id, slot.name[0..slot.name_len], slot.appetite,
-                });
-                if (self.phase == .playing) {
-                    // Late joiner: spawn their entity, fold them into the
-                    // hunger bar, then send them a game_start so their client
-                    // enters game phase.  Existing players are unaffected —
-                    // no lobby_update is broadcast.
-                    try self.spawn_player_midgame(player_id);
-                    self.count_hunger_share(player_id);
-                    try self.send_game_start_to(player_id);
-                } else {
-                    try self.broadcast_lobby_update();
-                }
+            .take_slot => {
+                const p = try proto.decode_take_slot(fbs.reader());
+                try self.take_slot(conn_id, p.appetite);
             },
-            .ready_up => {
-                const slot = &self.players[player_id];
-                slot.ready = !slot.ready;
-                std.log.info("player {} ready: {}", .{ player_id, slot.ready });
-                try self.broadcast_lobby_update();
-                if (self.all_ready()) {
-                    std.log.info("all players ready — starting game", .{});
-                    const default_label = self.cfg.encounters.default().label;
-                    try self.start_game(default_label);
-                    try self.broadcast_game_start(default_label);
-                }
+            .leave_slot => {
+                const pid = seat orelse return;
+                self.release_slot(pid);
+                // Confirm the new standing: the client is an observer again.
+                try self.send_game_start_to_conn(conn_id);
+            },
+            .restart => {
+                // Only meaningful at the end screen; mid-game it is a stray
+                // key.  Any connection is honored — the browser tab that
+                // sends it may well be the room's observer display.  Seats
+                // are kept; the pool and the bar re-seed from them.
+                if (!self.restart_pending) return;
+                const label = self.cfg.encounters.default().label;
+                std.log.info("restart requested — starting next encounter", .{});
+                try self.start_game(label);
+                try self.broadcast_game_start(label);
             },
             .cycle_shape => {
-                // Always decode so the stream stays in sync for messages
-                // queued after this one.
                 const p = try proto.decode_cycle_shape(fbs.reader());
-                if (self.phase != .playing or player_id >= MAX_PLAYERS) return;
+                const player_id = seat orelse return;
+                if (self.restart_pending) return;
                 const moves = self.cfg.balance.player_recipes.len;
                 // An empty move table is impossible (config.zig rejects it),
                 // but cycling would divide by zero, so guard rather than trust.
@@ -851,7 +915,8 @@ pub const Session = struct {
                 // Always decode so the stream stays in sync for messages
                 // queued after this one.
                 const p = try proto.decode_move_cursor(fbs.reader());
-                if (self.phase != .playing or player_id >= MAX_PLAYERS) return;
+                const player_id = seat orelse return;
+                if (self.restart_pending) return;
                 const d = p.dir.delta();
                 // Clamped, so any number of steps in any direction leaves the
                 // cursor on a real cell.
@@ -859,7 +924,8 @@ pub const Session = struct {
                     self.field.grid.step(self.cursors[player_id], d.d_row, d.d_col);
             },
             .cast => {
-                if (self.phase != .playing or player_id >= MAX_PLAYERS) return;
+                const player_id = seat orelse return;
+                if (self.restart_pending) return;
                 // Out of casts this turn: silent ignore.  The turn is waiting
                 // on someone else, and this player has nothing left to say.
                 if (self.casts_left[player_id] == 0) return;
@@ -919,7 +985,8 @@ pub const Session = struct {
                 try self.maybe_end_turn();
             },
             .cancel_cast => {
-                if (self.phase != .playing or player_id >= MAX_PLAYERS) return;
+                const player_id = seat orelse return;
+                if (self.restart_pending) return;
                 // Nothing of their own to take back: silent, because a player
                 // pressing undo on an empty plan has made no mistake.
                 if (!self.cancel_pending(player_id)) return;
@@ -927,9 +994,42 @@ pub const Session = struct {
                     player_id, self.casts_left[player_id],
                 });
             },
-            .reconnect => {},
             else => {},
         }
+    }
+
+    /// Bind a connection to a free player seat.  SILENT no-ops: a connection
+    /// that already holds a seat, and a game whose four seats are all taken —
+    /// the asker simply stays what it was.
+    ///
+    /// Public as a test seam: in play this runs from the `take_slot` wire
+    /// message.
+    pub fn take_slot(self: *Session, conn_id: usize, appetite: u32) !void {
+        const conn = &self.connections[conn_id];
+        if (conn.player_id != null) return;
+        const slot = for (&self.players) |*p| {
+            if (!p.occupied) break p;
+        } else {
+            std.log.debug("take_slot ignored — all {} seats taken", .{MAX_PLAYERS});
+            return;
+        };
+
+        slot.occupied = true;
+        slot.appetite = appetite;
+        slot.conn = conn_id;
+        conn.player_id = slot.player_id;
+        // A freed seat keeps nothing of its previous owner.
+        self.stats.players[slot.player_id] = .{};
+
+        // Fold them into the running game: pool first (their proportion of
+        // what remains, see logic.grow_charges), then the bar, then a body.
+        logic.grow_charges(&self.charges, self.counted_players());
+        self.count_hunger_share(slot.player_id);
+        try self.spawn_player_midgame(slot.player_id);
+        try self.send_game_start_to_conn(conn_id);
+        std.log.info("player {} took a seat (appetite {}, {} seated)", .{
+            slot.player_id, appetite, self.seated_players(),
+        });
     }
 
     /// Saturating u32 → u16 for stats fields.
@@ -943,7 +1043,7 @@ pub const Session = struct {
     /// to `current` (see uncount_hunger_share), but never below it, so the
     /// verdict still cannot change until the next turn settles.
     fn check_end(self: *Session) !void {
-        if (self.phase != .playing) return;
+        if (self.restart_pending) return;
         // Field-cleared wins ties: if the final feast fills the bar exactly,
         // the players still ate everything they could.
         if (self.field.is_exhausted()) {
@@ -978,17 +1078,12 @@ pub const Session = struct {
     fn end_game(self: *Session, reason: proto.EndReason) !void {
         std.log.info("game over — score: {} reason: {s}", .{ self.score, @tagName(reason) });
 
-        // The final board, before the phase flips.  `tick` stops broadcasting
-        // state the moment the session leaves `.playing`, so without this the
-        // last state clients ever saw is the one from BEFORE the closing feast:
-        // they would be told the game ended on a board that still holds the
-        // slime it just ate.  Clients replay that feast as their outro, and
-        // they need the board it lands on to do it.
+        // The final board, before the report.  Without this the last state
+        // clients ever saw is the one from BEFORE the closing feast: they
+        // would be told the game ended on a board that still holds the slime
+        // it just ate.  Clients replay that feast as their outro, and they
+        // need the board it lands on to do it.
         try self.broadcast_game_state();
-
-        self.phase = .lobby;
-        // Reset ready flags so players must opt-in to the next game.
-        for (&self.players) |*p| p.ready = false;
 
         // Finalise the tuning report.
         self.stats.reason = reason;
@@ -997,15 +1092,12 @@ pub const Session = struct {
         self.stats.hunger_final = self.hunger.current;
         self.stats.hunger_max = self.hunger.max;
         // Compact per-player stats (indexed by player_id during play) into a
-        // dense list with names for the wire.
+        // dense list for the wire.
         var compacted = [_]proto.PlayerStats{.{}} ** MAX_PLAYERS;
         var dense: u8 = 0;
         for (&self.players, 0..) |*slot, pid| {
             if (!slot.occupied) continue;
-            var ps = self.stats.players[pid];
-            ps.name = slot.name;
-            ps.name_len = slot.name_len;
-            compacted[dense] = ps;
+            compacted[dense] = self.stats.players[pid];
             dense += 1;
         }
         self.stats.players = compacted;
@@ -1018,15 +1110,18 @@ pub const Session = struct {
             .stats = self.stats,
         });
         try self.broadcast_raw(fbs.getWritten());
-        try self.broadcast_lobby_update();
+
+        // Hold at the end screen until a `restart` arrives; seated players
+        // keep their seats.
+        self.restart_pending = true;
     }
 
-    /// Spawn an ECS entity for a player who joined while the game is in
+    /// Spawn an ECS entity for a player who took a seat while the game is in
     /// progress.  IDEMPOTENT: a player owns at most one entity, so a repeated
-    /// `join_lobby` (reconnect handshake, retry, duplicated input) is a no-op.
-    /// Snapshots walk the player_marker array and the client's selection
-    /// projection treats one entity as one caster, so a second body would show
-    /// a phantom teammate with a wheel of their own.
+    /// `take_slot` (retry, duplicated input) is a no-op.  Snapshots walk the
+    /// player_marker array and the client's selection projection treats one
+    /// entity as one caster, so a second body would show a phantom teammate
+    /// with a wheel of their own.
     fn spawn_player_midgame(self: *Session, player_id: u8) !void {
         if (player_id >= MAX_PLAYERS) return;
         const slot = &self.players[player_id];
@@ -1039,14 +1134,18 @@ pub const Session = struct {
         std.log.info("player {} joined mid-game", .{player_id});
     }
 
-    /// The game_start payload for one player: encounter label, their id, the
-    /// per-turn cast budget and the grid dimensions the client must render.
+    /// The game_start payload for one connection: encounter label, join code
+    /// (the game id), the receiver's standing (their seat, or NO_PLAYER for
+    /// an observer), the per-turn cast budget, the charge pool and the grid
+    /// dimensions the client must render.
     fn game_start_msg(self: *const Session, label: []const u8, player_id: u8) proto.GameStart {
         var msg = proto.GameStart{
             .encounter_label = [_]u8{0} ** 32,
             .encounter_label_len = @intCast(@min(label.len, 32)),
             .player_id = player_id,
+            .join_code = self.join_code,
             .casts_per_turn = self.cfg.balance.casts_per_turn,
+            .charges = self.charges,
             .grid_rows = self.field.grid.rows,
             .grid_cols = self.field.grid.cols,
         };
@@ -1054,56 +1153,30 @@ pub const Session = struct {
         return msg;
     }
 
-    /// Send a game_start message to a single player so their client transitions
-    /// to game phase.  Used for late joiners while the session is already playing.
-    fn send_game_start_to(self: *Session, player_id: u8) !void {
-        if (player_id >= MAX_PLAYERS) return;
-        const slot = &self.players[player_id];
-        const t = slot.transport orelse return;
+    /// Send one connection a game_start describing its CURRENT standing —
+    /// on connect, after a take_slot is granted, and after a leave_slot.
+    fn send_game_start_to_conn(self: *Session, conn_id: usize) !void {
+        if (conn_id >= MAX_CONNECTIONS) return;
+        const conn = &self.connections[conn_id];
+        const t = conn.transport orelse return;
         const encounter = self.current_encounter orelse return;
-        var buf: [64]u8 = undefined;
+        const pid = conn.player_id orelse proto.NO_PLAYER;
+        var buf: [80]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
-        try proto.encode(fbs.writer(), .game_start, self.game_start_msg(encounter.label, slot.player_id));
+        try proto.encode(fbs.writer(), .game_start, self.game_start_msg(encounter.label, pid));
         try t.send(fbs.getWritten());
     }
 
-    pub fn broadcast_lobby_update(self: *Session) !void {
-        var base = proto.LobbyUpdate{
-            .join_code = self.join_code,
-            .player_count = self.player_count,
-            .players = [_]proto.PlayerInfo{std.mem.zeroes(proto.PlayerInfo)} ** proto.MAX_PLAYERS,
-            .player_id = 0xFF,
-        };
-        for (&self.players, 0..) |*slot, i| {
-            if (!slot.occupied) continue;
-            base.players[i] = .{
-                .player_id = slot.player_id,
-                .name = slot.name,
-                .name_len = slot.name_len,
-                .kind = .player,
-                .ready = slot.ready,
-                .connected = slot.connected,
-            };
-        }
-        for (&self.players) |*slot| {
-            if (!slot.connected) continue;
-            const t = slot.transport orelse continue;
-            var msg = base;
-            msg.player_id = slot.player_id;
-            var buf: [512]u8 = undefined;
-            var fbs = std.io.fixedBufferStream(&buf);
-            try proto.encode(fbs.writer(), .lobby_update, msg);
-            t.send(fbs.getWritten()) catch {};
-        }
-    }
-
+    /// Tell every connection a fresh encounter began, each from its own
+    /// standing (seat or observer).
     pub fn broadcast_game_start(self: *Session, encounter_label: []const u8) !void {
-        for (&self.players) |*slot| {
-            if (!slot.connected) continue;
-            const t = slot.transport orelse continue;
-            var buf: [64]u8 = undefined;
+        for (&self.connections) |*conn| {
+            if (!conn.active) continue;
+            const t = conn.transport orelse continue;
+            const pid = conn.player_id orelse proto.NO_PLAYER;
+            var buf: [80]u8 = undefined;
             var fbs = std.io.fixedBufferStream(&buf);
-            try proto.encode(fbs.writer(), .game_start, self.game_start_msg(encounter_label, slot.player_id));
+            try proto.encode(fbs.writer(), .game_start, self.game_start_msg(encounter_label, pid));
             try t.send(fbs.getWritten());
         }
     }
@@ -1171,20 +1244,22 @@ pub const Session = struct {
         try self.broadcast_raw(fbs.getWritten());
     }
 
+    /// Send to EVERY active connection — observers included: the game is a
+    /// spectator sport by default.
     fn broadcast_raw(self: *Session, data: []const u8) !void {
-        for (&self.players) |*slot| {
-            if (!slot.connected) continue;
-            const t = slot.transport orelse continue;
+        for (&self.connections) |*conn| {
+            if (!conn.active) continue;
+            const t = conn.transport orelse continue;
             t.send(data) catch {};
         }
     }
 
-    pub fn enqueue_message(self: *Session, player_id: u8, data: []const u8) void {
-        if (player_id >= MAX_PLAYERS) return;
-        const slot = &self.players[player_id];
-        slot.queue_lock.lock();
-        defer slot.queue_lock.unlock();
-        slot.msg_queue.appendSlice(slot.allocator, data) catch {};
+    pub fn enqueue_message(self: *Session, conn_id: usize, data: []const u8) void {
+        if (conn_id >= MAX_CONNECTIONS) return;
+        const conn = &self.connections[conn_id];
+        conn.queue_lock.lock();
+        defer conn.queue_lock.unlock();
+        conn.msg_queue.appendSlice(conn.allocator, data) catch {};
     }
 };
 

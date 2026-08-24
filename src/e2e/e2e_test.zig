@@ -266,12 +266,14 @@ fn run_bot_inner(ctx: *BotCtx) !void {
     try client.readTimeout(BOT_TIMEOUT_MS);
 
     // ---- Message loop -------------------------------------------------------
-    var sent_join: bool = false;
-    var sent_ready: bool = false;
+    // Every connection is an OBSERVER of the already-running game until its
+    // take_slot is granted (confirmed by a game_start whose player_id is a
+    // real seat).
+    var sent_take: bool = false;
     var in_game: bool = false;
     // Our player id, from game_start — needed to pick our own entity (and so
     // our own cursor) out of each snapshot.
-    var my_player_id: u8 = 0xFF;
+    var my_player_id: u8 = proto.NO_PLAYER;
 
     while (true) {
         const msg = try client.read() orelse continue;
@@ -284,31 +286,20 @@ fn run_bot_inner(ctx: *BotCtx) !void {
         const payload = msg.data[1..];
 
         switch (tag) {
-            .lobby_update => {
-                var fbs = std.io.fixedBufferStream(payload);
-                const lu = proto.decode_lobby_update(fbs.reader()) catch continue;
-
-                if (in_game) break; // shouldn't happen, but be safe
-
-                // Send join_lobby exactly once.
-                if (!sent_join) {
-                    try send_join_lobby(&client, ctx.name);
-                    sent_join = true;
-                }
-
-                // Send ready_up exactly once, after both players are present.
-                if (!sent_ready and lu.player_count >= 2) {
-                    std.debug.print("[e2e] {s} sees {} players, sending ready_up\n", .{
-                        ctx.name, lu.player_count,
-                    });
-                    try send_ready_up(&client);
-                    sent_ready = true;
-                }
-            },
-
             .game_start => {
                 var fbs = std.io.fixedBufferStream(payload);
                 const start = proto.decode_game_start(fbs.reader()) catch continue;
+                if (start.player_id == proto.NO_PLAYER) {
+                    // Observing.  Ask for a seat exactly once.
+                    if (!sent_take) {
+                        std.debug.print("[e2e] {s} observing game {s}; taking a seat\n", .{
+                            ctx.name, start.join_code,
+                        });
+                        try send_take_slot(&client);
+                        sent_take = true;
+                    }
+                    continue;
+                }
                 in_game = true;
                 my_player_id = start.player_id;
                 ctx.result.grid_cells =
@@ -398,13 +389,11 @@ fn run_bot_inner(ctx: *BotCtx) !void {
 // Send helpers  (each allocates a local stack buf, passes mutable slice)
 // ---------------------------------------------------------------------------
 
-fn send_join_lobby(client: *ws.Client, name: []const u8) !void {
-    var buf: [32]u8 = undefined;
+/// Ask for a player seat in the running game (appetite 0, like a browser).
+fn send_take_slot(client: *ws.Client) !void {
+    var buf: [8]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    const name_len: u8 = @intCast(@min(name.len, 16));
-    var p = proto.JoinLobby{ .name = [_]u8{0} ** 16, .name_len = name_len };
-    @memcpy(p.name[0..name_len], name[0..name_len]);
-    try proto.encode(fbs.writer(), .join_lobby, p);
+    try proto.encode(fbs.writer(), .take_slot, proto.TakeSlot{});
     try client.writeBin(fbs.getWritten());
 }
 
@@ -414,13 +403,6 @@ fn send_move_cursor(client: *ws.Client, dir: proto.CursorDir) !void {
     var buf: [2]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     try proto.encode(fbs.writer(), .move_cursor, proto.MoveCursor{ .dir = dir });
-    try client.writeBin(fbs.getWritten());
-}
-
-fn send_ready_up(client: *ws.Client) !void {
-    var buf: [2]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try proto.encode(fbs.writer(), .ready_up, {});
     try client.writeBin(fbs.getWritten());
 }
 

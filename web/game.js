@@ -7,7 +7,10 @@ const LAYOUT = {
   // gain resolution without any coordinate in here changing.
   screen: { w: 1024, h: 768 },
   renderScale: 2,
-  bg: "#14141e",
+  // The whole screen is the same PAPER as the slime field (see
+  // slimeField.paper): one continuous e-paper surface, with everything on it
+  // drawn as ink.
+  bg: "rgba(238,242,250,1)",
 
   // Slime field: the server-authoritative grid.  Its rows × cols come from
   // the wire (balance.slime_grid), so cell size is derived, not fixed: the
@@ -15,13 +18,19 @@ const LAYOUT = {
   slimeField: {
     x0: 40, x1: 984, y0: 220, y1: 620,
     labelDy: 24,
-    border: "rgba(180,200,255,0.25)",
+    border: "rgba(0,0,0,0.22)",
     reservoirFont: 14,
+
+    // The field is PAPER: the same white the slime tile art is drawn on
+    // (scripts/gen_slime_tiles.py PAPER), so the tiles' white cards merge
+    // into one continuous surface and only the line art shows — the face
+    // the e-paper badge wears.  The UI around the field stays dark.
+    paper: "rgba(238,242,250,1)",
 
     // Empty cell: a dim recessed socket, so a hole reads as "awaiting the
     // reservoir" rather than as background.
-    socketFill: "rgba(0,0,0,0.22)",
-    socketBorder: "rgba(255,255,255,0.05)",
+    socketFill: "rgba(0,0,0,0.10)",
+    socketBorder: "rgba(0,0,0,0.08)",
 
     // --- Individual slime unit tiles (see tileSprite) --------------------
     tileMax: 72,        // cap on cell size (design px); small grids letterbox
@@ -38,20 +47,20 @@ const LAYOUT = {
 
     // --- Aim cursor + projected shape footprint (see shapePreview) --------
     //
-    // Both are drawn at the SOCKET edge, outside the tile body, so neither can
-    // be read as part of a tile's own art.
+    // One owner-keyed language for every selected square, mirroring the
+    // badge's tile rings: SOLID outline = the local player, DOTTED = a
+    // sibling player.  Cursors bracket the CELL edge; footprint outlines sit
+    // at the SOCKET edge, so the two never merge on a shared cell.
     cursorWidth: 3,       // the local player's cursor: thick, unmissable
     cursorMateWidth: 2,   // teammates' cursors: present but subordinate
-    cursorCornerFrac: 0.3, // crosshair arm length, as a fraction of the cell
     previewWidth: 3.5,    // projected-footprint outline stroke width
     previewPulseHz: 2.4,  // pulse rate
     previewAlphaMin: 0.35,// pulse trough
     previewAlphaMax: 0.95,// pulse crest
-    // Under-socket tint on a covered cell, and the wash laid OVER its tile.
-    // Both are drawn in the color the cell will BECOME, so a committed cast
-    // reads as an outcome rather than as a generic highlight.
+    // Under-socket tint on a covered cell, in the color the cell will BECOME
+    // — visible where the footprint covers EMPTY ground (an occupied cell
+    // shows the coverage by swapping to the inverted tile art instead).
     previewFillAlpha: 0.16,
-    previewWashAlpha: 0.3, // scaled by the pulse, so the wash breathes too
 
     // --- Locked-in casts --------------------------------------------------
     //
@@ -74,7 +83,7 @@ const LAYOUT = {
   hungerBar: {
     x0: 40, x1: 984, y: 150, h: 18,
     labelFont: 14, labelDy: -8,
-    bg: "rgba(30,10,10,0.78)",
+    bg: "rgba(0,0,0,0.12)",
     // Grey, matching neutral/defused slime.  The bar is a one-way clock now:
     // there is nothing to segment it by, because nothing takes hunger back.
     fill: "rgba(150,150,162,0.9)",
@@ -88,8 +97,8 @@ const LAYOUT = {
   chargeBar: {
     x0: 40, x1: 984, y: 196, h: 10,
     labelFont: 13, labelDy: -6,
-    bg: "rgba(40,30,10,0.78)",
-    lowBorder: "rgba(255,196,64,0.95)",
+    bg: "rgba(0,0,0,0.12)",
+    lowBorder: "rgba(200,140,0,0.95)",
     textFont: 13,
   },
 
@@ -102,15 +111,20 @@ const LAYOUT = {
   // clipped by the columns after it rather than reflowing the panel.
   wheelPanel: { x: 24, y0: 652, rowH: 18, font: 13, labelW: 84, nameW: 42 },
 
-  // Lil Guys: one per connected player, purely cosmetic — they mill about the
-  // field and pounce at the turn-end feast (see tickLilGuys).  `speed` is px/s;
-  // `snap` is how close counts as arrived.
+  // Lil Guys: one per connected player, purely cosmetic — they wait at the
+  // LEFT edge of the field (the door the feast floods in through), sprint the
+  // meal at turn end, and file back to the door as the board settles (see
+  // tickLilGuys / the cinematic).  `speed` is px/s; `snap` is how close
+  // counts as arrived.
   //
-  // `size` is the box drawSprite fits the sprite into.  36 design px is
-  // 72 DEVICE px at renderScale 2 — the art's native frame size, so its 1px
-  // detail lines survive the nearest-neighbour blit.  Any other value resamples
-  // them at a fractional ratio and the face turns to mush.
-  lilGuys: { size: 36, speed: 220, snap: 3 },
+  // `scale` sizes the drawSprite box RELATIVE TO A SLIME BLOCK: the guys are
+  // a quarter again as big as the food they eat, whatever cell size the grid
+  // letterboxes to (see lilGuySize).  The blit is nearest-neighbour off a
+  // 72px frame, so pixel widths alternate slightly at non-integer ratios —
+  // traded knowingly for a size that tracks the board.  `doorGap` is the
+  // clearance between a parked guy and the grid's left edge, so the corral
+  // never overlaps the first column of cells.
+  lilGuys: { scale: 1.25, speed: 220, snap: 3, doorGap: 6 },
 
   // The turn-end feast, played out cell by cell (see the cinematic section).
   // The whole sequence is a deliberate pause in play: input is dead until it
@@ -135,15 +149,20 @@ const LAYOUT = {
     maxStepS: 1 / 15,
   },
 
-  actionMenu: {
-    w: 340, h: 126, marginBottom: 128,
-    padX: 10, padTopY: 14,
-    actionRowDy: 16, actionFont: 16, actionCols: [0, 130, 205],
-    aimRowDy: 34, aimFont: 13,
-    selectedRowDy: 48, selectedFont: 12,
-    castBarDy: 56, castBarH: 16,
-    timerTextDy: 86, timerTextFont: 13,
-    previewDy: 102, previewFont: 13,
+  // Per-player action menus: one box per SEAT (max `seats`), bottom row,
+  // to the right of the wheel panel.  Each shows only the spell shape its
+  // player is holding plus their lock-in state; pulse/shake are the physical
+  // feedback for valid / refused selections (see the menu FX section).
+  playerMenus: {
+    seats: 4, w: 160, h: 96, gap: 14, x0: 291, y: 656,
+    labelDy: 16, labelFont: 12,
+    shapeCellMax: 13, shapeCellGap: 2,
+    statusDy: 10, statusFont: 12,      // up from the box's bottom edge
+    pulseS: 0.35, pulseScale: 1.10,    // valid lock-in: one swell and back
+    shakeS: 0.4, shakeAmp: 5, shakeHz: 26, // refused: decaying sideways rattle
+    // Gentle continuous breathing on the menu of the LAST committed action,
+    // so "who moved most recently" stays readable after the swell ends.
+    lastPulseHz: 1.4, lastPulseScale: 1.03,
   },
 
   // Default floater lifetime ≥ 3s so feedback is readable; cosmetic chomps
@@ -187,6 +206,8 @@ const LAYOUT = {
     fcols: { label: 40, cells: 260 },
     pcols: { name: 40, casts: 190, covered: 250, defused: 420, recipes: 590 },
     hintFont: 14,
+    // The clickable "next round" button, bottom-centred under the report.
+    button: { w: 320, h: 52, bottomGap: 28, font: 18 },
   },
 };
 
@@ -195,35 +216,64 @@ const SW = LAYOUT.screen.w;
 const SH = LAYOUT.screen.h;
 const FIELD = LAYOUT.slimeField;
 
-const C_BG = LAYOUT.bg ?? "#14141e";
-const C_TEXT = "rgba(230,230,230,1)";
-const C_HEADER = "rgba(180,200,255,1)";
-const C_SLIME_HDR = "rgba(160,255,140,1)";
-const C_OWN_ROW = "rgba(255,255,60,0.9)";
-const C_MENU_BG = "rgba(20,20,40,0.86)";
-const C_MENU_BORDER = C_HEADER;
+// Everything below is INK on the paper background: the palette that used to
+// be light-on-dark is restated dark-on-light, same hues, e-paper contrast.
+const C_BG = LAYOUT.bg ?? "rgba(238,242,250,1)";
+const C_TEXT = "rgba(40,40,55,1)";
+const C_HEADER = "rgba(60,90,200,1)";
+const C_SLIME_HDR = "rgba(30,140,60,1)";
+const C_OWN_ROW = "rgba(190,140,0,1)";
+/**
+ * Per-seat identity colors, indexed by player id (seat 0..3): every mark a
+ * player leaves on the shared screen — stamp outlines, cursor box, pending
+ * pips, menu frame — wears their color, so four people can read one board.
+ * Dark enough to hold contrast on the paper field.
+ *
+ * Future: controllers will inject custom colors; route any override through
+ * `playerColor` so the default palette stays the fallback.
+ */
+const PLAYER_COLORS = [
+  "rgba(190,140,0,1)", // P0 amber
+  "rgba(70,110,220,1)", // P1 blue
+  "rgba(40,150,80,1)", // P2 green
+  "rgba(160,70,190,1)", // P3 purple
+];
+/** Marks owned by nobody we can name (observer id 0xFF, stale seat). */
+const C_UNSEATED = "rgba(110,110,130,0.8)";
+
+/** THE lookup for a player's color — every owner-keyed mark goes through
+ *  here, so controller-injected palettes later only touch this. */
+function playerColor(owner) {
+  return PLAYER_COLORS[owner] ?? C_UNSEATED;
+}
+
+const C_MENU_BG = "rgba(0,0,0,0.05)";
 /** Warning red: a stamp aimed off the grid or at cells with nothing to hit. */
-const C_BAD = "rgba(255,110,110,1)";
+const C_BAD = "rgba(210,50,50,1)";
 /** Muted tint for the wasted tail of a stamp floater — present but not
  *  competing with the count that actually accomplished something. */
-const C_MUTED = "rgba(190,150,150,0.85)";
+const C_MUTED = "rgba(150,110,110,0.9)";
 
 /** The shared charge pool.  Amber, and used NOWHERE else: charges are the one
  *  resource that never comes back, so they get a colour of their own rather
  *  than borrowing a tier's. */
-const C_CHARGE = "rgba(255,196,64,1)";
+const C_CHARGE = "rgba(200,140,0,1)";
 /** A recipe that costs nothing — green, because it is always castable. */
-const C_FREE = "rgba(140,230,150,1)";
+const C_FREE = "rgba(30,150,70,1)";
 /** Food the flood could not reach.  Deliberately cold and dull: sheltered
  *  slime is not a threat, it is wasted opportunity. */
-const C_SHELTERED = "rgba(120,170,210,1)";
+const C_SHELTERED = "rgba(60,120,170,1)";
 
 /** Sprite used for the cosmetic Lil Guys roaming the slime field.  Generated
  *  from the board build's authored art by scripts/gen_lilguy.py. */
 const LIL_GUY_SPRITE = "lilguy";
+/** The slime tile atlas (scripts/gen_slime_tiles.py): authored SlimeBlock art
+ *  shared with the e-paper badge.  Frames are picked by NAME from its json
+ *  (hard/medium/soft/goo + *_invert for selected cells). */
+const SLIME_SPRITE = "slime";
 
-/** Sprite sheets to load; Lil Guys are the only sprites rendered. */
-const CLASSES = [LIL_GUY_SPRITE];
+/** Sprite sheets to load: the Lil Guys and the slime tile atlas. */
+const CLASSES = [LIL_GUY_SPRITE, SLIME_SPRITE];
 
 const sprites = new Map();
 
@@ -397,6 +447,9 @@ function clearEntityState() {
   stampedThisFrame.clear();
   lastTransientGame = null;
   chargesSeenMax = 0;
+  menuFx.clear();
+  prevMenuPending = new Map();
+  lastCommitPid = null;
 }
 
 const canvas = document.getElementById("canvas");
@@ -461,24 +514,27 @@ function drawPreLobby() {
   text("Slime Feast", L.titleX, L.titleY, L.titleFont, C_HEADER);
 
   if (preLobbyMode === "choose") {
-    const highlight = "rgba(255,255,100,1)";
+    const highlight = "rgba(170,120,0,1)";
     text("[C]  Create lobby", L.optX, L.optY0, L.optFont, highlight);
     text("[J]  Join existing lobby", L.optX, L.optY0 + L.optGap, L.optFont, C_TEXT);
     if (PAGE_CONFIG_HASH) {
       text(`(custom config ${PAGE_CONFIG_HASH})`,
-        L.optX, L.optY0 + 2 * L.optGap, L.errorFont, "rgba(170,170,170,1)");
+        L.optX, L.optY0 + 2 * L.optGap, L.errorFont, "rgba(110,110,120,1)");
     }
     if (preLobbyError) {
-      text(preLobbyError, L.optX, L.optY0 + 2 * L.optGap + L.errorDy, L.errorFont, "rgba(255,100,100,1)");
+      text(preLobbyError, L.optX, L.optY0 + 2 * L.optGap + L.errorDy, L.errorFont, "rgba(200,50,50,1)");
     }
+    // The study guide lives here now that there is no lobby screen: the next
+    // stop after this one is a live game.
+    drawRecipeGuide();
   } else if (preLobbyMode === "entering_code") {
     text("Enter lobby code:", L.optX, L.codePromptY, L.optFont, C_TEXT);
     // Show typed code + blinking underscore cursor.
     const display = preLobbyCode.padEnd(6, "_");
-    text(display, L.optX, L.codeY, L.codeFont, "rgba(255,255,100,1)");
-    text("[ENTER] to confirm    [ESC] back", L.optX, L.codeHintY, L.codeHintFont, "rgba(170,170,170,1)");
+    text(display, L.optX, L.codeY, L.codeFont, "rgba(170,120,0,1)");
+    text("[ENTER] to confirm    [ESC] back", L.optX, L.codeHintY, L.codeHintFont, "rgba(110,110,120,1)");
     if (preLobbyError) {
-      text(preLobbyError, L.optX, L.codeHintY + 40, L.errorFont, "rgba(255,100,100,1)");
+      text(preLobbyError, L.optX, L.codeHintY + 40, L.errorFont, "rgba(200,50,50,1)");
     }
   }
 }
@@ -488,30 +544,6 @@ function drawFull() {
   const L = LAYOUT.full;
   text("Session full (max 6 players).", L.x, SH / 2 + L.titleDy, L.titleFont, C_TEXT);
   text("Close another tab to free a slot.", L.x, SH / 2 + L.subDy, L.subFont, C_TEXT);
-}
-
-function drawLobby(lobby) {
-  clear();
-  const L = LAYOUT.lobby;
-  text("Slime Feast", L.titleX, L.titleY, L.titleFont, C_HEADER);
-
-  const joinCode = lobby.join_code || "??????";
-  text(`Room: ${joinCode}`, L.codeX, L.codeY, L.codeFont, C_TEXT);
-
-  const players = lobby.players || [];
-  players.forEach((p, i) => {
-    const y = L.listY + i * L.rowGap + L.rowDy;
-    const color = p.id === lobby.player_id ? "rgba(255,255,100,1)" : C_TEXT;
-    const ready = p.ready ? "[READY]" : "[     ]";
-    const conn = p.connected ? "" : " (disconnected)";
-    text(`${p.name}  ${p.kind}  ${ready}${conn}`, L.rowX, y, L.rowFont, color);
-  });
-
-  const pickerY = L.listY + 6 * L.rowGap + L.readyDy;
-  const readyLabel = lobby.ready ? "Press ENTER to un-ready" : "Press ENTER when ready";
-  text(readyLabel, L.rowX, pickerY, L.readyFont, C_TEXT);
-
-  drawRecipeGuide();
 }
 
 /** Draw colored text parts left-to-right; returns the x after the last part. */
@@ -578,7 +610,7 @@ function drawRecipeGuide() {
 
   text("HOW CASTING WORKS", L.guideX, y, L.guideFont + 2, C_HEADER);
   y += L.guideLineH;
-  const descColor = "rgba(200,200,210,0.9)";
+  const descColor = "rgba(70,70,85,0.95)";
   // The turn loop: a fixed budget of casts each, all of them resolving
   // together once the last player has chosen, then the whole field is eaten.
   const castingLine = [
@@ -740,9 +772,9 @@ function spawnRefusalFloater(game) {
 }
 
 /** Player-recipe floater color (matches the recipe label color elsewhere). */
-const RECIPE_COLOR_PLAYER = "rgba(255,255,140,1)";
+const RECIPE_COLOR_PLAYER = "rgba(170,120,0,1)";
 /** Group floater color — distinct so co-op fires pop. */
-const RECIPE_COLOR_TEAM = "rgba(140,240,255,1)";
+const RECIPE_COLOR_TEAM = "rgba(0,140,180,1)";
 
 /**
  * Big celebratory floaters when recipes fire (the server broadcasts one event
@@ -830,7 +862,7 @@ function floatStampOutcome(ev, slot, rows, cols) {
 }
 
 /** Turn-loop floater color (matches the cast-budget gauge). */
-const CAST_EVENT_COLOR = "rgba(120,220,255,1)";
+const CAST_EVENT_COLOR = "rgba(0,130,200,1)";
 
 // The turn-end headline ("Lil Guys Eating!", then the tally) is spawned by the
 // feast cinematic, which is the only thing that knows when the meal starts and
@@ -852,15 +884,13 @@ function drawWheelPanel(game) {
   const entities = game.entities || [];
   entities.forEach((e, i) => {
     const y = CP.y0 + i * CP.rowH;
-    const own = e.owner === game.player_id;
-    text(`P${e.owner}`, CP.x, y, CP.font, own ? C_OWN_ROW : "rgba(180,200,255,0.75)");
+    text(`P${e.owner}`, CP.x, y, CP.font, playerColor(e.owner));
 
     // Selection is server-authoritative, so this is what that player WILL
     // cast.  A stale frame against a freshly reloaded (shorter) move table
     // falls back to the first move, matching the server's own clamp.
     const move = PLAYER_RECIPES[e.selected_shape ?? 0] ?? PLAYER_RECIPES[0];
-    text(move?.label ?? "-", CP.x + CP.nameW, y, CP.font,
-      own ? RECIPE_COLOR_PLAYER : "rgba(180,200,255,0.75)");
+    text(move?.label ?? "-", CP.x + CP.nameW, y, CP.font, RECIPE_COLOR_PLAYER);
 
     // Casts left this turn: a filled pip per remaining cast, so "who are we
     // waiting on" is readable at a glance.  A player with none left has LOCKED
@@ -881,8 +911,7 @@ function drawWheelPanel(game) {
     const at = last !== null && left === 0
       ? `!${Math.floor(last.square / cols)},${last.square % cols}`
       : `@${e.cursor_row ?? 0},${e.cursor_col ?? 0}`;
-    text(at, usedX + 60, y, CP.font,
-      own ? C_OWN_ROW : "rgba(180,200,255,0.6)");
+    text(at, usedX + 60, y, CP.font, playerColor(e.owner));
   });
 }
 
@@ -961,30 +990,37 @@ let TEAM_RECIPES = [];
  * @param {{stamps: Array<object>, cost: number, labels: string[]}} sum
  * @param {object} recipe - the move or group (carries offsets + cost)
  * @param {{row: number, col: number}} anchor - square the stamp centres on
+ * @param {number} owner - player_id credited with the stamp (a group goes to
+ *   the completing cast's owner, mirroring the server); picks the outline's
+ *   color
+ * @param {boolean} pending - every cast in this stamp is LOCKED IN: the
+ *   outline draws dotted (a fact), where live aim draws solid
  */
-function addOutput(sum, recipe, anchor) {
+function addOutput(sum, recipe, anchor, owner, pending) {
   sum.stamps.push({
     offsets: recipe.offsets ?? [],
     label: recipe.label,
     anchor,
+    owner,
+    pending,
   });
   sum.cost += recipe.cost ?? 0;
   sum.labels.push(recipe.label);
 }
 
 /**
- * The turn as the viewer can best guess it: every cast already LOCKED IN, plus
- * the viewer's own live aim if they still have a cast to spend.
+ * The turn as the viewer can best guess it: every cast already LOCKED IN,
+ * plus EVERY seated player's live aim while they still have a cast to spend.
  *
- * Locked-in casts are facts — the server froze their square and move — so they
- * are taken verbatim and in order.  A teammate who has NOT locked in yet is
- * deliberately absent: their wheel and cursor are still moving, and projecting
- * a group off them would promise a shape nobody has committed to.  The
- * viewer's own aim is the exception, because that is the choice the preview
- * exists to answer ("what happens if I press ENTER here").
+ * Locked-in casts are facts — the server froze their square and move — so
+ * they are taken verbatim and in order, and they render DOTTED.  Live aim is
+ * a live wheel + cursor the server broadcasts for every seat, rendered SOLID
+ * in that player's color: the whole table (and any observer screen) sees
+ * where everyone is pointing before anything is committed.
  *
  * @returns {Array<{owner: number, move: number, row: number, col: number,
- *   pending: boolean}>} in lock-in order, own live aim last.
+ *   pending: boolean}>} lock-ins first in order, then live aim in seat
+ *   order with the viewer's own last (it wins overlap precedence).
  */
 function projectedCasts(game) {
   const { cols } = gridDims(game);
@@ -996,17 +1032,21 @@ function projectedCasts(game) {
     pending: true,
   }));
 
-  const own = (game.entities ?? []).find((e) => e.owner === game.player_id);
-  if (own !== undefined && (own.casts_left ?? 0) > 0) {
-    casts.push({
-      owner: own.owner,
-      move: own.selected_shape ?? 0,
-      row: own.cursor_row ?? 0,
-      col: own.cursor_col ?? 0,
+  const live = [];
+  let ownAim = null;
+  for (const e of game.entities ?? []) {
+    if ((e.casts_left ?? 0) === 0) continue;
+    const aim = {
+      owner: e.owner,
+      move: e.selected_shape ?? 0,
+      row: e.cursor_row ?? 0,
+      col: e.cursor_col ?? 0,
       pending: false,
-    });
+    };
+    if (e.owner === game.player_id) ownAim = aim; else live.push(aim);
   }
-  return casts;
+  if (ownAim !== null) live.push(ownAim);
+  return casts.concat(live);
 }
 
 /**
@@ -1053,7 +1093,13 @@ function projectBatch(game) {
         }
         if (picks.length < tr.components.length) break;
         for (const pi of picks) consumed[pi] = true;
-        addOutput(sum, tr, { row: head.row, col: head.col });
+        // Credited to the contributor who locked in LAST, exactly as the
+        // server resolves it (game_logic.resolve_batch).  The group is a
+        // FACT (dotted) only once every contribution is locked in; one live
+        // aim in the bag keeps it a solid could-be.
+        const last = Math.max(...picks);
+        addOutput(sum, tr, { row: head.row, col: head.col }, casts[last].owner,
+          picks.every((pi) => casts[pi].pending));
       }
     }
   });
@@ -1062,7 +1108,7 @@ function projectBatch(game) {
     if (consumed[ci]) return;
     const move = PLAYER_RECIPES[c.move];
     if (move === undefined) return;
-    addOutput(sum, move, { row: c.row, col: c.col });
+    addOutput(sum, move, { row: c.row, col: c.col }, c.owner, c.pending);
   });
 
   return sum;
@@ -1087,6 +1133,15 @@ function shapePreview(game) {
   const projected = projectBatch(game);
 
   const cells = new Map();
+  // flat → { owner, pending } for EVERY on-grid covered cell — inert ones
+  // included (already-defused slime, empty ground).  This is the map the
+  // renderer draws the stamp's SHAPE from, so it must be the whole
+  // footprint: a coverage map that skipped the do-nothing cells would show
+  // a stamp with holes in it.  The outline wears the owner's color; pending
+  // (locked-in) draws dotted, live aim solid.  Where stamps overlap the
+  // VIEWER's own wins: your own aim is what your cast resolves against —
+  // same precedence as the badge's overlay map.
+  const owners = new Map();
   let offGrid = 0;
   let inert = 0;
   let hits = 0;
@@ -1098,6 +1153,9 @@ function shapePreview(game) {
       const cl = stamp.anchor.col + dCol;
       if (r < 0 || r >= rows || cl < 0 || cl >= cols) { offGrid++; continue; }
       const flat = r * cols + cl;
+      if (!owners.has(flat) || stamp.owner === game.player_id) {
+        owners.set(flat, { owner: stamp.owner, pending: stamp.pending });
+      }
       // Chain multiple stamps over the same cell: each one steps it down
       // again, exactly as the server applies them in sequence.
       const current = cells.get(flat) ?? grid[flat];
@@ -1122,7 +1180,7 @@ function shapePreview(game) {
     }
   }
 
-  return { cells, offGrid, inert, hits, defused, opened, projected };
+  return { cells, owners, offGrid, inert, hits, defused, opened, projected };
 }
 
 // ---------------------------------------------------------------------------
@@ -1162,17 +1220,17 @@ function updateFeastTracking(game) {
   const STACK = LAYOUT.floater.stack;
 
   if (scoreGain > 0) {
-    spawnFloater(`+${scoreGain}`, at.x + jitter(), at.y - STACK, "rgba(100,220,100,1)");
+    spawnFloater(`+${scoreGain}`, at.x + jitter(), at.y - STACK, "rgba(30,150,60,1)");
   }
   if (hungerGain > 0) {
-    spawnFloater(`+${hungerGain} hunger`, at.x + jitter(), at.y + STACK, "rgba(255,150,50,1)");
+    spawnFloater(`+${hungerGain} hunger`, at.x + jitter(), at.y + STACK, "rgba(200,100,0,1)");
   }
 }
 
 /** Highlight colour per shape-wheel direction key (1 = next, 2 = back). */
 const WHEEL_COLOR = {
-  forward: "rgba(160,220,255,1)",
-  backward: "rgba(255,80,180,1)",
+  forward: "rgba(30,120,200,1)",
+  backward: "rgba(200,30,140,1)",
 };
 
 /** Tier ordinal → name string; matches protocol Tier ordinal order, hardest
@@ -1190,14 +1248,14 @@ const TIER_CHAR = { red: "≡", yellow: "=", green: "-" };
  *  game-over stats tables all read from this map, so a tier always looks the
  *  same wherever it appears. */
 const TIER_COLOR = {
-  red: "rgba(255,90,90,1)",
-  yellow: "rgba(250,210,80,1)",
-  green: "rgba(130,230,130,1)",
+  red: "rgba(215,60,60,1)",
+  yellow: "rgba(200,150,0,1)",
+  green: "rgba(50,160,70,1)",
 };
 
 /** Shape footprints in the recipe guide and the on-grid preview: deliberately
  *  NOT a tier color, since a shape is tier-agnostic. */
-const SHAPE_COLOR = "rgba(160,220,255,1)";
+const SHAPE_COLOR = "rgba(40,120,200,1)";
 
 /** Neutral and defused slime: harmless, so it must not read as any tier color.
  *  Grey is the "safe / inert" color — shared by both tiles and by the hunger
@@ -1206,7 +1264,7 @@ const NEUTRAL_COLOR = "rgba(150,150,162,1)";
 
 /** Special slime: the objective. Violet, shared with nothing, because it is
  *  neither food nor hazard and no cast can touch it. */
-const SPECIAL_COLOR = "rgba(198,130,255,1)";
+const SPECIAL_COLOR = "rgba(140,70,210,1)";
 
 /**
  * Restate an `rgba(r,g,b,a)` color at a new alpha.
@@ -1267,10 +1325,10 @@ function drawHungerBar(game) {
   // Danger is signalled by the border, never the fill.
   const nearFull = frac > 0.85;
   rectStroke(H.x0 - 2, H.y - 2, w + 4, H.h + 4, nearFull ? 3 : 1,
-    nearFull ? H.dangerBorder : "rgba(255,255,255,0.25)");
+    nearFull ? H.dangerBorder : "rgba(0,0,0,0.25)");
 
   text(`${hunger.current}/${hunger.max}`,
-    H.x0 + w - 90, H.y + H.h + 14, H.textFont, "rgba(200,200,210,0.9)");
+    H.x0 + w - 90, H.y + H.h + 14, H.textFont, "rgba(70,70,85,0.95)");
 }
 
 /**
@@ -1304,7 +1362,7 @@ function drawChargeBar(game) {
 
   const low = frac <= 0.15;
   rectStroke(B.x0 - 2, B.y - 2, w + 4, B.h + 4, low ? 3 : 1,
-    low ? B.lowBorder : "rgba(255,255,255,0.25)");
+    low ? B.lowBorder : "rgba(0,0,0,0.25)");
 
   text(`\u26a1 ${charges}`, B.x0 + w - 90, B.y + B.h + 14, B.textFont, C_CHARGE);
 }
@@ -1553,9 +1611,20 @@ function hazardTier(name) {
   return TIER_NAMES.includes(name) ? name : null;
 }
 
-/** state|size → rendered tile canvas.  Cleared when the cell size changes. */
+/** state|selected|size → rendered tile canvas.  Cleared on cell-size change. */
 const tileCache = new Map();
 let tileCacheSize = -1;
+
+/** Tile body → slime atlas frame stem (see scripts/gen_slime_tiles.py).
+ *  Hard/Medium/Soft/Goo are the authored red/yellow/green/grey; neutral and
+ *  defused both map to goo, matching the badge.  `special` has no authored
+ *  art and keeps the procedural drawing. */
+const SLIME_FRAME = {
+  red: "hard",
+  yellow: "medium",
+  green: "soft",
+  neutral: "goo",
+};
 
 /** Trace a rounded rect onto `c` (no fill/stroke). */
 function roundRectPath(c, x, y, w, h, r) {
@@ -1578,13 +1647,19 @@ function roundRectPath(c, x, y, w, h, r) {
  * The blob is inset by FIELD.tileGap per side, giving the large gutter that
  * makes units read as separate pieces.  Returns a canvas the size of a cell,
  * so callers blit it at the cell rect (scaled/offset for animation).
+ *
+ * Slime bodies blit the authored SlimeBlock atlas (black-and-white, shared
+ * with the e-paper badge); `selected` swaps in the *_invert frame — the mark
+ * for a cell covered by the cast preview or a cursor.  `special` (and the
+ * unlikely case of the atlas not having loaded) falls back to the original
+ * procedural gel tile.
  */
-function tileSprite(name, size) {
+function tileSprite(name, size, selected = false) {
   if (size !== tileCacheSize) {
     tileCache.clear();
     tileCacheSize = size;
   }
-  const key = `${name}|${size}`;
+  const key = `${name}|${selected ? 1 : 0}|${size}`;
   const hit = tileCache.get(key);
   if (hit) return hit;
 
@@ -1598,6 +1673,20 @@ function tileSprite(name, size) {
 
   const inset = size * FIELD.tileGap;
   const bw = size - inset * 2;
+
+  const atlas = sprites.get(SLIME_SPRITE);
+  const stem = SLIME_FRAME[style.body];
+  if (atlas !== undefined && stem !== undefined) {
+    const meta = atlas.meta;
+    const idx = meta.frames[selected ? `${stem}_invert` : stem];
+    // Pixel art: nearest-neighbour upscale, same as drawSprite.
+    c.imageSmoothingEnabled = false;
+    c.drawImage(atlas.img, idx * meta.frame_w, 0, meta.frame_w, meta.frame_h,
+      inset, inset, bw, bw);
+    tileCache.set(key, cv);
+    return cv;
+  }
+
   const radius = bw * FIELD.tileRadius;
   const [r, g, b] = TILE_RGB[style.body];
 
@@ -1754,17 +1843,43 @@ function drawSlimeField(game) {
   const g = gridRect(rows, cols);
   const t = performance.now() / 1000;
 
+  // Paper first: the tiles' own white cards dissolve into it (see
+  // FIELD.paper), leaving just the line art — the badge's e-paper face.
   rect(FIELD.x0, FIELD.y0, FIELD.x1 - FIELD.x0, FIELD.y1 - FIELD.y0,
-    "rgba(255,255,255,0.03)");
+    FIELD.paper);
 
-  // Cells the wheel selections would cover if everyone cast now, and what
-  // each becomes.  Exact, not a guess: placement is a pure function of
-  // (shape, cursor).  Computed once per frame.
-  const preview = replay || playSuspended() ? new Map() : shapePreview(game).cells;
-  const pulse = preview.size > 0
+  // Cells the wheel selections would cover if everyone cast now, what each
+  // becomes, and WHOSE stamp covers it (outline in the owner's seat color:
+  // solid = live aim, dotted = locked in).  `owners` is the WHOLE footprint
+  // — covered-but-inert cells (already-defused slime, empty ground) included
+  // — so the stamp's shape renders unbroken; `cells` holds only the
+  // outcomes, for the tint.  Exact, not a guess: placement is a pure
+  // function of (shape, cursor).  Computed once per frame.
+  const pv = replay || playSuspended()
+    ? { cells: new Map(), owners: new Map() }
+    : shapePreview(game);
+  const preview = pv.cells;
+  const previewOwners = pv.owners;
+  // Only LIVE aim pulses ("not yet resolved"); locked-in outlines hold
+  // steady — a commitment is a fact, not a question.
+  let anyLive = false;
+  for (const o of previewOwners.values()) {
+    if (!o.pending) { anyLive = true; break; }
+  }
+  const pulse = anyLive
     ? FIELD.previewAlphaMin + (FIELD.previewAlphaMax - FIELD.previewAlphaMin) *
     (0.5 + 0.5 * Math.sin(t * Math.PI * 2 * FIELD.previewPulseHz))
     : 0;
+
+  // Cells drawn with the INVERTED tile art: covered by the cast preview, or
+  // under any player's cursor (the crosshair still says whose).  Suppressed
+  // with the rest of the aiming overlays during the replay.
+  const cursorCells = new Set();
+  if (!replay && !playSuspended()) {
+    for (const e of game.entities ?? []) {
+      cursorCells.add((e.cursor_row ?? 0) * cols + (e.cursor_col ?? 0));
+    }
+  }
 
   // Who eats and who watches, on THIS board and on the board the pending cast
   // would create.  A cell that is sheltered now but eaten after — `opened` —
@@ -1812,11 +1927,12 @@ function drawSlimeField(game) {
       drawTile(anim.from, x0, y0, g.cell, 1 + p * 0.3, 0, 1 - p);
     }
 
-    // Projected footprint: a socket tinted in the OUTCOME color plus a pulsing
-    // outline, on every cell a pending cast will cover.  Drawn UNDER the tile
-    // so it reads as ground being targeted, and covering an empty cell still
-    // shows (that is exactly the aiming mistake worth seeing).
+    // Projected footprint.  `coveredBy` marks EVERY covered cell — inert
+    // ones (already-defused slime, empty ground) included — so the stamp's
+    // whole shape reads; `becomes` exists only where the stamp changes
+    // something and drives the outcome-colored socket tint.
     const becomes = preview.get(flat);
+    const coveredBy = previewOwners.get(flat);
     if (becomes !== undefined) {
       rect(x0 + inset, y0 + inset, body, body,
         withAlpha(becomesColor(becomes), FIELD.previewFillAlpha));
@@ -1824,8 +1940,12 @@ function drawSlimeField(game) {
 
     const name = grid[flat];
     if (!cellIsSlime(name)) {
-      // Empty cell: the footprint outline is all there is to draw.
-      if (becomes !== undefined) drawPreviewMark(x0, y0, inset, body, becomes, pulse);
+      // Empty cell: the footprint outline is all there is to draw — and
+      // covering empty ground still shows, which is exactly the aiming
+      // mistake worth seeing.
+      if (coveredBy !== undefined) {
+        drawPreviewMark(x0, y0, inset, body, coveredBy, pulse);
+      }
       continue;
     }
 
@@ -1843,20 +1963,19 @@ function drawSlimeField(game) {
       scale = 1 + Math.sin(t * FIELD.bobFreq + bobPhase(flat)) * FIELD.bobAmp;
     }
 
-    drawTile(name, x0, y0, g.cell, scale, dy, 1);
+    // Selected cells (covered by a stamp or under a cursor) swap to the
+    // inverted tile art — already-defused slime inverts too, so the stamp's
+    // shape stays unbroken over cells it would not change.
+    drawTile(name, x0, y0, g.cell, scale, dy, 1,
+      coveredBy !== undefined || cursorCells.has(flat));
 
-    // Outcome wash OVER the tile.  The socket tint above is hidden behind an
-    // occupied tile, which is precisely where the preview matters most, so the
-    // covered tile is also washed in the color it will become.
-    if (becomes !== undefined) {
-      rect(x0 + inset, y0 + inset, body, body,
-        withAlpha(becomesColor(becomes), FIELD.previewWashAlpha * pulse));
+    // Footprint outline in the owner's seat color (solid = live aim, dotted
+    // = locked in), at the socket edge — outside the tile body, so it is
+    // never confused with the tile's own art.  The OUTCOME survives in the
+    // socket tint and the inverted tile.
+    if (coveredBy !== undefined) {
+      drawPreviewMark(x0, y0, inset, body, coveredBy, pulse);
     }
-
-    // Footprint outline: pulsing, in the color the cell will BECOME, at the
-    // socket edge — outside the tile body, so it is never confused with the
-    // static inner ring that marks an already-defused unit.
-    if (becomes !== undefined) drawPreviewMark(x0, y0, inset, body, becomes, pulse);
 
     // Downgrade flash: a white bloom over the settled tile.
     if (anim?.kind === "flash") {
@@ -1885,7 +2004,7 @@ function drawSlimeField(game) {
     ? `${reservoir} more slime incoming ↓`
     : "reservoir empty — last of the slime";
   text(label, FIELD.x0, FIELD.y1 + FIELD.labelDy, FIELD.reservoirFont,
-    reservoir > 0 ? "rgba(170,180,220,0.8)" : "rgba(255,255,140,0.9)");
+    reservoir > 0 ? "rgba(90,100,140,0.9)" : "rgba(170,120,0,0.95)");
 }
 
 /** The color standing for a projected outcome tier ("defused" has no tier). */
@@ -1894,14 +2013,20 @@ function becomesColor(becomes) {
 }
 
 /**
- * Outline one previewed cell in the color it will BECOME after the stamp —
- * so the preview shows the outcome, not merely "this will be hit".
+ * Outline one previewed cell in its owner's seat color.  SOLID = live aim
+ * (still moving, so it pulses); DOTTED = locked in (a fact, drawn steady at
+ * full preview alpha).  The cell's OUTCOME shows in the socket tint and the
+ * inverted tile art, not here.
+ *
+ * @param {{owner: number, pending: boolean}} mark  the cell's covering stamp
  */
-function drawPreviewMark(x0, y0, inset, body, becomes, pulse) {
+function drawPreviewMark(x0, y0, inset, body, mark, pulse) {
   ctx.save();
-  ctx.globalAlpha = pulse;
-  rectStroke(x0 + inset, y0 + inset, body, body, FIELD.previewWidth,
-    becomesColor(becomes));
+  ctx.globalAlpha = mark.pending ? FIELD.previewAlphaMax : pulse;
+  ctx.strokeStyle = playerColor(mark.owner);
+  ctx.lineWidth = FIELD.previewWidth;
+  if (mark.pending) ctx.setLineDash([FIELD.previewWidth, FIELD.previewWidth]);
+  ctx.strokeRect(x0 + inset, y0 + inset, body, body);
   ctx.restore();
 }
 
@@ -1934,15 +2059,15 @@ function drawShelteredMark(x0, y0, inset, body, alpha, color) {
 }
 
 /**
- * Draw every player's aim cursor as a corner crosshair on their cell.
+ * Draw every player's aim cursor as a square outline bracketing their cell,
+ * SOLID in that player's seat color — dotted is reserved for locked-in
+ * stamps, and a cursor is always live.  The viewer's own is thicker and
+ * drawn last, on top of anyone sharing the cell.
  *
  * The server sends a live cursor for EVERY player, so teammates can see where
- * each other are aiming and coordinate a team shape.  The local player's is thicker
- * and yellow; teammates' are thinner and blue.
- *
- * A crosshair rather than a full box: a box at the socket edge would compete
- * with the footprint outline drawn there, and the corner arms stay legible even
- * when both land on the same cell.
+ * each other are aiming and coordinate a team shape.  Drawn at the CELL edge,
+ * outside the socket, so it never merges with the footprint outline at the
+ * socket edge when both land on the same cell.
  */
 function drawCursors(game, g, cols) {
   const own = [];
@@ -1953,11 +2078,11 @@ function drawCursors(game, g, cols) {
     const y0 = g.y0 + r * g.cell;
     const isOwn = e.owner === game.player_id;
     // Own cursor drawn last, on top of any teammate sharing the cell.
-    if (isOwn) { own.push({ x0, y0 }); continue; }
-    drawCrosshair(x0, y0, g.cell, FIELD.cursorMateWidth, C_HEADER);
+    if (isOwn) { own.push({ x0, y0, owner: e.owner }); continue; }
+    drawCursorBox(x0, y0, g.cell, FIELD.cursorMateWidth, playerColor(e.owner));
   }
   for (const o of own) {
-    drawCrosshair(o.x0, o.y0, g.cell, FIELD.cursorWidth, C_OWN_ROW);
+    drawCursorBox(o.x0, o.y0, g.cell, FIELD.cursorWidth, playerColor(o.owner));
   }
 }
 
@@ -1986,7 +2111,7 @@ function drawPendingMarks(game, g, cols) {
     let x = cx - span / 2 + r;
     for (const pc of list) {
       ctx.save();
-      ctx.fillStyle = pc.player_id === game.player_id ? C_OWN_ROW : C_HEADER;
+      ctx.fillStyle = playerColor(pc.player_id);
       ctx.beginPath();
       ctx.arc(x, cy, r, 0, Math.PI * 2);
       ctx.fill();
@@ -1996,28 +2121,25 @@ function drawPendingMarks(game, g, cols) {
   }
 }
 
-/** Four corner arms bracketing one cell. */
-function drawCrosshair(x0, y0, cell, lineW, color) {
-  const arm = cell * FIELD.cursorCornerFrac;
+/** A square outline bracketing one cell, solid in the owner's seat color
+ *  (dotted means "locked in" and a cursor never is).  Inset by half the
+ *  stroke so the line stays inside the cell instead of bleeding into its
+ *  neighbours. */
+function drawCursorBox(x0, y0, cell, lineW, color) {
   ctx.save();
   ctx.strokeStyle = color;
   ctx.lineWidth = lineW;
-  ctx.beginPath();
-  // Top-left, top-right, bottom-left, bottom-right.
-  ctx.moveTo(x0, y0 + arm); ctx.lineTo(x0, y0); ctx.lineTo(x0 + arm, y0);
-  ctx.moveTo(x0 + cell - arm, y0); ctx.lineTo(x0 + cell, y0); ctx.lineTo(x0 + cell, y0 + arm);
-  ctx.moveTo(x0, y0 + cell - arm); ctx.lineTo(x0, y0 + cell); ctx.lineTo(x0 + arm, y0 + cell);
-  ctx.moveTo(x0 + cell - arm, y0 + cell); ctx.lineTo(x0 + cell, y0 + cell); ctx.lineTo(x0 + cell, y0 + cell - arm);
-  ctx.stroke();
+  ctx.strokeRect(x0 + lineW / 2, y0 + lineW / 2, cell - lineW, cell - lineW);
   ctx.restore();
 }
 
 /**
  * Blit one cached tile into the cell at (x0, y0), scaled about the cell centre
  * and offset vertically by `dy` (animation).  `alpha` < 1 fades it out.
+ * `selected` draws the inverted tile art (cast preview / cursor coverage).
  */
-function drawTile(name, x0, y0, cell, scale, dy, alpha) {
-  const sprite = tileSprite(name, Math.round(cell));
+function drawTile(name, x0, y0, cell, scale, dy, alpha, selected = false) {
+  const sprite = tileSprite(name, Math.round(cell), selected);
   if (!sprite) return;
   const size = cell * scale;
   const off = (cell - size) / 2;
@@ -2040,11 +2162,14 @@ function drawTile(name, x0, y0, cell, scale, dy, alpha) {
 // `turn_ended` event.  Everything here is animation over that single fact.
 //
 // One guy is shown per connected player (read off `game.entities`, which the
-// server already sends for the wheel panel).  Between turns they mill about the
-// field; when a `turn_ended` arrives the feast cinematic (below) takes them over
-// and walks them cell to cell through the whole meal.
+// server already sends for the wheel panel).  Between turns they WAIT at the
+// left edge of the field — the door the feast floods in through, so where
+// they stand is a true statement about where the meal will start.  When a
+// `turn_ended` arrives the feast cinematic (below) takes them over, walks
+// them cell to cell through the whole meal, and sends them back to the door
+// as the board settles.
 //
-// Because they are cosmetic, a guy's chosen cell is a display choice and can be
+// Because they are cosmetic, a guy's position is a display choice and can be
 // picked freely — no server state depends on it.
 
 /**
@@ -2070,23 +2195,31 @@ const LIL_GUY_ANIM_BASE = 1_000_000;
 let lastBitePos = null;
 
 /**
- * Pick a flat index of REACHABLE food for a guy to stand on, or null when
- * there is none.  `nth` spreads the horde out instead of stacking it.
- *
- * Guys must never loiter on food they cannot get to: standing on a sheltered
- * cell would say "this is next" about the one cell that is not.  With nothing
- * reachable they hold at the door instead, which is exactly where the problem
- * is.
+ * The sprite box for a Lil Guy: 1.5 slime blocks, whatever cell size the
+ * grid currently letterboxes to — the guys stay proportioned to the food
+ * they eat instead of towering over a dense board or drowning on a sparse
+ * one.
  */
-function feastCell(game, nth) {
-  const grid = game.grid ?? [];
-  const reach = reachability(game);
-  const edible = [];
-  for (let flat = 0; flat < grid.length; flat++) {
-    if (reach.eaten.has(flat)) edible.push(flat);
-  }
-  if (edible.length === 0) return null;
-  return edible[(nth * 7) % edible.length];
+function lilGuySize(rows, cols) {
+  return gridRect(rows, cols).cell * LAYOUT.lilGuys.scale;
+}
+
+/**
+ * The door post for roster position `i` of `count`: a sprite top-left pixel
+ * position fully LEFT of the grid — the side the feast floods in from, with
+ * `doorGap` of clearance so the corral never overlaps the first column of
+ * cells — spread evenly down the grid's height so the crew reads as a queue
+ * at the door rather than a stack.  Clamped on-screen for the degenerate
+ * grid that fills the field wall to wall.
+ */
+function lilGuyPost(i, count, rows, cols) {
+  const size = lilGuySize(rows, cols);
+  const g = gridRect(rows, cols);
+  const cy = g.y0 + ((i + 0.5) * rows * g.cell) / Math.max(1, count);
+  return {
+    x: Math.max(4, g.x0 - size - LAYOUT.lilGuys.doorGap),
+    y: cy - size / 2,
+  };
 }
 
 /**
@@ -2101,8 +2234,8 @@ function feastCell(game, nth) {
  *   a stale corner of the field.
  */
 function syncLilGuys(game, spawnAt) {
-  const G = LAYOUT.lilGuys;
   const { rows, cols } = gridDims(game);
+  const size = lilGuySize(rows, cols);
   const players = (game.entities ?? []).filter((e) => e.owner !== undefined);
 
   const live = new Set(players.map((e) => e.owner));
@@ -2114,12 +2247,17 @@ function syncLilGuys(game, spawnAt) {
     const existing = lilGuys.get(e.owner);
     if (existing) return existing;
     const seat = spawnAt[i];
-    const at = seat !== undefined && seat !== null
-      ? cellCenter(seat, rows, cols)
-      : fieldCenter();
+    let at;
+    if (seat !== undefined && seat !== null) {
+      const c = cellCenter(seat, rows, cols);
+      at = { x: c.x - size / 2, y: c.y - size / 2 };
+    } else {
+      // No seat (idle): born at the door, which is where an idle guy stands.
+      at = lilGuyPost(i, players.length, rows, cols);
+    }
     const g = {
-      x: at.x - G.size / 2,
-      y: at.y - G.size / 2,
+      x: at.x,
+      y: at.y,
       target: seat ?? null,
       facingLeft: false,
       pendingClip: null,
@@ -2131,21 +2269,18 @@ function syncLilGuys(game, spawnAt) {
 }
 
 /**
- * Step one guy toward the centre of cell `flat` for at most `dt` seconds.
+ * Step one guy toward the pixel position (tx, ty) for at most `dt` seconds.
  *
- * Arrival is resolved WITHIN the slice that reaches the cell rather than on the
- * frame after: the cinematic walks a queue of cells against a wall-clock budget,
- * and a frame spent standing still at each one is a frame the budget did not
- * account for — over a full board that is most of a second.
+ * Arrival is resolved WITHIN the slice that reaches the target rather than on
+ * the frame after: the cinematic walks a queue of cells against a wall-clock
+ * budget, and a frame spent standing still at each one is a frame the budget
+ * did not account for — over a full board that is most of a second.
  *
  * @returns {{arrived: boolean, left: number}} `left` is the unused remainder of
  *   `dt` once it arrived, for the caller to spend on what comes next.
  */
-function walkLilGuy(g, flat, rows, cols, speed, dt) {
+function walkLilGuyTo(g, tx, ty, speed, dt) {
   const G = LAYOUT.lilGuys;
-  const at = cellCenter(flat, rows, cols);
-  const tx = at.x - G.size / 2;
-  const ty = at.y - G.size / 2;
   const dx = tx - g.x, dy = ty - g.y;
   const dist = Math.hypot(dx, dy);
   const reach = speed * dt;
@@ -2161,29 +2296,42 @@ function walkLilGuy(g, flat, rows, cols, speed, dt) {
   return { arrived: false, left: 0 };
 }
 
+/** Step one guy toward the centre of cell `flat` (see walkLilGuyTo). */
+function walkLilGuy(g, flat, rows, cols, speed, dt) {
+  const size = lilGuySize(rows, cols);
+  const at = cellCenter(flat, rows, cols);
+  return walkLilGuyTo(g, at.x - size / 2, at.y - size / 2, speed, dt);
+}
+
+/** Walk one guy back to their door post; face the field once parked. */
+function walkLilGuyHome(g, i, count, rows, cols, dt) {
+  const post = lilGuyPost(i, count, rows, cols);
+  g.target = null;
+  const walk = walkLilGuyTo(g, post.x, post.y, LAYOUT.lilGuys.speed, dt);
+  // Parked at the door: face the field it is about to flood into, not the
+  // wall it happened to approach from.
+  if (walk.arrived) g.facingLeft = false;
+  return walk;
+}
+
 /**
- * Advance the idle Lil Guys one frame: each mills toward a reachable cell of
- * food, which is a standing answer to "where would the feast go next".
- *
- * Not called while the cinematic runs — it drives the guys itself.
+ * Advance the idle Lil Guys one frame: everyone stands (or files back to)
+ * their door post on the field's left edge.  They only enter the board when
+ * it is time to eat — the cinematic drives them for that, so this is not
+ * called while it runs.
  */
 function tickLilGuys(game, dt) {
   const { rows, cols } = gridDims(game);
-  const players = (game.entities ?? []).filter((e) => e.owner !== undefined);
-  const seats = players.map((_, i) => feastCell(game, i));
-
-  syncLilGuys(game, seats).forEach((g, i) => {
-    const target = seats[i];
-    g.target = target;
-    if (target === null) return; // bare field: hold position at the door
-    void walkLilGuy(g, target, rows, cols, LAYOUT.lilGuys.speed, dt);
+  syncLilGuys(game, []).forEach((g, i, all) => {
+    void walkLilGuyHome(g, i, all.length, rows, cols, dt);
   });
 }
 
-function drawLilGuys(dt) {
-  const G = LAYOUT.lilGuys;
+function drawLilGuys(game, dt) {
+  const { rows, cols } = gridDims(game);
+  const size = lilGuySize(rows, cols);
   for (const g of lilGuys.values()) {
-    drawSprite(g.id, LIL_GUY_SPRITE, g.x, g.y, G.size, G.size, g.pendingClip,
+    drawSprite(g.id, LIL_GUY_SPRITE, g.x, g.y, size, size, g.pendingClip,
       dt, g.facingLeft);
     g.pendingClip = null; // one-shot: the animator owns the clip from here
   }
@@ -2345,13 +2493,14 @@ function startFeastCinematic(game) {
 
   // The longest route any one guy has to walk, measured from where he is now.
   let farthest = 0;
+  const guySize = lilGuySize(rows, cols);
   guys.forEach((g, i) => {
     const queue = queues.get(players[i]?.owner) ?? [];
     let px = g.x, py = g.y, len = 0;
     for (const flat of queue) {
       const at = cellCenter(flat, rows, cols);
-      const tx = at.x - LAYOUT.lilGuys.size / 2;
-      const ty = at.y - LAYOUT.lilGuys.size / 2;
+      const tx = at.x - guySize / 2;
+      const ty = at.y - guySize / 2;
       len += Math.hypot(tx - px, ty - py);
       px = tx; py = ty;
     }
@@ -2402,8 +2551,10 @@ function startFeastCinematic(game) {
   }
 
   const { x, y } = fieldCenter();
+  // Ink, not the light cast-event cyan: this headline floats over the paper
+  // field, where light colors vanish.
   spawnFloater("Lil Guys Eating!", x, y - LAYOUT.floater.stack - 8,
-    CAST_EVENT_COLOR, LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
+    "rgba(40,36,60,0.95)", LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
   return true;
 }
 
@@ -2431,10 +2582,14 @@ function tickCinematic(game, dt) {
   switch (cinematic.stage) {
     case "eat": tickEat(game, dt); break;
     case "collapse":
+      // The meal is over: the crew files back to the door while the board
+      // settles behind them, so the replay ends with everyone at the edge.
+      tickLilGuys(game, dt);
       cinematic.t -= dt;
       if (cinematic.t <= 0) beginFill();
       break;
     case "fill":
+      tickLilGuys(game, dt);
       cinematic.t -= dt;
       if (cinematic.t <= 0) finishFill();
       break;
@@ -2464,9 +2619,14 @@ function tickEat(game, dt) {
     if (!queue) return;
     if (queue.length === 0) {
       // Done eating, but a hold may still be owed on the last bite.  Drain it
-      // here, since the walk loop below is skipped once the queue is empty.
+      // here, since the walk loop below is skipped once the queue is empty;
+      // after that, head back to the door while the others finish.
       const pause = c.chomps.get(e.owner) ?? 0;
-      if (pause > 0) c.chomps.set(e.owner, Math.max(0, pause - dt));
+      if (pause > 0) {
+        c.chomps.set(e.owner, Math.max(0, pause - dt));
+      } else if (guys[i] !== undefined) {
+        void walkLilGuyHome(guys[i], i, players.length, rows, cols, dt);
+      }
       return;
     }
     const g = guys[i];
@@ -2526,7 +2686,7 @@ function bite(flat, g) {
   lastBitePos = at;
   g.pendingClip = "attack";
   spawnFloater("chomp", at.x, at.y - LAYOUT.floater.stack,
-    "rgba(230,230,240,0.85)", 0.8); // cosmetic: exempt from the 3s rule
+    "rgba(40,36,60,0.85)", 0.8); // ink, not white: it floats over the paper field
 }
 
 /**
@@ -2547,10 +2707,10 @@ function payDeferredFeast() {
   const jitter = () => (Math.random() - 0.5) * LAYOUT.floater.jitter;
   const STACK = LAYOUT.floater.stack;
   if (score > 0) {
-    spawnFloater(`+${score}`, at.x + jitter(), at.y - STACK, "rgba(100,220,100,1)");
+    spawnFloater(`+${score}`, at.x + jitter(), at.y - STACK, "rgba(30,150,60,1)");
   }
   if (hunger > 0) {
-    spawnFloater(`+${hunger} hunger`, at.x + jitter(), at.y + STACK, "rgba(255,150,50,1)");
+    spawnFloater(`+${hunger} hunger`, at.x + jitter(), at.y + STACK, "rgba(200,100,0,1)");
   }
 }
 
@@ -2711,153 +2871,228 @@ function spawnFeastTallyFloaters(tally) {
 }
 
 // ---------------------------------------------------------------------------
-// Action menu + projected stamp preview
+// Per-player action menus
 // ---------------------------------------------------------------------------
+//
+// One menu box per SEAT — always LAYOUT.playerMenus.seats of them, with
+// unfilled seats drawn as dim placeholders, so the row never reflows as
+// players come and go.  Each menu shows exactly one thing: the SHAPE of the
+// spell its player's wheel is currently holding, plus that player's lock-in
+// state for the round.  Feedback is physical rather than textual:
+//
+//   pulse — the box swells once when its player locks in a VALID cast on the
+//           board (a new pending cast of theirs appears on the wire)
+//   shake — the box rattles when its player's attempt is REFUSED: the turn
+//           cannot afford it (`over_budget`), or they are already fully
+//           locked in and pressing ENTER anyway (detected locally, since the
+//           server has nothing to say about a key that does nothing)
 
-function drawActionMenu(game) {
-  const M = LAYOUT.actionMenu;
-  const mx = SW / 2 - M.w / 2;
-  const my = SH - M.marginBottom;
-  const mw = M.w;
-  const mh = M.h;
+/** @typedef {{kind: "pulse"|"shake", t: number, dur: number}} MenuFx */
 
-  rect(mx, my, mw, mh, C_MENU_BG);
-  rectStroke(mx, my, mw, mh, 2, C_MENU_BORDER);
+/** player id → running feedback animation on their menu.  @type {Map<number, MenuFx>} */
+const menuFx = new Map();
 
-  const px = mx + M.padX;
+/** player id → pending-cast count last frame, for lock-in detection.
+ *  @type {Map<number, number>} */
+let prevMenuPending = new Map();
 
-  // The key rows are a contract: press this, get that.  The feast replay
-  // suspends it for a second and then hands it back, so those keys are still
-  // worth showing in their own colours.  The outro never hands it back — the
-  // match is decided — so the rows go grey rather than advertise a cast that
-  // can no longer happen.
-  const dead = outroActive();
-  const DEAD_KEY = "rgba(130,130,145,0.65)";
-  const keyColor = (live) => (dead ? DEAD_KEY : live);
+/** The player whose committed cast is the round's most recent — their menu
+ *  keeps a gentle pulse after the lock-in swell ends.  Cleared when their
+ *  commitment goes away (undo, or the turn resolving).
+ *  @type {number|null} */
+let lastCommitPid = null;
 
-  const aRowY = my + M.padTopY + M.actionRowDy;
-  text("[1] Next shape", px + M.actionCols[0], aRowY, M.actionFont, keyColor(WHEEL_COLOR.forward));
-  text("[2] Back", px + M.actionCols[1], aRowY, M.actionFont, keyColor(WHEEL_COLOR.backward));
-  // Undo is only offered when there is something of the viewer's OWN to take
-  // back — Escape reaches nobody else's commitment, and a key that does
-  // nothing is worse than a key that is not advertised.
-  {
-    const mine = (game.pending ?? []).some((pc) => pc.player_id === game.player_id);
-    text("[Esc] Undo", px + M.actionCols[2], aRowY, M.actionFont,
-      mine ? keyColor(C_BAD) : DEAD_KEY);
+/** Start (restarting if mid-flight) one player's menu feedback. */
+function triggerMenuFx(playerId, kind) {
+  const P = LAYOUT.playerMenus;
+  const dur = kind === "pulse" ? P.pulseS : P.shakeS;
+  menuFx.set(playerId, { kind, t: dur, dur });
+}
+
+/** Advance menu feedback animations, dropping the finished ones. */
+function tickMenuFx(dt) {
+  for (const [pid, fx] of menuFx) {
+    fx.t -= dt;
+    if (fx.t <= 0) menuFx.delete(pid);
   }
+}
 
-  // Aim row: the arrow keys move the cursor the shape is stamped on.
-  const own0 = (game.entities ?? []).find(e => e.owner === game.player_id);
-  const aimY = my + M.padTopY + M.aimRowDy;
-  text(`[← ↑ ↓ →] Aim  @${own0?.cursor_row ?? 0},${own0?.cursor_col ?? 0}`,
-    px, aimY, M.aimFont, keyColor(C_OWN_ROW));
-
-  // What ENTER would cast right now: the wheel position, its cost, and where
-  // it sits in the wheel.  Selection is server-authoritative and persists
-  // across casts and turns, so this is the one readout that answers "what am I
-  // holding" without the player having to remember what they pressed.
-  {
-    const sel = own0?.selected_shape ?? 0;
-    const move = PLAYER_RECIPES[sel] ?? PLAYER_RECIPES[0];
-    const wheel = PLAYER_RECIPES.length > 0
-      ? `  (${(sel % PLAYER_RECIPES.length) + 1}/${PLAYER_RECIPES.length})`
-      : "";
-    text(`[Enter] Lock in  ${move?.label ?? "-"}  \u26a1${move?.cost ?? 0}${wheel}`,
-      px, my + M.padTopY + M.selectedRowDy, M.selectedFont, keyColor(RECIPE_COLOR_PLAYER));
+/**
+ * Diff this frame's pending casts against the last frame's, per player.
+ * A count that GREW is a lock-in the server accepted — the valid-selection
+ * pulse, for whichever player's menu it was.  A count that shrank is an undo
+ * or the turn resolving, neither of which is feedback-worthy: the baseline
+ * just moves.  `over_budget` is sent only to the player who tried, so it
+ * always shakes the viewer's own menu.
+ *
+ * Call once per FRESH frame (transient events must be consumed exactly once).
+ */
+function updateMenuFx(game) {
+  const counts = new Map();
+  for (const pc of game.pending ?? []) {
+    counts.set(pc.player_id, (counts.get(pc.player_id) ?? 0) + 1);
   }
-
-  const tbw = mw - M.padX * 2;
-
-  // The local player's cast budget for this turn.  A lock-in spends a slot
-  // without resolving anything, so what matters is how many are left: the
-  // turn (and the feast) waits on the last one in the room.
-  {
-    const total = game.casts_per_turn ?? 0;
-    const own = (game.entities ?? []).find(e => e.owner === game.player_id);
-    const left = own ? (own.casts_left ?? 0) : 0;
-    const frac = total > 0 ? Math.max(0, Math.min(1, left / total)) : 0;
-
-    rect(px, my + M.castBarDy, tbw, M.castBarH, "rgba(30,30,30,0.8)");
-    if (left > 0) {
-      rect(px, my + M.castBarDy, tbw * frac, M.castBarH, "rgba(120,220,255,0.9)");
-    }
-    rectStroke(px, my + M.castBarDy, tbw, M.castBarH, 1, "rgba(255,255,255,0.3)");
-
-    // While the feast plays out — and afterwards, if that feast ended the
-    // match — keys are dropped on the floor, so the panel says so rather than
-    // inviting a cast that will not be sent.
-    const spent = "rgba(180,180,190,0.75)";
-    const [status, statusColor] = cinematicActive()
-      ? ["The Lil Guys are eating — hold on", CAST_EVENT_COLOR]
-      : outroActive()
-        ? ["Encounter over", spent]
-        : left > 0
-          ? [`Turn ${game.turn ?? 1} — ${left}/${total} casts left`, C_TEXT]
-          : [`Turn ${game.turn ?? 1} — out of neutralizer`, spent];
-    text(status, px, my + M.timerTextDy, M.timerTextFont, statusColor);
+  // The holder's commitment went away (undo, or the turn resolved): the
+  // "most recent action" marker has nothing to point at any more.
+  if (lastCommitPid !== null &&
+    (counts.get(lastCommitPid) ?? 0) < (prevMenuPending.get(lastCommitPid) ?? 0)) {
+    lastCommitPid = null;
   }
-
-  // What the whole team's wheel selections would do if everyone cast now,
-  // groups included.  The same resolution the field preview draws, so the
-  // numbers and the highlighted cells can never disagree.
-  //
-  // The replay suppresses the field's preview, so it suppresses these
-  // numbers too — they are read off the SERVER's board, which is several stages
-  // ahead of the one on screen, and would describe cells the player cannot see
-  // yet.  The outro suppresses them for the plainer reason that there is no
-  // next cast.  The status line above already explains the wait.
-  if (playSuspended()) return;
-
-  const pv = shapePreview(game);
-  const projected = pv.projected;
-
-  const parts = [];
-  if (pv.hits > 0) {
-    parts.push({ str: `${pv.hits} cells`, color: C_SLIME_HDR });
-    if (pv.defused > 0) {
-      parts.push({ str: `${pv.defused} defused`, color: SHAPE_COLOR });
+  for (const [pid, n] of counts) {
+    if (n > (prevMenuPending.get(pid) ?? 0)) {
+      triggerMenuFx(pid, "pulse");
+      lastCommitPid = pid;
     }
   }
-  // Coverage thrown away: clipped off the grid edge, or landing on cells with
-  // nothing left to downgrade.  This is the aiming signal, so it is called out
-  // in red rather than hidden.
-  const wasted = pv.offGrid + pv.inert;
-  if (wasted > 0) parts.push({ str: `${wasted} wasted`, color: C_BAD });
-  // What this batch would OPEN: food that is walled off now and eaten after.
-  // Ranked alongside the cells hit, because on most turns it is the larger
-  // number and always the one worth aiming for.
-  if (pv.opened > 0) {
-    parts.push({ str: `opens ${pv.opened} food`, color: C_SLIME_HDR });
+  prevMenuPending = counts;
+
+  if (game.over_budget) triggerMenuFx(game.player_id, "shake");
+}
+
+/** Draw the whole seat row: one menu per player, placeholders for the rest. */
+function drawPlayerMenus(game) {
+  const P = LAYOUT.playerMenus;
+  const players = (game.entities ?? []).slice(0, P.seats);
+  for (let seat = 0; seat < P.seats; seat++) {
+    const x = P.x0 + seat * (P.w + P.gap);
+    const e = players[seat];
+    if (e === undefined) {
+      drawEmptySeat(x, P.y, P.w, P.h);
+    } else {
+      drawPlayerMenu(game, e, x, P.y);
+    }
   }
-  // The price of the WHOLE turn as it stands, and whether the pool can pay
-  // it.  Shown even at zero cost, and in red when it cannot: a cast that takes
-  // the turn over budget is refused outright, so this is the warning that says
-  // why ENTER is about to do nothing.
-  if (projected.cost > 0 || projected.labels.length > 0) {
-    const affordable = (game.charges ?? 0) >= projected.cost;
-    parts.push({
-      str: `\u26a1${projected.cost}${affordable ? "" : " OVER BUDGET"}`,
-      color: affordable ? C_CHARGE : C_BAD,
-    });
+}
+
+/** A seat nobody is sitting in: present (so the row reads as four chairs),
+ *  but visibly hollow. */
+function drawEmptySeat(x, y, w, h) {
+  ctx.save();
+  ctx.strokeStyle = "rgba(110,110,130,0.35)";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]);
+  ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+  ctx.restore();
+  ctx.save();
+  ctx.font = `${LAYOUT.playerMenus.labelFont}px monospace`;
+  ctx.fillStyle = "rgba(110,110,130,0.4)";
+  ctx.textAlign = "center";
+  ctx.fillText("empty", x + w / 2, y + h / 2 + 4);
+  ctx.restore();
+}
+
+/** One player's menu: their held spell's shape, and their lock-in state. */
+function drawPlayerMenu(game, e, x, y) {
+  const P = LAYOUT.playerMenus;
+  const own = e.owner === game.player_id;
+  const locked = (e.casts_left ?? 0) === 0;
+  const fx = menuFx.get(e.owner);
+
+  ctx.save();
+  const cx = x + P.w / 2;
+  const cy = y + P.h / 2;
+  if (fx) {
+    if (fx.kind === "pulse") {
+      // One swell and back: sin over the animation's life, peaking mid-way.
+      const p = 1 - fx.t / fx.dur;
+      const s = 1 + (P.pulseScale - 1) * Math.sin(p * Math.PI);
+      ctx.translate(cx, cy);
+      ctx.scale(s, s);
+      ctx.translate(-cx, -cy);
+    } else {
+      // Sideways rattle, decaying to rest so it ends where it started.
+      const decay = fx.t / fx.dur;
+      const dx = Math.sin(fx.t * P.shakeHz * Math.PI * 2) * P.shakeAmp * decay;
+      ctx.translate(dx, 0);
+    }
+  } else if (e.owner === lastCommitPid) {
+    // The round's most recent committed action: keep breathing after the
+    // lock-in swell, so the marker survives until someone else moves.
+    const t = performance.now() / 1000;
+    const s = 1 + (P.lastPulseScale - 1) *
+      (0.5 + 0.5 * Math.sin(t * Math.PI * 2 * P.lastPulseHz));
+    ctx.translate(cx, cy);
+    ctx.scale(s, s);
+    ctx.translate(-cx, -cy);
   }
 
-  let dx = px;
-  const pvY = my + M.previewDy;
-  text("Turn:", dx, pvY, M.previewFont, "rgba(180,200,255,0.85)");
-  dx += 52;
-  if (parts.length === 0) {
-    text("—", dx, pvY, M.previewFont, "rgba(120,120,140,0.7)");
+  rect(x, y, P.w, P.h, C_MENU_BG);
+  // Locked in: a solid bright frame plus a tint wash — the box itself is the
+  // state, readable across the room, with the label below as confirmation.
+  if (locked) rect(x, y, P.w, P.h, withAlpha(SHAPE_COLOR, 0.10));
+  rectStroke(x, y, P.w, P.h, locked ? 4 : 2,
+    locked ? SHAPE_COLOR : playerColor(e.owner));
+
+  // Seat label: whose menu this is, in their color.
+  ctx.font = `${P.labelFont}px monospace`;
+  ctx.textAlign = "center";
+  ctx.fillStyle = playerColor(e.owner);
+  ctx.fillText(own ? `P${e.owner} (you)` : `P${e.owner}`, x + P.w / 2, y + P.labelDy);
+
+  // The held spell, drawn as its shape — the same rows the field preview
+  // stamps, so what the menu shows IS what ENTER lands.
+  const move = PLAYER_RECIPES[e.selected_shape ?? 0] ?? PLAYER_RECIPES[0];
+  const shapeTop = y + P.labelDy + 6;
+  const shapeBottom = y + P.h - P.statusDy - P.statusFont - 2;
+  drawSpellShape(x + P.w / 2, (shapeTop + shapeBottom) / 2,
+    P.w - 20, shapeBottom - shapeTop, move?.rows ?? ["#"], locked);
+
+  // Lock-in state for the round: pips while casts remain (the same ◆
+  // language as the wheel panel), the banner once they are spent.
+  const statusY = y + P.h - P.statusDy;
+  if (locked) {
+    ctx.fillStyle = SHAPE_COLOR;
+    ctx.font = `bold ${P.statusFont}px monospace`;
+    ctx.fillText("LOCKED IN", x + P.w / 2, statusY);
   } else {
-    for (const p of parts) {
-      text(p.str, dx, pvY, M.previewFont, p.color);
-      dx += ctx.measureText(p.str).width + 12;
+    ctx.fillStyle = CAST_EVENT_COLOR;
+    ctx.font = `${P.statusFont}px monospace`;
+    ctx.fillText("◆".repeat(e.casts_left ?? 0), x + P.w / 2, statusY);
+  }
+  ctx.restore();
+}
+
+/**
+ * Draw a spell's shape as a small grid of filled cells, centred on (cx, cy)
+ * and fitted inside maxW×maxH.  The anchor cell — the one the cursor aims —
+ * is outlined, matching the ◉ convention of the lobby guide.  `dim` mutes the
+ * fill for a menu whose player is locked in: the spell is still held, but no
+ * cast of it is available this round.
+ */
+function drawSpellShape(cx, cy, maxW, maxH, rows, dim) {
+  const P = LAYOUT.playerMenus;
+  const nR = rows.length;
+  const nC = rows[0]?.length ?? 0;
+  if (nR === 0 || nC === 0) return;
+
+  const gap = P.shapeCellGap;
+  const cell = Math.min(
+    P.shapeCellMax,
+    (maxW - (nC - 1) * gap) / nC,
+    (maxH - (nR - 1) * gap) / nR,
+  );
+  const w = nC * cell + (nC - 1) * gap;
+  const h = nR * cell + (nR - 1) * gap;
+  const x0 = cx - w / 2;
+  const y0 = cy - h / 2;
+  const anchorR = Math.floor(nR / 2);
+  const anchorC = Math.floor(nC / 2);
+
+  const fill = withAlpha(SHAPE_COLOR, dim ? 0.45 : 1);
+  for (let r = 0; r < nR; r++) {
+    for (let cl = 0; cl < nC; cl++) {
+      const cxp = x0 + cl * (cell + gap);
+      const cyp = y0 + r * (cell + gap);
+      if (rows[r][cl] === "#") {
+        rect(cxp, cyp, cell, cell, fill);
+      } else {
+        rect(cxp, cyp, cell, cell, "rgba(110,110,130,0.15)");
+      }
+      if (r === anchorR && cl === anchorC) {
+        rectStroke(cxp, cyp, cell, cell, 1.5, withAlpha(C_OWN_ROW, dim ? 0.45 : 1));
+      }
     }
   }
-  if (projected.labels.length > 0) {
-    text(projected.labels.join(", "), dx + 8, pvY, M.previewFont, "rgba(255,255,140,0.9)");
-  }
-
 }
 
 /** The `game` object whose transient events have already been consumed.
@@ -2912,7 +3147,9 @@ function drawGame(game, dt) {
   if (fresh) {
     spawnRefusalFloater(game);
     //spawnRecipeFloaters(game);
+    updateMenuFx(game);
   }
+  tickMenuFx(dt);
 
   clear();
 
@@ -2920,15 +3157,29 @@ function drawGame(game, dt) {
   text(`Turn ${game.turn ?? 1}`,
     H.waveX, H.waveY, H.waveFont, C_HEADER);
 
+  // The game id (join code), top right, so anyone watching can tell others
+  // what to join.
+  const gameId = `Game ${game.join_code ?? "------"}`;
+  ctx.font = `${H.labelFont}px monospace`;
+  text(gameId, SW - ctx.measureText(gameId).width - 24, H.waveY, H.labelFont, C_HEADER);
+
+  // Observers watch the same board; the only key that means anything to them
+  // is the one that puts them in it.
+  if (game.observer) {
+    const hint = "OBSERVING — press P to take a seat (Shift+P leaves one)";
+    ctx.font = `${H.labelFont - 4}px monospace`;
+    text(hint, SW - ctx.measureText(hint).width - 24, H.waveY + 24, H.labelFont - 4, C_TEXT);
+  }
+
   text("SLIME FIELD", FIELD.x0, FIELD.y0 + H.labelDy, H.labelFont, C_SLIME_HDR);
 
   drawScore(game);
   drawHungerBar(game);
   drawChargeBar(game);
   drawSlimeField(game);
-  drawLilGuys(dt);
+  drawLilGuys(game, dt);
   drawWheelPanel(game);
-  drawActionMenu(game);
+  drawPlayerMenus(game);
 
   // Floaters drawn last so they appear on top of everything.
   drawFloaters();
@@ -2978,7 +3229,7 @@ function drawGameOver(msg) {
   text(`Neutral slime consumed: ${score}${hungerText}`, L.x, L.scoreY, L.scoreFont, C_SLIME_HDR);
 
   if (!stats) {
-    text("Press any key to return to lobby.", L.x, SH - 40, L.hintFont, C_TEXT);
+  drawRestartButton();
     return;
   }
 
@@ -2991,7 +3242,7 @@ function drawGameOver(msg) {
 
   /** One "LABEL  ≡12 -5" row, bucketed by tier. */
   const feastRow = (label, obj) => {
-    text(label, F.label, y, L.rowFont, "rgba(200,200,210,0.9)");
+    text(label, F.label, y, L.rowFont, "rgba(70,70,85,0.95)");
     drawTierCells(F.cells, y, L.rowFont, obj);
     y += L.rowH;
   };
@@ -3007,7 +3258,7 @@ function drawGameOver(msg) {
   text(
     `eaten ${consumed} (${feast.neutral ?? 0} neutral + ${feast.defused ?? 0} defused)` +
     `  ·  hunger ${feast.hunger_normal ?? 0}`,
-    F.label, y, L.rowFont, "rgba(200,200,210,0.9)",
+    F.label, y, L.rowFont, "rgba(70,70,85,0.95)",
   );
   y += L.rowH;
   // The headline tuning number: food that existed, was edible, and was never
@@ -3031,14 +3282,14 @@ function drawGameOver(msg) {
   text("DEFUSED", P.defused, y, L.sectionFont, C_HEADER);
   text("RECIPES", P.recipes, y, L.sectionFont, C_HEADER);
   y += L.rowH;
-  for (const p of stats.players ?? []) {
-    text(p.name || "(anon)", P.name, y, L.rowFont, C_TEXT);
+  (stats.players ?? []).forEach((p, i) => {
+    text(`P${i + 1}`, P.name, y, L.rowFont, C_TEXT);
     text(String(p.casts), P.casts, y, L.rowFont, C_TEXT);
     text(String(p.cells_covered ?? 0), P.covered, y, L.rowFont, C_SLIME_HDR);
     text(String(p.cells_neutralized ?? 0), P.defused, y, L.rowFont, SHAPE_COLOR);
-    text(`${p.recipe_casts}/${p.casts}`, P.recipes, y, L.rowFont, "rgba(255,255,140,0.9)");
+    text(`${p.recipe_casts}/${p.casts}`, P.recipes, y, L.rowFont, "rgba(170,120,0,0.95)");
     y += L.rowH;
-  }
+  });
   y += 14;
 
   // ---- Recipe fire counts (labels resolved by table index; order must
@@ -3053,13 +3304,43 @@ function drawGameOver(msg) {
   text("RECIPES", P.name, y, L.sectionFont, C_HEADER);
   y += L.rowH;
   text(recipeParts.length > 0 ? recipeParts.join("  ·  ") : "none fired",
-    P.name, y, L.rowFont, recipeParts.length > 0 ? "rgba(255,255,140,0.9)" : "rgba(120,120,140,0.7)");
+    P.name, y, L.rowFont, recipeParts.length > 0 ? "rgba(170,120,0,0.95)" : "rgba(120,120,140,0.7)");
   y += L.rowH;
   const eaten = (stats.slime_total ?? 0) - (stats.slime_left ?? 0);
   text(`total spells cast: ${stats.casts_total}  ·  slime eaten: ${eaten}/${stats.slime_total ?? 0}`,
-    P.name, y, L.rowFont, "rgba(200,200,210,0.9)");
+    P.name, y, L.rowFont, "rgba(70,70,85,0.95)");
 
   text("Press any key to return to lobby.", L.x, SH - 40, L.hintFont, C_TEXT);
+}
+
+/** Design-space bounds of the next-round button.  Fixed geometry, so click
+ *  hit-testing needs no per-frame state. */
+const RESTART_BUTTON = (() => {
+  const B = LAYOUT.gameOver.button;
+  return { x: (SW - B.w) / 2, y: SH - B.h - B.bottomGap, w: B.w, h: B.h };
+})();
+let restartHover = false;
+
+/** True while the report is up and the button should exist: clicks anywhere
+ *  else — and clicks during the outro replay — must not start a round. */
+function restartButtonActive() {
+  return latestMsg?.phase === "game_over" && !outroActive();
+}
+
+/** The one way a new round starts: a CLICK, from a browser tab.  Drawn as a
+ *  real button so the trigger is unmistakably deliberate. */
+function drawRestartButton() {
+  const B = LAYOUT.gameOver.button;
+  const r = RESTART_BUTTON;
+  rect(r.x, r.y, r.w, r.h,
+    restartHover ? "rgba(60,90,200,0.18)" : "rgba(60,90,200,0.08)");
+  rectStroke(r.x, r.y, r.w, r.h, restartHover ? 3 : 2, C_HEADER);
+  ctx.save();
+  ctx.font = `bold ${B.font}px monospace`;
+  ctx.fillStyle = C_HEADER;
+  ctx.textAlign = "center";
+  ctx.fillText("START NEXT ROUND", r.x + r.w / 2, r.y + r.h / 2 + B.font * 0.35);
+  ctx.restore();
 }
 
 // ---------------------------------------------------------------------------
@@ -3184,7 +3465,6 @@ function renderFrame(msg, dt) {
   switch (msg.phase) {
     case "pre_lobby": drawPreLobby(); break;
     case "connecting": drawConnecting(); break;
-    case "lobby": drawLobby(msg.lobby); break;
     case "game": drawGame(msg.game, dt); break;
     case "game_over": drawGameOver(msg); break;
     default: drawConnecting();
@@ -3256,9 +3536,8 @@ function connect() {
 // ---------------------------------------------------------------------------
 
 const FORWARDED_KEYS = new Set([
-  // Enter = lock in a cast (game) / ready toggle (lobby) / dismiss (game over).
-  // Escape = take back your newest lock-in, one per press; the lobby and menus
-  // use it as a plain "back".
+  // Enter = lock in a cast (game) / dismiss (game over).
+  // Escape = take back your newest lock-in, one per press.
   "Enter", "Escape",
   // Shape wheel: 1 turns forward, 2 turns back.  Selection lives on the
   // server, so these are the whole of the client's part in it.
@@ -3267,6 +3546,10 @@ const FORWARDED_KEYS = new Set([
   // stamped on.  Clamped server-side, so holding a direction at an edge is
   // harmless.
   "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+  // Seats: p takes a player slot (silently ignored when all four are taken),
+  // Shift+P gives it up and goes back to observing.  Case matters — it is
+  // exactly what KeyboardEvent.key reports.
+  "p", "P",
 ]);
 
 /** Forward one key to the Zig client via the tab WebSocket. */
@@ -3294,7 +3577,64 @@ document.addEventListener("keydown", (e) => {
   // decided, and the only key the Zig client still answers to is the one that
   // dismisses the report — which must not be spent before the report is up.
   if (cinematicActive() || outroActive()) return;
+  if (latestMsg?.phase === "game" && latestMsg.game) {
+    const g = latestMsg.game;
+    // A lock-in FREEZES its player: while any cast of theirs is pending, the
+    // cursor and the wheel are committed — aiming or re-rolling now would
+    // silently desync what they see from what they promised the round.  The
+    // keys are dropped HERE, not sent and refused: the server would happily
+    // move the cursor, and the lock is a client-honoured contract.  ESC is
+    // the one exception — cancelling is exactly how the player frees
+    // themselves back up.
+    const frozen = (g.pending ?? []).some((pc) => pc.player_id === g.player_id);
+    const steering = e.key === "1" || e.key === "2" || e.key.startsWith("Arrow");
+    if (frozen && steering) {
+      triggerMenuFx(g.player_id, "shake");
+      return;
+    }
+    // ENTER with every cast already spent is a refusal the server never
+    // answers (the key does nothing), so the invalid-selection shake is
+    // raised locally: the player asked, the answer is no, their menu says so.
+    if (e.key === "Enter") {
+      const own = (g.entities ?? []).find((en) => en.owner === g.player_id);
+      if (own !== undefined && (own.casts_left ?? 0) === 0) {
+        triggerMenuFx(g.player_id, "shake");
+      }
+    }
+  }
   sendKey(e.key);
+});
+
+/** A mouse event's position in DESIGN units: the canvas is CSS-scaled, so
+ *  client coordinates must be mapped back through its on-screen rect. */
+function canvasCoords(e) {
+  const r = canvas.getBoundingClientRect();
+  return {
+    x: (e.clientX - r.left) * (SW / r.width),
+    y: (e.clientY - r.top) * (SH / r.height),
+  };
+}
+
+function overRestartButton(e) {
+  if (!restartButtonActive()) return false;
+  const { x, y } = canvasCoords(e);
+  const r = RESTART_BUTTON;
+  return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+}
+
+canvas.addEventListener("mousemove", (e) => {
+  restartHover = overRestartButton(e);
+  canvas.style.cursor = restartHover ? "pointer" : "default";
+});
+
+// Starting the next round is a CLICK on the report's button — deliberately
+// not a key, so nobody mashing casts at the buzzer relaunches the game by
+// accident.  Computed from the event (not the hover flag) so touch works.
+canvas.addEventListener("click", (e) => {
+  if (!overRestartButton(e)) return;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ action: "restart" }));
+  }
 });
 
 /** Send a pre-lobby room action to the bridge. */

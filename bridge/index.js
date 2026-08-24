@@ -8,12 +8,17 @@
  * each tab as a distinct player.
  *
  * Multiple lobbies are supported.  Each lobby runs its own Zig server process
- * on a dedicated port.  The LobbyRegistry tracks all active lobbies by their
- * 6-character join code.  Tabs are routed to a lobby via:
- *   { action: "create" }                          — spawn a new server + join it
- *   { action: "join",      code: "XXXXXX" }       — join an existing lobby by code
- *   { action: "reconnect", code: "XXXXXX",
- *              player_id: N }                      — rejoin after page refresh
+ * on a dedicated port; a game is ALWAYS running in it (there is no lobby
+ * phase).  The LobbyRegistry tracks all active lobbies by their 6-character
+ * join code.  Tabs are routed to a lobby via:
+ *   { action: "create" }                    — spawn a new server + attach
+ *   { action: "join", code: "XXXXXX" }      — attach to an existing lobby
+ *
+ * A tab attaches as an OBSERVER of the running game.  Taking one of the four
+ * player seats is the browser's P key (Shift+P leaves), forwarded like any
+ * other key — the Zig client turns it into the take_slot/leave_slot protocol.
+ * Starting the next round from the end screen is a CLICK on the report's
+ * button ({ action: "restart" } → RESTART stdio line); only tabs have one.
  *
  * Responsibilities per TabSession:
  *   - Show pre_lobby screen until a room is chosen
@@ -26,14 +31,16 @@
  *
  * Shared:
  *   - HTTP static file server on port 3000 (serves web/)
- *   - Hardware controller discovery/pairing over USB serial (controllers.js):
- *     board buttons feed the same KEY: path; selected-shape feedback flows
- *     back to the board's e-paper.
+ *   - Hardware controller discovery over USB serial (controllers.js): every
+ *     board is its own player with a dedicated Zig client; selected-shape
+ *     feedback flows back to the board's e-paper.
  *
  * Stdio protocol (Zig ↔ bridge):
  *   Zig stdin  ← WIRE:<hex>\n   raw server message bytes, hex-encoded
  *   Zig stdin  ← KEY:<name>\n   browser KeyboardEvent.key value
- *   Zig stdin  ← READY\n        sent once when server WS first opens
+ *   Zig stdin  ← READY\n        sent when the server WS opens
+ *   Zig stdin  ← JOIN\n         take a player seat (board sessions)
+ *   Zig stdin  ← RESTART\n      start the next round (tab button click)
  *   Zig stdout → {"tag":"render",...}\n   full UI state for the browser
  *   Zig stdout → {"tag":"send","bytes":"<hex>"}\n  forward to server
  */
@@ -45,11 +52,7 @@ const fs          = require("fs");
 const path        = require("path");
 const { WebSocketServer, WebSocket } = require("ws");
 const { PlayerSession } = require("./session");
-const {
-  ControllerManager,
-  shapeFromRender,
-  finalScoreFromRender,
-} = require("./controllers");
+const { ControllerManager } = require("./controllers");
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -463,24 +466,12 @@ function roomTabJoined(room) {
 /** @type {Set<TabSession>} */
 const activeSessions = new Set();
 
-// Hardware controllers (dc_rp2040 boards on USB serial). Hybrid player model:
-// a linked board first tries to pair with a started tab session (drives that
-// tab's player); with no tab free it becomes its own headless player
-// (ControllerSession) in the active lobby. Sessions iterate in Set insertion
-// order = tab-connection order, so pairing picks the oldest started tab first.
+// Hardware controllers (dc_rp2040 boards on USB serial).  Every linked board
+// is its own player (ControllerSession) in the active lobby.
 const controllerManager = new ControllerManager({
   clientBin: CLIENT_BIN,
-  getSessions: () => activeSessions,
-  onKey: (session, key) => {
-    if (session.started) session.writeToZig(`KEY:${key}\n`);
-  },
-  // A paired board's appetite stat applies to the tab's player; the Zig
-  // client forwards it to the server (re-joining if it already joined).
-  onStat: (session, appetite) => {
-    if (session.started) session.writeToZig(`STAT:appetite=${appetite}\n`);
-  },
-  // Headless boards join the single active lobby, or the newest when several
-  // exist (Map preserves insertion order), or wait when there is none.
+  // Boards join the single active lobby, or the newest when several exist
+  // (Map preserves insertion order), or wait when there is none.
   pickRoom: () => {
     const rooms = [...lobbyRegistry.values()];
     return rooms.length > 0 ? rooms[rooms.length - 1] : null;
@@ -498,10 +489,6 @@ class TabSession extends PlayerSession {
   constructor(tabWs) {
     super({ clientBin: CLIENT_BIN, label: "tab" });
     this.tabWs          = tabWs;
-    /** Paired hardware controller (managed by ControllerManager). */
-    this.controller     = null;
-    /** msg.phase of the last render frame (game-over edge detection). */
-    this.lastPhase      = null;
   }
 
   // ---- PlayerSession hooks --------------------------------------------------
@@ -509,16 +496,6 @@ class TabSession extends PlayerSession {
   onZigFrame(msg, line) {
     if (msg.tag === "render") {
       if (this.tabWs.readyState === WebSocket.OPEN) this.tabWs.send(line);
-      const score = finalScoreFromRender(msg, this.lastPhase);
-      this.lastPhase = msg.phase;
-      // Mirror the selected shape to a paired hardware controller's e-paper.
-      if (this.controller !== null) {
-        this.controller.sendShape(
-          shapeFromRender(msg, moveLabelsFor(this.room ? this.room.configHash : null)),
-        );
-        // Game just ended: bank the final team score on the board.
-        if (score !== null) this.controller.sendScore(score);
-      }
     } else {
       console.warn("[bridge] unknown Zig frame tag:", msg.tag);
     }
@@ -542,7 +519,7 @@ class TabSession extends PlayerSession {
     this.room    = room;
     roomTabJoined(room);
     this.spawnZig();
-    // A waiting hardware controller may now pair with this session.
+    // A waiting board may now get a player in this (possibly new) room.
     controllerManager.sessionStarted();
     // Small delay: give the server process a moment to bind its port if just spawned.
     setTimeout(() => {
@@ -598,7 +575,7 @@ class TabSession extends PlayerSession {
       return;
     }
 
-    if (msg.action === "join" || msg.action === "reconnect") {
+    if (msg.action === "join") {
       const rawCode = (msg.code || "").toUpperCase().trim();
       if (rawCode.length !== 6) {
         this.sendPreLobbyError("invalid_code");
@@ -606,11 +583,11 @@ class TabSession extends PlayerSession {
       }
       const room = lobbyRegistry.get(rawCode);
       if (!room) {
-        console.log(`[lobby] join/reconnect: code=${rawCode} not found; registry=${[...lobbyRegistry.keys()].join(",") || "(empty)"}`);
+        console.log(`[lobby] join: code=${rawCode} not found; registry=${[...lobbyRegistry.keys()].join(",") || "(empty)"}`);
         this.sendPreLobbyError("not_found");
         return;
       }
-      console.log(`[lobby] join/reconnect: code=${rawCode} found, routing tab`);
+      console.log(`[lobby] join: code=${rawCode} found, routing tab`);
       // Acknowledge immediately so the browser clears the pre_lobby screen
       // before the Zig client finishes connecting to the server.  `config`
       // makes joiners adopt the lobby's balance tables (may differ from the
@@ -645,9 +622,6 @@ class TabSession extends PlayerSession {
     this.closeShared();
     if (this.room) { roomTabLeft(this.room); this.room = null; }
     this.started = false;
-    // Detach the controller but keep its sticky mapping: if this tab starts
-    // again, the same board re-pairs to it.
-    controllerManager.releaseSession(this);
     console.warn(`[bridge] tab bounced to pre_lobby (${reason})`);
     this.sendPreLobbyError(reason);
   }
@@ -657,7 +631,6 @@ class TabSession extends PlayerSession {
     this.closed = true;
     this.closeShared();
     if (this.room)     { roomTabLeft(this.room); this.room = null; }
-    controllerManager.releaseSession(this, { forget: true });
     activeSessions.delete(this);
     console.log(`[bridge] tab session torn down (${activeSessions.size} active)`);
   }
@@ -692,6 +665,14 @@ browserWss.on("connection", (tabWs) => {
     // Key events are only forwarded once inside a room.
     if (typeof msg.key === "string") {
       if (session.started) session.writeToZig(`KEY:${msg.key}\n`);
+      return;
+    }
+
+    // The report screen's button: only browser tabs can start the next
+    // round, and only by this click (never a key), so the action routes
+    // here rather than through the KEY: path.
+    if (msg.action === "restart") {
+      if (session.started) session.writeToZig("RESTART\n");
       return;
     }
 

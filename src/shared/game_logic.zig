@@ -268,6 +268,35 @@ pub fn shrink_hunger_max(hunger: *c.Health, contribution: u16) void {
     hunger.max -= @intCast(shrink);
 }
 
+/// One of `counted` players left mid-game: remove their proportion of the
+/// REMAINING charge pool.
+///
+///     shrink = floor(charges / counted)
+///
+/// Charges are pooled — spent (and injected) as a group, with no per-player
+/// ledger — so the leaver's proportion is simply 1/n of whatever is left.
+/// What the team already spent stays spent.  `counted` includes the leaver.
+/// NOTE: the session never calls this for the LAST player out (counted == 1
+/// would drain the pool to 0); their share stays in trust for the next taker.
+pub fn shrink_charges(charges: *u32, counted: u32) void {
+    if (counted == 0) return;
+    charges.* -= charges.* / counted;
+}
+
+/// A player joined a game that already counted `counted_before` players:
+/// grow the remaining pool by their proportion.
+///
+///     grow = floor(charges / counted_before)
+///
+/// The exact inverse of `shrink_charges` (modulo floor), so a join followed
+/// by a leave — or the reverse — cannot be farmed for charges.  The FIRST
+/// player to join (`counted_before == 0`) grows nothing: the pool starts at
+/// the encounter's seed and that seed is theirs.
+pub fn grow_charges(charges: *u32, counted_before: u32) void {
+    if (counted_before == 0) return;
+    charges.* +|= charges.* / counted_before;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -608,6 +637,69 @@ test "shrink_hunger_max: a full or empty bar is left alone" {
     var blank = c.Health{ .current = 0, .max = 0 };
     shrink_hunger_max(&blank, 30);
     try std.testing.expectEqual(@as(u16, 0), blank.max);
+}
+
+test "shrink_charges: the leaver takes 1/n of the remaining pool" {
+    // Four players, 100 charges left: the leaver's proportion is 25.
+    var pool: u32 = 100;
+    shrink_charges(&pool, 4);
+    try std.testing.expectEqual(@as(u32, 75), pool);
+    // A second leaver is now one of three: floor(75/3) = 25 again.
+    shrink_charges(&pool, 3);
+    try std.testing.expectEqual(@as(u32, 50), pool);
+}
+
+test "shrink_charges: rounding favours the players who stay" {
+    // floor(10/3) = 3 comes off, not 4: the indivisible remainder stays with
+    // the group.
+    var pool: u32 = 10;
+    shrink_charges(&pool, 3);
+    try std.testing.expectEqual(@as(u32, 7), pool);
+}
+
+test "shrink_charges: counted == 1 drains the pool (why the session skips it)" {
+    var pool: u32 = 42;
+    shrink_charges(&pool, 1);
+    try std.testing.expectEqual(@as(u32, 0), pool);
+}
+
+test "shrink_charges: an empty pool and a zero count are left alone" {
+    var pool: u32 = 0;
+    shrink_charges(&pool, 3);
+    try std.testing.expectEqual(@as(u32, 0), pool);
+    // counted == 0 cannot happen for a counted leaver, but must not divide
+    // by zero if it ever does.
+    var untouched: u32 = 9;
+    shrink_charges(&untouched, 0);
+    try std.testing.expectEqual(@as(u32, 9), untouched);
+}
+
+test "grow_charges: a joiner adds their proportion of the remaining pool" {
+    // Two players hold 60: a third joining brings the pool to 90 — everyone
+    // now owns 30, the same as before.
+    var pool: u32 = 60;
+    grow_charges(&pool, 2);
+    try std.testing.expectEqual(@as(u32, 90), pool);
+}
+
+test "grow_charges: the first joiner inherits the seed unchanged" {
+    var pool: u32 = 40;
+    grow_charges(&pool, 0);
+    try std.testing.expectEqual(@as(u32, 40), pool);
+}
+
+test "grow_charges and shrink_charges round-trip (no join/leave farming)" {
+    // join (2 -> 3 players) then leave (3 -> 2): back where we started.
+    var pool: u32 = 60;
+    grow_charges(&pool, 2); // 90
+    shrink_charges(&pool, 3); // 60
+    try std.testing.expectEqual(@as(u32, 60), pool);
+    // With an indivisible pool the floors only ever round DOWN, so cycling
+    // can never mint charges.
+    var odd: u32 = 61;
+    grow_charges(&odd, 2); // 61 + 30 = 91
+    shrink_charges(&odd, 3); // 91 - 30 = 61
+    try std.testing.expect(odd <= 61);
 }
 
 test "add_hunger: clamps at max" {
