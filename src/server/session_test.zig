@@ -93,14 +93,12 @@ fn tiered(tier: c.Tier) c.SlimeCell {
 /// one downgrade from defused, so a single stamp finishes a cell.
 const enc_twenty_green = enc.Encounter{
     .label = "test_twenty_green",
-    .hunger_max = 1000,
     .slime = .{ .tiered = .{ 0, 0, 20 } },
 };
 
 /// 20 red hazard units: red needs THREE stamps per cell to defuse.
 const enc_twenty_red = enc.Encounter{
     .label = "test_twenty_red",
-    .hunger_max = 1000,
     .slime = .{ .tiered = .{ 20, 0, 0 } },
 };
 
@@ -108,35 +106,28 @@ const enc_twenty_red = enc.Encounter{
 /// clear part of the field.
 const enc_fifty_green = enc.Encounter{
     .label = "test_fifty_green",
-    .hunger_max = 1000,
     .slime = .{ .tiered = .{ 0, 0, 50 } },
 };
 
 /// Mixed tiers + neutral: 10 red + 8 green + 7 neutral = 25 units.
 const enc_mixed = enc.Encounter{
     .label = "test_mixed",
-    .hunger_max = 1000,
     .slime = .{ .tiered = .{ 10, 0, 8 }, .neutral = 7 },
 };
 
-/// Tiny hunger budget of EDIBLE units, so one feast overfills the bar.  Live
-/// hazards would be walls and cost nothing, so this has to be neutral slime.
-/// Retained shape: exactly as many units as one `block` stamp covers
-/// (3x3 = 9).  Eating them live costs 3 each, so the bar fills on the 8th unit
-/// — BEFORE the field empties, which is what makes the loss unambiguous (a
-/// simultaneous clear would win the tie).  Defusing them first costs 9 total,
-/// a comfortable clear.
+/// Exactly as many EDIBLE units as one `block` stamp covers (3x3 = 9).  Live,
+/// they are walls: no hunger, no score.  Under the default fixture config the
+/// duo bar is 200, so hunger never binds here — the pressure is the walls.
 const enc_tight_budget = enc.Encounter{
     .label = "test_tight_budget",
-    .hunger_max = 20,
     .slime = .{ .neutral = 9 },
 };
 
-/// A bar so small that one modest feast overfills it — the shortest path to a
+/// Nine edible units for the hunger_full tests.  Pair with `HungerBase(3)` —
+/// a duo bar of 6 — so one modest feast overfills it: the shortest path to a
 /// clean `hunger_full` loss with slime still on the board.
 const enc_paper_stomach = enc.Encounter{
     .label = "test_paper_stomach",
-    .hunger_max = 5,
     .slime = .{ .neutral = 9 },
 };
 
@@ -144,7 +135,6 @@ const enc_paper_stomach = enc.Encounter{
 /// from the first turn and every unit scores.
 const enc_neutral_only = enc.Encounter{
     .label = "test_neutral_only",
-    .hunger_max = 1000,
     .slime = .{ .neutral = 40 },
 };
 
@@ -152,7 +142,6 @@ const enc_neutral_only = enc.Encounter{
 /// start in the reservoir.
 const enc_overflow = enc.Encounter{
     .label = "test_overflow",
-    .hunger_max = 1000,
     .slime = .{ .tiered = .{ 0, 0, 40 }, .neutral = 40 },
 };
 
@@ -422,6 +411,22 @@ fn start(s: *TwoPlayerSession, encounter: *const enc.Encounter) !void {
     try s.sess.start_game_encounter(encounter);
 }
 
+/// A config identical to the fixture except for `hunger_base` — for tests
+/// that need a hunger bar of a specific size.  Appetites are 0 in these
+/// sessions, so a two-player bar is exactly `2 * base`.
+fn HungerBase(comptime base: u16) type {
+    return struct {
+        const cfg = shared.config.Config{
+            .balance = blk: {
+                var b = fixtures.test_config.balance;
+                b.hunger_base = base;
+                break :blk b;
+            },
+            .encounters = fixtures.test_config.encounters,
+        };
+    };
+}
+
 /// Join one more player into an already-built session, for the few tests about
 /// groups that need MORE than a pair.  The extra player has no TestPlayer, so
 /// its outbound bytes go to the session's own sink and are not inspected —
@@ -555,7 +560,9 @@ test "ready flow starts the default encounter with the configured grid" {
     try std.testing.expectEqual(BAL.slime_grid.cols, gs.grid_cols);
     try std.testing.expectEqual(BAL.casts_per_turn, gs.casts_per_turn);
 
-    try std.testing.expectEqual(@as(u16, DEFAULT_ENC.hunger_max), s.sess.hunger.max);
+    // The bar is the players' appetite contributions summed — two appetite-0
+    // players here, so twice the base.
+    try std.testing.expectEqual(2 * logic.player_hunger(BAL, 0), s.sess.hunger.max);
     try std.testing.expectEqual(@as(u16, 0), s.sess.hunger.current);
     try std.testing.expectEqual(DEFAULT_ENC.total_units(), s.sess.slime_total);
 }
@@ -992,7 +999,6 @@ test "a stamp only reaches the grid; the reservoir is out of range" {
     // 80 green units: 60 on the grid, 20 waiting off-grid.
     const encounter = enc.Encounter{
         .label = "test_green_overflow",
-        .hunger_max = 1000,
         .slime = .{ .tiered = .{ 0, 0, 80 } },
     };
     try start(&s, &encounter);
@@ -1546,7 +1552,6 @@ test "an edible field is eaten whole and refilled from the reservoir" {
     // 80 NEUTRAL units: nothing blocks, so the flood reaches the whole grid.
     const enc_all_neutral = enc.Encounter{
         .label = "test_all_neutral",
-        .hunger_max = 1000,
         .slime = .{ .neutral = 80 },
     };
     try start(&s, &enc_all_neutral); // 60 on-grid, 20 waiting
@@ -2253,7 +2258,6 @@ test "player recipe fires are broadcast when the cast converts" {
 /// single charge over, so a second expensive cast must be refused.
 const enc_thin_pool = enc.Encounter{
     .label = "test_thin_pool",
-    .hunger_max = 1000,
     .charges = 10,
     .slime = .{ .tiered = .{ 0, 0, 50 } },
 };
@@ -2452,9 +2456,10 @@ test "a full hunger bar ends the game with slime left over" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
+    // hunger_base 3 → the pair's bar is 6.
+    try init_two_player_session_cfg(&s, allocator, SEED, &HungerBase(3).cfg);
     defer s.deinit();
-    // 8 edible units on the field against a bar of 5: the feast overfills it.
+    // 8 edible units on the field against a bar of 6: the feast overfills it.
     try start(&s, &enc_paper_stomach);
     // Hold one unit back so the field is NOT cleared by the feast: the loss has
     // to be unambiguous.
@@ -2465,12 +2470,12 @@ test "a full hunger bar ends the game with slime left over" {
     try end_turn_idly(&s.sess);
 
     try std.testing.expectEqual(session_mod.SessionPhase.lobby, s.sess.phase);
-    try std.testing.expectEqual(@as(u16, 5), s.sess.hunger.current); // clamped at max
+    try std.testing.expectEqual(@as(u16, 6), s.sess.hunger.current); // clamped at max
 
     const go = try game_over_msg(try drain(s.p[0].buf.items, arena));
     try std.testing.expectEqual(proto.EndReason.hunger_full, go.stats.reason);
-    try std.testing.expectEqual(@as(u16, 5), go.stats.hunger_final);
-    try std.testing.expectEqual(@as(u16, 5), go.stats.hunger_max);
+    try std.testing.expectEqual(@as(u16, 6), go.stats.hunger_final);
+    try std.testing.expectEqual(@as(u16, 6), go.stats.hunger_max);
     try std.testing.expectEqual(@as(u32, 9), go.stats.slime_total);
     // The bar filled before the field was cleared, so slime survives.
     try std.testing.expect(go.stats.slime_left > 0);
@@ -2482,7 +2487,7 @@ test "defusing the tight budget survives what idle play loses" {
     var s: TwoPlayerSession = undefined;
     try init_two_player_session(&s, allocator);
     defer s.deinit();
-    try start(&s, &enc_tight_budget); // hunger_max 20
+    try start(&s, &enc_tight_budget); // duo bar 200 — hunger never binds here
     set_block_field(&s.sess, tiered(.green), 2, 5);
 
     // One `block` stamp defuses the whole field.  Left alone, those 9 cells are
@@ -2508,12 +2513,12 @@ test "field_cleared wins the tie when the last bite fills the bar" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
+    // 2 neutral units against a bar of exactly 2 (hunger_base 1 × two
+    // players): the field empties as the bar fills.
+    try init_two_player_session_cfg(&s, allocator, SEED, &HungerBase(1).cfg);
     defer s.deinit();
-    // 2 neutral units, hunger_max exactly 2: the field empties as the bar fills.
     const encounter = enc.Encounter{
         .label = "test_exact",
-        .hunger_max = 2,
         .slime = .{ .neutral = 2 },
     };
     try start(&s, &encounter);
@@ -2661,9 +2666,10 @@ test "the game-ending turn sends the post-feast board before game_over" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
+    // hunger_base 3 → a duo bar of 6, so one feast overfills it.
+    try init_two_player_session_cfg(&s, allocator, SEED, &HungerBase(3).cfg);
     defer s.deinit();
-    try start(&s, &enc_paper_stomach); // one feast overfills the bar
+    try start(&s, &enc_paper_stomach);
     s.sess.field.grid.put(8, .empty);
     s.sess.field.reservoir = .{ .neutral = 1 };
 
@@ -2732,14 +2738,13 @@ test "match stats: feast tallies, players and recipes are reported" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
-    defer s.deinit();
     // Same 25-unit mix as `enc_mixed`, but with a hunger bar the single feast
-    // below fills exactly — that is what makes the game end and the report get
-    // sent inside one turn.
+    // below fills exactly (hunger_base 4 × two players = 8) — that is what
+    // makes the game end and the report get sent inside one turn.
+    try init_two_player_session_cfg(&s, allocator, SEED, &HungerBase(4).cfg);
+    defer s.deinit();
     const enc_stats_mixed = enc.Encounter{
         .label = "test_stats_mixed",
-        .hunger_max = 8,
         .charges = 50,
         .slime = .{ .tiered = .{ 10, 0, 8 }, .neutral = 7 },
     };
@@ -2860,7 +2865,7 @@ test "game_state carries the whole grid, the reservoir and the hunger bar" {
 
     // The off-grid remainder drives the client's "incoming" indicator.
     try std.testing.expectEqual(s.sess.field.reservoir.total(), gs.reservoir);
-    try std.testing.expectEqual(@as(u16, enc_overflow.hunger_max), gs.hunger.max);
+    try std.testing.expectEqual(2 * logic.player_hunger(BAL, 0), gs.hunger.max);
     try std.testing.expectEqual(@as(u16, 0), gs.hunger.current);
     try std.testing.expectEqual(@as(u32, 0), gs.score);
 }
@@ -3221,4 +3226,122 @@ test "the same seed replays the same field; a different seed diverges" {
     // the layout must not be identical (else the seed is being ignored).
     const d = try run(allocator, 99);
     try std.testing.expect(!grids_equal(a, d));
+}
+
+// ---------------------------------------------------------------------------
+// Appetite → hunger capacity
+//
+// The bar's capacity is the SUM of every present player's contribution,
+// min(hunger_base + appetite * appetite_scale, hunger_player_cap) each — see
+// game_logic.player_hunger.  Appetite arrives with join_lobby (a board's
+// persistent flash stat, forwarded by the bridge); everyone else is 0.
+// ---------------------------------------------------------------------------
+
+/// Send `pid`'s join_lobby carrying `appetite` — the wire path a board-backed
+/// player's stat actually takes.
+fn enqueue_join(sess: *Session, pid: u8, name: []const u8, appetite: u32) !void {
+    var p = proto.JoinLobby{
+        .name = [_]u8{0} ** 16,
+        .name_len = @intCast(name.len),
+        .appetite = appetite,
+    };
+    @memcpy(p.name[0..name.len], name);
+    try enqueue_msg(sess, pid, .join_lobby, p);
+}
+
+test "the hunger bar sums each player's appetite contribution" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+
+    // Alice joins with a board that has banked an appetite of 4; Bob has none.
+    try enqueue_join(&s.sess, s.p[0].pid, "Alice", 4);
+    try enqueue_join(&s.sess, s.p[1].pid, "Bob", 0);
+    try flush(&s.sess);
+
+    try start(&s, &enc_fifty_green);
+
+    // 100 + 4*5 = 120 for Alice, 100 for Bob.
+    const want = logic.player_hunger(BAL, 4) + logic.player_hunger(BAL, 0);
+    try std.testing.expectEqual(want, s.sess.hunger.max);
+    try std.testing.expectEqual(@as(u16, 220), s.sess.hunger.max);
+}
+
+test "a repeated join_lobby cannot inflate the bar" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try enqueue_join(&s.sess, s.p[0].pid, "Alice", 4);
+    try flush(&s.sess);
+    try start(&s, &enc_fifty_green);
+    const before = s.sess.hunger.max;
+
+    // The Zig client re-sends join_lobby when a stat line lands late; the
+    // share is frozen at count time, so nothing may move.
+    try enqueue_join(&s.sess, s.p[0].pid, "Alice", 9);
+    try flush(&s.sess);
+    try std.testing.expectEqual(before, s.sess.hunger.max);
+}
+
+test "a mid-game joiner grows the bar by their own contribution" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    const before = s.sess.hunger.max; // 200: two appetite-0 players
+
+    var late = TestPlayer{};
+    late.init(allocator);
+    defer late.deinit(allocator);
+    const late_pid = s.sess.join(late.transport(), "Zed") orelse return error.JoinFailed;
+    try enqueue_join(&s.sess, late_pid, "Zed", 2);
+    try flush(&s.sess);
+
+    try std.testing.expectEqual(
+        before + logic.player_hunger(BAL, 2),
+        s.sess.hunger.max,
+    );
+}
+
+test "a mid-game leave gives back the leaver's UNUSED share; a rejoin brings it all back" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green); // bar 200 (100 each)
+
+    // Half the bar already eaten when Bob leaves: half of his 100 was still
+    // unused, so exactly 50 comes off — and nothing already eaten moves.
+    s.sess.hunger.current = 100;
+    s.sess.disconnect(s.p[1].pid);
+    try std.testing.expectEqual(@as(u16, 150), s.sess.hunger.max);
+    try std.testing.expectEqual(@as(u16, 100), s.sess.hunger.current);
+
+    // Bob returns: his FULL share rejoins the bar (the asymmetry is the
+    // deliberate price of leaving), and a second reconnect changes nothing.
+    try std.testing.expect(s.sess.reconnect(s.p[1].pid, s.p[1].transport()));
+    try std.testing.expectEqual(@as(u16, 250), s.sess.hunger.max);
+    try std.testing.expect(s.sess.reconnect(s.p[1].pid, s.p[1].transport()));
+    try std.testing.expectEqual(@as(u16, 250), s.sess.hunger.max);
+}
+
+test "a lobby disconnect does not touch hunger accounting" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+
+    // Still in the lobby: the slot simply empties; the next start recomputes
+    // the bar from whoever is present.
+    s.sess.disconnect(s.p[1].pid);
+    try start(&s, &enc_fifty_green);
+    try std.testing.expectEqual(logic.player_hunger(BAL, 0), s.sess.hunger.max);
 }

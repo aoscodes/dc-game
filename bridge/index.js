@@ -245,7 +245,7 @@ function validateDataDir(dir) {
 
 /**
  * POST body: { balance: <balance.json object>,
- *              encounter: { hunger_max, charges, zones: [...] } }
+ *              encounter: { charges, zones: [...] } }
  * The encounter is saved as the single default encounter labelled "custom".
  * `zones` is a legacy wire name: the Zig loader sums the entries into the one
  * slime pool this game has, so old saved configs keep working.
@@ -283,7 +283,6 @@ function handleTuneSave(req, res) {
       default: "custom",
       encounters: [{
         label: "custom",
-        hunger_max: msg.encounter.hunger_max,
         charges: msg.encounter.charges,
         zones: msg.encounter.zones,
       }],
@@ -474,6 +473,11 @@ const controllerManager = new ControllerManager({
   getSessions: () => activeSessions,
   onKey: (session, key) => {
     if (session.started) session.writeToZig(`KEY:${key}\n`);
+  },
+  // A paired board's appetite stat applies to the tab's player; the Zig
+  // client forwards it to the server (re-joining if it already joined).
+  onStat: (session, appetite) => {
+    if (session.started) session.writeToZig(`STAT:appetite=${appetite}\n`);
   },
   // Headless boards join the single active lobby, or the newest when several
   // exist (Map preserves insertion order), or wait when there is none.

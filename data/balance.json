@@ -1,5 +1,8 @@
 {
   "hunger_cost_normal": 1,
+  "hunger_base": 30,
+  "appetite_scale": 5,
+  "hunger_player_cap": 500,
   "slime_grid": {
     "rows": 6,
     "cols": 10

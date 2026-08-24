@@ -142,6 +142,14 @@ pub const SlimeGridDims = struct {
 /// Default grid used when `slime_grid` is absent from balance.json.
 pub const DEFAULT_SLIME_GRID = SlimeGridDims{ .rows = 6, .cols = 10 };
 
+/// Defaults for the appetite → hunger formula, used when the fields are
+/// absent from balance.json.  See `game_logic.player_hunger` for the formula
+/// itself; the board firmware mirrors it (board/src/game/balance.c
+/// balance_player_hunger), so a change here should be made there too.
+pub const DEFAULT_HUNGER_BASE: u16 = 30;
+pub const DEFAULT_APPETITE_SCALE: u16 = 5;
+pub const DEFAULT_HUNGER_PLAYER_CAP: u16 = 500;
+
 /// All designer-tunable balance numbers.  Loaded from `data/balance.json`
 /// (see config.zig); tests use the frozen fixture in fixtures.zig.
 pub const Balance = struct {
@@ -162,6 +170,18 @@ pub const Balance = struct {
     /// anything has its remaining budgets stranded instead (see
     /// session.strand_budgets_if_broke), so a turn always ends.
     casts_per_turn: u8,
+    /// Hunger capacity ONE player contributes with an appetite of 0.  The
+    /// game's hunger bar capacity is the SUM of every player's contribution
+    /// (see game_logic.player_hunger), so this replaces the old per-encounter
+    /// `hunger_max`: a bigger team simply has more room to eat.
+    hunger_base: u16 = DEFAULT_HUNGER_BASE,
+    /// Extra hunger capacity per point of a player's appetite stat (the
+    /// board's persistent flash stat, sent when a controller joins).  Linear:
+    /// contribution = hunger_base + appetite * appetite_scale.
+    appetite_scale: u16 = DEFAULT_APPETITE_SCALE,
+    /// Ceiling on ONE player's hunger contribution, however large their
+    /// appetite has grown — keeps a veteran board from trivialising the bar.
+    hunger_player_cap: u16 = DEFAULT_HUNGER_PLAYER_CAP,
     player_recipes: []const PlayerRecipe,
     team_recipes: []const TeamRecipe,
 

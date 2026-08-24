@@ -13,6 +13,9 @@ const GameState = sw.GameState;
 const WIRE_PREFIX = "WIRE:";
 const KEY_PREFIX  = "KEY:";
 const NAME_PREFIX = "NAME:";
+/// Player stats fed in from hardware, e.g. "STAT:appetite=7" — the board's
+/// persistent appetite counter, forwarded by the bridge (controllers.js).
+const STAT_APPETITE_PREFIX = "STAT:appetite=";
 
 const RENDER_HZ: u64 = 60;
 const TICK_NS: u64 = std.time.ns_per_s / RENDER_HZ;
@@ -101,6 +104,12 @@ var g_key_queue: inp.KeyQueue = .{};
 var g_name_buf: [16]u8 = undefined;
 var g_name_len: usize = 0;
 
+// Appetite stat for JoinLobby, set via the STAT:appetite= stdio line before
+// READY (same thread discipline as g_name_buf).  A STAT line arriving AFTER
+// the join re-sends join_lobby so the server picks the value up — join_lobby
+// is idempotent server-side (name refresh in lobby, no-op entity mid-game).
+var g_appetite: u32 = 0;
+
 var g_stdout_mu: std.Thread.Mutex = .{};
 
 fn stdout_writer() sw.Writer {
@@ -141,6 +150,16 @@ fn stdin_reader(_: void) void {
             const name = trimmed[NAME_PREFIX.len..];
             g_name_len = @min(name.len, g_name_buf.len);
             @memcpy(g_name_buf[0..g_name_len], name[0..g_name_len]);
+        } else if (std.mem.startsWith(u8, trimmed, STAT_APPETITE_PREFIX)) {
+            const value = trimmed[STAT_APPETITE_PREFIX.len..];
+            g_appetite = std.fmt.parseInt(u32, value, 10) catch {
+                std.log.warn("bad appetite stat line: {s}", .{trimmed});
+                continue;
+            };
+            // A board pairing after the join (or updating its stat) must
+            // still reach the server: re-join carries the new appetite and is
+            // idempotent server-side.
+            if (g_ready.load(.acquire)) send_join_lobby();
         }
     }
 }
@@ -150,16 +169,28 @@ fn emit_send(bytes: []const u8) void {
 }
 
 fn send_join() void {
-    var fbs = std.io.fixedBufferStream(&g_state.send_buf);
-    const w = fbs.writer();
     if (g_state.player_id != 0xFF) {
-        proto.encode(w, .reconnect, proto.Reconnect{ .player_id = g_state.player_id }) catch return;
+        var fbs = std.io.fixedBufferStream(&g_state.send_buf);
+        proto.encode(fbs.writer(), .reconnect, proto.Reconnect{ .player_id = g_state.player_id }) catch return;
+        emit_send(fbs.getWritten());
     } else {
-        const name: []const u8 = if (g_name_len > 0) g_name_buf[0..g_name_len] else "Player";
-        var p = proto.JoinLobby{ .name = [_]u8{0} ** 16, .name_len = @intCast(name.len) };
-        @memcpy(p.name[0..name.len], name);
-        proto.encode(w, .join_lobby, p) catch return;
+        send_join_lobby();
     }
+}
+
+/// Send join_lobby with the current name and appetite.  Also used to refresh
+/// the appetite after a late STAT: line — the server treats a repeated
+/// join_lobby as a stat/name update, never as a second player.
+fn send_join_lobby() void {
+    var fbs = std.io.fixedBufferStream(&g_state.send_buf);
+    const name: []const u8 = if (g_name_len > 0) g_name_buf[0..g_name_len] else "Player";
+    var p = proto.JoinLobby{
+        .name = [_]u8{0} ** 16,
+        .name_len = @intCast(name.len),
+        .appetite = g_appetite,
+    };
+    @memcpy(p.name[0..name.len], name);
+    proto.encode(fbs.writer(), .join_lobby, p) catch return;
     emit_send(fbs.getWritten());
 }
 

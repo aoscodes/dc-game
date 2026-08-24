@@ -73,7 +73,7 @@ pub const ConfigError = error{
     NoZones,
     TooManyZones,
     NoSlime,
-    InvalidHungerMax,
+    InvalidHungerFormula,
     UnknownDefaultEncounter,
 };
 
@@ -175,6 +175,11 @@ const BalanceJson = struct {
     },
     /// Defaulted so a config written before turns keeps validating.
     casts_per_turn: u8 = balance.DEFAULT_CASTS_PER_TURN,
+    /// Appetite → hunger formula knobs (see game_logic.player_hunger).
+    /// Defaulted so configs written before appetite keep validating.
+    hunger_base: u16 = balance.DEFAULT_HUNGER_BASE,
+    appetite_scale: u16 = balance.DEFAULT_APPETITE_SCALE,
+    hunger_player_cap: u16 = balance.DEFAULT_HUNGER_PLAYER_CAP,
     player_recipes: []const PlayerRecipeJson,
     team_recipes: []const TeamRecipeJson,
 };
@@ -192,7 +197,6 @@ const ZoneJson = struct {
 
 const EncounterJson = struct {
     label: []const u8,
-    hunger_max: u16,
     /// Charges the shared pool starts with; defaulted so configs written before
     /// the charge economy keep validating.
     charges: u32 = enc.DEFAULT_CHARGES,
@@ -234,6 +238,16 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
             c.MAX_GRID_ROWS, c.MAX_GRID_COLS,
         });
         return ConfigError.InvalidSlimeGrid;
+    }
+    // A base of 0 would let a lone appetite-0 player contribute nothing, so
+    // the bar could start at 0 and hunger could never end the game; a cap
+    // under the base would silently pay every player less than the base
+    // promises.  Both are always config mistakes.
+    if (raw.hunger_base == 0 or raw.hunger_player_cap < raw.hunger_base) {
+        fail("{s}: need hunger_base >= 1 and hunger_player_cap >= hunger_base (got base={} cap={})", .{
+            BALANCE_FILE, raw.hunger_base, raw.hunger_player_cap,
+        });
+        return ConfigError.InvalidHungerFormula;
     }
     if (raw.player_recipes.len > balance.MAX_PLAYER_RECIPES) {
         fail("{s}: {} player recipes exceeds cap {}", .{ BALANCE_FILE, raw.player_recipes.len, balance.MAX_PLAYER_RECIPES });
@@ -287,6 +301,9 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         .hunger_cost_normal = raw.hunger_cost_normal,
         .slime_grid = .{ .rows = raw.slime_grid.rows, .cols = raw.slime_grid.cols },
         .casts_per_turn = raw.casts_per_turn,
+        .hunger_base = raw.hunger_base,
+        .appetite_scale = raw.appetite_scale,
+        .hunger_player_cap = raw.hunger_player_cap,
         .player_recipes = players,
         .team_recipes = teams,
     };
@@ -321,10 +338,6 @@ fn parse_encounters(a: std.mem.Allocator, bytes: []const u8) !enc.EncounterSet {
             fail("{s}: encounter '{s}' has {} zones (max {})", .{ ENCOUNTERS_FILE, e.label, e.zones.len, enc.MAX_ZONES });
             return ConfigError.TooManyZones;
         }
-        if (e.hunger_max == 0) {
-            fail("{s}: encounter '{s}' hunger_max must be > 0", .{ ENCOUNTERS_FILE, e.label });
-            return ConfigError.InvalidHungerMax;
-        }
         // With no charges the team could never open a wall, so any encounter
         // whose field is not already fully edible would be unwinnable from the
         // first frame.  Rejected at load rather than shipped as a trap.
@@ -347,7 +360,6 @@ fn parse_encounters(a: std.mem.Allocator, bytes: []const u8) !enc.EncounterSet {
         }
         out.* = .{
             .label = e.label,
-            .hunger_max = e.hunger_max,
             .charges = e.charges,
             .slime = slime,
         };
@@ -458,7 +470,7 @@ const minimal_balance =
 /// Minimal valid encounters document for rejection tests.
 const minimal_encounters =
     \\{"default":"e1","encounters":[
-    \\ {"label":"e1","hunger_max":100,"zones":[{"neutral":5}]}]}
+    \\ {"label":"e1","zones":[{"neutral":5}]}]}
 ;
 
 /// A one-recipe balance document, `{...}`-interpolated at the recipe body so
@@ -806,6 +818,65 @@ test "casts_per_turn is read from the document" {
     try std.testing.expectEqual(@as(u8, 7), loaded.config.balance.casts_per_turn);
 }
 
+test "appetite formula knobs default when absent" {
+    var loaded = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expectEqual(balance.DEFAULT_HUNGER_BASE, loaded.config.balance.hunger_base);
+    try std.testing.expectEqual(balance.DEFAULT_APPETITE_SCALE, loaded.config.balance.appetite_scale);
+    try std.testing.expectEqual(balance.DEFAULT_HUNGER_PLAYER_CAP, loaded.config.balance.hunger_player_cap);
+}
+
+test "appetite formula knobs are read from the document" {
+    const doc =
+        \\{"hunger_cost_normal":1,
+        \\ "hunger_base":12,"appetite_scale":3,"hunger_player_cap":40,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u16, 12), loaded.config.balance.hunger_base);
+    try std.testing.expectEqual(@as(u16, 3), loaded.config.balance.appetite_scale);
+    try std.testing.expectEqual(@as(u16, 40), loaded.config.balance.hunger_player_cap);
+}
+
+test "a zero hunger_base or a cap under the base is rejected" {
+    // base 0: a lone appetite-0 player would contribute nothing and hunger
+    // could never end the game.
+    const zero_base =
+        \\{"hunger_cost_normal":1,
+        \\ "hunger_base":0,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidHungerFormula,
+        parse(std.testing.allocator, zero_base, minimal_encounters),
+    );
+    // cap < base: every player would be paid less than the base promises.
+    const low_cap =
+        \\{"hunger_cost_normal":1,
+        \\ "hunger_base":30,"hunger_player_cap":10,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidHungerFormula,
+        parse(std.testing.allocator, low_cap, minimal_encounters),
+    );
+}
+
+test "retired encounter hunger_max is rejected, not ignored" {
+    // The bar's capacity is the sum of the players' appetite contributions
+    // now (balance.hunger_base et al), so a leftover per-encounter budget
+    // would silently do nothing.
+    const stale =
+        \\{"default":"e1","encounters":[
+        \\ {"label":"e1","hunger_max":60,"zones":[{"neutral":5}]}]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidEncountersJson,
+        parse(std.testing.allocator, minimal_balance, stale),
+    );
+}
+
 test "retired realtime and medicine fields are rejected" {
     // The turn loop has no buffers, locks or per-second eat rate, and medicine
     // is gone entirely.  Leaving a stale tunable in a config would silently do
@@ -943,7 +1014,7 @@ test "a group needing more contributors than a lobby holds is rejected" {
 test "legacy multi-zone encounters are summed into one slime total" {
     const doc =
         \\{"default":"e1","encounters":[
-        \\ {"label":"e1","hunger_max":100,"zones":[
+        \\ {"label":"e1","zones":[
         \\   {"tiered":{"red":3},"neutral":1},
         \\   {"tiered":{"red":2,"green":4},"neutral":5}]}]}
     ;
@@ -959,7 +1030,7 @@ test "legacy multi-zone encounters are summed into one slime total" {
 test "specials are summed from the zones and default to none" {
     const doc =
         \\{"default":"e1","encounters":[
-        \\ {"label":"e1","hunger_max":100,"zones":[
+        \\ {"label":"e1","zones":[
         \\   {"neutral":4,"special":1},
         \\   {"tiered":{"red":2},"special":2}]}]}
     ;
@@ -978,7 +1049,7 @@ test "an encounter of nothing but specials is still 'slime' for validation" {
     // team wins the moment it starts — the loader's job is not to judge design.
     const doc =
         \\{"default":"e1","encounters":[
-        \\ {"label":"e1","hunger_max":100,"zones":[{"special":3}]}]}
+        \\ {"label":"e1","zones":[{"special":3}]}]}
     ;
     var loaded = try parse(std.testing.allocator, minimal_balance, doc);
     defer loaded.deinit();
@@ -992,7 +1063,7 @@ test "encounter charges default, are read, and 0 is rejected" {
 
     const doc =
         \\{"default":"e1","encounters":[
-        \\ {"label":"e1","hunger_max":100,"charges":7,"zones":[{"neutral":5}]}]}
+        \\ {"label":"e1","charges":7,"zones":[{"neutral":5}]}]}
     ;
     var loaded = try parse(std.testing.allocator, minimal_balance, doc);
     defer loaded.deinit();
@@ -1002,7 +1073,7 @@ test "encounter charges default, are read, and 0 is rejected" {
     // trap rather than a challenge.
     const bad =
         \\{"default":"e1","encounters":[
-        \\ {"label":"e1","hunger_max":100,"charges":0,"zones":[{"neutral":5}]}]}
+        \\ {"label":"e1","charges":0,"zones":[{"neutral":5}]}]}
     ;
     try std.testing.expectError(
         ConfigError.InvalidCharges,
@@ -1013,7 +1084,7 @@ test "encounter charges default, are read, and 0 is rejected" {
 test "encounter with no slime at all is rejected" {
     const bad =
         \\{"default":"e1","encounters":[
-        \\ {"label":"e1","hunger_max":100,"zones":[{"neutral":0}]}]}
+        \\ {"label":"e1","zones":[{"neutral":0}]}]}
     ;
     try std.testing.expectError(
         ConfigError.NoSlime,
@@ -1024,7 +1095,7 @@ test "encounter with no slime at all is rejected" {
 test "unknown default encounter is rejected" {
     const bad =
         \\{"default":"nope","encounters":[
-        \\ {"label":"e1","hunger_max":100,"zones":[{"neutral":5}]}]}
+        \\ {"label":"e1","zones":[{"neutral":5}]}]}
     ;
     try std.testing.expectError(
         ConfigError.UnknownDefaultEncounter,
@@ -1035,7 +1106,7 @@ test "unknown default encounter is rejected" {
 test "too many zones is rejected" {
     const zone = "{\"neutral\":1},";
     const bad = "{\"default\":\"e1\",\"encounters\":[{\"label\":\"e1\"," ++
-        "\"hunger_max\":100,\"zones\":[" ++
+        "\"zones\":[" ++
         zone ** (enc.MAX_ZONES) ++ "{\"neutral\":1}]}]}";
     try std.testing.expectError(
         ConfigError.TooManyZones,

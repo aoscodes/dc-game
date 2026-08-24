@@ -3,7 +3,6 @@
   "encounters": [
     {
       "label": "slime_feast_01",
-      "hunger_max": 60,
       "charges": 30,
       "zones": [
         {

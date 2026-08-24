@@ -24,6 +24,12 @@ pub const MsgTag = enum(u8) {
 pub const JoinLobby = struct {
     name: [16]u8,
     name_len: u8,
+    /// The joining player's appetite stat — the board's persistent flash
+    /// counter, forwarded through the bridge.  0 for players with no board
+    /// (browsers, bots), which is also the safe default for old clients.
+    /// The server folds it into the hunger bar's capacity via
+    /// game_logic.player_hunger.
+    appetite: u32 = 0,
 };
 
 /// One step of the shape wheel.  A DIRECTION, not a destination, for the same
@@ -490,6 +496,7 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
 fn encode_join_lobby(w: anytype, p: JoinLobby) !void {
     try w.writeByte(p.name_len);
     try w.writeAll(p.name[0..p.name_len]);
+    try w.writeInt(u32, p.appetite, .little);
 }
 
 fn encode_lobby_update(w: anytype, p: LobbyUpdate) !void {
@@ -716,6 +723,7 @@ pub fn decode_join_lobby(reader: anytype) !JoinLobby {
     if (len == 0 or len > 16) return DecodeError.NameTooLong;
     var p = JoinLobby{ .name = [_]u8{0} ** 16, .name_len = len };
     _ = try reader.readAll(p.name[0..len]);
+    p.appetite = try reader.readInt(u32, .little);
     return p;
 }
 
@@ -902,12 +910,12 @@ test "round-trip: game_over carries score and match stats" {
     try std.testing.expectEqual(@as(u16, 5), d.stats.casts_total);
 }
 
-test "round-trip: join_lobby" {
+test "round-trip: join_lobby carries the name and the appetite stat" {
     var buf: [32]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
 
     const name = "Alice";
-    var p = JoinLobby{ .name = [_]u8{0} ** 16, .name_len = @intCast(name.len) };
+    var p = JoinLobby{ .name = [_]u8{0} ** 16, .name_len = @intCast(name.len), .appetite = 17 };
     @memcpy(p.name[0..name.len], name);
 
     try encode(fbs.writer(), .join_lobby, p);
@@ -916,6 +924,7 @@ test "round-trip: join_lobby" {
     const decoded = try decode_join_lobby(fbs.reader());
     try std.testing.expectEqual(p.name_len, decoded.name_len);
     try std.testing.expectEqualSlices(u8, name, decoded.name[0..decoded.name_len]);
+    try std.testing.expectEqual(@as(u32, 17), decoded.appetite);
 }
 
 test "round-trip: game_state — turn, hunger, score, grid, and selection survive" {

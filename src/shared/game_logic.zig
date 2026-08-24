@@ -232,6 +232,42 @@ pub fn hunger_full(hunger: c.Health) bool {
     return hunger.max > 0 and hunger.current >= hunger.max;
 }
 
+/// THE appetite → hunger formula: what ONE player adds to the game's hunger
+/// bar capacity.  Linear in the player's appetite stat, capped per player:
+///
+///     contribution = min(hunger_base + appetite * appetite_scale,
+///                        hunger_player_cap)
+///
+/// The game's hunger max is the SUM of this over every player in the game,
+/// whatever kind of game it is — so group hunger is always the players'
+/// hunger totals added together.  A player with no board (or a board with a
+/// fresh flash) has appetite 0 and contributes exactly `hunger_base`.
+///
+/// MIRRORED by the board firmware for its on-board game
+/// (board/src/game/balance.c `balance_player_hunger`); change both together.
+pub fn player_hunger(bal: *const balance.Balance, appetite: u32) u16 {
+    // 64-bit so no appetite a board can bank (u32) can overflow the product.
+    const raw = @as(u64, bal.hunger_base) +
+        @as(u64, appetite) * @as(u64, bal.appetite_scale);
+    return @intCast(@min(raw, @as(u64, bal.hunger_player_cap)));
+}
+
+/// A player carrying `contribution` of the bar's capacity left mid-game:
+/// remove their share of the UNUSED capacity only.
+///
+///     shrink = floor(contribution * (max - current) / max)
+///
+/// Proportional to the hunger still remaining, so what has already been
+/// eaten stays eaten: the bar never drops below `current`, and a departure
+/// that leaves `current == max` ends the game through the ordinary
+/// hunger_full check rather than a special case here.
+pub fn shrink_hunger_max(hunger: *c.Health, contribution: u16) void {
+    if (hunger.max == 0) return;
+    const remaining: u64 = hunger.max - hunger.current;
+    const shrink = (@as(u64, contribution) * remaining) / @as(u64, hunger.max);
+    hunger.max -= @intCast(shrink);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -514,6 +550,64 @@ test "resolve_batch: a three-component group needs three distinct players" {
     const batch = resolve_batch(&bal, &dup);
     try std.testing.expectEqual(@as(usize, 3), batch.count);
     for (batch.slice()) |b| try std.testing.expect(!b.stamp.is_team);
+}
+
+test "player_hunger: linear in appetite from the base" {
+    var bal = test_bal.*;
+    bal.hunger_base = 30;
+    bal.appetite_scale = 5;
+    bal.hunger_player_cap = 500;
+    try std.testing.expectEqual(@as(u16, 30), player_hunger(&bal, 0));
+    try std.testing.expectEqual(@as(u16, 35), player_hunger(&bal, 1));
+    try std.testing.expectEqual(@as(u16, 80), player_hunger(&bal, 10));
+}
+
+test "player_hunger: capped per player, even for an absurd appetite" {
+    var bal = test_bal.*;
+    bal.hunger_base = 30;
+    bal.appetite_scale = 5;
+    bal.hunger_player_cap = 500;
+    // 30 + 94*5 = 500 exactly; one more point changes nothing.
+    try std.testing.expectEqual(@as(u16, 500), player_hunger(&bal, 94));
+    try std.testing.expectEqual(@as(u16, 500), player_hunger(&bal, 95));
+    // The full u32 range must not overflow the arithmetic either.
+    try std.testing.expectEqual(@as(u16, 500), player_hunger(&bal, std.math.maxInt(u32)));
+}
+
+test "shrink_hunger_max: removes the leaver's share of the UNUSED capacity" {
+    // Two players of 30 each; half the bar eaten.  The leaver's 30 covers the
+    // bar in the same ratio it was contributed, so half of it (15) is still
+    // unused and comes off the max.
+    var hunger = c.Health{ .current = 30, .max = 60 };
+    shrink_hunger_max(&hunger, 30);
+    try std.testing.expectEqual(@as(u16, 45), hunger.max);
+    try std.testing.expectEqual(@as(u16, 30), hunger.current);
+}
+
+test "shrink_hunger_max: never drops the max below what was already eaten" {
+    // Bar nearly full: almost none of the leaver's share is unused, so almost
+    // none is removed — and current is untouched.
+    var hunger = c.Health{ .current = 59, .max = 60 };
+    shrink_hunger_max(&hunger, 30);
+    try std.testing.expectEqual(@as(u16, 60), hunger.max); // floor(30*1/60) = 0
+    try std.testing.expect(hunger.max >= hunger.current);
+
+    // The sole contributor leaving an untouched bar removes all of it.
+    var fresh = c.Health{ .current = 0, .max = 30 };
+    shrink_hunger_max(&fresh, 30);
+    try std.testing.expectEqual(@as(u16, 0), fresh.max);
+}
+
+test "shrink_hunger_max: a full or empty bar is left alone" {
+    // current == max: no unused capacity to remove; hunger_full still holds.
+    var full = c.Health{ .current = 60, .max = 60 };
+    shrink_hunger_max(&full, 30);
+    try std.testing.expectEqual(@as(u16, 60), full.max);
+    try std.testing.expect(hunger_full(full));
+    // max == 0 (pre-game): nothing to divide by, nothing to shrink.
+    var blank = c.Health{ .current = 0, .max = 0 };
+    shrink_hunger_max(&blank, 30);
+    try std.testing.expectEqual(@as(u16, 0), blank.max);
 }
 
 test "add_hunger: clamps at max" {

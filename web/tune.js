@@ -11,7 +11,9 @@
  *
  * Limits mirrored from src/shared/config.zig / protocol caps:
  *   recipes <= 64 per table, group components 2..6 (each an existing move
- *   label), encounter hunger_max 1..65535, slime grid rows 1..16 × cols 1..16.
+ *   label), slime grid rows 1..16 × cols 1..16, hunger_base 1..65535 with
+ *   hunger_player_cap >= hunger_base (the loader rejects a cap under the
+ *   base).
  */
 
 /** Slime difficulty tiers, hardest first — mirrors components.Tier. */
@@ -36,17 +38,27 @@ const DEFAULT_CASTS_PER_TURN = 3;
 const DEFAULT_RECIPE_COST = 1;
 /** Mirrors encounter.DEFAULT_CHARGES. */
 const DEFAULT_CHARGES = 30;
+/** Mirrors balance.DEFAULT_HUNGER_BASE / _APPETITE_SCALE / _HUNGER_PLAYER_CAP.
+ *  The bar's capacity is per PLAYER now: each player contributes
+ *  min(hunger_base + appetite * appetite_scale, hunger_player_cap), and the
+ *  game's hunger max is the sum over everyone in it. */
+const DEFAULT_HUNGER_BASE = 30;
+const DEFAULT_APPETITE_SCALE = 5;
+const DEFAULT_HUNGER_PLAYER_CAP = 500;
 
 /** Scalar balance fields: [key, label, min, max, step]. */
 const RATE_FIELDS = [
   ["hunger_cost_normal", "hunger per unit eaten", 0, 1000, 1],
   ["casts_per_turn", "casts per player per turn", 1, 255, 1],
+  ["hunger_base", "hunger capacity per player (appetite 0)", 1, 65535, 1],
+  ["appetite_scale", "extra capacity per appetite point", 0, 65535, 1],
+  ["hunger_player_cap", "per-player capacity ceiling", 1, 65535, 1],
 ];
 
 /**
  * @type {{
  *   balance: object,
- *   encounter: { hunger_max: number, charges: number,
+ *   encounter: { charges: number,
  *                slime: { tiered: object, neutral: number, special: number } },
  * }}
  * `encounter.slime` is the ONE slime pool of the encounter: whatever does not
@@ -123,6 +135,9 @@ async function load() {
       },
       // Default like the server does for older configs.
       casts_per_turn: bal.casts_per_turn ?? DEFAULT_CASTS_PER_TURN,
+      hunger_base: bal.hunger_base ?? DEFAULT_HUNGER_BASE,
+      appetite_scale: bal.appetite_scale ?? DEFAULT_APPETITE_SCALE,
+      hunger_player_cap: bal.hunger_player_cap ?? DEFAULT_HUNGER_PLAYER_CAP,
       player_recipes: bal.player_recipes.map((r) => ({
         label: r.label,
         shape: shapeFrom(r.shape),
@@ -136,7 +151,6 @@ async function load() {
       })),
     },
     encounter: {
-      hunger_max: def.hunger_max,
       charges: def.charges ?? DEFAULT_CHARGES,
       // Multi-zone configs collapse into the single pool, exactly as the Zig
       // loader does, so an old config round-trips to the same game.
@@ -440,10 +454,10 @@ function renderTeamRecipes() {
  */
 function renderEncounter() {
   const scalars = document.getElementById("encounter-scalars");
+  // The hunger budget is no longer an encounter knob: the bar's capacity is
+  // the sum of the players' appetite contributions (see the hunger_base /
+  // appetite_scale / hunger_player_cap rate fields above).
   scalars.replaceChildren(
-    el("label", {},
-      el("span", {}, "hunger budget (bar capacity)"),
-      numInput(state.encounter, "hunger_max", 1, 65535)),
     el("label", {},
       el("span", {}, "team charges (whole encounter, never refills)"),
       numInput(state.encounter, "charges", 1, 4294967295)));
@@ -550,7 +564,6 @@ document.getElementById("save").addEventListener("click", async () => {
           })),
         },
         encounter: {
-          hunger_max: state.encounter.hunger_max,
           charges: state.encounter.charges,
           zones: [{
             tiered: sparseTiers(state.encounter.slime.tiered),

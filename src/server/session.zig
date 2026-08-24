@@ -130,6 +130,10 @@ pub const PlayerSlot = struct {
     player_id: u8,
     name: [16]u8 = [_]u8{0} ** 16,
     name_len: u8 = 0,
+    /// The player's appetite stat, from join_lobby: a board's persistent
+    /// flash counter, or 0 for browsers/bots.  Read when the player is folded
+    /// into the hunger bar (game start or mid-game join).
+    appetite: u32 = 0,
     ready: bool = false,
     entity: ecs.Entity = std.math.maxInt(ecs.Entity),
     transport: ?shared.Transport = null,
@@ -153,7 +157,17 @@ pub const Session = struct {
     tick_count: u32 = 0,
     current_encounter: ?*const enc.Encounter = null,
     /// Total Hunger bar.  Fills as slime is consumed; full = encounter over.
+    ///
+    /// Its CAPACITY is the sum of every counted player's appetite-derived
+    /// contribution (see `hunger_share` and game_logic.player_hunger) — group
+    /// hunger is the players' hunger totals added together, so the bar grows
+    /// when a player joins and gives back its unused share when one leaves.
     hunger: c.Health = .{ .current = 0, .max = 0 },
+    /// What each player currently contributes to `hunger.max`.  0 = not
+    /// counted (empty slot, or left mid-game).  Never 0 for a counted player:
+    /// config.zig validates hunger_base >= 1, so a contribution is always
+    /// positive and 0 is unambiguous.
+    hunger_share: [MAX_PLAYERS]u16 = [_]u16{0} ** MAX_PLAYERS,
     /// The team's shared charge pool for the WHOLE game.  Seeded from
     /// `encounter.charges` and never replenished: every charge spent is gone
     /// for good, which is what makes an efficient shape worth aiming.
@@ -277,6 +291,10 @@ pub const Session = struct {
         }
         p.connected = true;
         p.transport = transport;
+        // Rejoining a live game counts them back into the bar.  Their FULL
+        // share, not the sliver their departure gave back: a returning eater
+        // brings a whole appetite, and the asymmetry is deliberate.
+        if (self.phase == .playing) self.count_hunger_share(player_id);
         return true;
     }
 
@@ -290,6 +308,9 @@ pub const Session = struct {
             p.ready = false;
             p.name_len = 0;
             self.player_count -= 1;
+        } else {
+            // Mid-game: the bar gives back this player's unused share.
+            self.uncount_hunger_share(player_id);
         }
     }
 
@@ -330,7 +351,15 @@ pub const Session = struct {
         self.turn = 1;
         self.reset_budgets();
 
-        self.hunger = .{ .current = 0, .max = encounter.hunger_max };
+        // The bar's capacity is the SUM of every present player's
+        // appetite-derived contribution — there is no per-encounter budget
+        // any more, so a bigger or hungrier team simply has more room to eat.
+        self.hunger = .{ .current = 0, .max = 0 };
+        self.hunger_share = [_]u16{0} ** MAX_PLAYERS;
+        for (&self.players) |*p| {
+            if (!p.occupied or !p.connected) continue;
+            self.count_hunger_share(p.player_id);
+        }
         self.charges = encounter.charges;
         self.score = 0;
         self.slime_total = encounter.total_units();
@@ -357,6 +386,35 @@ pub const Session = struct {
             self.cfg.balance.casts_per_turn,
         });
         try self.spawn_players();
+    }
+
+    /// Fold one player into the hunger bar's capacity.  IDEMPOTENT: a player
+    /// already counted (share non-zero) is left alone, so a repeated
+    /// join_lobby or reconnect can never inflate the bar.  The share is
+    /// FROZEN at count time — a later appetite update changes nothing until
+    /// the next game.
+    fn count_hunger_share(self: *Session, player_id: u8) void {
+        if (player_id >= MAX_PLAYERS) return;
+        if (self.hunger_share[player_id] != 0) return;
+        const share = logic.player_hunger(&self.cfg.balance, self.players[player_id].appetite);
+        self.hunger_share[player_id] = share;
+        self.hunger.max +|= share;
+    }
+
+    /// A counted player left mid-game: give back their share of the UNUSED
+    /// capacity only (see game_logic.shrink_hunger_max).  What was already
+    /// eaten stays eaten, so the bar never drops below `current`; a departure
+    /// that leaves it exactly full ends the game through the ordinary
+    /// hunger_full check at the next turn end.
+    fn uncount_hunger_share(self: *Session, player_id: u8) void {
+        if (player_id >= MAX_PLAYERS) return;
+        const share = self.hunger_share[player_id];
+        if (share == 0) return;
+        self.hunger_share[player_id] = 0;
+        logic.shrink_hunger_max(&self.hunger, share);
+        std.log.info("player {} left mid-game — hunger bar now {}/{}", .{
+            player_id, self.hunger.current, self.hunger.max,
+        });
     }
 
     /// Give every connected player their avatar entity.
@@ -745,12 +803,17 @@ pub const Session = struct {
                 const n = @min(p.name_len, 16);
                 @memcpy(slot.name[0..n], p.name[0..n]);
                 slot.name_len = @intCast(n);
-                std.log.info("player {} name set: {s}", .{ player_id, slot.name[0..slot.name_len] });
+                slot.appetite = p.appetite;
+                std.log.info("player {} name set: {s} (appetite {})", .{
+                    player_id, slot.name[0..slot.name_len], slot.appetite,
+                });
                 if (self.phase == .playing) {
-                    // Late joiner: spawn their entity, then send them a
-                    // game_start so their client enters game phase.  Existing
-                    // players are unaffected — no lobby_update is broadcast.
+                    // Late joiner: spawn their entity, fold them into the
+                    // hunger bar, then send them a game_start so their client
+                    // enters game phase.  Existing players are unaffected —
+                    // no lobby_update is broadcast.
                     try self.spawn_player_midgame(player_id);
+                    self.count_hunger_share(player_id);
                     try self.send_game_start_to(player_id);
                 } else {
                     try self.broadcast_lobby_update();
@@ -875,8 +938,10 @@ pub const Session = struct {
     }
 
     /// Decide whether the encounter is over.  Called ONLY from `end_turn`:
-    /// nothing between turns can move the hunger bar, the slime count or the
-    /// charge pool, so there is no other moment where the answer can change.
+    /// nothing between turns can FILL the hunger bar, move the slime count or
+    /// the charge pool.  A mid-game leave can shrink the bar's capacity down
+    /// to `current` (see uncount_hunger_share), but never below it, so the
+    /// verdict still cannot change until the next turn settles.
     fn check_end(self: *Session) !void {
         if (self.phase != .playing) return;
         // Field-cleared wins ties: if the final feast fills the bar exactly,

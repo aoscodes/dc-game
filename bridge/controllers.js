@@ -8,6 +8,9 @@
  *   board  -> bridge:  CTRL:HELLO v=1          link accept (reply to GAME:HELLO)
  *                      CTRL:HB                 1s keepalive
  *                      CTRL:BTN <name> <D|U>   button press/release edges
+ *                      CTRL:STAT appetite=<u32> persistent flash stat, sent
+ *                                              once after CTRL:HELLO; feeds
+ *                                              the player's hunger capacity
  *                      CTRL:SCORE_ACK g=<u32>  score banked to flash (sent
  *                                              AFTER the save; re-sent on retries)
  *   bridge -> board:   GAME:HELLO v=1          link request (repeated until acked)
@@ -131,6 +134,11 @@ class Controller {
     /** Owned headless ControllerSession (board IS the player), or null. */
     this.playerSession = null;
     this.lastRxMs = 0;
+    /** Appetite stat reported by the board (CTRL:STAT), 0 until it arrives.
+     *  Forwarded to whichever player this board drives — it scales that
+     *  player's share of the game's hunger bar (see the Zig server's
+     *  game_logic.player_hunger). */
+    this.appetite = 0;
     this.lastShape = null; // last FB:SHAPE payload sent (dedupe)
     this.helloTimer = null;
     this.hbTimer = null;
@@ -215,6 +223,19 @@ class Controller {
       } else if (this.playerSession !== null) {
         this.playerSession.writeToZig(`KEY:${key}\n`);
       }
+      return;
+    }
+
+    if (line.startsWith("CTRL:STAT ")) {
+      // Persistent flash stats, reported once after the link comes up.
+      const arg = line.slice("CTRL:STAT ".length).trim();
+      const m = arg.match(/^appetite=(\d+)$/);
+      if (m === null) {
+        console.warn(`[ctrl] unknown stat '${arg}' from ${this.path}`);
+        return;
+      }
+      this.appetite = Number(m[1]) >>> 0;
+      this.manager.pushAppetite(this);
       return;
     }
 
@@ -329,8 +350,13 @@ class ControllerSession extends PlayerSession {
   // ---- PlayerSession hooks --------------------------------------------------
 
   onZigSpawned() {
-    // Before READY (sent on server WS open) so JoinLobby carries the name.
+    // Before READY (sent on server WS open) so JoinLobby carries the name
+    // and the board's appetite.  A CTRL:STAT that lands later still gets
+    // through: the Zig client re-sends join_lobby on a late STAT line.
     this.writeToZig(`NAME:${this.name}\n`);
+    if (this.controller !== null) {
+      this.writeToZig(`STAT:appetite=${this.controller.appetite}\n`);
+    }
   }
 
   onZigFrame(msg, _line) {
@@ -371,6 +397,9 @@ class ControllerSession extends PlayerSession {
       this.graceTimer = null;
     }
     this.controller = controller;
+    // The stat may have moved while the board was away (it banks appetite on
+    // its own); refresh the player's copy.
+    this.writeToZig(`STAT:appetite=${controller.appetite}\n`);
     console.log(`[ctrl] ${this.name} re-attached (uid=${controller.uid})`);
   }
 
@@ -410,6 +439,8 @@ class ControllerManager {
    *   creation order (each gets a `.controller` property managed here)
    * @param {(session: object, key: string) => void} hooks.onKey  deliver one
    *   key press to a tab session
+   * @param {(session: object, appetite: number) => void} hooks.onStat  deliver
+   *   a board's appetite stat to a tab session's Zig client
    * @param {() => object | null} hooks.pickRoom  room for a new headless
    *   player (null = none available)
    * @param {(room: object) => void} hooks.roomJoined  occupancy up
@@ -419,10 +450,11 @@ class ControllerManager {
    *   labels in balance-file order for a room's config (index space of
    *   `selected_shape`)
    */
-  constructor({ clientBin, getSessions, onKey, pickRoom, roomJoined, roomLeft, isRoomAlive, moveLabels }) {
+  constructor({ clientBin, getSessions, onKey, onStat, pickRoom, roomJoined, roomLeft, isRoomAlive, moveLabels }) {
     this.clientBin = clientBin;
     this.getSessions = getSessions;
     this.onKey = onKey;
+    this.onStat = onStat;
     this.pickRoom = pickRoom;
     this.roomJoined = roomJoined;
     this.roomLeft = roomLeft;
@@ -529,7 +561,18 @@ class ControllerManager {
     // Force a fresh shape push for the new pairing.
     ctrl.lastShape = null;
     ctrl.sendShape("-");
+    // The board's appetite applies to the tab's player from now on.
+    this.pushAppetite(ctrl);
     console.log(`[ctrl] paired uid=${ctrl.uid} to a tab session`);
+  }
+
+  /** Forward a board's appetite stat to whichever player it drives. */
+  pushAppetite(ctrl) {
+    if (ctrl.session !== null) {
+      this.onStat(ctrl.session, ctrl.appetite);
+    } else if (ctrl.playerSession !== null) {
+      ctrl.playerSession.writeToZig(`STAT:appetite=${ctrl.appetite}\n`);
+    }
   }
 
   makePlayer(ctrl, room) {

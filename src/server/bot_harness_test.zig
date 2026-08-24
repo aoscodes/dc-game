@@ -255,7 +255,6 @@ fn tier_total(values: [c.Tier.size]u16) u32 {
 /// rationing.
 const enc_green_field = enc.Encounter{
     .label = "bot_green_field",
-    .hunger_max = 1000,
     .charges = 500,
     .slime = .{ .tiered = .{ 0, 0, 60 } },
 };
@@ -265,7 +264,6 @@ const enc_green_field = enc.Encounter{
 /// what the two teams can REACH, not about who fills the bar first.
 const enc_survival = enc.Encounter{
     .label = "bot_survival",
-    .hunger_max = 1000,
     .charges = 500,
     .slime = .{ .tiered = .{ 0, 0, 60 } },
 };
@@ -393,7 +391,6 @@ test "profile cycles correctly across cast cycles" {
 
     const big_field = enc.Encounter{
         .label = "bot_big_field",
-        .hunger_max = 60000,
         .slime = .{ .neutral = 6 },
     };
 
@@ -426,7 +423,6 @@ test "aim injection walks the cursor and anchors casts where the bot aimed" {
     };
     const big_field = enc.Encounter{
         .label = "bot_aim_field",
-        .hunger_max = 60000,
         .slime = .{ .neutral = 60 },
     };
 
@@ -467,7 +463,6 @@ test "a cast lands where the bot aimed, not where it ends up" {
     };
     const big_field = enc.Encounter{
         .label = "bot_anchor_field",
-        .hunger_max = 60000,
         .slime = .{ .tiered = .{ 0, 0, 60 } },
     };
 
