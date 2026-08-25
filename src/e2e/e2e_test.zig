@@ -268,7 +268,8 @@ fn run_bot_inner(ctx: *BotCtx) !void {
     // ---- Message loop -------------------------------------------------------
     // Every connection is an OBSERVER of the already-running game until its
     // take_slot is granted (confirmed by a game_start whose player_id is a
-    // real seat).
+    // real seat).  The boot encounter holds at the PRE-MATCH screen; this
+    // test plays the browser tab's part and clicks past it with `restart`.
     var sent_take: bool = false;
     var in_game: bool = false;
     // Our player id, from game_start — needed to pick our own entity (and so
@@ -298,6 +299,14 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                         try send_take_slot(&client);
                         sent_take = true;
                     }
+                    continue;
+                }
+                if (start.prematch) {
+                    // The pre-match guide is holding play: click past it, as
+                    // the browser tab would.  Both bots may send this; the
+                    // second is a stray click the server ignores.
+                    std.debug.print("[e2e] {s} at pre-match; beginning play\n", .{ctx.name});
+                    try send_restart(&client);
                     continue;
                 }
                 in_game = true;
@@ -394,6 +403,14 @@ fn send_take_slot(client: *ws.Client) !void {
     var buf: [8]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     try proto.encode(fbs.writer(), .take_slot, proto.TakeSlot{});
+    try client.writeBin(fbs.getWritten());
+}
+
+/// Advance a hold (the pre-match guide here) — the browser tab's click.
+fn send_restart(client: *ws.Client) !void {
+    var buf: [2]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try proto.encode(fbs.writer(), .restart, {});
     try client.writeBin(fbs.getWritten());
 }
 

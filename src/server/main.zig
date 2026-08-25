@@ -201,10 +201,13 @@ pub fn main() !void {
     session = try Session.init(allocator, join_code, &g_loaded.config);
     defer if (session) |*s| s.deinit();
 
-    // A game is ALWAYS running: launch the default encounter immediately.
-    // With no players seated the game idles (turns need a seated player to
-    // end), so nothing is consumed until someone takes a slot.
-    if (session) |*s| try s.start_game(g_loaded.config.encounters.default().label);
+    // A game is ALWAYS live: launch the default encounter immediately, but
+    // hold it at the PRE-MATCH screen (the browser's recipe guide) — play
+    // begins when a tab clicks past it.  Seats can be taken meanwhile.
+    if (session) |*s| {
+        try s.start_game(g_loaded.config.encounters.default().label);
+        s.prematch = true;
+    }
 
     std.log.info("Room code: {s}", .{join_code});
     std.log.info("Listening on port {d}", .{port});

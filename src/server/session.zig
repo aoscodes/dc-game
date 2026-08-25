@@ -184,6 +184,13 @@ pub const Session = struct {
     /// that starts the next encounter — and seat changes — arrive through
     /// it.  Cleared by start_game.
     restart_pending: bool = false,
+    /// The encounter is holding at its PRE-MATCH screen (the browser's
+    /// recipe guide): everything is seeded and seats can be taken, but
+    /// gameplay input is ignored and no state is broadcast until a browser
+    /// tab's `restart` click begins play.  Entered at server boot and on
+    /// every end-screen restart, NOT by start_game itself — the test seam
+    /// (and the bot harness) start encounters that play immediately.
+    prematch: bool = false,
     world: GameWorld,
     tick_count: u32 = 0,
     current_encounter: ?*const enc.Encounter = null,
@@ -402,6 +409,7 @@ pub const Session = struct {
         self.tick_count = 0;
 
         self.restart_pending = false;
+        self.prematch = false;
         self.current_encounter = encounter;
         self.pending_count = 0;
         // Everyone opens on the first move in the table: the encounter is a
@@ -523,11 +531,12 @@ pub const Session = struct {
         try self.drain_queues();
         self.profiler.end(.drain);
 
-        // Holding at the end screen: the board is final and already
-        // broadcast, so nothing below has anything to add.  The drain above
-        // is what lets a `restart` (or a seat change) through — a restart
-        // clears the flag inside the drain and play resumes this same tick.
-        if (self.restart_pending) return;
+        // Holding — at the end screen (board final, already broadcast) or at
+        // the pre-match guide (board seeded, nothing moving yet): nothing
+        // below has anything to add.  The drain above is what lets a
+        // `restart` (or a seat change) through — a restart clears its flag
+        // inside the drain and play resumes this same tick.
+        if (self.restart_pending or self.prematch) return;
 
         self.tick_count += 1;
 
@@ -664,7 +673,7 @@ pub const Session = struct {
     /// since left still resolve: they committed, and the team priced the turn
     /// around them.
     fn maybe_end_turn(self: *Session) !void {
-        if (self.restart_pending) return;
+        if (self.restart_pending or self.prematch) return;
         if (!self.budgets_spent()) return;
         try self.resolve_pending();
         try self.end_turn();
@@ -886,20 +895,29 @@ pub const Session = struct {
                 try self.send_game_start_to_conn(conn_id);
             },
             .restart => {
-                // Only meaningful at the end screen; mid-game it is a stray
-                // key.  Any connection is honored — the browser tab that
-                // sends it may well be the room's observer display.  Seats
-                // are kept; the pool and the bar re-seed from them.
-                if (!self.restart_pending) return;
-                const label = self.cfg.encounters.default().label;
-                std.log.info("restart requested — starting next encounter", .{});
-                try self.start_game(label);
-                try self.broadcast_game_start(label);
+                // Advances a HOLD; mid-game it is a stray click.  Any
+                // connection is honored — the browser tab that sends it may
+                // well be the room's observer display.
+                if (self.restart_pending) {
+                    // End screen -> next encounter's PRE-MATCH guide.  Seats
+                    // are kept; the pool and the bar re-seed from them.
+                    const label = self.cfg.encounters.default().label;
+                    std.log.info("restart requested — next encounter, holding at pre-match", .{});
+                    try self.start_game(label);
+                    self.prematch = true;
+                    try self.broadcast_game_start(label);
+                } else if (self.prematch) {
+                    // Pre-match guide -> play.
+                    std.log.info("pre-match dismissed — play begins", .{});
+                    self.prematch = false;
+                    const encounter = self.current_encounter orelse return;
+                    try self.broadcast_game_start(encounter.label);
+                }
             },
             .cycle_shape => {
                 const p = try proto.decode_cycle_shape(fbs.reader());
                 const player_id = seat orelse return;
-                if (self.restart_pending) return;
+                if (self.restart_pending or self.prematch) return;
                 const moves = self.cfg.balance.player_recipes.len;
                 // An empty move table is impossible (config.zig rejects it),
                 // but cycling would divide by zero, so guard rather than trust.
@@ -916,7 +934,7 @@ pub const Session = struct {
                 // queued after this one.
                 const p = try proto.decode_move_cursor(fbs.reader());
                 const player_id = seat orelse return;
-                if (self.restart_pending) return;
+                if (self.restart_pending or self.prematch) return;
                 const d = p.dir.delta();
                 // Clamped, so any number of steps in any direction leaves the
                 // cursor on a real cell.
@@ -925,7 +943,7 @@ pub const Session = struct {
             },
             .cast => {
                 const player_id = seat orelse return;
-                if (self.restart_pending) return;
+                if (self.restart_pending or self.prematch) return;
                 // Out of casts this turn: silent ignore.  The turn is waiting
                 // on someone else, and this player has nothing left to say.
                 if (self.casts_left[player_id] == 0) return;
@@ -986,7 +1004,7 @@ pub const Session = struct {
             },
             .cancel_cast => {
                 const player_id = seat orelse return;
-                if (self.restart_pending) return;
+                if (self.restart_pending or self.prematch) return;
                 // Nothing of their own to take back: silent, because a player
                 // pressing undo on an empty plan has made no mistake.
                 if (!self.cancel_pending(player_id)) return;
@@ -1144,6 +1162,7 @@ pub const Session = struct {
             .encounter_label_len = @intCast(@min(label.len, 32)),
             .player_id = player_id,
             .join_code = self.join_code,
+            .prematch = self.prematch,
             .casts_per_turn = self.cfg.balance.casts_per_turn,
             .charges = self.charges,
             .grid_rows = self.field.grid.rows,

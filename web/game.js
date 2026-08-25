@@ -185,12 +185,12 @@ const LAYOUT = {
     codePromptY: 160, codeY: 210, codeFont: 36, codeHintY: 270, codeHintFont: 16,
   },
 
-  lobby: {
+  // The pre-match screen: title + game id up top, the study guide below,
+  // and the BEGIN button (gameOver.button geometry) at the bottom.
+  guide: {
     titleX: 40, titleY: 52, titleFont: 32,
     codeX: 40, codeY: 92, codeFont: 22,
-    listY: 130, rowGap: 36, rowDy: 20, rowX: 60, rowFont: 20,
-    readyDy: 20, readyFont: 18,
-    guideX: 40, guideY: 408, guideFont: 13, guideLineH: 19,
+    guideX: 40, guideY: 140, guideFont: 13, guideLineH: 19,
     recipeHeaderGap: 10, recipeRowH: 25, recipeFont: 14,
     recipeLabelW: 170, recipeSlotGap: 10, recipeArrowGap: 24,
   },
@@ -524,9 +524,6 @@ function drawPreLobby() {
     if (preLobbyError) {
       text(preLobbyError, L.optX, L.optY0 + 2 * L.optGap + L.errorDy, L.errorFont, "rgba(200,50,50,1)");
     }
-    // The study guide lives here now that there is no lobby screen: the next
-    // stop after this one is a live game.
-    drawRecipeGuide();
   } else if (preLobbyMode === "entering_code") {
     text("Enter lobby code:", L.optX, L.codePromptY, L.optFont, C_TEXT);
     // Show typed code + blinking underscore cursor.
@@ -576,7 +573,7 @@ function costParts(cost) {
  * @returns {number} x after the drawn glyph.
  */
 function drawShapeGlyph(x, y, font, rows) {
-  const G = LAYOUT.lobby;
+  const G = LAYOUT.guide;
   const anchorR = Math.floor(rows.length / 2);
   const anchorC = Math.floor((rows[0]?.length ?? 0) / 2);
   ctx.font = `${font}px monospace`;
@@ -605,17 +602,17 @@ function drawShapeGlyph(x, y, font, rows) {
  * Moves appear in data/balance.json order, which IS the wheel order.
  */
 function drawRecipeGuide() {
-  const L = LAYOUT.lobby;
+  const L = LAYOUT.guide;
   let y = L.guideY;
 
-  text("HOW CASTING WORKS", L.guideX, y, L.guideFont + 2, C_HEADER);
   y += L.guideLineH;
   const descColor = "rgba(70,70,85,0.95)";
   // The turn loop: a fixed budget of casts each, all of them resolving
   // together once the last player has chosen, then the whole field is eaten.
   const castingLine = [
-    { str: `Press ENTER to LOCK IN — ${CASTS_PER_TURN} cast${CASTS_PER_TURN === 1 ? "" : "s"} each per turn.`, color: descColor },
-    { str: "A GROUP fires when two of you lock in its moves on the SAME square in one turn!", color: RECIPE_COLOR_TEAM },
+    { str: `Press A to LOCK IN`, color: descColor },
+    { str: "Once all Researchers have LOCKED IN their selection the SD2 will disperse", color: RECIPE_COLOR_TEAM },
+    { str: "Neutralizing Agent over the Substance field", color: RECIPE_COLOR_TEAM },
   ];
   const descLines = [
     [
@@ -707,6 +704,30 @@ function drawRecipeGuide() {
       drawRecipeRow(r, RECIPE_COLOR_TEAM, made, `(needs ${r.components.length} players)`);
     }
   }
+}
+
+/**
+ * The pre-match screen: shown before EVERY encounter (server holds play on
+ * its `prematch` flag).  The study guide, the game id so others can join,
+ * and the BEGIN button that starts play — a browser click, like the end
+ * screen's, so a round never begins by accident.
+ */
+function drawPreMatch(game) {
+  clear();
+  const L = LAYOUT.guide;
+  text("Slime Feast — get ready!", L.titleX, L.titleY, L.titleFont, C_HEADER);
+  text(`Game ${game?.join_code ?? "------"}`, L.codeX, L.codeY, L.codeFont, C_TEXT);
+  const standing = game?.observer
+    ? "You are OBSERVING — press P to take a seat (Shift+P leaves one)."
+    : `You are seated as P${game?.player_id ?? "?"}.`;
+  ctx.save();
+  ctx.font = `${L.codeFont - 6}px monospace`;
+  text(standing, L.codeX + 260, L.codeY, L.codeFont - 6,
+    game?.observer ? C_TEXT : playerColor(game?.player_id));
+  ctx.restore();
+
+  drawRecipeGuide();
+  drawRestartButton("BEGIN MATCH");
 }
 
 /**
@@ -1213,17 +1234,6 @@ function updateFeastTracking(game) {
     cinematic.deferred.score += scoreGain;
     cinematic.deferred.hunger += hungerGain;
     return;
-  }
-
-  const at = lastBitePos ?? fieldCenter();
-  const jitter = () => (Math.random() - 0.5) * LAYOUT.floater.jitter;
-  const STACK = LAYOUT.floater.stack;
-
-  if (scoreGain > 0) {
-    spawnFloater(`+${scoreGain}`, at.x + jitter(), at.y - STACK, "rgba(30,150,60,1)");
-  }
-  if (hungerGain > 0) {
-    spawnFloater(`+${hungerGain} hunger`, at.x + jitter(), at.y + STACK, "rgba(200,100,0,1)");
   }
 }
 
@@ -1998,13 +2008,6 @@ function drawSlimeField(game) {
   rectStroke(FIELD.x0, FIELD.y0, FIELD.x1 - FIELD.x0, FIELD.y1 - FIELD.y0, 1,
     FIELD.border);
 
-  // Reservoir: off-grid slime waiting to drop into the top row.
-  const reservoir = game.reservoir ?? 0;
-  const label = reservoir > 0
-    ? `${reservoir} more slime incoming ↓`
-    : "reservoir empty — last of the slime";
-  text(label, FIELD.x0, FIELD.y1 + FIELD.labelDy, FIELD.reservoirFont,
-    reservoir > 0 ? "rgba(90,100,140,0.9)" : "rgba(170,120,0,0.95)");
 }
 
 /** The color standing for a projected outcome tier ("defused" has no tier). */
@@ -2689,34 +2692,8 @@ function bite(flat, g) {
     "rgba(40,36,60,0.85)", 0.8); // ink, not white: it floats over the paper field
 }
 
-/**
- * Float the score and hunger the meal earned, at the last cell bitten.
- *
- * The server applied these the instant the turn ended; the replay holds them
- * back so the numbers arrive with the meal that explains them.  Held deltas are
- * cleared as they are paid, so every exit from the replay — finishing, being cut
- * short, or the game ending underneath it — can call this and none can pay
- * twice.  Silently dropping them would leave the score jumping unexplained.
- */
-function payDeferredFeast() {
-  if (!cinematic) return;
-  const { score, hunger } = cinematic.deferred;
-  cinematic.deferred.score = 0;
-  cinematic.deferred.hunger = 0;
-  const at = lastBitePos ?? fieldCenter();
-  const jitter = () => (Math.random() - 0.5) * LAYOUT.floater.jitter;
-  const STACK = LAYOUT.floater.stack;
-  if (score > 0) {
-    spawnFloater(`+${score}`, at.x + jitter(), at.y - STACK, "rgba(30,150,60,1)");
-  }
-  if (hunger > 0) {
-    spawnFloater(`+${hunger} hunger`, at.x + jitter(), at.y + STACK, "rgba(200,100,0,1)");
-  }
-}
-
 /** The board is picked clean: pay out the deltas the meal earned, then drop. */
 function finishEat() {
-  payDeferredFeast();
   beginCollapse();
 }
 
@@ -2831,7 +2808,6 @@ function finishFill() {
 /** Cut the replay short and land it on the server's board immediately. */
 function snapFinishCinematic() {
   if (!cinematic) return;
-  payDeferredFeast();
   cellAnim.clear();
   endCinematic();
 }
@@ -3166,19 +3142,16 @@ function drawGame(game, dt) {
   // Observers watch the same board; the only key that means anything to them
   // is the one that puts them in it.
   if (game.observer) {
-    const hint = "OBSERVING — press P to take a seat (Shift+P leaves one)";
+    const hint = "OBSERVING — press P to take a seat";
     ctx.font = `${H.labelFont - 4}px monospace`;
     text(hint, SW - ctx.measureText(hint).width - 24, H.waveY + 24, H.labelFont - 4, C_TEXT);
   }
-
-  text("SLIME FIELD", FIELD.x0, FIELD.y0 + H.labelDy, H.labelFont, C_SLIME_HDR);
 
   drawScore(game);
   drawHungerBar(game);
   drawChargeBar(game);
   drawSlimeField(game);
   drawLilGuys(game, dt);
-  drawWheelPanel(game);
   drawPlayerMenus(game);
 
   // Floaters drawn last so they appear on top of everything.
@@ -3221,7 +3194,7 @@ function drawGameOver(msg) {
   const REASON_TEXT = {
     hunger_full: "The Lil Guys got full!",
     field_cleared: "Slime field cleared!",
-    out_of_charges: "Out of charges — nothing left to cast, and nothing left to eat.",
+    out_of_charges: "Neutralizing Agent Exhausted",
   };
   const reasonText = stats ? (REASON_TEXT[stats.reason] ?? stats.reason) : "";
   text(`Encounter over — ${reasonText}`, L.x, L.titleY, L.titleFont, C_HEADER);
@@ -3229,7 +3202,7 @@ function drawGameOver(msg) {
   text(`Neutral slime consumed: ${score}${hungerText}`, L.x, L.scoreY, L.scoreFont, C_SLIME_HDR);
 
   if (!stats) {
-  drawRestartButton();
+    drawRestartButton("START NEXT ROUND");
     return;
   }
 
@@ -3237,41 +3210,26 @@ function drawGameOver(msg) {
   const F = L.fcols;
   const feast = stats.feast ?? {};
   let y = L.feastY;
-  text("FEAST", F.label, y, L.sectionFont, C_HEADER);
   y += L.rowH;
 
-  /** One "LABEL  ≡12 -5" row, bucketed by tier. */
   const feastRow = (label, obj) => {
     text(label, F.label, y, L.rowFont, "rgba(70,70,85,0.95)");
     drawTierCells(F.cells, y, L.rowFont, obj);
     y += L.rowH;
   };
-  // `covered` and `neutralized` are bucketed by the tier each cell was BEFORE
-  // the stamp, so the rows read as "what did we hit", not "what is left".
-  feastRow("cells downgraded", feast.covered);
-  feastRow("cells defused", feast.neutralized);
 
   y += 4;
   const spent = feast.charges_spent ?? 0;
   const left = feast.charges_left ?? 0;
   const consumed = (feast.neutral ?? 0) + (feast.defused ?? 0);
-  text(
-    `eaten ${consumed} (${feast.neutral ?? 0} neutral + ${feast.defused ?? 0} defused)` +
-    `  ·  hunger ${feast.hunger_normal ?? 0}`,
-    F.label, y, L.rowFont, "rgba(70,70,85,0.95)",
-  );
   y += L.rowH;
   // The headline tuning number: food that existed, was edible, and was never
   // reached.  A high figure means the charges went somewhere that did not open
   // a road, which is the only way this game is really lost.
-  text(`walled off and never eaten: ${feast.sheltered ?? 0}`,
-    F.label, y, L.rowFont, C_SHELTERED);
   y += L.rowH;
   // Charges per unit of food: the single ratio that says whether the encounter
   // was priced right.  Guarded, because a team can finish having spent nothing.
   const perUnit = consumed > 0 ? (spent / consumed).toFixed(2) : "—";
-  text(`\u26a1 ${spent} spent, ${left} unspent  ·  ${perUnit} per unit eaten`,
-    F.label, y, L.rowFont, C_CHARGE);
   y += L.rowH + 14;
 
   // ---- Per-player table ----------------------------------------------------
@@ -3310,7 +3268,7 @@ function drawGameOver(msg) {
   text(`total spells cast: ${stats.casts_total}  ·  slime eaten: ${eaten}/${stats.slime_total ?? 0}`,
     P.name, y, L.rowFont, "rgba(70,70,85,0.95)");
 
-  text("Press any key to return to lobby.", L.x, SH - 40, L.hintFont, C_TEXT);
+  drawRestartButton("START NEXT ROUND");
 }
 
 /** Design-space bounds of the next-round button.  Fixed geometry, so click
@@ -3321,15 +3279,17 @@ const RESTART_BUTTON = (() => {
 })();
 let restartHover = false;
 
-/** True while the report is up and the button should exist: clicks anywhere
- *  else — and clicks during the outro replay — must not start a round. */
+/** True while a HOLD screen is up and the button should exist: the report
+ *  (once its outro replay lands) or the pre-match guide.  Clicks anywhere
+ *  else must not advance the match. */
 function restartButtonActive() {
-  return latestMsg?.phase === "game_over" && !outroActive();
+  return (latestMsg?.phase === "game_over" && !outroActive()) ||
+    latestMsg?.phase === "pre_match";
 }
 
-/** The one way a new round starts: a CLICK, from a browser tab.  Drawn as a
- *  real button so the trigger is unmistakably deliberate. */
-function drawRestartButton() {
+/** The one way the match advances past a hold: a CLICK, from a browser tab.
+ *  Drawn as a real button so the trigger is unmistakably deliberate. */
+function drawRestartButton(label) {
   const B = LAYOUT.gameOver.button;
   const r = RESTART_BUTTON;
   rect(r.x, r.y, r.w, r.h,
@@ -3339,7 +3299,7 @@ function drawRestartButton() {
   ctx.font = `bold ${B.font}px monospace`;
   ctx.fillStyle = C_HEADER;
   ctx.textAlign = "center";
-  ctx.fillText("START NEXT ROUND", r.x + r.w / 2, r.y + r.h / 2 + B.font * 0.35);
+  ctx.fillText(label, r.x + r.w / 2, r.y + r.h / 2 + B.font * 0.35);
   ctx.restore();
 }
 
@@ -3465,6 +3425,7 @@ function renderFrame(msg, dt) {
   switch (msg.phase) {
     case "pre_lobby": drawPreLobby(); break;
     case "connecting": drawConnecting(); break;
+    case "pre_match": drawPreMatch(msg.game); break;
     case "game": drawGame(msg.game, dt); break;
     case "game_over": drawGameOver(msg); break;
     default: drawConnecting();

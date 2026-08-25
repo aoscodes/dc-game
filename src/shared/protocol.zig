@@ -8,9 +8,10 @@ pub const MsgTag = enum(u8) {
     // take a player slot explicitly.
     take_slot = 0x02,
     leave_slot = 0x04,
-    /// Start the next encounter from the end screen.  Sent by browser-tab
-    /// clients when the report's button is CLICKED (never a key press);
-    /// ignored while a game is running.
+    /// Advance the match from a HOLD: from the end screen into the next
+    /// encounter's pre-match guide, and from the guide into play.  Sent by
+    /// browser-tab clients when the screen's button is CLICKED (never a key
+    /// press); ignored while a game is running.
     restart = 0x06,
     cycle_shape = 0x07,
     cast = 0x09,
@@ -231,6 +232,10 @@ pub const GameStart = struct {
     /// The session's join code — the game id, shown by clients so others can
     /// join or observe.
     join_code: [6]u8 = [_]u8{'-'} ** 6,
+    /// True while the encounter is holding at its PRE-MATCH screen (the
+    /// recipe guide): everything is set up and seats can be taken, but play
+    /// waits for a browser tab's `restart` click.
+    prematch: bool = false,
     /// Casts each player gets per turn (balance.casts_per_turn).  Sent once at
     /// start because it never changes mid-encounter.
     casts_per_turn: u8 = 0,
@@ -490,6 +495,7 @@ fn encode_game_start(w: anytype, p: GameStart) !void {
     try w.writeAll(p.encounter_label[0..p.encounter_label_len]);
     try w.writeByte(p.player_id);
     try w.writeAll(&p.join_code);
+    try w.writeByte(if (p.prematch) 1 else 0);
     try w.writeByte(p.casts_per_turn);
     try w.writeInt(u32, p.charges, .little);
     try w.writeByte(p.grid_rows);
@@ -697,6 +703,7 @@ pub fn decode_game_start(reader: anytype) !GameStart {
     _ = try reader.readAll(p.encounter_label[0..llen]);
     p.player_id = try reader.readByte();
     _ = try reader.readAll(&p.join_code);
+    p.prematch = (try reader.readByte()) != 0;
     p.casts_per_turn = try reader.readByte();
     p.charges = try reader.readInt(u32, .little);
     p.grid_rows = try reader.readByte();
@@ -950,6 +957,7 @@ test "round-trip: game_start — join code, grid dims and cast buffer survive" {
         .encounter_label_len = @intCast(label.len),
         .player_id = 3,
         .join_code = "ABCDEF".*,
+        .prematch = true,
         .casts_per_turn = 3,
         .charges = 40,
         .grid_rows = 6,
@@ -964,6 +972,7 @@ test "round-trip: game_start — join code, grid dims and cast buffer survive" {
 
     try std.testing.expectEqual(@as(u8, 3), decoded.player_id);
     try std.testing.expectEqualSlices(u8, "ABCDEF", &decoded.join_code);
+    try std.testing.expect(decoded.prematch);
     try std.testing.expectEqual(@as(u8, 3), decoded.casts_per_turn);
     try std.testing.expectEqual(@as(u32, 40), decoded.charges);
     try std.testing.expectEqual(@as(u8, 6), decoded.grid_rows);

@@ -247,7 +247,9 @@ fn process_recv() void {
                 // A fresh outro must not survive into the next encounter.
                 g_state.game.final_score = null;
                 g_state.game.final_stats = null;
-                g_state.phase = .game;
+                // A holding encounter shows the pre-match guide until a
+                // browser tab clicks past it (another game_start follows).
+                g_state.phase = if (p.prematch) .pre_match else .game;
             },
             .game_state => {
                 const p = proto.decode_game_state(r) catch continue;
@@ -348,6 +350,9 @@ pub fn main() !void {
 
         switch (g_state.phase) {
             .connecting => {},
+            // Same input handling as play: seat keys (p / Shift+P) must work
+            // while the guide holds; gameplay sends are ignored server-side.
+            .pre_match => update_game(),
             .game => update_game(),
             .game_over => {
                 // The end screen holds until a browser tab CLICKS the

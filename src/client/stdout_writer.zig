@@ -40,7 +40,7 @@ pub const Writer = struct {
     }
 };
 
-pub const ClientPhaseTag = enum { connecting, game, game_over };
+pub const ClientPhaseTag = enum { connecting, pre_match, game, game_over };
 
 pub const LastActionEntry = struct { entity: u32, anim: c.ActionAnimation };
 
@@ -206,7 +206,9 @@ fn write_render_inner(
         // final `game_state` before `game_over` for exactly this — so it costs
         // nothing but the bytes.  `turn_ended` is cleared after one write, so
         // the outro starts once and the frames after it are static.
-        .game = if (phase == .game or phase == .game_over) JsonGame{
+        // Carried in `pre_match` too: the guide screen needs the game id and
+        // the viewer's standing (seats can be taken while it holds).
+        .game = if (phase != .connecting) JsonGame{
             .encounter = game.encounter_label[0..game.encounter_label_len],
             .join_code = &game.join_code,
             .player_id = game.player_id,

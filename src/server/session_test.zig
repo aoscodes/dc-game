@@ -2802,10 +2802,12 @@ test "the end screen holds — no new game, no broadcasts — until a restart ar
     try std.testing.expectEqual(@as(usize, 0), s.p[0].buf.items.len);
 
     // A restart (any connection — in play it is the browser tab) begins the
-    // config's default encounter; nobody re-joins.
+    // config's default encounter, HOLDING at its pre-match guide; nobody
+    // re-joins.
     try enqueue_msg(&s.sess, s.p[0].pid, .restart, {});
     try flush(&s.sess);
     try std.testing.expect(!s.sess.restart_pending);
+    try std.testing.expect(s.sess.prematch);
     try std.testing.expectEqual(@as(u16, 1), s.sess.turn);
     try std.testing.expectEqual(@as(u16, 0), s.sess.hunger.current);
     try std.testing.expectEqual(@as(u8, 2), s.sess.seated_players());
@@ -2817,13 +2819,59 @@ test "the end screen holds — no new game, no broadcasts — until a restart ar
     logic.grow_charges(&want_pool, 1);
     try std.testing.expectEqual(want_pool, s.sess.charges);
 
-    // Everyone is told, from their own standing.
+    // Everyone is told, from their own standing, with the hold flagged.
     const msgs = try drain(s.p[0].buf.items, arena);
     const gs_msg = find_tag(msgs, .game_start) orelse return error.NoGameStart;
     var fbs = std.io.fixedBufferStream(gs_msg.payload);
     const gs = try proto.decode_game_start(fbs.reader());
     try std.testing.expectEqual(s.p[0].pid, gs.player_id);
+    try std.testing.expect(gs.prematch);
     try std.testing.expectEqualSlices(u8, DEFAULT_ENC.label, gs.encounter_label[0..gs.encounter_label_len]);
+
+    // A second click dismisses the guide and play begins.
+    s.p[0].clear();
+    try enqueue_msg(&s.sess, s.p[0].pid, .restart, {});
+    try flush(&s.sess);
+    try std.testing.expect(!s.sess.prematch);
+    const msgs2 = try drain(s.p[0].buf.items, arena);
+    const gs2_msg = find_tag(msgs2, .game_start) orelse return error.NoGameStart;
+    var fbs2 = std.io.fixedBufferStream(gs2_msg.payload);
+    const gs2 = try proto.decode_game_start(fbs2.reader());
+    try std.testing.expect(!gs2.prematch);
+}
+
+test "the pre-match hold ignores gameplay input but seats freely" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    s.sess.prematch = true; // as the server boot (and every restart) sets it
+
+    // Casting during the guide does nothing — no lock-in, no budget spent.
+    aim_at(&s.sess, s.p[0].pid, 2, 5);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(usize, 0), s.sess.pending_count);
+    try std.testing.expectEqual(BUDGET, s.sess.casts_left[s.p[0].pid]);
+
+    // But a newcomer can still take a seat while everyone reads.
+    var late = TestPlayer{};
+    late.init(allocator);
+    defer late.deinit(allocator);
+    const conn_id = s.sess.connect(late.transport()) orelse return error.JoinFailed;
+    try enqueue_msg(&s.sess, conn_id, .take_slot, proto.TakeSlot{});
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u8, 3), s.sess.seated_players());
+
+    // The click begins play; the queued-up team can now cast.
+    try enqueue_msg(&s.sess, s.p[0].pid, .restart, {});
+    try flush(&s.sess);
+    try std.testing.expect(!s.sess.prematch);
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(usize, 1), s.sess.pending_count);
 }
 
 test "a restart mid-game is a stray key and changes nothing" {
