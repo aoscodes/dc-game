@@ -516,7 +516,6 @@ function resetPreLobby() {
 function drawPreLobby() {
   clear();
   const L = LAYOUT.preLobby;
-  text("Slime Feast", L.titleX, L.titleY, L.titleFont, C_HEADER);
 
   if (preLobbyMode === "choose") {
     const highlight = "rgba(170,120,0,1)";
