@@ -1413,7 +1413,7 @@ function drawHungerBar(game) {
   const w = H.x1 - H.x0;
   const frac = hunger.max > 0 ? Math.min(1, hunger.current / hunger.max) : 0;
 
-  text("TOTAL HUNGER", H.x0, H.y + H.labelDy, H.labelFont, C_HEADER);
+  text("L. Genus Specimen apitite level", H.x0, H.y + H.labelDy, H.labelFont, C_HEADER);
 
   rect(H.x0, H.y, w, H.h, H.bg);
   if (frac > 0) rect(H.x0, H.y, w * frac, H.h, H.fill);
@@ -1448,12 +1448,10 @@ function drawChargeBar(game) {
   const w = B.x1 - B.x0;
   const frac = chargesSeenMax > 0 ? Math.min(1, charges / chargesSeenMax) : 0;
 
-  text("TEAM CHARGES (whole encounter — never refills)",
+  text("Neutralizer Units Remaining",
     B.x0, B.y + B.labelDy, B.labelFont, C_CHARGE);
 
   rect(B.x0, B.y, w, B.h, B.bg);
-  // Anchored at the LEFT so the remaining pool stays where the eye expects a
-  // quantity to be, and the empty gap grows into the space it used to hold.
   if (frac > 0) rect(B.x0, B.y, w * frac, B.h, C_CHARGE);
 
   const low = frac <= 0.15;
@@ -1465,7 +1463,7 @@ function drawChargeBar(game) {
 
 function drawScore(game) {
   const S = LAYOUT.score;
-  text(`Score: ${game.score ?? 0}`, S.x, S.y, S.font, C_SLIME_HDR);
+  text(`LGW units collected: ${game.score ?? 0}`, S.x, S.y, S.font, C_SLIME_HDR);
 }
 
 // ---------------------------------------------------------------------------
