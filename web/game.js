@@ -193,6 +193,11 @@ const LAYOUT = {
     guideX: 40, guideY: 140, guideFont: 13, guideLineH: 19,
     recipeHeaderGap: 10, recipeRowH: 25, recipeFont: 14,
     recipeLabelW: 170, recipeSlotGap: 10, recipeArrowGap: 24,
+    // Mini-board cell size for the shape demo inside each recipe card, and
+    // the grid the card's demo slot is budgeted for: every card reserves a
+    // demoGridMax × demoGridMax box (shapes centre inside it), so all cards
+    // come out the same size whatever shape they hold.
+    demoCell: 20, demoGridMax: 6,
   },
 
   connecting: { x: 40, y: 60, font: 24 },
@@ -555,6 +560,16 @@ function drawParts(x, y, font, parts, gap) {
   return dx;
 }
 
+/** Width a drawParts run occupies (no trailing gap), so callers can center
+ *  it before drawing. */
+function partsWidth(font, parts, gap) {
+  if (parts.length === 0) return 0;
+  ctx.font = `${font}px monospace`;
+  let w = -gap;
+  for (const p of parts) w += ctx.measureText(p.str).width + gap;
+  return w;
+}
+
 /**
  * Colored parts for a recipe's charge cost.  Every recipe shows one, including
  * the free ones: "0" is a real tactical option and hiding it would make a free
@@ -566,34 +581,51 @@ function costParts(cost) {
 }
 
 /**
- * Draw a recipe's shape as a small glyph grid ("###" / ".#."), with the anchor
- * cell marked — that is the cell you aim at, and every other cell is placed
- * relative to it.
+ * Draw a recipe's shape as a MINI BOARD, rendered with the same pieces the
+ * field uses: every cell gets the recessed socket rect, and each covered ("#")
+ * cell wears the INVERTED slime tile art — the game's own mark for "a cast
+ * covers this cell" — over a SHAPE_COLOR footprint outline at the socket edge.
+ * The anchor cell (the one you aim at; every other cell lands relative to it)
+ * is bracketed at the cell edge in C_OWN_ROW, the same aim-cell convention as
+ * the action menu's shape (drawSpellShape).
  *
- * @returns {number} x after the drawn glyph.
+ * @param {number} cx   - horizontal centre of the demo grid
+ * @param {number} top  - top edge of the demo grid
+ * @param {string[]} rows - authored shape rows ("###" / ".#.")
+ * @param {number} cell - cell size in design px (LAYOUT.guide.demoCell)
  */
-function drawShapeGlyph(x, y, font, rows) {
-  const G = LAYOUT.guide;
-  const anchorR = Math.floor(rows.length / 2);
-  const anchorC = Math.floor((rows[0]?.length ?? 0) / 2);
-  ctx.font = `${font}px monospace`;
-  const cw = ctx.measureText("#").width;
-  const ch = font * 0.82;
-  // Top-align the block on the row baseline so tall shapes grow downward and
-  // never collide with the row above.
-  const y0 = y - ch * anchorR;
-  rows.forEach((line, r) => {
-    for (let cl = 0; cl < line.length; cl++) {
-      const on = line[cl] === "#";
-      const isAnchor = r === anchorR && cl === anchorC;
-      const glyph = on ? (isAnchor ? "◉" : "■") : "·";
-      const color = on
-        ? (isAnchor ? C_OWN_ROW : SHAPE_COLOR)
-        : "rgba(110,110,130,0.5)";
-      text(glyph, x + cl * cw, y0 + r * ch, font, color);
+function drawShapeDemo(cx, top, rows, cell) {
+  const nR = rows.length;
+  const nC = rows[0]?.length ?? 0;
+  if (nR === 0 || nC === 0) return;
+  const anchorR = Math.floor(nR / 2);
+  const anchorC = Math.floor(nC / 2);
+  const x0 = cx - (nC * cell) / 2;
+
+  const inset = cell * FIELD.tileGap;
+  const body = cell - inset * 2;
+  for (let r = 0; r < nR; r++) {
+    for (let cl = 0; cl < nC; cl++) {
+      const cxp = x0 + cl * cell;
+      const cyp = top + r * cell;
+      // Socket: the same ground every field cell stands on.
+      rect(cxp + inset, cyp + inset, body, body, FIELD.socketFill);
+      rectStroke(cxp + inset, cyp + inset, body, body, 1, FIELD.socketBorder);
+      if (rows[r][cl] === "#") {
+        // Covered cell: inverted hazard tile + footprint outline, exactly the
+        // pair the live cast preview paints on the field.
+        drawTile("red", cxp, cyp, cell, 1, 0, 1, true);
+        ctx.save();
+        ctx.strokeStyle = SHAPE_COLOR;
+        ctx.lineWidth = 1.5;
+        ctx.strokeRect(cxp + inset, cyp + inset, body, body);
+        ctx.restore();
+      }
+      if (r === anchorR && cl === anchorC) {
+        rectStroke(cxp, cyp, cell, cell, 1.5, C_OWN_ROW);
+      }
     }
-  });
-  return x + (rows[0]?.length ?? 0) * cw;
+  }
 }
 
 /**
@@ -616,47 +648,49 @@ function drawRecipeGuide() {
   ];
   const descLines = [
     [
-      { str: "AIM with the arrow keys. Turn the SHAPE WHEEL to pick your move:", color: descColor },
-      { str: "1 next", color: WHEEL_COLOR.forward },
-      { str: "2 back", color: WHEEL_COLOR.backward },
+      { str: "GAMEPLAY INSTRUCTIONS TO COME", color: descColor },
+      //  { str: "AIM with the arrow keys. Turn the SHAPE WHEEL to pick your move:", color: descColor },
+      //  { str: "1 next", color: WHEEL_COLOR.forward },
+      //  { str: "2 back", color: WHEEL_COLOR.backward },
+      //],
+      //[
+      //  { str: "Your pick STAYS until you turn the wheel again — it survives casting and the turn end.", color: descColor },
+      //],
+      //[
+      //  { str: "Each move below stamps its SHAPE on the grid, centred on your cursor.", color: descColor },
+      //],
+      //[
+      //  { str: "Every covered cell steps down one tier:", color: descColor },
+      //  { str: `${TIER_CHAR.red}red`, color: TIER_COLOR.red },
+      //  { str: "→", color: descColor },
+      //  { str: `${TIER_CHAR.yellow}yellow`, color: TIER_COLOR.yellow },
+      //  { str: "→", color: descColor },
+      //  { str: `${TIER_CHAR.green}green`, color: TIER_COLOR.green },
+      //  { str: "→ defused (harmless to eat).", color: descColor },
+      //],
+      //[
+      //  { str: "Aim is captured when you press ENTER — re-aiming will not move a cast already locked in.", color: descColor },
+      //],
+      //[
+      //  { str: "Nothing lands until the turn resolves, so you can see the whole plan first.", color: descColor },
+      //  { str: "ESC takes back your last lock-in.", color: C_BAD },
+      //],
+      //[
+      //  { str: "The turn ends once EVERYONE has locked in: every cast lands at once, then the Lil Guys pour in from the LEFT.", color: descColor },
+      //],
+      //[
+      //  { str: "They only eat what they can WALK to. Live hazard slime is a wall — everything behind it survives.", color: descColor },
+      //],
+      //[
+      //  { str: "Defuse a wall and you open a road. Survivors fall to the bottom, then fresh slime drops in on top.", color: descColor },
+      //],
+      //[
+      //  { str: "Every cast spends from ONE shared pool", color: descColor },
+      //  { str: "\u26a1", color: C_CHARGE },
+      //  { str: "that lasts the WHOLE encounter and never refills. A cast the turn cannot afford is REFUSED, costing nothing.", color: descColor },
     ],
-    [
-      { str: "Your pick STAYS until you turn the wheel again — it survives casting and the turn end.", color: descColor },
-    ],
-    [
-      { str: "Each move below stamps its SHAPE on the grid, centred on your cursor.", color: descColor },
-    ],
-    [
-      { str: "Every covered cell steps down one tier:", color: descColor },
-      { str: `${TIER_CHAR.red}red`, color: TIER_COLOR.red },
-      { str: "→", color: descColor },
-      { str: `${TIER_CHAR.yellow}yellow`, color: TIER_COLOR.yellow },
-      { str: "→", color: descColor },
-      { str: `${TIER_CHAR.green}green`, color: TIER_COLOR.green },
-      { str: "→ defused (harmless to eat).", color: descColor },
-    ],
-    [
-      { str: "Aim is captured when you press ENTER — re-aiming will not move a cast already locked in.", color: descColor },
-    ],
-    [
-      { str: "Nothing lands until the turn resolves, so you can see the whole plan first.", color: descColor },
-      { str: "ESC takes back your last lock-in.", color: C_BAD },
-    ],
-    [
-      { str: "The turn ends once EVERYONE has locked in: every cast lands at once, then the Lil Guys pour in from the LEFT.", color: descColor },
-    ],
-    [
-      { str: "They only eat what they can WALK to. Live hazard slime is a wall — everything behind it survives.", color: descColor },
-    ],
-    [
-      { str: "Defuse a wall and you open a road. Survivors fall to the bottom, then fresh slime drops in on top.", color: descColor },
-    ],
-    [
-      { str: "Every cast spends from ONE shared pool", color: descColor },
-      { str: "\u26a1", color: C_CHARGE },
-      { str: "that lasts the WHOLE encounter and never refills. A cast the turn cannot afford is REFUSED, costing nothing.", color: descColor },
-    ],
-    castingLine,
+    //  castingLine,
+
   ];
   for (const line of descLines) {
     drawParts(L.guideX, y, L.guideFont, line, 8);
@@ -667,28 +701,81 @@ function drawRecipeGuide() {
   text("MOVES", L.guideX, y, L.guideFont + 2, C_HEADER);
   y += L.guideLineH;
 
+  // Each recipe is a bordered CARD with its parts stacked vertically (label,
+  // components, shape, cost).  Every card is the SAME fixed size, budgeted
+  // for the largest shape the demo may hold (demoGridMax × demoGridMax), so
+  // the grid of cards stays regular whatever each recipe contains: each part
+  // lives in a fixed slot, and slots a card has no content for stay blank.
+  // Cards flow LEFT-TO-RIGHT, wrapping to a new row when the next card would
+  // run past the canvas edge.
+  const maxX = SW - L.guideX; // right margin mirrors the left one
+  const cardGap = L.recipeSlotGap;
+  const cardPad = 8;
+  const cardBorder = "rgba(0,0,0,0.25)";
+  const lineH = L.guideLineH;
+  const demoGapY = 4; // breathing room above and below the mini board
+  const demoBox = L.demoGridMax * L.demoCell; // demo slot: fits a 6×6 shape
+  const cardW = cardPad * 2 + demoBox;
+  const cardH = cardPad + L.recipeFont // label baseline
+    + lineH                            // component slot (blank for moves)
+    + demoGapY + demoBox + demoGapY    // mini-board demo slot
+    + lineH                            // cost line
+    + lineH                            // suffix slot (blank for moves)
+    + cardPad;
+  let x = L.guideX;
+
+  /** Close out the current flow row (no-op if nothing is on it). */
+  const flushRow = () => {
+    if (x > L.guideX) {
+      y += cardH + cardGap;
+      x = L.guideX;
+    }
+  };
+
   /**
-   * One guide row: label, what it is made of, its shape, its cost.
-   * `made` is the recipe column — empty for a move (the wheel is how you pick
-   * it), the component move labels for a group.
+   * One guide card: label, what it is made of, its shape (a mini board drawn
+   * with the game's own tiles — see drawShapeDemo), its cost — stacked top to
+   * bottom inside a border box, every line centred on the card and the shape
+   * centred in its slot.  `made` is the components line — empty for a move
+   * (the wheel is how you pick it), the component move labels for a group.
    */
   const drawRecipeRow = (r, labelColor, made, suffix) => {
-    text(r.label, L.guideX, y, L.recipeFont, labelColor);
-    let x = L.guideX + L.recipeLabelW;
-    x = drawParts(x, y, L.recipeFont, made, L.recipeSlotGap);
-    text("→", x, y, L.recipeFont, descColor);
-    x += L.recipeArrowGap;
-    x = drawShapeGlyph(x, y, L.recipeFont, r.rows ?? ["#"]) + L.recipeSlotGap;
-    x = drawParts(x, y, L.recipeFont, costParts(r.cost), L.recipeSlotGap);
-    if (suffix) text(suffix, x + 4, y, L.guideFont, RECIPE_COLOR_TEAM);
-    // Tall shapes render below the baseline, so advance past the whole block.
-    const shapeH = (r.rows?.length ?? 1) * L.recipeFont * 0.82;
-    y += Math.max(L.recipeRowH, shapeH + 4);
+    if (x > L.guideX && x + cardW > maxX) flushRow();
+    rectStroke(x, y, cardW, cardH, 1, cardBorder);
+    const cx = x + cardW / 2;
+    ctx.font = `${L.recipeFont}px monospace`;
+    let by = y + cardPad + L.recipeFont; // label baseline
+    text(r.label, cx - ctx.measureText(r.label).width / 2, by,
+      L.recipeFont, labelColor);
+    by += lineH; // component slot, blank when there are none
+    if (made.length > 0) {
+      drawParts(cx - partsWidth(L.recipeFont, made, L.recipeSlotGap) / 2, by,
+        L.recipeFont, made, L.recipeSlotGap);
+    }
+    const rows = r.rows ?? ["#"];
+    // Centre the shape inside the fixed demo slot, both axes.
+    by += demoGapY;
+    drawShapeDemo(cx, by + (demoBox - rows.length * L.demoCell) / 2,
+      rows, L.demoCell);
+    by += demoBox + demoGapY;
+    by += lineH;
+    const cost = costParts(r.cost);
+    drawParts(cx - partsWidth(L.recipeFont, cost, L.recipeSlotGap) / 2, by,
+      L.recipeFont, cost, L.recipeSlotGap);
+    if (suffix) {
+      by += lineH;
+      ctx.font = `${L.guideFont}px monospace`;
+      text(suffix, cx - ctx.measureText(suffix).width / 2, by,
+        L.guideFont, RECIPE_COLOR_TEAM);
+    }
+    x += cardW + cardGap;
   };
 
   for (const r of PLAYER_RECIPES) {
     drawRecipeRow(r, RECIPE_COLOR_PLAYER, [], null);
   }
+  flushRow();
+
   if (TEAM_RECIPES.length > 0) {
     y += L.recipeHeaderGap;
     text("GROUPS", L.guideX, y, L.guideFont + 2, C_HEADER);
@@ -703,6 +790,7 @@ function drawRecipeGuide() {
       });
       drawRecipeRow(r, RECIPE_COLOR_TEAM, made, `(needs ${r.components.length} players)`);
     }
+    flushRow();
   }
 }
 
@@ -715,10 +803,9 @@ function drawRecipeGuide() {
 function drawPreMatch(game) {
   clear();
   const L = LAYOUT.guide;
-  text("Slime Feast — get ready!", L.titleX, L.titleY, L.titleFont, C_HEADER);
   text(`Game ${game?.join_code ?? "------"}`, L.codeX, L.codeY, L.codeFont, C_TEXT);
   const standing = game?.observer
-    ? "You are OBSERVING — press P to take a seat (Shift+P leaves one)."
+    ? "Press P to play once game starts"
     : `You are seated as P${game?.player_id ?? "?"}.`;
   ctx.save();
   ctx.font = `${L.codeFont - 6}px monospace`;
@@ -727,7 +814,7 @@ function drawPreMatch(game) {
   ctx.restore();
 
   drawRecipeGuide();
-  drawRestartButton("BEGIN MATCH");
+  drawRestartButton("SCAN FOR NEARBY SLIME");
 }
 
 /**
@@ -3031,7 +3118,8 @@ function drawPlayerMenu(game, e, x, y) {
 /**
  * Draw a spell's shape as a small grid of filled cells, centred on (cx, cy)
  * and fitted inside maxW×maxH.  The anchor cell — the one the cursor aims —
- * is outlined, matching the ◉ convention of the lobby guide.  `dim` mutes the
+ * is outlined, matching the anchor bracket of the lobby guide's shape demos
+ * (drawShapeDemo).  `dim` mutes the
  * fill for a menu whose player is locked in: the spell is still held, but no
  * cast of it is available this round.
  */
