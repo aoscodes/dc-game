@@ -1,0 +1,38 @@
+.container {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  align-items: center;
+  justify-content: center;
+  margin: 30%;
+}
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  width: 100%;
+  margin: 10%;
+}
+
+.card {
+  display: flex;
+  width: 200px;
+  height: 200px;
+
+  border: 2px solid rgba(60,90,200,0.18);
+
+  align-items: center;
+  justify-content: center;
+
+  background-color: rgba(60,90,200,0.08);
+}
+
+body {
+  background: rgb(238, 242, 250);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+}
+
+canvas { display: block; image-rendering: pixelated; width: 1024px; height: 768px; }

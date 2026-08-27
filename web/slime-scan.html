@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DC Game</title>
+  <style>
+  </style>
+</head>
+<body>
+<canvas id="canvas" width="2048" height="1536"></canvas>
+<!-- ?v= is a cache buster: CI rewrites "dev" to the commit SHA on deploy.
+     Absolute path: this shell is also served at /config/{hash}. -->
+<script src="/game.js?v=dev"></script>
+</body>
+</html>

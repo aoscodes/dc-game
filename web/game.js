@@ -3282,7 +3282,7 @@ function drawGameOver(msg) {
     out_of_charges: "Neutralizing Agent Exhausted",
   };
   const reasonText = stats ? (REASON_TEXT[stats.reason] ?? stats.reason) : "";
-  text(`Encounter over — ${reasonText}`, L.x, L.titleY, L.titleFont, C_HEADER);
+  text(`${reasonText}`, L.x, L.titleY, L.titleFont, C_HEADER);
   const hungerText = stats ? `   ·   Hunger ${stats.hunger_final}/${stats.hunger_max}` : "";
   text(`Neutral slime consumed: ${score}${hungerText}`, L.x, L.scoreY, L.scoreFont, C_SLIME_HDR);
 
