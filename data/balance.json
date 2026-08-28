@@ -14,7 +14,14 @@
       "match_len": 3
     },
     "egg": {
-      "match_len": 3
+      "match_len": 3,
+      "back_ranks_only": true
+    },
+    "canister": {
+      "charge_refill": 3
+    },
+    "bomb": {
+      "explode_rocks_only": false
     }
   },
   "player_recipes": [

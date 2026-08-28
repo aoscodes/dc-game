@@ -45,6 +45,14 @@ const DEFAULT_CHARGES = 30;
 const DEFAULT_HUNGER_BASE = 30;
 const DEFAULT_APPETITE_SCALE = 5;
 const DEFAULT_HUNGER_PLAYER_CAP = 500;
+/** Mirrors balance.DEFAULT_MATCH_LEN. */
+const DEFAULT_MATCH_LEN = 3;
+/** Mirrors balance.DEFAULT_CHARGE_REFILL: charges a swallowed canister
+ *  pours back into the team pool. */
+const DEFAULT_CHARGE_REFILL = 3;
+/** Mirrors balance.BACK_RANKS: the rightmost columns a back_ranks_only
+ *  special kind may spawn in — the far side from the feast's door. */
+const BACK_RANKS = 2;
 
 /** Scalar balance fields: [key, label, min, max, step]. */
 const RATE_FIELDS = [
@@ -90,9 +98,11 @@ const sparseTiers = (dense) =>
   Object.fromEntries(TIERS.filter((t) => (dense?.[t] ?? 0) > 0).map((t) => [t, dense[t]]));
 
 /** Special kinds, mirroring components.SpecialKind (ordinal order).
- *  `neutralizer` is the inert wall that pops when a line matches; `egg` is
- *  edible and hatches a baby. */
-const SPECIAL_KINDS = ["neutralizer", "egg"];
+ *  `neutralizer` fires a 3x3 Agent block when eaten; `egg` is edible and
+ *  hatches a baby; `rock` is the permanent wall nothing can touch;
+ *  `canister` refills the team's charge pool when eaten; `bomb` destroys
+ *  its 3x3 surroundings when eaten (or just the rocks in it). */
+const SPECIAL_KINDS = ["neutralizer", "egg", "rock", "canister", "bomb"];
 
 const specialsFrom = (obj) =>
   Object.fromEntries(SPECIAL_KINDS.map((k) => [k, obj?.[k] ?? 0]));
@@ -153,6 +163,14 @@ async function load() {
       hunger_base: bal.hunger_base ?? DEFAULT_HUNGER_BASE,
       appetite_scale: bal.appetite_scale ?? DEFAULT_APPETITE_SCALE,
       hunger_player_cap: bal.hunger_player_cap ?? DEFAULT_HUNGER_PLAYER_CAP,
+      // Per-kind special tuning, densified so inputs always bind (and so a
+      // round-trip PRESERVES it — older editors silently dropped the table).
+      specials: Object.fromEntries(SPECIAL_KINDS.map((k) => [k, {
+        match_len: bal.specials?.[k]?.match_len ?? DEFAULT_MATCH_LEN,
+        back_ranks_only: bal.specials?.[k]?.back_ranks_only ?? false,
+        charge_refill: bal.specials?.[k]?.charge_refill ?? DEFAULT_CHARGE_REFILL,
+        explode_rocks_only: bal.specials?.[k]?.explode_rocks_only ?? false,
+      }])),
       player_recipes: bal.player_recipes.map((r) => ({
         label: r.label,
         shape: shapeFrom(r.shape),
@@ -198,6 +216,17 @@ const clamp = (v, min, max) => Math.min(max, Math.max(min, v));
  * Bounded number input bound to obj[key].  Clamps on change; steps of 1
  * force integers (the data files use integer fields except round duration).
  */
+/** A checkbox bound to obj[key] (a boolean). */
+function boolInput(obj, key, onChange = null) {
+  const input = el("input", { type: "checkbox" });
+  input.checked = !!obj[key];
+  input.addEventListener("change", () => {
+    obj[key] = input.checked;
+    if (onChange) onChange();
+  });
+  return input;
+}
+
 function numInput(obj, key, min, max, step = 1, cls = "", onChange = null) {
   const input = el("input", { type: "number", min, max, step, class: cls });
   input.value = obj[key];
@@ -384,7 +413,47 @@ function renderRates() {
       el("br"),
     );
   }
-  box.append(slimeGridRow());
+  box.append(slimeGridRow(), el("br"), ...specialsRows());
+}
+
+/**
+ * Per-kind special tuning: the (dormant) match length and the back-ranks
+ * spawn restriction.  The checkbox pins the kind's spawns to the grid's
+ * rightmost BACK_RANKS columns — the far side from the feast's door, where
+ * (since slime never falls sideways) a unit stays for its whole life.
+ */
+function specialsRows() {
+  const rows = [];
+  for (const k of SPECIAL_KINDS) {
+    const tuning = state.balance.specials[k];
+    rows.push(
+      el("label", {},
+        el("span", {}, `${k} match length (match machinery is dormant)`),
+        numInput(tuning, "match_len", 2, Math.max(MAX_GRID_ROWS, MAX_GRID_COLS))),
+      el("br"),
+      el("label", {},
+        el("span", {}, `${k} spawns only on the back ${BACK_RANKS} columns (far from the feast's door)`),
+        boolInput(tuning, "back_ranks_only")),
+      el("br"),
+    );
+    if (k === "canister") {
+      rows.push(
+        el("label", {},
+          el("span", {}, "canister charge refill (charges back per canister eaten)"),
+          numInput(tuning, "charge_refill", 0, 65535)),
+        el("br"),
+      );
+    }
+    if (k === "bomb") {
+      rows.push(
+        el("label", {},
+          el("span", {}, "bomb blast destroys ONLY rocks (everything else survives)"),
+          boolInput(tuning, "explode_rocks_only")),
+        el("br"),
+      );
+    }
+  }
+  return rows;
 }
 
 /**
@@ -491,12 +560,23 @@ function renderEncounter() {
     // Special kinds: the neutralizer is inert to every cast; the feast
     // swallows it for free and it fires a 3x3 Neutralizing Agent block as it
     // goes down.  The egg is ordinary food and hatches a baby when eaten.
+    // The rock is a permanent wall nothing can touch; the canister is a free
+    // pickup that refills the team's charge pool.
     el("div", { class: "row" },
       el("span", { class: "muted" }, "neutralizer specials (free pickup; fires a 3x3 Agent block when eaten) "),
       numInput(pool.special, "neutralizer", 0, 65535, 1, "", renderSlimeTotal)),
     el("div", { class: "row" },
       el("span", { class: "muted" }, "egg specials (edible; hatches a baby when eaten) "),
       numInput(pool.special, "egg", 0, 65535, 1, "", renderSlimeTotal)),
+    el("div", { class: "row" },
+      el("span", { class: "muted" }, "rock specials (permanent wall: impassable, cast-proof, never eaten) "),
+      numInput(pool.special, "rock", 0, 65535, 1, "", renderSlimeTotal)),
+    el("div", { class: "row" },
+      el("span", { class: "muted" }, "canister specials (free pickup; refills team charges when eaten) "),
+      numInput(pool.special, "canister", 0, 65535, 1, "", renderSlimeTotal)),
+    el("div", { class: "row" },
+      el("span", { class: "muted" }, "bomb specials (free pickup; destroys its 3x3 surroundings when eaten) "),
+      numInput(pool.special, "bomb", 0, 65535, 1, "", renderSlimeTotal)),
   ));
   renderSlimeTotal();
 }

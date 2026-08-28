@@ -141,6 +141,8 @@ const LAYOUT = {
     eatCapS: 5,
     chompPauseS: 0.1,   // beat held on each bitten cell, so a bite is legible
     collapseS: 0.4,     // one fall: survivors dropping, then the refill landing
+    effectStepS: 0.15,  // stagger between a swallowed neutralizer's affected cells
+    ringS: 0.4,         // one affected cell's border flash, fading out
     // Longest frame the replay will honour.  requestAnimationFrame stops firing
     // in a hidden tab, so returning to one delivers a single frame worth however
     // long it was away — and spending it would eat the whole meal in one step,
@@ -350,6 +352,7 @@ async function loadBalanceData(hash = PAGE_CONFIG_HASH) {
   if (!res.ok) throw new Error(`fetch ${balanceUrl(hash)}: HTTP ${res.status}`);
   const bal = await res.json();
   CASTS_PER_TURN = bal.casts_per_turn ?? 3;
+  BOMB_ROCKS_ONLY = bal.specials?.bomb?.explode_rocks_only ?? false;
   PLAYER_RECIPES = bal.player_recipes.map((r) => ({
     label: r.label,
     rows: r.shape,
@@ -1368,6 +1371,24 @@ const SPECIAL_COLOR = "rgba(140,70,210,1)";
  *  as a prize rather than a threat. */
 const EGG_COLOR = "rgba(235,200,120,1)";
 
+/** Rock special: the permanent wall — inedible, impassable, cast-proof.
+ *  Cold slate, deliberately duller than any hazard: nothing to do here. */
+const ROCK_COLOR = "rgba(96,94,108,1)";
+
+/** Canister special: free pickup that refills the team's charge pool
+ *  ("Neutralizing Agent energy").  Teal, energetic but not a hazard hue. */
+const CANISTER_COLOR = "rgba(60,180,190,1)";
+
+/** Bomb special: free pickup that DESTROYS its 3x3 surroundings when eaten
+ *  (or just the rocks in it, per balance).  Hot orange: handle with care. */
+const BOMB_COLOR = "rgba(225,110,40,1)";
+
+/** Whether the bomb's blast destroys ONLY rocks (balance
+ *  specials.bomb.explode_rocks_only) — read with the balance tables so the
+ *  replay and the reachability preview mutate boards exactly as the server
+ *  did. */
+let BOMB_ROCKS_ONLY = false;
+
 /** BabyType ordinal → placeholder colour name; matches components.BabyType.
  *  These are the 5 baby kinds until real assets/identities arrive. */
 const BABY_TYPES = ["rose", "mint", "sky", "gold", "plum"];
@@ -1557,8 +1578,9 @@ function fieldCenter() {
 // --- Feast reachability ------------------------------------------------------
 //
 // MIRRORS slime.eat_all.  The Lil Guys enter along the LEFT edge and flood
-// 4-connected through empty cells and food; live hazards and neutralizer
-// specials stop them dead (eggs are food).  Everything the flood misses survives the turn.
+// 4-connected through empty cells and food; live hazards and rocks stop them
+// dead (eggs, neutralizers and canisters are all consumed en route).
+// Everything the flood misses survives the turn.
 //
 // The client recomputes this rather than being told, because it needs the
 // answer for a HYPOTHETICAL board — the one the player's pending cast would
@@ -1583,66 +1605,58 @@ let reachCacheVal = null;
  * @param {Map<number,string>} [overrides] - flat → replacement cell name,
  *   used to ask "what would this cast open up?" without mutating the board.
  * @returns {{eaten: Set<number>, order: number[],
- *            settles: Map<number, Array<number|null>>,
+ *            settles: Map<number, number[]>,
  *            sheltered: Set<number>, walls: Set<number>}}
  *   `eaten` is food the flood reaches and `order` the same cells in the order
  *   the flood found them (the route the Lil Guys walk); `settles` maps a bite
- *   index to the settles that follow it — each entry a swallowed
- *   neutralizer's cell (collapse, then its 3x3 fires there) or null (a plain
- *   dry-pass settle); `sheltered` is food the flood cannot reach, and `walls`
- *   is every blocker still standing.
+ *   index to the neutralizer blocks fired after it (each entry the swallowed
+ *   neutralizer's cell — its 3x3 fires there, on the STANDING board);
+ *   `sheltered` is food the flood cannot reach, and `walls` is every blocker
+ *   still standing.
  */
 function floodFeast(board, rows, cols, overrides) {
-  // A full SIMULATION of the meal.  MIRRORS slime.eat_all pass for pass:
+  // A full SIMULATION of the meal.  MIRRORS slime.eat_all bite for bite:
   // eat every reachable edible cell with the board HELD STILL — gravity
-  // never plugs an open route — settling only when a neutralizer is
-  // swallowed (collapse FIRST, then its 3x3 fires on the settled board and
-  // the flood re-enters) and when a pass runs dry (falls that open new food
-  // resume the meal).  Same flood order, same settle timing, same falls —
-  // so `order` is the exact sequence of bite POSITIONS the server took (a
-  // flat can appear twice: a settle can refill a slot a later pass eats).
+  // never plugs an open route.  A swallowed neutralizer's 3x3 fires on the
+  // STANDING board (no collapse mid-flow) and the same flood flows through
+  // what it defused; a bomb's blast levels its 3x3 the same way.  The board
+  // collapses exactly ONCE, after the meal — gravity feeds nothing, so
+  // whatever the falls drop into reach is next turn's dinner.
   const work = board.slice(0, rows * cols);
   if (overrides) for (const [flat, name] of overrides) work[flat] = name;
 
   /** Bite positions in the order they were taken. */
   const order = [];
-  /** Settles after order[i]: neutralizer cell (3x3 center) or null. */
+  /** Neutralizer blocks after order[i]: each the 3x3's center cell. */
   const settles = new Map();
-  const settle = (effect) => {
-    let moved = 0;
-    collapseBoard(work, rows, cols, () => { moved++; });
-    if (effect !== null) {
-      for (const cell of agentBlockCells(effect, rows, cols)) {
+
+  for (;;) {
+    const flat = nextBiteOn(work, rows, cols);
+    if (flat === null) break;
+    const name = work[flat];
+    work[flat] = "empty";
+    order.push(flat);
+    if (name === "special_neutralizer") {
+      // The block fires where it was eaten, on the board AS IT STANDS.
+      for (const cell of agentBlockCells(flat, rows, cols)) {
         const next = downgradeName(work[cell]);
         if (next !== null) work[cell] = next;
       }
-    }
-    // A settle that neither moved nor fired is invisible: not recorded.
-    if (effect !== null || moved > 0) {
       const at = order.length - 1;
       if (!settles.has(at)) settles.set(at, []);
-      settles.get(at).push(effect);
+      settles.get(at).push(flat);
+    } else if (name === "special_bomb") {
+      // The blast levels its 3x3 where it was eaten, on the board AS IT
+      // STANDS — the next bite's flood sees what it flattened.
+      detonateOn(work, flat, rows, cols, null);
     }
-    return moved;
-  };
-
-  feast: for (;;) {
-    let ateAny = false;
-    for (;;) {
-      const flat = nextBiteOn(work, rows, cols);
-      if (flat === null) break;
-      const name = work[flat];
-      work[flat] = "empty";
-      order.push(flat);
-      ateAny = true;
-      if (name === "special_neutralizer") {
-        settle(flat);
-        continue feast;
-      }
-    }
-    if (!ateAny) break;
-    if (settle(null) === 0) break;
   }
+
+  // The meal is over: ONE settle, applied before the accounting below so
+  // sheltered/walls are read off the settled board exactly as the server
+  // counts them.  Food the falls drop into reach is not sheltered — nothing
+  // walls it, it is simply uneaten.
+  collapseBoard(work, rows, cols, null);
 
   const eaten = new Set(order);
   const walls = new Set();
@@ -1730,6 +1744,22 @@ function agentBlockCells(center, rows, cols) {
 }
 
 /**
+ * The bomb's blast — MIRRORS slime.detonate: destroy every occupied cell in
+ * the 3x3 around `center` (or, with BOMB_ROCKS_ONLY, just the rocks in it).
+ * Walked in the server's row-major order; `onDestroy(flat, name)` is called
+ * per destroyed cell so the replay can burst them where they stood.
+ */
+function detonateOn(board, center, rows, cols, onDestroy) {
+  for (const cell of agentBlockCells(center, rows, cols)) {
+    const name = board[cell];
+    if (!cellIsSlime(name)) continue;
+    if (BOMB_ROCKS_ONLY && name !== "special_rock") continue;
+    board[cell] = "empty";
+    if (onDestroy) onDestroy(cell, name);
+  }
+}
+
+/**
  * `floodFeast` over a render frame's own grid, memoised per frame.
  *
  * @param {object} game    - render frame (grid + dims)
@@ -1781,6 +1811,9 @@ const TILE_RGB = {
   neutral: parseRgb(NEUTRAL_COLOR),
   special_neutralizer: parseRgb(SPECIAL_COLOR),
   special_egg: parseRgb(EGG_COLOR),
+  special_rock: parseRgb(ROCK_COLOR),
+  special_canister: parseRgb(CANISTER_COLOR),
+  special_bomb: parseRgb(BOMB_COLOR),
 };
 
 /**
@@ -1792,6 +1825,12 @@ const TILE_RGB = {
  *   "special_neutralizer" → violet body + ★ glyph (free pickup: eaten for no
  *                            score, fires a 3x3 Agent block)
  *   "special_egg"         → cream body + ○ glyph  (food with a baby inside)
+ *   "special_rock"        → slate body + ■ glyph  (permanent wall: inedible,
+ *                            impassable, cast-proof)
+ *   "special_canister"    → teal body + ⚡ glyph  (free pickup: refills the
+ *                            team's charge pool)
+ *   "special_bomb"        → orange body + ✱ glyph (free pickup: destroys its
+ *                            3x3 surroundings — or just the rocks in it)
  * A defused cell is safe to eat, so its BODY is grey like neutral; the ring
  * distinguishes "someone defused this" from "this was never a threat".
  */
@@ -1801,6 +1840,9 @@ function cellStyle(name) {
   if (name === "defused") return { body: "neutral", glyph: null, ring: false };
   if (name === "special_neutralizer") return { body: "special_neutralizer", glyph: "\u2605", ring: false };
   if (name === "special_egg") return { body: "special_egg", glyph: "\u25cb", ring: false };
+  if (name === "special_rock") return { body: "special_rock", glyph: "\u25a0", ring: false };
+  if (name === "special_canister") return { body: "special_canister", glyph: "\u26a1", ring: false };
+  if (name === "special_bomb") return { body: "special_bomb", glyph: "\u2731", ring: false };
   return TIER_NAMES.includes(name)
     ? { body: name, glyph: TIER_CHAR[name], ring: false }
     : { body: "neutral", glyph: null, ring: false };
@@ -1811,20 +1853,23 @@ function cellIsSlime(name) {
   return cellStyle(name) !== null;
 }
 
-/** True when the flood can EAT this cell.  Live hazards are walls; empty
- *  space conducts but is not food.  Both specials are consumed en route: an
- *  egg is food with a baby inside, a neutralizer is free equipment that
- *  fires a 3x3 Agent block as it is swallowed. */
+/** True when the flood can EAT this cell.  Live hazards and rocks are walls;
+ *  empty space conducts but is not food.  Consumable specials are eaten en
+ *  route: an egg is food with a baby inside, a neutralizer is free equipment
+ *  that fires a 3x3 Agent block as it is swallowed, a canister is free
+ *  equipment that refills the team's charge pool. */
 function cellIsEdible(name) {
   return name === "neutral" || name === "defused" ||
-    name === "special_egg" || name === "special_neutralizer";
+    name === "special_egg" || name === "special_neutralizer" ||
+    name === "special_canister" || name === "special_bomb";
 }
 
 /** True when this cell stops the flood dead.  The single rule the whole board
  *  is read through: a wall is not just uneaten, it shelters everything the
- *  flood would have reached through it.  Only live hazards wall. */
+ *  flood would have reached through it.  Live hazards wall, and so does the
+ *  rock — permanently, since no cast can touch it. */
 function cellBlocksFeast(name) {
-  return TIER_NAMES.includes(name);
+  return TIER_NAMES.includes(name) || name === "special_rock";
 }
 
 /** The tier of a cell that is still a HAZARD, or null for anything else
@@ -2206,6 +2251,19 @@ function drawSlimeField(game) {
       ctx.save();
       ctx.globalAlpha = (1 - p) * 0.8;
       rect(x0 + inset, y0 + inset, body, body, "rgba(255,255,255,1)");
+      ctx.restore();
+    }
+
+    // Agent-block ring: a violet border flashed on a cell the swallowed
+    // neutralizer's 3x3 just downgraded, fading as the next cell lands —
+    // the block sweeping its footprint one square at a time.
+    if (anim?.kind === "ring") {
+      const p = animProgress(anim);
+      ctx.save();
+      ctx.globalAlpha = 1 - p;
+      ctx.strokeStyle = SPECIAL_COLOR;
+      ctx.lineWidth = 3;
+      ctx.strokeRect(x0 + inset, y0 + inset, body, body);
       ctx.restore();
     }
   }
@@ -2590,7 +2648,9 @@ function drawLilGuys(game, dt) {
 
 /**
  * @typedef {object} Cinematic
- * @property {"eat"|"collapse"|"fill"|"matchFx"} stage
+ * @property {"eat"|"midEffect"|"collapse"|"fill"|"matchFx"} stage
+ *   — `midEffect` is a swallowed neutralizer's block landing one cell at a
+ *   time on the STANDING board; it pauses the meal, which resumes after
  * @property {number} rows
  * @property {number} cols
  * @property {string[]} board  - what is DRAWN: the replay's current board
@@ -2604,9 +2664,16 @@ function drawLilGuys(game, dt) {
  * @property {number[]} script - bite POSITIONS in server order.  Bites are
  *   strictly sequential (a settle between passes re-aims the ones after it),
  *   so the meal is a single global script rather than per-eater queues.
- * @property {Map<number, Array<number|null>>} settles - settles owed after
- *   each script index (see floodFeast); applied by settleAfterBite the
- *   moment that bite lands
+ * @property {Map<number, number[]>} settles - neutralizer blocks owed after
+ *   each script index (see floodFeast); each pauses the meal and plays as
+ *   midEffect
+ * @property {number[]} settleQueue - the current bite's blocks still to
+ *   play (each the swallowed neutralizer's cell)
+ * @property {number|null} pendingEffect - the 3x3 center midEffect is
+ *   landing cell by cell
+ * @property {number[]} effectCells - the pending block's covered cells, in
+ *   the server's row-major application order
+ * @property {number} effectIdx - the next effectCells entry to apply
  * @property {number} biteIdx - the next script entry to take
  * @property {number} holdT   - chomp pause remaining after the last bite
  * @property {{owner?: number, baby?: object}[]} eaters - every mouth, Lil
@@ -2732,6 +2799,10 @@ function startFeastCinematic(game) {
     frame: game,
     script: [],
     settles: new Map(),
+    settleQueue: [],
+    pendingEffect: null,
+    effectCells: [],
+    effectIdx: 0,
     biteIdx: 0,
     holdT: 0,
     eaters: [],
@@ -2846,7 +2917,7 @@ function armEatPass(game) {
     // applied between bites, so positions stay true) and drop.
     while (c.biteIdx < c.script.length) {
       bite(c.script[c.biteIdx], null);
-      settleAfterBite(c.biteIdx);
+      applySettlesInstant(c.biteIdx);
       c.biteIdx++;
     }
     beginCollapse();
@@ -2890,6 +2961,10 @@ function tickCinematic(game, dt) {
   cinematic.frame = game;
   switch (cinematic.stage) {
     case "eat": tickEat(game, dt); break;
+    case "midEffect":
+      tickLilGuys(game, dt);
+      tickMidEffect(dt);
+      break;
     case "collapse":
       // This pass's meal is over: the crew files back to the door while the
       // board settles behind them.  A later pass calls them right back in.
@@ -2958,8 +3033,8 @@ function tickEat(game, dt) {
     const body = resolve(eater);
     if (body === null) {
       bite(flat, null);
-      settleAfterBite(c.biteIdx);
       c.biteIdx++;
+      if (pauseForSettles(c.biteIdx - 1)) return;
       continue;
     }
     const walk = eater.baby !== undefined
@@ -2972,10 +3047,13 @@ function tickEat(game, dt) {
       body.target = flat;
       bite(flat, body);
     }
-    settleAfterBite(c.biteIdx);
     c.holdT = c.chompS;
     c.biteIdx++;
     left = walk.left;
+    // A block owed on this bite PAUSES the meal: it lands cell by cell on
+    // the standing board, and only then does the next bite get looked for.
+    // The rest of the frame's slice is forfeit — a pause is a pause.
+    if (pauseForSettles(c.biteIdx - 1)) return;
   }
 
   // Everyone off duty: walk toward the next assigned bite, or file home.
@@ -3022,6 +3100,25 @@ function bite(flat, g) {
   c.board[flat] = "empty";
   cellAnim.set(flat, { kind: "pop", dur: FIELD.popS, t: FIELD.popS, from: was });
 
+  // A swallowed canister pours its agent energy back into the team pool —
+  // the server already credited it; this is the on-board receipt.
+  if (was === "special_canister") {
+    const fx = cellCenter(flat, c.rows, c.cols);
+    spawnFloater("agent refilled!", fx.x, fx.y - LAYOUT.floater.stack,
+      CANISTER_COLOR, 0.9);
+  }
+
+  // A swallowed bomb levels its 3x3 the moment it goes down — MIRRORS the
+  // server's inline blast, so the replay board opens exactly where the
+  // flood's route continues.  Destroyed tiles burst where they stood.
+  if (was === "special_bomb") {
+    detonateOn(c.board, flat, c.rows, c.cols, (cell, name) => {
+      cellAnim.set(cell, { kind: "pop", dur: FIELD.popS, t: FIELD.popS, from: name });
+    });
+    const fx = cellCenter(flat, c.rows, c.cols);
+    spawnFloater("BOOM!", fx.x, fx.y - LAYOUT.floater.stack, BOMB_COLOR, 0.9);
+  }
+
   if (g === null) return;
 
   const at = cellCenter(flat, c.rows, c.cols);
@@ -3032,24 +3129,18 @@ function bite(flat, g) {
 }
 
 /**
- * Apply the settles scripted after bite `idx` to the replay board — MIRRORS
- * slime.eat_all's settle points, the only moments gravity runs during the
- * meal.  Each settle collapses first; a swallowed neutralizer's 3x3 Agent
- * block then fires on the SETTLED board at the cell it was eaten from, so
- * the replay opens exactly where the server's flood re-entered.
+ * Apply the neutralizer blocks scripted after bite `idx` to the replay
+ * board AT ONCE — MIRRORS slime.eat_all: each 3x3 fires on the STANDING
+ * board where its neutralizer was eaten (no collapse mid-flow).
+ *
+ * Only for the nobody-to-walk path, which resolves the whole meal in one
+ * frame by design; a watched meal pauses instead (see pauseForSettles).
  */
-function settleAfterBite(idx) {
+function applySettlesInstant(idx) {
   const c = cinematic;
   const list = c.settles?.get(idx);
   if (!list) return;
   for (const effect of list) {
-    collapseBoard(c.board, c.rows, c.cols, (dest, fell) => {
-      cellAnim.set(dest, {
-        kind: "drop", dur: LAYOUT.cinematic.collapseS,
-        t: LAYOUT.cinematic.collapseS, cells: fell,
-      });
-    });
-    if (effect === null) continue;
     for (const cell of agentBlockCells(effect, c.rows, c.cols)) {
       const next = downgradeName(c.board[cell]);
       if (next === null) continue;
@@ -3060,6 +3151,78 @@ function settleAfterBite(idx) {
     spawnFloater("neutralized!", fx.x, fx.y - LAYOUT.floater.stack,
       SPECIAL_COLOR, 0.9);
   }
+}
+
+/**
+ * Pause the meal on the neutralizer blocks owed after bite `idx`, if any.
+ * Queues them and enters the midEffect stage; returns true when the meal
+ * paused (the caller's eat frame is over).
+ */
+function pauseForSettles(idx) {
+  const c = cinematic;
+  const list = c.settles?.get(idx);
+  if (!list || list.length === 0) return false;
+  c.settleQueue = list.slice();
+  nextMidSettleOrResume();
+  return true;
+}
+
+/**
+ * The standing board takes the pending block.  Its cells are queued in the
+ * server's row-major application order and land ONE AT A TIME (see
+ * tickMidEffect), each flashing a border as its downgrade lands.
+ */
+function beginMidEffect() {
+  const c = cinematic;
+  const effect = c.pendingEffect;
+  c.pendingEffect = null;
+  if (effect === null) {
+    nextMidSettleOrResume();
+    return;
+  }
+  c.effectCells = agentBlockCells(effect, c.rows, c.cols);
+  c.effectIdx = 0;
+  c.stage = "midEffect";
+  c.t = 0; // the first cell lands on the next tick
+  const fx = cellCenter(effect, c.rows, c.cols);
+  spawnFloater("neutralized!", fx.x, fx.y - LAYOUT.floater.stack,
+    SPECIAL_COLOR, 0.9);
+}
+
+/**
+ * One frame of the effect stage: every `effectStepS`, the block's next cell
+ * WITH SOMETHING TO DOWNGRADE takes its step — board updated, border flashed
+ * — so the result of each cell is on screen before the next one lands.
+ * Cells the block covers but cannot change are skipped silently.
+ */
+function tickMidEffect(dt) {
+  const c = cinematic;
+  c.t -= dt;
+  if (c.t > 0) return;
+  while (c.effectIdx < c.effectCells.length) {
+    const cell = c.effectCells[c.effectIdx++];
+    const next = downgradeName(c.board[cell]);
+    if (next === null) continue;
+    c.board[cell] = next;
+    cellAnim.set(cell, {
+      kind: "ring", dur: LAYOUT.cinematic.ringS, t: LAYOUT.cinematic.ringS,
+    });
+    c.t = LAYOUT.cinematic.effectStepS;
+    return;
+  }
+  nextMidSettleOrResume();
+}
+
+/** The block in flight is done: play the next one owed on this bite, or
+ *  hand the board back to the meal. */
+function nextMidSettleOrResume() {
+  const c = cinematic;
+  if (c.settleQueue.length > 0) {
+    c.pendingEffect = c.settleQueue.shift();
+    beginMidEffect();
+    return;
+  }
+  c.stage = "eat";
 }
 
 /** A baby eats one cell: same bite, with the circle's puff standing in for

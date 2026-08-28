@@ -1893,6 +1893,32 @@ test "turn_ended reports the feast the clients must animate" {
     try std.testing.expectEqual(charges_before, te.charges_left);
 }
 
+test "a swallowed canister refills the team's charge pool at turn end" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_twenty_green);
+
+    // A canister on the feast's path, with reserves so the game outlives
+    // the turn.
+    paint_grid(&s.sess, .empty);
+    s.sess.field.reservoir = .{ .neutral = 3 };
+    const grid = &s.sess.field.grid;
+    grid.set(0, 0, .neutral);
+    grid.set(0, 1, .{ .special = .canister });
+
+    const charges_before = s.sess.charges;
+    try end_turn_idly(&s.sess);
+
+    // Free equipment: the canister is eaten (no score beyond the neutral's)
+    // and its agent energy lands back in the pool.
+    const refill = BAL.special_tuning(.canister).charge_refill;
+    try std.testing.expectEqual(charges_before + refill, s.sess.charges);
+    try std.testing.expectEqual(@as(u32, 1), s.sess.score);
+}
+
 test "a turn with no slime on the field is a free turn" {
     const allocator = std.testing.allocator;
 
@@ -3220,17 +3246,16 @@ test "match stats: feast tallies, players and recipes are reported" {
     try enqueue_cast_as(&s.sess, s.p[1].pid, SWEEP);
     try flush(&s.sess);
 
-    // The turn ends.  Gravity runs BETWEEN passes (never mid-route), so the
-    // meal plays out:
-    //   pass 1: (0,0), defused by Alice — the door's first edible — then the
+    // The turn ends.  Gravity runs AFTER the meal (never mid-route, never
+    // feeding it), so the meal plays out:
+    //   eat:    (0,0), defused by Alice — the door's first edible — then the
     //           five row-2 neutrals along the floor and, through the empty
     //           rows beneath, the two neutrals at (1,8)/(1,9).  Eight cells,
     //           with the board holding still throughout.
-    //   settle: every column packs onto row 4-5 — greens and Bob's three
-    //           defused cells land on row 4, the red layer on row 5.
-    //   pass 2: Bob's three defused cells, now exposed from ABOVE; gravity
-    //           turned his casts into food.  The next settle moves nothing
-    //           and the meal ends: nothing edible remains anywhere.
+    //   settle: every column packs onto rows 4-5 — greens and Bob's three
+    //           defused cells land on row 4, the red layer on row 5 — and
+    //           the meal is OVER: Bob's defused cells sit in reach, uneaten,
+    //           next turn's dinner.
     try end_turn_idly(&s.sess);
 
     const go = try game_over_msg(try drain(s.p[0].buf.items, arena));
@@ -3238,8 +3263,9 @@ test "match stats: feast tallies, players and recipes are reported" {
 
     try std.testing.expectEqual(proto.EndReason.hunger_full, st.reason);
     try std.testing.expectEqual(@as(u32, 25), st.slime_total);
-    // 11 of 25 eaten; the other 14 are all walls (greens and reds).
-    try std.testing.expectEqual(@as(u32, 14), st.slime_left);
+    // 8 of 25 eaten; the rest are walls (greens and reds) plus Bob's three
+    // defused cells, dropped into reach by the settle but no longer eaten.
+    try std.testing.expectEqual(@as(u32, 17), st.slime_left);
     try std.testing.expectEqual(@as(u16, 2), st.casts_total);
 
     // Coverage: 4 green cells covered (1 poke + 3 sweep), all defused since
@@ -3247,19 +3273,21 @@ test "match stats: feast tallies, players and recipes are reported" {
     try std.testing.expectEqual(@as(u16, 4), st.feast.cells_covered[GREEN]);
     try std.testing.expectEqual(@as(u16, 0), st.feast.cells_covered[RED]);
     try std.testing.expectEqual(@as(u16, 4), st.feast.neutralized[GREEN]);
-    // Eaten: all seven neutrals plus all four defused cells.
+    // Eaten: all seven neutrals plus Alice's door defusal.  Bob's three
+    // defused cells were sealed while the meal ran and only fell into reach
+    // at the settle — after the eating was over.
     try std.testing.expectEqual(@as(u16, 7), st.feast.neutral_consumed);
-    try std.testing.expectEqual(@as(u16, 4), st.feast.defused_consumed);
-    // Nothing edible survives: the board holds still while a route is open,
-    // so every neutral was eaten before the red layer could seal it.
+    try std.testing.expectEqual(@as(u16, 1), st.feast.defused_consumed);
+    // Nothing is SHELTERED though: after the settle, Bob's cells sit in the
+    // open — uneaten, but nothing walls them.
     try std.testing.expectEqual(@as(u16, 0), st.feast.sheltered);
-    try std.testing.expectEqual(@as(u16, @intCast(11 * BAL.hunger_cost_normal)), st.feast.hunger_normal);
+    try std.testing.expectEqual(@as(u16, @intCast(8 * BAL.hunger_cost_normal)), st.feast.hunger_normal);
     // Two casts at the fixture default of 1 charge each, out of a pool of
     // 100 (the encounter's 50, grown once for the second seat).
     try std.testing.expectEqual(@as(u16, 2), st.feast.charges_spent);
     try std.testing.expectEqual(@as(u32, 98), st.feast.charges_left);
     // Score = every unit eaten, defused or neutral alike.
-    try std.testing.expectEqual(@as(u32, 11), go.score);
+    try std.testing.expectEqual(@as(u32, 8), go.score);
 
     // Players: dense, coverage attribution + recipe participation.
     try std.testing.expectEqual(@as(u8, 2), st.player_count);

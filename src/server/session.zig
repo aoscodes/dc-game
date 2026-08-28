@@ -455,6 +455,7 @@ pub const Session = struct {
         self.field = slime.SlimeField.init(
             self.cfg.balance.slime_grid,
             encounter.slime,
+            &self.cfg.balance,
             self.rand(),
         );
         // Everyone starts aiming at the middle of the field: the least
@@ -760,6 +761,20 @@ pub const Session = struct {
 
             logic.add_hunger(&self.hunger, feast.hunger_total());
             self.score += feast.score;
+            // Swallowed canisters refill the team's Neutralizing Agent
+            // energy — credited before check_end so a feast that both
+            // drained the wallet and drank a canister is judged on the
+            // refilled pool.
+            if (feast.charges_refilled > 0) {
+                const before = self.charges;
+                self.charges +|= feast.charges_refilled;
+                std.log.info("feast drank {} canister{s} — charges {} -> {}", .{
+                    feast.canisters,
+                    if (feast.canisters == 1) "" else "s",
+                    before,
+                    self.charges,
+                });
+            }
             self.record_feast(feast);
             cells_total +|= feast.cells;
             hunger_total +|= feast.hunger_total();
@@ -767,10 +782,10 @@ pub const Session = struct {
             last_sheltered = feast.sheltered;
             last_walls = feast.walls;
 
-            // The feast already left the board settled (it collapses at
-            // neutralizers and at every dry pass), so this is a safety no-op
-            // today — except after a (dormant) match pass popped holes,
-            // which is exactly what it exists to tidy.  Then
+            // The feast already left the board settled (it ends with one
+            // collapse), so this is a safety no-op today — except after a
+            // (dormant) match pass popped holes, which is exactly what it
+            // exists to tidy.  Then
             // the refill: the one part of a settle a client cannot derive
             // (it comes out of the session's PRNG), so which cells filled —
             // and with what — is captured and broadcast.
@@ -779,7 +794,7 @@ pub const Session = struct {
             for (0..self.field.grid.len()) |flat| {
                 was_empty[flat] = !self.field.grid.get(@intCast(flat)).is_slime();
             }
-            _ = self.field.fill(self.rand());
+            _ = self.field.fill(&self.cfg.balance, self.rand());
             var refill = proto.FieldRefilled{ .pass = passes };
             for (0..self.field.grid.len()) |flat| {
                 const cell = self.field.grid.get(@intCast(flat));

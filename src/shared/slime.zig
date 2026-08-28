@@ -17,7 +17,10 @@
 //!
 //!   fill        — move reservoir slime into empty cells, TOP ROW FIRST
 //!                 (row 0 down), each unit's type drawn from the reservoir in
-//!                 proportion to what remains.
+//!                 proportion to what remains.  A `back_ranks_only` special
+//!                 kind (balance.SpecialTuning) is only ever seated in the
+//!                 rightmost BACK_RANKS columns; a front cell whose eligible
+//!                 pool is empty is SKIPPED, not filled.
 //!   apply_shape — stamp a cast's footprint at an aimed anchor, DOWNGRADING
 //!                 every covered hazard one tier.  Deterministic: the player
 //!                 chose the cells, so nothing is random and nothing is
@@ -25,10 +28,9 @@
 //!   eat_all     — the turn-end feast: eat every EDIBLE unit REACHABLE from
 //!                 the left edge.  Live hazards are inedible walls; specials
 //!                 are consumed on the way through — an egg HATCHES a baby
-//!                 (reported, not resolved here) and a neutralizer settles
-//!                 the board (COLLAPSE, then its 3x3 Agent block on the
-//!                 settled cells), letting the feast re-enter and eat
-//!                 straight through whatever it defused.
+//!                 (reported, not resolved here) and a neutralizer fires a
+//!                 3x3 Agent block INLINE on the standing board, letting the
+//!                 same flood eat straight through whatever it defused.
 //!   collapse    — drop every surviving unit to the bottom of its column, so
 //!                 the holes the feast made rise to the top.
 //!   resolve_matches — after the refill, pop every run of `match_len`+
@@ -42,18 +44,18 @@
 //! LEFT EDGE and can only reach through cells it eats or cells that are
 //! already empty.  A live hazard therefore shelters everything behind it, and
 //! the strategic question of a turn becomes *which wall to open*, not merely
-//! *how much slime to clean*.  Gravity NEVER interrupts an open route: a
-//! contiguous path that was reachable when the feast began is eaten to the
-//! end.  The board only collapses at the meal's punctuation marks — when a
-//! neutralizer is swallowed (settle first, then its block fires) and when a
-//! pass runs dry — and each settle can drop new food into reach, so the
-//! feast resumes until a pass eats nothing or a collapse moves nothing.
+//! *how much slime to clean*.  Gravity NEVER feeds the feast: a contiguous
+//! path that was reachable when the feast began is eaten to the end, a
+//! swallowed neutralizer's block (or a bomb's blast) fires on the STANDING
+//! board without disturbing it, and the board collapses exactly ONCE — after
+//! the meal is over.  Whatever the falls drop into reach waits for the next
+//! turn.
 //!
-//! Turn-end order is `eat_all` (passes and settles interleaved) → `fill`:
-//! eat until nothing reachable is edible and the board is stable, then top
-//! the columns up from the reservoir.  Falling matters because it re-sorts
-//! which cells touch the left edge, so a wall that sheltered slime this turn
-//! may not next turn.
+//! Turn-end order is `eat_all` (eat, then one settle) → `fill`: eat until
+//! nothing reachable is edible, let the survivors fall, then top the columns
+//! up from the reservoir.  Falling matters because it re-sorts which cells
+//! touch the left edge, so a wall that sheltered slime this turn may not
+//! next turn.
 //!
 //! Neither the reservoir nor an off-grid unit can be neutralized: casting is a
 //! grid-only operation by construction (`SlimeReservoir` has no neutralized
@@ -70,17 +72,18 @@ pub const SlimeField = struct {
 
     /// Build a field of `dims` holding `total` slime: as much as fits is
     /// placed on the grid (top row first), the remainder stays in the
-    /// reservoir.
+    /// reservoir.  `bal` supplies the per-kind spawn rules the fill honours.
     pub fn init(
         dims: balance.SlimeGridDims,
         total: c.SlimeReservoir,
+        bal: *const balance.Balance,
         rand: std.Random,
     ) SlimeField {
         var self = SlimeField{
             .grid = c.SlimeGrid.init(dims.rows, dims.cols),
             .reservoir = total,
         };
-        _ = self.fill(rand);
+        _ = self.fill(bal, rand);
         return self;
     }
 
@@ -109,33 +112,63 @@ pub const SlimeField = struct {
     /// Move reservoir slime into every empty cell, walking row 0 (the top)
     /// downward so refills visibly enter from above.  Stops when the grid is
     /// full or the reservoir runs dry.  Returns the number of cells filled.
-    pub fn fill(self: *SlimeField, rand: std.Random) u16 {
+    ///
+    /// A `back_ranks_only` special kind may only be seated in the rightmost
+    /// `balance.BACK_RANKS` columns — the far side from the feast's door, and
+    /// (since collapse never moves a cell sideways) the columns it will hold
+    /// for its whole life.  A front cell whose ELIGIBLE pool is empty (the
+    /// reservoir holds only restricted kinds) is SKIPPED, not filled, and the
+    /// walk continues: back cells still take what is theirs.  A skipped cell
+    /// consumes NO randomness — exactly one draw per cell filled is the
+    /// cross-implementation contract the board's port mirrors.
+    pub fn fill(self: *SlimeField, bal: *const balance.Balance, rand: std.Random) u16 {
         var filled: u16 = 0;
         var flat: u16 = 0;
         const n = self.grid.len();
         while (flat < n) : (flat += 1) {
             if (self.grid.get(flat).is_slime()) continue;
-            const cell = self.take_from_reservoir(rand) orelse break;
+            if (self.reservoir.is_empty()) break;
+            const col = self.grid.col_of(flat);
+            const cell = self.take_from_reservoir(bal, col, rand) orelse continue;
             self.grid.put(flat, cell);
             filled += 1;
         }
         return filled;
     }
 
-    /// Draw one unit from the reservoir, chosen uniformly among the units
-    /// remaining (so the grid mixes in proportion to the reservoir's
-    /// composition).  Returns null when the reservoir is empty.
-    fn take_from_reservoir(self: *SlimeField, rand: std.Random) ?c.SlimeCell {
-        const total = self.reservoir.total();
-        if (total == 0) return null;
+    /// True when a special kind may spawn in `col`: either unrestricted, or
+    /// the column is one of the grid's rightmost `balance.BACK_RANKS`.
+    fn may_spawn(self: *const SlimeField, bal: *const balance.Balance, kind: c.SpecialKind, col: u8) bool {
+        if (!bal.special_tuning(kind).back_ranks_only) return true;
+        return col >= self.grid.cols -| balance.BACK_RANKS;
+    }
 
-        var pick = rand.uintLessThan(u32, total);
+    /// Draw one unit for a cell in `col`, chosen uniformly among the ELIGIBLE
+    /// units remaining (so the grid mixes in proportion to the reservoir's
+    /// composition), where a `back_ranks_only` special kind is eligible only
+    /// in the back columns.  Returns null when nothing eligible remains —
+    /// the caller skips the cell.  Buckets are walked in a fixed order
+    /// (neutral, specials by ordinal, tiers), part of the lockstep contract.
+    fn take_from_reservoir(
+        self: *SlimeField,
+        bal: *const balance.Balance,
+        col: u8,
+        rand: std.Random,
+    ) ?c.SlimeCell {
+        var eligible: u32 = self.reservoir.total();
+        for (self.reservoir.special, 0..) |count, k| {
+            if (!self.may_spawn(bal, @enumFromInt(k), col)) eligible -= count;
+        }
+        if (eligible == 0) return null;
+
+        var pick = rand.uintLessThan(u32, eligible);
         if (pick < self.reservoir.neutral) {
             self.reservoir.neutral -= 1;
             return .neutral;
         }
         pick -= self.reservoir.neutral;
         for (&self.reservoir.special, 0..) |*count, k| {
+            if (!self.may_spawn(bal, @enumFromInt(k), col)) continue;
             if (pick < count.*) {
                 count.* -= 1;
                 return .{ .special = @enumFromInt(k) };
@@ -149,7 +182,7 @@ pub const SlimeField = struct {
             }
             pick -= count.*;
         }
-        unreachable; // `total` is the sum of the buckets just walked.
+        unreachable; // `eligible` is the sum of the buckets just walked.
     }
 
     /// Stamp one cast's shape on the grid, anchored at (`row`, `col`).
@@ -215,71 +248,75 @@ pub const SlimeField = struct {
     /// Specials are consumed like anything edible: an egg is food (flat rate,
     /// scores, recorded in `hatched_cells` so the caller can hatch a baby per
     /// egg) and leaves the board where it stood; a NEUTRALIZER is free
-    /// equipment — no score, no hunger — that settles the board (COLLAPSE,
-    /// then EFFECT): the columns drain first, then its 3x3 Agent block fires
-    /// on the settled board at the cell it was eaten from, and the feast
-    /// re-enters from the left to flow through whatever it defused.  This is
+    /// equipment — no score, no hunger — whose 3x3 Agent block fires INLINE
+    /// on the STANDING board at the cell it was eaten from, and the same
+    /// flood flows straight through whatever it defused.  Neither disturbs
+    /// the board's footing: gravity waits for the pass to run dry.  This is
     /// the whole tactical core: a cast's value is the path it opens, and
     /// slime the team cannot expose survives untouched.
     ///
-    /// When nothing reachable is edible, the board collapses once; if the
-    /// falls dropped new food into reach the feast resumes, and the meal only
-    /// ends when a pass eats nothing or a settle moves nothing.
+    /// When nothing reachable is edible, the meal is OVER: the board
+    /// collapses exactly once — and whatever the falls drop into reach
+    /// simply waits for the next turn.  Gravity feeds nothing.
     ///
     /// The grid comes back COLLAPSED, with its walls and sheltered slime
     /// intact; the caller's next step is `fill`.
     ///
     /// Deterministic: no randomness, and the bite order (first edible in
-    /// flood order, board settled only at neutralizers and dry passes) is
-    /// part of the contract — the browser's replay and the badge's port take
-    /// the identical bites.
+    /// flood order, board settled once at the end) is part of the contract —
+    /// the browser's replay and the badge's port take the identical bites.
     pub fn eat_all(self: *SlimeField, bal: *const balance.Balance) FeastOutcome {
         var out = FeastOutcome{};
 
-        // PASSES OF BITES: eat everything reachable without collapsing, so
-        // no wall can fall into an open route and plug it mid-pass.  A
-        // swallowed neutralizer settles the board — collapse, THEN its 3x3
-        // fires on the settled cells — and the flood re-enters; a dry pass
-        // settles once more, and food that fell into reach reopens the meal.
+        // ONE CONTINUOUS FLOW: eat everything reachable without collapsing,
+        // so no wall can fall into an open route and plug it mid-meal.  A
+        // swallowed neutralizer fires its 3x3 (and a bomb its blast) on the
+        // standing board and the same flood flows on through what it opened.
         //
-        // Terminates: a pass either eats at least one unit or ends the loop,
-        // a dry-pass settle must move at least one unit to continue, and
-        // nothing enters the grid mid-feast.
-        feast: while (true) {
-            var ate_any = false;
-            while (self.next_bite()) |flat| {
-                ate_any = true;
-                const effect = self.consume(flat, bal, &out) orelse continue;
-                switch (effect) {
-                    // Recorded in `consume`; nothing on the board changes.
-                    .hatch => {},
-                    .neutralize_block => {
-                        // Settle FIRST, then fire the 3x3 where the
-                        // neutralizer was eaten — on the collapsed board —
-                        // and send the flood back in from the left.
-                        _ = self.collapse();
-                        out.agents += 1;
-                        const fired = self.apply_shape(
-                            AGENT_BLOCK,
-                            self.grid.row_of(flat),
-                            self.grid.col_of(flat),
-                        );
-                        for (fired.downgraded, 0..) |n, t| {
-                            out.agent_downgraded[t] += n;
-                        }
-                        out.agent_defused += fired.neutralized;
-                        continue :feast;
-                    },
-                }
+        // Terminates: every bite removes exactly one unit and nothing enters
+        // the grid mid-feast.
+        while (self.next_bite()) |flat| {
+            const effect = self.consume(flat, bal, &out) orelse continue;
+            switch (effect) {
+                // Recorded in `consume`; nothing on the board changes.
+                .hatch, .refill_charges => {},
+                .neutralize_block => {
+                    // The 3x3 fires where the neutralizer was eaten, on
+                    // the board AS IT STANDS — no collapse mid-flow —
+                    // and the next bite's flood sees what it opened.
+                    out.agents += 1;
+                    const fired = self.apply_shape(
+                        AGENT_BLOCK,
+                        self.grid.row_of(flat),
+                        self.grid.col_of(flat),
+                    );
+                    for (fired.downgraded, 0..) |n, t| {
+                        out.agent_downgraded[t] += n;
+                    }
+                    out.agent_defused += fired.neutralized;
+                },
+                .explode => {
+                    // The blast levels the 3x3 where the bomb was eaten,
+                    // on the board AS IT STANDS — no collapse mid-flow —
+                    // and the next bite's flood sees what it flattened.
+                    out.bombs += 1;
+                    out.destroyed += self.detonate(
+                        flat,
+                        bal.special_tuning(.bomb).explode_rocks_only,
+                    );
+                },
             }
-            if (!ate_any) break;
-            if (self.collapse() == 0) break;
         }
+
+        // The meal is over: ONE settle.  Whatever falls into reach here is
+        // next turn's dinner, never this one's — gravity feeds nothing.
+        _ = self.collapse();
 
         // Everything the finished meal still cannot reach: the walls that
         // held, and the food they saved.  Counted for the players' feedback —
         // "you left N units behind a wall" is the lesson the next turn is
-        // built on.
+        // built on.  Food the settle just dropped INTO reach is not
+        // sheltered: nothing walls it, it is simply uneaten.
         var visited = [_]bool{false} ** c.MAX_GRID_CELLS;
         _ = self.flood(&visited, false);
         var flat: u16 = 0;
@@ -294,7 +331,7 @@ pub const SlimeField = struct {
 
     /// The next unit the feast eats: the FIRST edible cell in flood order, or
     /// null when nothing edible is reachable.  Recomputed per bite because
-    /// every bite opens a cell (and a neutralizer settles the board).
+    /// every bite opens a cell (and a neutralizer's block can open more).
     fn next_bite(self: *const SlimeField) ?u16 {
         var visited = [_]bool{false} ** c.MAX_GRID_CELLS;
         return self.flood(&visited, true);
@@ -355,8 +392,8 @@ pub const SlimeField = struct {
     /// Eat the edible unit at `flat`, accruing hunger and score for FOOD
     /// kinds and recording an egg's hatch.  Returns the special's on-eat
     /// effect (null for plain slime) so `eat_all` can resolve a
-    /// board-changing one at the right moment: the board collapses FIRST,
-    /// then the neutralizer's block fires on the settled cells.
+    /// board-changing one: the neutralizer's block fires on the STANDING
+    /// board — mid-flow, no collapse — right where the cell was eaten.
     fn consume(
         self: *SlimeField,
         flat: u16,
@@ -386,8 +423,14 @@ pub const SlimeField = struct {
                         out.hatched_cells[out.hatched] = flat;
                         out.hatched += 1;
                     },
-                    // Resolved by `eat_all` after the board settles.
-                    .neutralize_block => {},
+                    // Resolved by `eat_all` on the standing board.
+                    .neutralize_block, .explode => {},
+                    .refill_charges => {
+                        // Tallied here; the session credits the team pool.
+                        out.canisters += 1;
+                        out.charges_refilled +|=
+                            bal.special_tuning(kind).charge_refill;
+                    },
                 }
                 return effect;
             },
@@ -398,6 +441,40 @@ pub const SlimeField = struct {
         out.hunger += bal.hunger_cost_normal;
         self.grid.put(flat, .empty);
         return null;
+    }
+
+    /// The bomb's blast: DESTROY every unit in the 3x3 around `flat` — or,
+    /// with `rocks_only`, just the rocks in it (the one tool that can remove
+    /// one).  Destroyed units leave play outright: no score, no hunger, and
+    /// nothing returns to the reservoir.  Walked in row-major offset order,
+    /// the same order every implementation mirrors.  Returns the number of
+    /// units destroyed.
+    fn detonate(self: *SlimeField, flat: u16, rocks_only: bool) u16 {
+        var destroyed: u16 = 0;
+        const r = self.grid.row_of(flat);
+        const cl = self.grid.col_of(flat);
+        var dr: i32 = -1;
+        while (dr <= 1) : (dr += 1) {
+            var dc: i32 = -1;
+            while (dc <= 1) : (dc += 1) {
+                const nr = @as(i32, r) + dr;
+                const nc = @as(i32, cl) + dc;
+                if (nr < 0 or nr >= self.grid.rows or
+                    nc < 0 or nc >= self.grid.cols) continue;
+                const cell = self.grid.at(@intCast(nr), @intCast(nc));
+                if (!cell.is_slime()) continue;
+                if (rocks_only) {
+                    const is_rock = switch (cell) {
+                        .special => |kind| kind == .rock,
+                        else => false,
+                    };
+                    if (!is_rock) continue;
+                }
+                self.grid.set(@intCast(nr), @intCast(nc), .empty);
+                destroyed += 1;
+            }
+        }
+        return destroyed;
     }
 
     /// Drop every surviving unit to the bottom of its column, preserving the
@@ -476,8 +553,8 @@ pub const SlimeField = struct {
                     m.downgraded = shape_out.downgraded;
                     m.neutralized = shape_out.neutralized;
                 },
-                // A hatch is an on-eat effect; no matchable kind carries it.
-                .hatch => unreachable,
+                // On-eat effects; no matchable kind carries them.
+                .hatch, .refill_charges, .explode => unreachable,
             }
         }
         return out;
@@ -636,6 +713,18 @@ pub const FeastOutcome = struct {
     /// went all the way to defused (most of which this same feast then ate).
     agent_downgraded: [c.Tier.size]u16 = [_]u16{0} ** c.Tier.size,
     agent_defused: u16 = 0,
+    /// Canisters consumed.  Free like the neutralizer — counted in `cells`,
+    /// never in score or hunger.
+    canisters: u16 = 0,
+    /// Charges the swallowed canisters refill into the team pool
+    /// (`charge_refill` per canister); the caller credits the pool.
+    charges_refilled: u32 = 0,
+    /// Bombs consumed.  Free — counted in `cells`, never in score or hunger
+    /// — each destroying its 3x3 surroundings as it was swallowed.
+    bombs: u16 = 0,
+    /// Units the bombs DESTROYED: removed from play outright, not eaten —
+    /// no score, no hunger, and nothing returns to the reservoir.
+    destroyed: u16 = 0,
     /// Hunger added: `hunger_cost_normal` per unit eaten.
     hunger: u32 = 0,
     /// Score: 1 per unit eaten (all eaten units are neutral or defused).
@@ -750,7 +839,7 @@ test "init fills the grid from the reservoir and keeps the overflow" {
     var rng = prng(1);
     var res = c.SlimeReservoir{ .neutral = 20 };
     res.tiered[ti(.red)] = 30;
-    const field = SlimeField.init(.{ .rows = 2, .cols = 3 }, res, rng.random());
+    const field = SlimeField.init(.{ .rows = 2, .cols = 3 }, res, test_bal, rng.random());
 
     // 6 cells filled, 50 - 6 = 44 left in the reservoir.
     try testing.expectEqual(@as(u16, 6), field.grid.occupied());
@@ -761,7 +850,7 @@ test "init fills the grid from the reservoir and keeps the overflow" {
 
 test "init leaves cells empty when the reservoir cannot fill the grid" {
     var rng = prng(2);
-    const field = SlimeField.init(.{ .rows = 4, .cols = 4 }, .{ .neutral = 5 }, rng.random());
+    const field = SlimeField.init(.{ .rows = 4, .cols = 4 }, .{ .neutral = 5 }, test_bal, rng.random());
     try testing.expectEqual(@as(u16, 5), field.grid.occupied());
     try testing.expect(field.reservoir.is_empty());
     // Filled top-first: the first 5 flat cells hold the slime.
@@ -772,7 +861,7 @@ test "init leaves cells empty when the reservoir cannot fill the grid" {
 
 test "fill refills empty cells from the top row downward" {
     var rng = prng(3);
-    var field = SlimeField.init(.{ .rows = 3, .cols = 2 }, .{ .neutral = 6 }, rng.random());
+    var field = SlimeField.init(.{ .rows = 3, .cols = 2 }, .{ .neutral = 6 }, test_bal, rng.random());
     try testing.expect(field.reservoir.is_empty());
 
     field.grid.set(0, 0, .empty);
@@ -780,7 +869,7 @@ test "fill refills empty cells from the top row downward" {
     field.grid.set(2, 1, .empty);
     field.reservoir.neutral = 2;
 
-    const filled = field.fill(rng.random());
+    const filled = field.fill(test_bal, rng.random());
     // Only 2 units available, and they go to the two TOPMOST empty cells.
     try testing.expectEqual(@as(u16, 2), filled);
     try testing.expect(field.grid.at(0, 0).is_slime());
@@ -793,7 +882,7 @@ test "fill draws every reservoir bucket and exhausts it exactly" {
     var res = c.SlimeReservoir{ .neutral = 4 };
     res.tiered[ti(.red)] = 4;
     res.tiered[ti(.green)] = 4;
-    const field = SlimeField.init(.{ .rows = 3, .cols = 4 }, res, rng.random());
+    const field = SlimeField.init(.{ .rows = 3, .cols = 4 }, res, test_bal, rng.random());
 
     try testing.expectEqual(@as(u16, 12), field.grid.occupied());
     try testing.expect(field.reservoir.is_empty());
@@ -807,6 +896,65 @@ test "fill draws every reservoir bucket and exhausts it exactly" {
     try testing.expectEqual(@as(u16, 4), field.grid.tier_count(.green));
 }
 
+test "a back_ranks_only special is only ever seated in the rightmost BACK_RANKS columns" {
+    // All-egg reservoir on a 3x4 grid: only the back two columns may seat
+    // one, so the six front cells are SKIPPED — left empty, no draw spent —
+    // while the six back cells fill.
+    var bal = fixtures.test_config.balance;
+    bal.specials[@intFromEnum(c.SpecialKind.egg)].back_ranks_only = true;
+
+    var rng = prng(7);
+    const res = c.SlimeReservoir{ .special = .{ 0, 20, 0, 0, 0 } };
+    var field = SlimeField.init(.{ .rows = 3, .cols = 4 }, res, &bal, rng.random());
+
+    try testing.expectEqual(@as(u16, 6), field.grid.occupied());
+    var row: u8 = 0;
+    while (row < 3) : (row += 1) {
+        var col: u8 = 0;
+        while (col < 4) : (col += 1) {
+            const expected: c.SlimeCell = if (col >= 2) .{ .special = .egg } else .empty;
+            try testing.expectEqual(expected, field.grid.at(row, col));
+        }
+    }
+    try testing.expectEqual(@as(u32, 14), field.reservoir.total());
+}
+
+test "restricted eggs never drift left of the back ranks across whole turns" {
+    // The lifecycle guarantee: fills seat eggs only in the back columns, and
+    // collapse never moves a cell sideways, so no egg is ever seen in a
+    // front column no matter how many turns the field churns.
+    var bal = fixtures.test_config.balance;
+    bal.specials[@intFromEnum(c.SpecialKind.egg)].back_ranks_only = true;
+
+    var rng = prng(21);
+    var res = c.SlimeReservoir{ .neutral = 30, .special = .{ 0, 10, 0, 0, 0 } };
+    res.tiered[ti(.red)] = 6;
+    var field = SlimeField.init(.{ .rows = 4, .cols = 4 }, res, &bal, rng.random());
+
+    var turns: u8 = 0;
+    while (turns < 8) : (turns += 1) {
+        var flat: u16 = 0;
+        while (flat < field.grid.len()) : (flat += 1) {
+            switch (field.grid.get(flat)) {
+                .special => |kind| if (kind == .egg) {
+                    try testing.expect(field.grid.col_of(flat) >= 4 - balance.BACK_RANKS);
+                },
+                else => {},
+            }
+        }
+        _ = field.eat_all(&bal);
+        _ = field.fill(&bal, rng.random());
+    }
+}
+
+test "an unrestricted egg spawns anywhere (the default)" {
+    // Default tuning: a one-column-wide front cell takes the egg happily.
+    var rng = prng(9);
+    const res = c.SlimeReservoir{ .special = .{ 0, 1, 0, 0, 0 } };
+    const field = SlimeField.init(.{ .rows = 1, .cols = 3 }, res, test_bal, rng.random());
+    try testing.expectEqual(c.SlimeCell{ .special = .egg }, field.grid.get(0));
+}
+
 test "reservoir slime always arrives at full difficulty" {
     // Casting cannot reach off-grid slime, so a refill after a cast brings in
     // an un-neutralized unit even though the grid was just cleaned.
@@ -818,7 +966,7 @@ test "reservoir slime always arrives at full difficulty" {
     _ = field.apply_shape(DOT, 0, 0);
     try testing.expectEqual(c.SlimeCell.neutralized, field.grid.get(0));
 
-    _ = field.fill(rng.random());
+    _ = field.fill(test_bal, rng.random());
     try testing.expectEqual(c.SlimeCell{ .tiered = .red }, field.grid.get(1));
 }
 
@@ -1060,10 +1208,11 @@ test "a chain of neutralizers eats through wall after wall in ONE feast" {
     try testing.expect(field.is_exhausted());
 }
 
-test "a neutralizer settles the board FIRST, then its block fires on the settled cells" {
-    // Collapse-then-effect, in a column: the red rides two rows above the
-    // swallowed neutralizer, OUTSIDE its 3x3 — until the settle drops it to
-    // the floor, inside.  Effect-then-collapse would leave it red.
+test "a neutralizer's block fires on the STANDING board: no mid-meal collapse" {
+    // The red rides two rows above the swallowed neutralizer, OUTSIDE its
+    // 3x3.  The board holds still while the block fires — no collapse
+    // mid-flow — so the red is never pulled into the footprint: it survives
+    // untouched and only falls once the meal runs dry.
     //   col0
     //   r0:  R
     //   r1:  .
@@ -1075,9 +1224,9 @@ test "a neutralizer settles the board FIRST, then its block fires on the settled
 
     const feast = field.eat_all(test_bal);
     try testing.expectEqual(@as(u16, 1), feast.agents);
-    try testing.expectEqual(@as(u16, 1), feast.agent_downgraded[ti(.red)]);
-    // The red fell to (3,0) before the 3x3 fired at rows 1-3, so it was hit.
-    try testing.expectEqual(c.SlimeCell{ .tiered = .yellow }, field.grid.at(3, 0));
+    try testing.expectEqual(@as(u16, 0), feast.agent_downgraded[ti(.red)]);
+    // The dry-pass settle dropped the still-red hazard to the floor.
+    try testing.expectEqual(c.SlimeCell{ .tiered = .red }, field.grid.at(3, 0));
     try testing.expectEqual(@as(u16, 1), feast.cells);
     try testing.expectEqual(@as(u16, 1), feast.walls);
 }
@@ -1127,7 +1276,7 @@ test "a consumable special is food: eaten, scored, and hatched" {
 }
 
 test "no cast can ever change a special of any kind" {
-    for ([_]c.SpecialKind{ .neutralizer, .egg }) |kind| {
+    for ([_]c.SpecialKind{ .neutralizer, .egg, .rock, .canister }) |kind| {
         var field = empty_field(1, 1);
         field.grid.put(0, .{ .special = kind });
         var i: usize = 0;
@@ -1165,12 +1314,14 @@ test "the feast flows around a wall that does not span the grid" {
     try testing.expectEqual(c.SlimeCell.empty, field.grid.at(0, 1));
 }
 
-test "gravity never plugs an open route: the pass is eaten whole, THEN falls feed the next" {
-    // REGRESSION: the eager per-bite collapse used to drop the red riding
-    // column 1 into the feast's route mid-meal, sheltering food that was
-    // reachable when the pass began.  Now every pass eats its whole
-    // contiguous path before gravity runs — and the dry-pass settle still
-    // OPENS new food for the pass after it.
+test "gravity never plugs a route NOR feeds the feast: one settle ends the meal" {
+    // REGRESSION, both ways.  The eager per-bite collapse used to drop the
+    // red riding column 1 into the feast's route mid-meal, sheltering food
+    // that was reachable when the meal began; the old multi-pass settle
+    // used to RESUME eating whatever the terminal collapse dropped into
+    // reach.  Now the whole contiguous path is eaten with the board held
+    // still, then ONE settle ends the meal — the food it drops into reach
+    // is next turn's dinner.
     //   col: 0 1
     //   r0:  R n
     //   r1:  R n
@@ -1187,22 +1338,21 @@ test "gravity never plugs an open route: the pass is eaten whole, THEN falls fee
     field.grid.set(3, 1, .neutral);
 
     const feast = field.eat_all(test_bal);
-    // Pass 1: the door neutral at (3,0), then along the floor to (3,1) —
-    // the board holds still, so the red at (2,1) never falls into the way.
-    // The settle then stacks column 0's reds on the floor and drops column
-    // 1's food onto its red, opening the overhead route: pass 2 eats the two
-    // neutrals now at (1,1) and (2,1) over the top.  Nothing is sheltered.
-    try testing.expectEqual(@as(u16, 4), feast.cells);
+    // The door neutral at (3,0), then along the floor to (3,1) — the board
+    // holds still, so the red at (2,1) never falls into the way.  The
+    // settle then stacks the columns and the meal is OVER: the two column-1
+    // neutrals land at (1,1)/(2,1), in reach but uneaten.
+    try testing.expectEqual(@as(u16, 2), feast.cells);
+    // Not sheltered: nothing walls them, they are simply next turn's meal.
     try testing.expectEqual(@as(u16, 0), feast.sheltered);
     try testing.expectEqual(@as(u16, 4), feast.walls);
-    // The walls end settled: reds fill column 0's bottom three rows, and
-    // column 1's red sits alone on the floor.
     try testing.expectEqual(c.SlimeCell.empty, field.grid.at(0, 0));
     try testing.expectEqual(c.SlimeCell{ .tiered = .red }, field.grid.at(1, 0));
     try testing.expectEqual(c.SlimeCell{ .tiered = .red }, field.grid.at(2, 0));
     try testing.expectEqual(c.SlimeCell{ .tiered = .red }, field.grid.at(3, 0));
+    try testing.expectEqual(c.SlimeCell.neutral, field.grid.at(1, 1));
+    try testing.expectEqual(c.SlimeCell.neutral, field.grid.at(2, 1));
     try testing.expectEqual(c.SlimeCell{ .tiered = .red }, field.grid.at(3, 1));
-    try testing.expectEqual(c.SlimeCell.empty, field.grid.at(2, 1));
 }
 
 test "a full-height wall in column 0 stops the feast at the door" {
@@ -1322,24 +1472,23 @@ test "collapse on a packed column moves nothing and is idempotent" {
 
 test "collapse conserves every unit" {
     var rng = prng(21);
-    var res = c.SlimeReservoir{ .neutral = 6, .special = .{ 1, 1 } };
+    var res = c.SlimeReservoir{ .neutral = 6, .special = .{ 1, 1, 0, 0, 0 } };
     res.tiered[ti(.red)] = 4;
-    var field = SlimeField.init(.{ .rows = 4, .cols = 3 }, res, rng.random());
+    var field = SlimeField.init(.{ .rows = 4, .cols = 3 }, res, test_bal, rng.random());
     _ = field.eat_all(test_bal);
     const before = field.grid.occupied();
     _ = field.collapse();
     try testing.expectEqual(before, field.grid.occupied());
 }
 
-test "turn settlement is eat (with settles between passes), then refill" {
-    // Gravity runs BETWEEN passes: the dry-pass settle re-sorts the field,
-    // so slime that was sealed when the feast started can be exposed and
-    // eaten in the same turn.  The field comes back settled, and `fill` tops
-    // it up from the rows the falls cleared.
+test "turn settlement is eat, then ONE settle, then refill" {
+    // Gravity runs AFTER the meal: the settle re-sorts the field for the
+    // NEXT turn — slime it exposes is not eaten now.  The field comes back
+    // settled, and `fill` tops it up from the rows the falls cleared.
     //
     //   . = empty   n = neutral   R = live red
     //        col0 col1
-    //   row0   R    n     <- sealed NOW — but the settle after pass 1 exposes it
+    //   row0   R    n     <- sealed: the feast never gets it this turn
     //   row1   R    R
     //   row2   n    .     <- on the left edge, so this one is dinner
     var field = empty_field(3, 2);
@@ -1351,11 +1500,11 @@ test "turn settlement is eat (with settles between passes), then refill" {
     field.reservoir.neutral = 1;
 
     const feast = field.eat_all(test_bal);
-    // Pass 1 takes (2,0) and runs dry; the settle drops every column — the
-    // sealed neutral lands at (1,1), above the red that fell to (2,1), and
-    // the door column's reds stack at (1,0)/(2,0).  Pass 2 then reaches the
-    // neutral over the top of the walls: the seal did not survive the fall.
-    try testing.expectEqual(@as(u16, 2), feast.cells);
+    // The feast takes (2,0) and runs dry; the settle then drops every
+    // column — the sealed neutral lands at (1,1), IN REACH over the fallen
+    // walls, but the meal is already over: it waits for the next turn.
+    try testing.expectEqual(@as(u16, 1), feast.cells);
+    // Not sheltered: nothing walls it any more, it is simply uneaten.
     try testing.expectEqual(@as(u16, 0), feast.sheltered);
     try testing.expectEqual(@as(u16, 3), feast.walls);
 
@@ -1363,14 +1512,146 @@ test "turn settlement is eat (with settles between passes), then refill" {
     try testing.expectEqual(@as(u16, 0), field.collapse());
     try testing.expectEqual(c.SlimeCell{ .tiered = .red }, field.grid.at(1, 0));
     try testing.expectEqual(c.SlimeCell{ .tiered = .red }, field.grid.at(2, 0));
+    try testing.expectEqual(c.SlimeCell.neutral, field.grid.at(1, 1));
     try testing.expectEqual(c.SlimeCell{ .tiered = .red }, field.grid.at(2, 1));
 
     // The one refill lands in the rows the falls cleared.
     var rng = prng(5);
-    try testing.expectEqual(@as(u16, 1), field.fill(rng.random()));
+    try testing.expectEqual(@as(u16, 1), field.fill(test_bal, rng.random()));
     const top_filled = @intFromBool(field.grid.at(0, 0) != .empty) +
         @intFromBool(field.grid.at(0, 1) != .empty);
     try testing.expectEqual(@as(u8, 1), top_filled);
+}
+
+test "a rock is an impassable wall: never eaten, and it shelters like a hazard" {
+    // The feast cannot eat or pass a rock, and no cast can open it — the
+    // food behind one is reachable only around it.
+    var field = empty_field(1, 3);
+    field.grid.put(0, .neutral);
+    field.grid.put(1, .{ .special = .rock });
+    field.grid.put(2, .neutral);
+
+    const feast = field.eat_all(test_bal);
+    try testing.expectEqual(@as(u16, 1), feast.cells);
+    try testing.expectEqual(@as(u16, 1), feast.sheltered);
+    try testing.expectEqual(@as(u16, 1), feast.walls);
+    try testing.expectEqual(c.SlimeCell{ .special = .rock }, field.grid.get(1));
+    try testing.expectEqual(c.SlimeCell.neutral, field.grid.get(2));
+}
+
+test "a field holding nothing but rocks is WON: rocks are not playable" {
+    var field = empty_field(1, 2);
+    field.grid.put(0, .neutral);
+    field.grid.put(1, .{ .special = .rock });
+    try testing.expect(!field.is_exhausted());
+
+    const feast = field.eat_all(test_bal);
+    try testing.expectEqual(@as(u16, 1), feast.cells);
+    // The rock remains — permanently — and the field is still exhausted:
+    // demanding it gone would make the encounter unwinnable.
+    try testing.expectEqual(@as(u16, 1), field.grid.occupied());
+    try testing.expect(field.is_exhausted());
+}
+
+test "a rock falls with its column like any unit" {
+    var field = empty_field(3, 1);
+    field.grid.set(0, 0, .{ .special = .rock });
+
+    try testing.expectEqual(@as(u16, 1), field.collapse());
+    try testing.expectEqual(c.SlimeCell.empty, field.grid.at(0, 0));
+    try testing.expectEqual(c.SlimeCell{ .special = .rock }, field.grid.at(2, 0));
+}
+
+test "a canister is free equipment that refills charge_refill per swallow" {
+    var field = empty_field(1, 4);
+    field.grid.put(0, .neutral);
+    field.grid.put(1, .{ .special = .canister });
+    field.grid.put(2, .{ .special = .canister });
+    field.grid.put(3, .neutral);
+
+    const feast = field.eat_all(test_bal);
+    // All four eaten — the canisters conduct and are swallowed en route —
+    // but only the two neutrals are FOOD: canisters score nothing, cost no
+    // hunger, and pour their agent energy back into the pool.
+    try testing.expectEqual(@as(u16, 4), feast.cells);
+    try testing.expectEqual(@as(u32, 2), feast.score);
+    try testing.expectEqual(2 * test_bal.hunger_cost_normal, feast.hunger);
+    try testing.expectEqual(@as(u16, 2), feast.canisters);
+    try testing.expectEqual(
+        2 * @as(u32, test_bal.special_tuning(.canister).charge_refill),
+        feast.charges_refilled,
+    );
+    try testing.expect(field.is_exhausted());
+}
+
+test "a bomb levels its 3x3: everything around it is DESTROYED, not eaten" {
+    //   col: 0 1 2
+    //   r0:  n R n
+    //   r1:  B R n
+    //   r2:  n R n
+    // The bomb at the door blows the red wall (and the neutral under it)
+    // out of play; the feast then flows through the crater to column 2.
+    var field = empty_field(3, 3);
+    field.grid.set(0, 0, .neutral);
+    field.grid.set(1, 0, .{ .special = .bomb });
+    field.grid.set(2, 0, .neutral);
+    var row: u8 = 0;
+    while (row < 3) : (row += 1) {
+        field.grid.set(row, 1, .{ .tiered = .red });
+        field.grid.set(row, 2, .neutral);
+    }
+
+    const feast = field.eat_all(test_bal);
+    try testing.expectEqual(@as(u16, 1), feast.bombs);
+    // Destroyed: the three reds and the neutral at (2,0) — removed outright,
+    // no score, no hunger.
+    try testing.expectEqual(@as(u16, 4), feast.destroyed);
+    // Eaten: (0,0), the bomb (free), and column 2's three neutrals.
+    try testing.expectEqual(@as(u16, 5), feast.cells);
+    try testing.expectEqual(@as(u32, 4), feast.score);
+    try testing.expectEqual(4 * test_bal.hunger_cost_normal, feast.hunger);
+    try testing.expectEqual(@as(u16, 0), feast.sheltered);
+    try testing.expectEqual(@as(u16, 0), feast.walls);
+    try testing.expectEqual(@as(u16, 0), field.grid.occupied());
+    try testing.expect(field.is_exhausted());
+}
+
+test "explode_rocks_only: the blast destroys rocks and spares everything else" {
+    var bal = fixtures.test_config.balance;
+    bal.specials[@intFromEnum(c.SpecialKind.bomb)].explode_rocks_only = true;
+
+    // n B K n (K = rock, inside the bomb's 3x3): the rock is blown out of
+    // play — the one way to remove one — and the path opens.
+    var field = empty_field(1, 4);
+    field.grid.put(0, .neutral);
+    field.grid.put(1, .{ .special = .bomb });
+    field.grid.put(2, .{ .special = .rock });
+    field.grid.put(3, .neutral);
+
+    const feast = field.eat_all(&bal);
+    try testing.expectEqual(@as(u16, 1), feast.bombs);
+    try testing.expectEqual(@as(u16, 1), feast.destroyed); // the rock alone
+    try testing.expectEqual(@as(u16, 3), feast.cells); // two neutrals + bomb
+    try testing.expectEqual(@as(u32, 2), feast.score);
+    try testing.expectEqual(@as(u16, 0), field.grid.occupied());
+    try testing.expect(field.is_exhausted());
+
+    // n B R n under the same tuning: the live red is IN the blast but is
+    // NOT a rock, so it survives — and still walls the food behind it.
+    // (Default tuning would have levelled it: see the 3x3 bomb test.)
+    var spared = empty_field(1, 4);
+    spared.grid.put(0, .neutral);
+    spared.grid.put(1, .{ .special = .bomb });
+    spared.grid.put(2, .{ .tiered = .red });
+    spared.grid.put(3, .neutral);
+
+    const held = spared.eat_all(&bal);
+    try testing.expectEqual(@as(u16, 1), held.bombs);
+    try testing.expectEqual(@as(u16, 0), held.destroyed);
+    try testing.expectEqual(@as(u16, 2), held.cells); // the neutral + bomb
+    try testing.expectEqual(@as(u16, 1), held.walls);
+    try testing.expectEqual(@as(u16, 1), held.sheltered);
+    try testing.expectEqual(c.SlimeCell{ .tiered = .red }, spared.grid.get(2));
 }
 
 test "neutralizers are playable slime: the win requires eating them too" {
@@ -1422,7 +1703,7 @@ test "turn after turn, gravity and refills eventually feed every unit" {
     res.tiered[ti(.red)] = 6;
     res.tiered[ti(.green)] = 4;
     const total_units = res.total();
-    var field = SlimeField.init(.{ .rows = 3, .cols = 3 }, res, rng.random());
+    var field = SlimeField.init(.{ .rows = 3, .cols = 3 }, res, test_bal, rng.random());
 
     var eaten: u32 = 0;
     var hunger: u32 = 0;
@@ -1443,7 +1724,7 @@ test "turn after turn, gravity and refills eventually feed every unit" {
         hunger += feast.hunger_total();
         score += feast.score;
         _ = field.collapse();
-        _ = field.fill(rng.random());
+        _ = field.fill(test_bal, rng.random());
     }
 
     try testing.expect(field.is_exhausted());
@@ -1457,7 +1738,7 @@ test "leaving hazards up costs the team the food, not extra hunger" {
     var rng = prng(9);
     var res = c.SlimeReservoir{ .neutral = 4 };
     res.tiered[ti(.red)] = 5;
-    var field = SlimeField.init(.{ .rows = 3, .cols = 3 }, res, rng.random());
+    var field = SlimeField.init(.{ .rows = 3, .cols = 3 }, res, test_bal, rng.random());
 
     const feast = field.eat_all(test_bal);
     // Whatever it managed to eat, it paid the flat rate and nothing more.
@@ -1488,11 +1769,11 @@ test "field ops are reproducible for a given seed" {
             var rng = prng(seed);
             var res = c.SlimeReservoir{ .neutral = 10 };
             res.tiered[ti(.red)] = 10;
-            var field = SlimeField.init(.{ .rows = 3, .cols = 4 }, res, rng.random());
+            var field = SlimeField.init(.{ .rows = 3, .cols = 4 }, res, test_bal, rng.random());
             _ = field.apply_shape(PLUS, 1, 1);
             _ = field.eat_all(test_bal);
             _ = field.collapse();
-            _ = field.fill(rng.random());
+            _ = field.fill(test_bal, rng.random());
             return field;
         }
     }.go;
@@ -1508,7 +1789,7 @@ test "eggs draw from the reservoir like any other unit" {
     var res = c.SlimeReservoir{ .neutral = 2 };
     res.special[@intFromEnum(c.SpecialKind.egg)] = 2;
     res.special[@intFromEnum(c.SpecialKind.neutralizer)] = 2;
-    const field = SlimeField.init(.{ .rows = 2, .cols = 3 }, res, rng.random());
+    const field = SlimeField.init(.{ .rows = 2, .cols = 3 }, res, test_bal, rng.random());
 
     // Composition preserved exactly; only placement is random.
     try testing.expectEqual(@as(u16, 6), field.grid.occupied());

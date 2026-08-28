@@ -314,9 +314,12 @@ fn write_render_inner(
 /// One slime cell as a compact renderer-facing name.  Hazards are named by
 /// their difficulty TIER ("red" = 3 casts from harmless, "green" = 1);
 /// "defused" is a fully neutralized cell, which is harmless but still edible.
-/// Specials are named per kind: "special_neutralizer" is inert to casts,
-/// inedible and a wall (and pops when matched); "special_egg" is edible and
-/// hatches a baby, so the renderer must draw it as food with a prize inside.
+/// Specials are named per kind: "special_neutralizer" fires a 3x3 Agent
+/// block when eaten; "special_egg" is edible and hatches a baby, so the
+/// renderer must draw it as food with a prize inside; "special_rock" is the
+/// permanent wall nothing can touch; "special_canister" refills the team's
+/// charge pool when swallowed; "special_bomb" destroys its 3x3 surroundings
+/// (or just the rocks in it, per balance) when swallowed.
 fn cell_name(cell: c.SlimeCell) []const u8 {
     return switch (cell) {
         .empty => "empty",
@@ -325,6 +328,9 @@ fn cell_name(cell: c.SlimeCell) []const u8 {
         .special => |kind| switch (kind) {
             .neutralizer => "special_neutralizer",
             .egg => "special_egg",
+            .rock => "special_rock",
+            .canister => "special_canister",
+            .bomb => "special_bomb",
         },
         .tiered => |t| switch (t) {
             .red => "red",

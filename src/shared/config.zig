@@ -147,6 +147,9 @@ const TiersU16Json = struct { red: u16 = 0, yellow: u16 = 0, green: u16 = 0 };
 /// Tuning knobs for one special kind (see balance.SpecialTuning).
 const SpecialTuningJson = struct {
     match_len: u8 = balance.DEFAULT_MATCH_LEN,
+    back_ranks_only: bool = false,
+    charge_refill: u16 = balance.DEFAULT_CHARGE_REFILL,
+    explode_rocks_only: bool = false,
 };
 
 /// Per-kind tuning table.  Every kind defaults, so `"specials"` and any kind
@@ -154,6 +157,9 @@ const SpecialTuningJson = struct {
 const SpecialsJson = struct {
     neutralizer: SpecialTuningJson = .{},
     egg: SpecialTuningJson = .{},
+    rock: SpecialTuningJson = .{},
+    canister: SpecialTuningJson = .{},
+    bomb: SpecialTuningJson = .{},
 };
 
 /// Per-kind special unit counts for one zone.  An OBJECT, not a scalar: the
@@ -162,6 +168,9 @@ const SpecialsJson = struct {
 const SpecialCountsJson = struct {
     neutralizer: u16 = 0,
     egg: u16 = 0,
+    rock: u16 = 0,
+    canister: u16 = 0,
+    bomb: u16 = 0,
 };
 
 const PlayerRecipeJson = struct {
@@ -284,10 +293,19 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
     // A match_len of 0/1 would fire on every lone special, and one longer
     // than the grid's longest line could never fire at all — both are always
     // config mistakes.
-    const specials = [c.SpecialKind.size]balance.SpecialTuning{
-        .{ .match_len = raw.specials.neutralizer.match_len },
-        .{ .match_len = raw.specials.egg.match_len },
-    };
+    // SpecialsJson's field names mirror the SpecialKind tags exactly, so the
+    // table builds itself — a new kind only has to be added to SpecialsJson
+    // for the compiler to wire it through.
+    var specials: [c.SpecialKind.size]balance.SpecialTuning = undefined;
+    inline for (@typeInfo(c.SpecialKind).@"enum".fields) |f| {
+        const t = @field(raw.specials, f.name);
+        specials[f.value] = .{
+            .match_len = t.match_len,
+            .back_ranks_only = t.back_ranks_only,
+            .charge_refill = t.charge_refill,
+            .explode_rocks_only = t.explode_rocks_only,
+        };
+    }
     const longest_line = @max(raw.slime_grid.rows, raw.slime_grid.cols);
     for (specials, 0..) |tuning, k| {
         if (tuning.match_len < 2 or tuning.match_len > longest_line) {
@@ -403,7 +421,10 @@ fn parse_encounters(a: std.mem.Allocator, bytes: []const u8) !enc.EncounterSet {
         var slime = c.SlimeReservoir{};
         for (e.zones) |z| {
             slime.neutral +|= z.neutral;
-            const per_kind = [_]u16{ z.special.neutralizer, z.special.egg };
+            const per_kind = [_]u16{
+                z.special.neutralizer, z.special.egg,  z.special.rock,
+                z.special.canister,    z.special.bomb,
+            };
             for (&slime.special, per_kind) |*acc, add| acc.* +|= add;
             const per_tier = [_]u16{ z.tiered.red, z.tiered.yellow, z.tiered.green };
             for (&slime.tiered, per_tier) |*acc, add| acc.* +|= add;
@@ -1166,6 +1187,25 @@ test "special tuning defaults, is read, and bad match_len is rejected" {
         ConfigError.InvalidMatchLen,
         parse(std.testing.allocator, too_long, minimal_encounters),
     );
+}
+
+test "back_ranks_only defaults off and is read per kind" {
+    var defaulted = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
+    defer defaulted.deinit();
+    for (defaulted.config.balance.specials) |tuning| {
+        try std.testing.expect(!tuning.back_ranks_only);
+    }
+
+    const doc =
+        \\{"hunger_cost_normal":1,
+        \\ "specials":{"egg":{"back_ranks_only":true}},
+        \\ "player_recipes":[{"label":"poke","shape":["#"]}],
+        \\ "team_recipes":[]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expect(loaded.config.balance.special_tuning(.egg).back_ranks_only);
+    try std.testing.expect(!loaded.config.balance.special_tuning(.neutralizer).back_ranks_only);
 }
 
 test "baby_hunger defaults and is read" {

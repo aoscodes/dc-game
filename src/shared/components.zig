@@ -105,8 +105,8 @@ pub const Tier = enum(u8) {
 ///
 ///   consumable   — whether the feast can eat it.  A consumable special
 ///                  conducts the flood and leaves the grid when consumed; an
-///                  inconsumable one is a permanent wall no cast can touch.
-///                  Every current kind is consumable.
+///                  inconsumable one is a permanent wall no cast can touch
+///                  (the rock is the one current example).
 ///   eat_effect   — what CONSUMING one does, beyond emptying the cell.
 ///   match_effect — whether LINING UP `match_len` of the kind in a row or
 ///                  column (after the turn-end refill) fires an effect.
@@ -123,16 +123,34 @@ pub const SpecialKind = enum(u8) {
     /// HATCHES a baby Lil Guy (uniform-random BabyType) who joins the
     /// encounter and grows the hunger pool.
     egg = 1,
+    /// INCONSUMABLE: a permanent wall.  The feast cannot eat or pass it, no
+    /// cast can touch it, and it never matches — it leaves the grid only by
+    /// never having been there.  Not playable, so a field holding nothing
+    /// else is still won; it falls with its column like any unit.
+    rock = 2,
+    /// Consumable.  A canister of Neutralizing Agent: free like the
+    /// neutralizer — no score, no hunger — and REFILLS the team's charge
+    /// pool by the kind's `charge_refill` tuning when swallowed.
+    canister = 3,
+    /// Consumable.  Free — no score, no hunger — and it EXPLODES as it is
+    /// swallowed: every unit in the 3x3 around its cell is DESTROYED
+    /// (removed outright, not eaten — no score, no hunger, gone from play).
+    /// With the kind's `explode_rocks_only` tuning set, the blast spares
+    /// everything except rocks — the one tool that can remove one.
+    bomb = 4,
 
     pub const size = @typeInfo(SpecialKind).@"enum".fields.len;
 
     /// True if the feast can eat this kind.  Consumable specials count as
     /// PLAYABLE slime: they can be cleared, so they do not exempt a field
-    /// from the win check the way an inconsumable one would.
+    /// from the win check the way an inconsumable one (the rock) does.
     pub fn consumable(self: SpecialKind) bool {
         return switch (self) {
             .neutralizer => true,
             .egg => true,
+            .rock => false,
+            .canister => true,
+            .bomb => true,
         };
     }
 
@@ -142,15 +160,22 @@ pub const SpecialKind = enum(u8) {
         return switch (self) {
             .neutralizer => .neutralize_block,
             .egg => .hatch,
+            .rock => null, // inconsumable: never eaten
+            .canister => .refill_charges,
+            .bomb => .explode,
         };
     }
 
     /// True if eating this kind feeds the team — normal score and normal
-    /// hunger.  A neutralizer is equipment, not food: consuming one is free.
+    /// hunger.  A neutralizer or canister is equipment, not food: consuming
+    /// one is free.
     pub fn eat_is_food(self: SpecialKind) bool {
         return switch (self) {
             .neutralizer => false,
             .egg => true,
+            .rock => false,
+            .canister => false,
+            .bomb => false,
         };
     }
 
@@ -162,6 +187,9 @@ pub const SpecialKind = enum(u8) {
         return switch (self) {
             .neutralizer => null,
             .egg => null,
+            .rock => null,
+            .canister => null,
+            .bomb => null,
         };
     }
 };
@@ -177,6 +205,13 @@ pub const SpecialEffect = enum(u8) {
     neutralize_block = 0,
     /// Hatch a baby Lil Guy of a uniform-random BabyType.
     hatch = 1,
+    /// Refill the team's charge pool by the kind's `charge_refill` tuning
+    /// (balance.SpecialTuning) — Neutralizing Agent energy back in the tank.
+    refill_charges = 2,
+    /// Destroy every unit in the 3x3 around the firing cell — removed from
+    /// play outright, not eaten.  With the kind's `explode_rocks_only`
+    /// tuning, the blast destroys only rocks and spares everything else.
+    explode = 3,
 };
 
 /// The five types a hatched baby Lil Guy can be.  Placeholder colour names
@@ -264,8 +299,8 @@ pub const SlimeCell = union(enum) {
     }
 
     /// True if this cell stops the feast advancing through it — a live
-    /// hazard, or an inconsumable special (none currently exist).  Everything
-    /// else (empty, edible) conducts the path, since an edible cell is eaten
+    /// hazard, or an inconsumable special (the rock).  Everything else
+    /// (empty, edible) conducts the path, since an edible cell is eaten
     /// and therefore opens.
     pub fn blocks_feast(self: SlimeCell) bool {
         return switch (self) {
@@ -605,6 +640,27 @@ test "special kind rulebook: both kinds are food-shaped, neither matches" {
         SpecialKind.neutralizer.eat_effect().?,
     );
 
+    // The rock is the impassable one: inconsumable, so it walls the feast,
+    // never feeds, never fires, and does not count as playable.
+    const rock = SlimeCell{ .special = .rock };
+    try testing.expect(!rock.is_edible());
+    try testing.expect(rock.blocks_feast());
+    try testing.expect(!SpecialKind.rock.consumable());
+    try testing.expect(!SpecialKind.rock.eat_is_food());
+    try testing.expectEqual(@as(?SpecialEffect, null), SpecialKind.rock.eat_effect());
+
+    // The canister conducts like the neutralizer — free equipment — and
+    // refills the team's charge pool when swallowed.
+    const canister = SlimeCell{ .special = .canister };
+    try testing.expect(canister.is_edible());
+    try testing.expect(!canister.blocks_feast());
+    try testing.expect(SpecialKind.canister.consumable());
+    try testing.expect(!SpecialKind.canister.eat_is_food());
+    try testing.expectEqual(
+        SpecialEffect.refill_charges,
+        SpecialKind.canister.eat_effect().?,
+    );
+
     // Matching is DORMANT: no current kind lines up.
     inline for (@typeInfo(SpecialKind).@"enum".fields) |f| {
         const kind: SpecialKind = @enumFromInt(f.value);
@@ -625,12 +681,15 @@ test "SlimeReservoir totals across tiers, neutral and specials" {
     try testing.expectEqual(@as(u32, 10), res.playable());
 
     // Every special kind counts toward the total (they still have to enter
-    // the grid), and only INCONSUMABLE ones would be excluded from
-    // `playable`, which is what the win check reads.  Every current kind is
-    // consumable — the feast can clear them all — so nothing is excluded.
+    // the grid), but INCONSUMABLE ones (the rock) are excluded from
+    // `playable`, which is what the win check reads: no play can ever
+    // clear a rock, so it must not hold the win hostage.
     res.special[@intFromEnum(SpecialKind.neutralizer)] = 4;
     res.special[@intFromEnum(SpecialKind.egg)] = 2;
     try testing.expectEqual(@as(u32, 16), res.total());
+    try testing.expectEqual(@as(u32, 16), res.playable());
+    res.special[@intFromEnum(SpecialKind.rock)] = 5;
+    try testing.expectEqual(@as(u32, 21), res.total());
     try testing.expectEqual(@as(u32, 16), res.playable());
 }
 

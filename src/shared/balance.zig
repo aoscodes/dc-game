@@ -159,6 +159,18 @@ pub const DEFAULT_MATCH_LEN: u8 = 3;
 /// (board/src/game/balance.c), so a change here should be made there too.
 pub const DEFAULT_BABY_HUNGER: u16 = 10;
 
+/// The BACK RANKS: how many of the grid's rightmost columns a
+/// `back_ranks_only` special kind may spawn in — the columns farthest from
+/// the feast's door on the left edge.  Mirrored by the board firmware
+/// (board/src/game/balance.c), so a change here should be made there too.
+pub const BACK_RANKS: u8 = 2;
+
+/// Default charges a swallowed canister refills, used when `charge_refill`
+/// is absent from balance.json's `specials` table.  Mirrored by the board
+/// firmware (board/src/game/balance.c), so a change here should be made
+/// there too.
+pub const DEFAULT_CHARGE_REFILL: u16 = 3;
+
 /// Designer knobs for one SpecialKind.  What a kind DOES is hard-coded
 /// (components.SpecialKind); this tunes only its numbers.
 pub const SpecialTuning = struct {
@@ -169,6 +181,23 @@ pub const SpecialTuning = struct {
     /// keeps it within 2..max(grid rows, cols) so a match is always
     /// physically possible.
     match_len: u8 = DEFAULT_MATCH_LEN,
+    /// When true, the kind may only ENTER the field in the rightmost
+    /// `BACK_RANKS` columns — the far side from the feast's door.  Collapse
+    /// never moves a cell sideways, so a unit spawned there STAYS there for
+    /// its whole life: the kind becomes a deep prize the feast must tunnel
+    /// across the board to reach.  A fill whose reservoir holds only
+    /// restricted kinds leaves front cells empty rather than seating one
+    /// (see slime.fill).  On a grid of `BACK_RANKS` columns or fewer the
+    /// restriction covers every cell and is a no-op.
+    back_ranks_only: bool = false,
+    /// Charges refilled into the team pool when one of this kind is
+    /// swallowed.  Only meaningful for kinds whose eat effect is
+    /// `refill_charges` (the canister); ignored for every other kind.
+    charge_refill: u16 = DEFAULT_CHARGE_REFILL,
+    /// When true, the kind's explosion destroys ONLY rocks — everything
+    /// else in the blast survives.  Only meaningful for kinds whose eat
+    /// effect is `explode` (the bomb); ignored for every other kind.
+    explode_rocks_only: bool = false,
 };
 
 /// All designer-tunable balance numbers.  Loaded from `data/balance.json`

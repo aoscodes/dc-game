@@ -77,7 +77,7 @@ pub const EncounterSet = struct {
 const testing = std.testing;
 
 test "Encounter total_units sums every slime bucket, specials included" {
-    var slime = c.SlimeReservoir{ .neutral = 5, .special = .{ 2, 1 } };
+    var slime = c.SlimeReservoir{ .neutral = 5, .special = .{ 2, 1, 0, 0, 0 } };
     slime.tiered[@intFromEnum(c.Tier.red)] = 10;
     slime.tiered[@intFromEnum(c.Tier.green)] = 3;
     const e = Encounter{ .label = "t", .slime = slime };

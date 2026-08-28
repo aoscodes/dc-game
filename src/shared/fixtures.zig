@@ -144,7 +144,7 @@ pub const encounters = [_]enc.Encounter{
         // Enough charges to matter but not enough to ignore: 40 charges against
         // 80 hazards means the team cannot simply defuse everything.
         .charges = 40,
-        .slime = .{ .tiered = .{ 35, 25, 20 }, .neutral = 30, .special = .{ 2, 0 } },
+        .slime = .{ .tiered = .{ 35, 25, 20 }, .neutral = 30, .special = .{ 2, 0, 0, 0, 0 } },
     },
 };
 
