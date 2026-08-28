@@ -102,7 +102,26 @@ const LAYOUT = {
     textFont: 13,
   },
 
-  score: { x: 40, y: 90, font: 20 },
+  // Score HUD, top-right: a big golden triangle with the collected count to
+  // its left.  Every eaten cell launches a small golden triangle (see
+  // flyTris) that streaks here; the big one swells once per arrival and the
+  // displayed count steps up with it, so the score visibly ACCRUES rather
+  // than jumping.  `x/y` is the big triangle's centre and the fliers' target.
+  scoreHud: {
+    x: 968, y: 58,
+    triSize: 15,          // big triangle circumradius (design px)
+    font: 26, gap: 14,    // score digits: size, and clearance from the triangle
+    pulseS: 0.35, pulseScale: 1.3, // arrival swell: one beat, and back
+    // Flying triangles: a brief random pop off the bitten cell, then an
+    // accelerating homing run.  `steer` is how hard velocity bends toward the
+    // target per second; `snap` is close-enough (plus a per-frame overshoot
+    // guard); `maxAgeS` is the failsafe so no flier orbits forever.
+    flySize: 7,
+    launchSpeed: 160, homeSpeed: 1500, rampS: 0.55, steer: 8,
+    snap: 12, maxAgeS: 2.5,
+    trailLen: 10,         // positions kept for the streak
+    trailAlpha: 0.55, trailWidth: 4, // streak: alpha and width at the head
+  },
 
   headers: { waveX: 40, waveY: 50, waveFont: 20, labelDy: -30, labelFont: 18 },
 
@@ -230,6 +249,11 @@ const C_TEXT = "rgba(40,40,55,1)";
 const C_HEADER = "rgba(60,90,200,1)";
 const C_SLIME_HDR = "rgba(30,140,60,1)";
 const C_OWN_ROW = "rgba(190,140,0,1)";
+// Score gold: the flying triangles, their streaks, and the HUD triangle.
+// Warmer and brighter than the ambers above on purpose — it is a reward, not
+// a warning — with a dark rim so it holds an edge on the paper background.
+const C_GOLD = "rgba(255,200,60,1)";
+const C_GOLD_DARK = "rgba(170,120,15,1)";
 /**
  * Per-seat identity colors, indexed by player id (seat 0..3): every mark a
  * player leaves on the shared screen — stamp outlines, cursor box, pending
@@ -441,6 +465,9 @@ function tickAnimator(id, cls, lastAction, dt) {
 function clearEntityState() {
   animState.clear();
   floaters.length = 0;
+  flyTris.length = 0;
+  scoreHud.displayed = 0;
+  scoreHud.pulseT = 0;
   lastScoreSeen = 0;
   lastHungerSeen = 0;
   lilGuys.clear();
@@ -1072,6 +1099,158 @@ function drawFloaters() {
 }
 
 // ---------------------------------------------------------------------------
+// Score fly-off (golden triangles: eaten cell → score HUD, top right)
+// ---------------------------------------------------------------------------
+//
+// Every cell the feast eats launches one small golden triangle from where it
+// stood: a short random pop, then an accelerating homing streak to the HUD
+// triangle beside the score.  On arrival it disappears, the HUD triangle
+// swells once, and the DISPLAYED score steps up by one — so the count on
+// screen accrues bite by bite instead of jumping to the server's total.
+//
+// The server's score is still the only truth: whenever nothing is in flight
+// and no replay is running, the displayed count snaps to `game.score`, which
+// covers hidden tabs, mid-game joins, and any cell whose scoring the client
+// mis-guessed.  The triangles are receipts, not a ledger.
+
+/** @typedef {{x:number, y:number, vx:number, vy:number, age:number,
+ *             trail: {x:number, y:number}[]}} FlyTri */
+/** @type {FlyTri[]} */
+const flyTris = [];
+
+/** What the HUD currently shows: the count (stepped up per arrival, synced to
+ *  the server when idle) and the seconds left in the arrival swell. */
+const scoreHud = { displayed: 0, pulseT: 0 };
+
+/** Trace an equilateral triangle path, point-up at rot=0, circumradius r. */
+function trianglePath(x, y, r, rot = 0) {
+  ctx.beginPath();
+  for (let i = 0; i < 3; i++) {
+    const a = rot - Math.PI / 2 + i * (2 * Math.PI / 3);
+    const px = x + r * Math.cos(a);
+    const py = y + r * Math.sin(a);
+    if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+}
+
+/** Launch one golden triangle from (x, y) — a bitten cell's centre. */
+function spawnFlyTri(x, y) {
+  const S = LAYOUT.scoreHud;
+  // Random outward pop, biased upward so the launch reads as a burst off the
+  // board before the homing pull takes over.
+  const a = Math.random() * Math.PI * 2;
+  flyTris.push({
+    x, y,
+    vx: Math.cos(a) * S.launchSpeed,
+    vy: Math.sin(a) * S.launchSpeed - 60,
+    age: 0,
+    trail: [],
+  });
+}
+
+/** One flier landed on the HUD: count it and start the swell. */
+function flyTriArrive() {
+  scoreHud.displayed += 1;
+  scoreHud.pulseT = LAYOUT.scoreHud.pulseS;
+}
+
+/**
+ * Advance every flier one frame and drop the arrived ones.
+ *
+ * Motion is velocity steering: each frame the velocity bends toward "straight
+ * at the HUD at the current target speed", and the target speed ramps from
+ * launch to homing over `rampS` — so the random pop reads first, then the
+ * flier commits.  Arrival is "close enough OR would overshoot this frame"
+ * (the homing run ends fast enough to clear the snap radius in one step),
+ * with `maxAgeS` as the failsafe.
+ */
+function tickFlyTris(dt) {
+  const S = LAYOUT.scoreHud;
+  scoreHud.pulseT = Math.max(0, scoreHud.pulseT - dt);
+  let w = 0;
+  for (const tri of flyTris) {
+    tri.age += dt;
+    const dx = S.x - tri.x;
+    const dy = S.y - tri.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    const speed = S.launchSpeed +
+      (S.homeSpeed - S.launchSpeed) * Math.min(1, tri.age / S.rampS);
+    if (dist <= Math.max(S.snap, speed * dt) || tri.age > S.maxAgeS) {
+      flyTriArrive();
+      continue;
+    }
+    const k = Math.min(1, S.steer * dt);
+    tri.vx += (dx / dist * speed - tri.vx) * k;
+    tri.vy += (dy / dist * speed - tri.vy) * k;
+    tri.trail.push({ x: tri.x, y: tri.y });
+    if (tri.trail.length > S.trailLen) tri.trail.shift();
+    tri.x += tri.vx * dt;
+    tri.y += tri.vy * dt;
+    flyTris[w++] = tri;
+  }
+  flyTris.length = w;
+}
+
+/** Draw every flier: fading tapered streak first, gold triangle on top,
+ *  nose rotated along its velocity. */
+function drawFlyTris() {
+  const S = LAYOUT.scoreHud;
+  ctx.save();
+  ctx.lineCap = "round";
+  for (const tri of flyTris) {
+    const pts = tri.trail.concat([{ x: tri.x, y: tri.y }]);
+    for (let i = 1; i < pts.length; i++) {
+      const f = i / pts.length; // 0 tail → 1 head
+      ctx.strokeStyle = `rgba(255,200,60,${(S.trailAlpha * f).toFixed(3)})`;
+      ctx.lineWidth = Math.max(0.5, S.trailWidth * f);
+      ctx.beginPath();
+      ctx.moveTo(pts[i - 1].x, pts[i - 1].y);
+      ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.stroke();
+    }
+    const rot = Math.atan2(tri.vy, tri.vx) + Math.PI / 2;
+    trianglePath(tri.x, tri.y, S.flySize, rot);
+    ctx.fillStyle = C_GOLD;
+    ctx.fill();
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = C_GOLD_DARK;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/**
+ * The score HUD, top right: big gold triangle, count to its left.  Both wear
+ * the arrival swell — a sine ease up and back over `pulseS`.  Drawn LAST so
+ * incoming fliers vanish INTO the triangle rather than over it.
+ */
+function drawScoreHud(game) {
+  const S = LAYOUT.scoreHud;
+  // Idle catch-up: with nothing in flight and no replay running, the server's
+  // total is the only number worth showing.
+  if (flyTris.length === 0 && !cinematicActive()) {
+    scoreHud.displayed = game.score ?? 0;
+  }
+  const frac = S.pulseS > 0 ? scoreHud.pulseT / S.pulseS : 0;
+  const scale = 1 + (S.pulseScale - 1) * Math.sin(frac * Math.PI);
+
+  trianglePath(S.x, S.y, S.triSize * scale);
+  ctx.fillStyle = C_GOLD;
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = C_GOLD_DARK;
+  ctx.stroke();
+
+  ctx.save();
+  ctx.font = `bold ${Math.round(S.font * scale)}px monospace`;
+  ctx.fillStyle = C_GOLD_DARK;
+  ctx.textAlign = "right";
+  ctx.fillText(`${scoreHud.displayed}`, S.x - S.triSize - S.gap, S.y + S.font * 0.35);
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------------
 // Shape-wheel + group preview (mirrors game_logic.zig / balance.zig)
 // ---------------------------------------------------------------------------
 
@@ -1509,11 +1688,6 @@ function drawChargeBar(game) {
     low ? B.lowBorder : "rgba(0,0,0,0.25)");
 
   text(`\u26a1 ${charges}`, B.x0 + w - 90, B.y + B.h + 14, B.textFont, C_CHARGE);
-}
-
-function drawScore(game) {
-  const S = LAYOUT.score;
-  text(`LGW units collected: ${game.score ?? 0}`, S.x, S.y, S.font, C_SLIME_HDR);
 }
 
 // ---------------------------------------------------------------------------
@@ -3105,6 +3279,13 @@ function bite(flat, g) {
   c.board[flat] = "empty";
   cellAnim.set(flat, { kind: "pop", dur: FIELD.popS, t: FIELD.popS, from: was });
 
+  // Every eaten cell is a score unit: send its golden triangle to the HUD.
+  // (Bomb-levelled neighbours below are DESTROYED, not eaten — no triangle.)
+  if (was && was !== "empty") {
+    const sp = cellCenter(flat, c.rows, c.cols);
+    spawnFlyTri(sp.x, sp.y);
+  }
+
   // A swallowed canister pours its agent energy back into the team pool —
   // the server already credited it; this is the on-board receipt.
   if (was === "special_canister") {
@@ -3457,6 +3638,13 @@ function finishSettle() {
 function snapFinishCinematic() {
   if (!cinematic) return;
   cellAnim.clear();
+  // Fliers belong to the meal being cut: land them all as one arrival — a
+  // single swell stands in for the flock, and drawScoreHud's idle sync snaps
+  // the displayed count to the server's total on the next frame.
+  if (flyTris.length > 0) {
+    flyTris.length = 0;
+    scoreHud.pulseT = LAYOUT.scoreHud.pulseS;
+  }
   endCinematic();
 }
 
@@ -4000,6 +4188,9 @@ function drawGame(game, dt) {
   }
   tickBabies(game, dt, fresh);
   tickMenuFx(dt);
+  // Fliers wear the same hidden-tab clamp as the replay that spawns them:
+  // a single huge frame must not teleport every streak onto the HUD at once.
+  tickFlyTris(Math.min(dt, LAYOUT.cinematic.maxStepS));
 
   clear();
 
@@ -4007,21 +4198,23 @@ function drawGame(game, dt) {
   text(`Turn ${game.turn ?? 1}`,
     H.waveX, H.waveY, H.waveFont, C_HEADER);
 
-  // The game id (join code), top right, so anyone watching can tell others
-  // what to join.
+  // The game id (join code), tucked under the score HUD top right, so anyone
+  // watching can tell others what to join.
   const gameId = `Game ${game.join_code ?? "------"}`;
-  ctx.font = `${H.labelFont}px monospace`;
-  text(gameId, SW - ctx.measureText(gameId).width - 24, H.waveY, H.labelFont, C_HEADER);
+  const idFont = 14;
+  ctx.font = `${idFont}px monospace`;
+  text(gameId, SW - ctx.measureText(gameId).width - 24,
+    LAYOUT.scoreHud.y + 34, idFont, C_HEADER);
 
   // Observers watch the same board; the only key that means anything to them
   // is the one that puts them in it.
   if (game.observer) {
     const hint = "OBSERVING — press P to take a seat";
     ctx.font = `${H.labelFont - 4}px monospace`;
-    text(hint, SW - ctx.measureText(hint).width - 24, H.waveY + 24, H.labelFont - 4, C_TEXT);
+    text(hint, SW - ctx.measureText(hint).width - 24,
+      LAYOUT.scoreHud.y + 54, H.labelFont - 4, C_TEXT);
   }
 
-  drawScore(game);
   drawHungerBar(game);
   drawChargeBar(game);
   drawSlimeField(game);
@@ -4029,8 +4222,11 @@ function drawGame(game, dt) {
   drawBabies(game);
   drawPlayerMenus(game);
 
-  // Floaters drawn last so they appear on top of everything.
+  // Floaters drawn last so they appear on top of everything; the score
+  // fliers over those, and the HUD last of all so fliers vanish INTO it.
   drawFloaters();
+  drawFlyTris();
+  drawScoreHud(game);
 }
 
 /**
