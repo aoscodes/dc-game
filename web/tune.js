@@ -170,6 +170,7 @@ async function load() {
       specials: Object.fromEntries(SPECIAL_KINDS.map((k) => [k, {
         match_len: bal.specials?.[k]?.match_len ?? DEFAULT_MATCH_LEN,
         back_ranks_only: bal.specials?.[k]?.back_ranks_only ?? false,
+        guaranteed_at_start: bal.specials?.[k]?.guaranteed_at_start ?? false,
         charge_refill: bal.specials?.[k]?.charge_refill ?? DEFAULT_CHARGE_REFILL,
         explode_rocks_only: bal.specials?.[k]?.explode_rocks_only ?? false,
       }])),
@@ -419,10 +420,13 @@ function renderRates() {
 }
 
 /**
- * Per-kind special tuning: the (dormant) match length and the back-ranks
- * spawn restriction.  The checkbox pins the kind's spawns to the grid's
- * rightmost BACK_RANKS columns — the far side from the feast's door, where
- * (since slime never falls sideways) a unit stays for its whole life.
+ * Per-kind special tuning: the (dormant) match length, the back-ranks
+ * spawn restriction, and the start-of-play guarantee.  The back-ranks
+ * checkbox pins the kind's spawns to the grid's rightmost BACK_RANKS
+ * columns — the far side from the feast's door, where (since slime never
+ * falls sideways) a unit stays for its whole life.  The guarantee checkbox
+ * seats one unit of the kind on the grid before the initial fill whenever
+ * the encounter's supply holds any (mid-game refills are untouched).
  * Leads with the global door-column rule: no special ever spawns in
  * column 0 while it is set.
  */
@@ -443,6 +447,10 @@ function specialsRows() {
       el("label", {},
         el("span", {}, `${k} spawns only on the back ${BACK_RANKS} columns (far from the feast's door)`),
         boolInput(tuning, "back_ranks_only")),
+      el("br"),
+      el("label", {},
+        el("span", {}, `${k} guaranteed on the starting grid (one seated at the start of play while the supply holds any)`),
+        boolInput(tuning, "guaranteed_at_start")),
       el("br"),
     );
     if (k === "canister") {

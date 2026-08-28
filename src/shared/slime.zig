@@ -73,9 +73,11 @@ pub const SlimeField = struct {
     grid: c.SlimeGrid,
     reservoir: c.SlimeReservoir,
 
-    /// Build a field of `dims` holding `total` slime: as much as fits is
-    /// placed on the grid (top row first), the remainder stays in the
-    /// reservoir.  `bal` supplies the per-kind spawn rules the fill honours.
+    /// Build a field of `dims` holding `total` slime: every
+    /// `guaranteed_at_start` kind the supply holds is seated first (see
+    /// seed_guaranteed), then as much as fits is placed on the grid (top row
+    /// first), the remainder stays in the reservoir.  `bal` supplies the
+    /// per-kind spawn rules the fill honours.
     pub fn init(
         dims: balance.SlimeGridDims,
         total: c.SlimeReservoir,
@@ -86,8 +88,47 @@ pub const SlimeField = struct {
             .grid = c.SlimeGrid.init(dims.rows, dims.cols),
             .reservoir = total,
         };
+        self.seed_guaranteed(bal, rand);
         _ = self.fill(bal, rand);
         return self;
+    }
+
+    /// Seat one unit of every `guaranteed_at_start` kind (balance.
+    /// SpecialTuning) the reservoir holds, BEFORE the initial fill, so the
+    /// kind is on the grid at the start of play rather than gambling on the
+    /// fill's uniform draw.  Each seeded unit lands in a uniform-random cell
+    /// among the cells its spawn rules allow (`may_spawn`: never the door
+    /// column, back-ranks kinds only in the back columns) and leaves the
+    /// reservoir; the fill then tops up the rest of the grid as always.
+    /// Kinds are walked in ordinal order and each seeding consumes exactly
+    /// one draw — part of the lockstep contract the board's port mirrors.
+    /// A kind with no reservoir units or no eligible cell is skipped.
+    fn seed_guaranteed(self: *SlimeField, bal: *const balance.Balance, rand: std.Random) void {
+        const n = self.grid.len();
+        for (&self.reservoir.special, 0..) |*count, k| {
+            const kind: c.SpecialKind = @enumFromInt(k);
+            if (!bal.special_tuning(kind).guaranteed_at_start) continue;
+            if (count.* == 0) continue;
+            var eligible: u16 = 0;
+            var flat: u16 = 0;
+            while (flat < n) : (flat += 1) {
+                if (self.grid.get(flat).is_slime()) continue;
+                if (self.may_spawn(bal, kind, self.grid.col_of(flat))) eligible += 1;
+            }
+            if (eligible == 0) continue;
+            var pick = rand.uintLessThan(u16, eligible);
+            flat = 0;
+            while (flat < n) : (flat += 1) {
+                if (self.grid.get(flat).is_slime()) continue;
+                if (!self.may_spawn(bal, kind, self.grid.col_of(flat))) continue;
+                if (pick == 0) {
+                    self.grid.put(flat, .{ .special = kind });
+                    count.* -= 1;
+                    break;
+                }
+                pick -= 1;
+            }
+        }
     }
 
     /// Total slime still in play: on the grid plus in the reservoir.
@@ -954,6 +995,68 @@ test "restricted eggs never drift left of the back ranks across whole turns" {
         _ = field.eat_all(&bal);
         _ = field.fill(&bal, rng.random());
     }
+}
+
+test "a guaranteed_at_start kind is seated at the start of play whatever the seed" {
+    // 1 egg among 100 hazards on a 4x4 grid: a pure uniform fill would
+    // usually leave the egg in the reservoir, so every seed passing is the
+    // guarantee at work, not luck.  The seeded egg still obeys the kind's
+    // spawn rules: back ranks only, never the door column.
+    var bal = fixtures.test_config.balance;
+    bal.specials[@intFromEnum(c.SpecialKind.egg)].back_ranks_only = true;
+    bal.specials[@intFromEnum(c.SpecialKind.egg)].guaranteed_at_start = true;
+
+    var seed: u64 = 0;
+    while (seed < 32) : (seed += 1) {
+        var rng = prng(seed);
+        var res = c.SlimeReservoir{ .special = .{ 0, 1, 0, 0, 0 } };
+        res.tiered[ti(.red)] = 100;
+        var field = SlimeField.init(.{ .rows = 4, .cols = 4 }, res, &bal, rng.random());
+
+        var eggs: u16 = 0;
+        var flat: u16 = 0;
+        while (flat < field.grid.len()) : (flat += 1) {
+            switch (field.grid.get(flat)) {
+                .special => |kind| if (kind == .egg) {
+                    eggs += 1;
+                    try testing.expect(field.grid.col_of(flat) >= 4 - balance.BACK_RANKS);
+                },
+                else => {},
+            }
+        }
+        try testing.expectEqual(@as(u16, 1), eggs);
+        // The seeded egg left the reservoir, not thin air: slime is conserved.
+        try testing.expectEqual(@as(u32, 101), field.remaining());
+    }
+}
+
+test "guaranteed_at_start seeds nothing when the supply holds none of the kind" {
+    var bal = fixtures.test_config.balance;
+    bal.specials[@intFromEnum(c.SpecialKind.egg)].guaranteed_at_start = true;
+
+    var rng = prng(3);
+    const res = c.SlimeReservoir{ .neutral = 5 };
+    var field = SlimeField.init(.{ .rows = 2, .cols = 3 }, res, &bal, rng.random());
+
+    try testing.expectEqual(@as(u16, 5), field.grid.occupied());
+    for (field.grid.live()) |cell| {
+        try testing.expect(cell != .special);
+    }
+}
+
+test "guaranteed_at_start is a no-op when no cell may seat the kind" {
+    // A single-column grid with the door restriction (the default) bars
+    // every cell to specials: the guarantee cannot fire, the egg waits in
+    // the reservoir, and the rest of the fill proceeds untouched.
+    var bal = fixtures.test_config.balance;
+    bal.specials[@intFromEnum(c.SpecialKind.egg)].guaranteed_at_start = true;
+
+    var rng = prng(5);
+    const res = c.SlimeReservoir{ .neutral = 2, .special = .{ 0, 1, 0, 0, 0 } };
+    var field = SlimeField.init(.{ .rows = 3, .cols = 1 }, res, &bal, rng.random());
+
+    try testing.expectEqual(@as(u16, 1), field.reservoir.special[@intFromEnum(c.SpecialKind.egg)]);
+    try testing.expectEqual(@as(u16, 2), field.grid.occupied());
 }
 
 test "an unrestricted egg spawns anywhere but the door column (the default)" {

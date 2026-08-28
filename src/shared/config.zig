@@ -148,6 +148,7 @@ const TiersU16Json = struct { red: u16 = 0, yellow: u16 = 0, green: u16 = 0 };
 const SpecialTuningJson = struct {
     match_len: u8 = balance.DEFAULT_MATCH_LEN,
     back_ranks_only: bool = false,
+    guaranteed_at_start: bool = false,
     charge_refill: u16 = balance.DEFAULT_CHARGE_REFILL,
     explode_rocks_only: bool = false,
 };
@@ -305,6 +306,7 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         specials[f.value] = .{
             .match_len = t.match_len,
             .back_ranks_only = t.back_ranks_only,
+            .guaranteed_at_start = t.guaranteed_at_start,
             .charge_refill = t.charge_refill,
             .explode_rocks_only = t.explode_rocks_only,
         };
@@ -1210,6 +1212,25 @@ test "back_ranks_only defaults off and is read per kind" {
     defer loaded.deinit();
     try std.testing.expect(loaded.config.balance.special_tuning(.egg).back_ranks_only);
     try std.testing.expect(!loaded.config.balance.special_tuning(.neutralizer).back_ranks_only);
+}
+
+test "guaranteed_at_start defaults off and is read per kind" {
+    var defaulted = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
+    defer defaulted.deinit();
+    for (defaulted.config.balance.specials) |tuning| {
+        try std.testing.expect(!tuning.guaranteed_at_start);
+    }
+
+    const doc =
+        \\{"hunger_cost_normal":1,
+        \\ "specials":{"egg":{"guaranteed_at_start":true}},
+        \\ "player_recipes":[{"label":"poke","shape":["#"]}],
+        \\ "team_recipes":[]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expect(loaded.config.balance.special_tuning(.egg).guaranteed_at_start);
+    try std.testing.expect(!loaded.config.balance.special_tuning(.neutralizer).guaranteed_at_start);
 }
 
 test "specials_avoid_door_column defaults on and is read" {

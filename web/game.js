@@ -3771,8 +3771,9 @@ function spawnMatchFloaters(game) {
 //
 // Hatched from eaten eggs, and brought along by boards that banked them.
 // PURELY VISUAL for now (their one mechanical effect — hunger capacity — is
-// server-side): small circles in the 5 placeholder type colours, idling on
-// posts under the field.  The TARGET brood is re-derived from every frame —
+// server-side): small circles in the 5 placeholder type colours, idling in
+// the Lil Guys' corral on the field's left edge.  The TARGET brood is
+// re-derived from every frame —
 // each seated player's board babies plus the session's hatched tally — so
 // joins, leaves, hatches, restarts and reconnects all reconcile to the same
 // picture.  A hatch additionally animates: the new baby spawns at the eaten
@@ -3798,17 +3799,26 @@ function babyRadius(rows, cols) {
   return Math.max(4, gridRect(rows, cols).cell * 0.16);
 }
 
-/** Resting spot for the i-th baby: a row of posts under the field. */
+/**
+ * Resting spot for the i-th baby: the same corral the Lil Guys queue in.
+ * The first column sits inside the guys' door column — the brood mills among
+ * the crew — and overflow columns march LEFT, behind their backs, staggered a
+ * half pitch so it reads as a scatter rather than a parade grid.  Clamped
+ * on-screen like the guys' own posts.
+ */
 function babyPost(i, rows, cols) {
   const g = gridRect(rows, cols);
+  const size = lilGuySize(rows, cols);
   const r = babyRadius(rows, cols);
-  const pitch = r * 3;
-  const perRow = Math.max(1, Math.floor(g.w / pitch));
-  const row = Math.floor(i / perRow);
-  const col = i % perRow;
+  const pitch = r * 2.6;
+  const perCol = Math.max(1, Math.floor(g.h / pitch));
+  const col = Math.floor(i / perCol);
+  const row = i % perCol;
+  const doorX = Math.max(4, g.x0 - size - LAYOUT.lilGuys.doorGap);
+  const jog = (col % 2) * pitch * 0.5;
   return {
-    x: g.x0 + r * 1.5 + col * pitch,
-    y: g.y0 + g.h + r * 2 + row * r * 2.6,
+    x: Math.max(4, doorX + size * 0.5 - col * pitch),
+    y: g.y0 + r * 1.5 + row * pitch + jog,
   };
 }
 

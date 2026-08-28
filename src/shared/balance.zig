@@ -190,6 +190,14 @@ pub const SpecialTuning = struct {
     /// (see slime.fill).  On a grid of `BACK_RANKS` columns or fewer the
     /// restriction covers every cell and is a no-op.
     back_ranks_only: bool = false,
+    /// When true, at least one unit of the kind is seated on the grid at the
+    /// START OF PLAY whenever the encounter's supply holds any: before the
+    /// initial fill, one unit is placed in a uniform-random cell that the
+    /// kind's spawn rules allow (see slime.SlimeField.init).  Only the
+    /// initial fill is affected — mid-game refills stay pure reservoir
+    /// draws.  A no-op when the supply holds none of the kind or no cell is
+    /// eligible.
+    guaranteed_at_start: bool = false,
     /// Charges refilled into the team pool when one of this kind is
     /// swallowed.  Only meaningful for kinds whose eat effect is
     /// `refill_charges` (the canister); ignored for every other kind.

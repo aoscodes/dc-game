@@ -16,7 +16,8 @@
     },
     "egg": {
       "match_len": 3,
-      "back_ranks_only": true
+      "back_ranks_only": true,
+      "guaranteed_at_start": true
     },
     "canister": {
       "charge_refill": 3
