@@ -163,6 +163,8 @@ async function load() {
       hunger_base: bal.hunger_base ?? DEFAULT_HUNGER_BASE,
       appetite_scale: bal.appetite_scale ?? DEFAULT_APPETITE_SCALE,
       hunger_player_cap: bal.hunger_player_cap ?? DEFAULT_HUNGER_PLAYER_CAP,
+      // Default like the server does: specials stay out of the door column.
+      specials_avoid_door_column: bal.specials_avoid_door_column ?? true,
       // Per-kind special tuning, densified so inputs always bind (and so a
       // round-trip PRESERVES it — older editors silently dropped the table).
       specials: Object.fromEntries(SPECIAL_KINDS.map((k) => [k, {
@@ -421,9 +423,16 @@ function renderRates() {
  * spawn restriction.  The checkbox pins the kind's spawns to the grid's
  * rightmost BACK_RANKS columns — the far side from the feast's door, where
  * (since slime never falls sideways) a unit stays for its whole life.
+ * Leads with the global door-column rule: no special ever spawns in
+ * column 0 while it is set.
  */
 function specialsRows() {
-  const rows = [];
+  const rows = [
+    el("label", {},
+      el("span", {}, "specials never spawn in the door column (column 0)"),
+      boolInput(state.balance, "specials_avoid_door_column")),
+    el("br"),
+  ];
   for (const k of SPECIAL_KINDS) {
     const tuning = state.balance.specials[k];
     rows.push(

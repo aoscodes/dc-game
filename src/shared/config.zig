@@ -217,6 +217,9 @@ const BalanceJson = struct {
     /// Hunger capacity per baby Lil Guy; defaulted so configs written before
     /// babies keep validating.
     baby_hunger: u16 = balance.DEFAULT_BABY_HUNGER,
+    /// When true (the default), no special kind ever spawns in column 0 —
+    /// the feast's door.  Defaulted so older configs keep validating.
+    specials_avoid_door_column: bool = true,
     /// Per-special-kind tuning; defaulted so configs written before special
     /// kinds keep validating.
     specials: SpecialsJson = .{},
@@ -374,6 +377,7 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         .appetite_scale = raw.appetite_scale,
         .hunger_player_cap = raw.hunger_player_cap,
         .baby_hunger = raw.baby_hunger,
+        .specials_avoid_door_column = raw.specials_avoid_door_column,
         .specials = specials,
         .player_recipes = players,
         .team_recipes = teams,
@@ -1206,6 +1210,22 @@ test "back_ranks_only defaults off and is read per kind" {
     defer loaded.deinit();
     try std.testing.expect(loaded.config.balance.special_tuning(.egg).back_ranks_only);
     try std.testing.expect(!loaded.config.balance.special_tuning(.neutralizer).back_ranks_only);
+}
+
+test "specials_avoid_door_column defaults on and is read" {
+    var defaulted = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
+    defer defaulted.deinit();
+    try std.testing.expect(defaulted.config.balance.specials_avoid_door_column);
+
+    const doc =
+        \\{"hunger_cost_normal":1,
+        \\ "specials_avoid_door_column":false,
+        \\ "player_recipes":[{"label":"poke","shape":["#"]}],
+        \\ "team_recipes":[]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expect(!loaded.config.balance.specials_avoid_door_column);
 }
 
 test "baby_hunger defaults and is read" {

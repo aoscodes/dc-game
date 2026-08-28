@@ -17,9 +17,12 @@
 //!
 //!   fill        — move reservoir slime into empty cells, TOP ROW FIRST
 //!                 (row 0 down), each unit's type drawn from the reservoir in
-//!                 proportion to what remains.  A `back_ranks_only` special
-//!                 kind (balance.SpecialTuning) is only ever seated in the
-//!                 rightmost BACK_RANKS columns; a front cell whose eligible
+//!                 proportion to what remains.  With
+//!                 `specials_avoid_door_column` (balance.Balance, default on)
+//!                 NO special is ever seated in column 0 — the feast's door —
+//!                 and a `back_ranks_only` special kind
+//!                 (balance.SpecialTuning) is only ever seated in the
+//!                 rightmost BACK_RANKS columns; a cell whose eligible
 //!                 pool is empty is SKIPPED, not filled.
 //!   apply_shape — stamp a cast's footprint at an aimed anchor, DOWNGRADING
 //!                 every covered hazard one tier.  Deterministic: the player
@@ -113,14 +116,16 @@ pub const SlimeField = struct {
     /// downward so refills visibly enter from above.  Stops when the grid is
     /// full or the reservoir runs dry.  Returns the number of cells filled.
     ///
-    /// A `back_ranks_only` special kind may only be seated in the rightmost
-    /// `balance.BACK_RANKS` columns — the far side from the feast's door, and
-    /// (since collapse never moves a cell sideways) the columns it will hold
-    /// for its whole life.  A front cell whose ELIGIBLE pool is empty (the
-    /// reservoir holds only restricted kinds) is SKIPPED, not filled, and the
-    /// walk continues: back cells still take what is theirs.  A skipped cell
-    /// consumes NO randomness — exactly one draw per cell filled is the
-    /// cross-implementation contract the board's port mirrors.
+    /// With `specials_avoid_door_column` set (the default) NO special kind is
+    /// ever seated in column 0 — the feast's door — and a `back_ranks_only`
+    /// special kind may only be seated in the rightmost `balance.BACK_RANKS`
+    /// columns — the far side from the door.  Since collapse never moves a
+    /// cell sideways, a unit holds its spawn column for its whole life.  A
+    /// cell whose ELIGIBLE pool is empty (the reservoir holds only restricted
+    /// kinds) is SKIPPED, not filled, and the walk continues: other cells
+    /// still take what is theirs.  A skipped cell consumes NO randomness —
+    /// exactly one draw per cell filled is the cross-implementation contract
+    /// the board's port mirrors.
     pub fn fill(self: *SlimeField, bal: *const balance.Balance, rand: std.Random) u16 {
         var filled: u16 = 0;
         var flat: u16 = 0;
@@ -136,17 +141,21 @@ pub const SlimeField = struct {
         return filled;
     }
 
-    /// True when a special kind may spawn in `col`: either unrestricted, or
-    /// the column is one of the grid's rightmost `balance.BACK_RANKS`.
+    /// True when a special kind may spawn in `col`.  Column 0 — the feast's
+    /// door — is barred to EVERY special while `specials_avoid_door_column`
+    /// is set (the default); beyond that a kind is either unrestricted or
+    /// limited to the grid's rightmost `balance.BACK_RANKS` columns.
     fn may_spawn(self: *const SlimeField, bal: *const balance.Balance, kind: c.SpecialKind, col: u8) bool {
+        if (bal.specials_avoid_door_column and col == 0) return false;
         if (!bal.special_tuning(kind).back_ranks_only) return true;
         return col >= self.grid.cols -| balance.BACK_RANKS;
     }
 
     /// Draw one unit for a cell in `col`, chosen uniformly among the ELIGIBLE
     /// units remaining (so the grid mixes in proportion to the reservoir's
-    /// composition), where a `back_ranks_only` special kind is eligible only
-    /// in the back columns.  Returns null when nothing eligible remains —
+    /// composition), where eligibility is `may_spawn` (no special in the door
+    /// column, `back_ranks_only` kinds only in the back columns).  Returns
+    /// null when nothing eligible remains —
     /// the caller skips the cell.  Buckets are walked in a fixed order
     /// (neutral, specials by ordinal, tiers), part of the lockstep contract.
     fn take_from_reservoir(
@@ -947,11 +956,44 @@ test "restricted eggs never drift left of the back ranks across whole turns" {
     }
 }
 
-test "an unrestricted egg spawns anywhere (the default)" {
-    // Default tuning: a one-column-wide front cell takes the egg happily.
+test "an unrestricted egg spawns anywhere but the door column (the default)" {
+    // Default tuning: no back-ranks restriction, but the door column is
+    // still barred to every special — the lone egg skips the col-0 cell
+    // (spending no draw) and seats in the next one.
     var rng = prng(9);
     const res = c.SlimeReservoir{ .special = .{ 0, 1, 0, 0, 0 } };
     const field = SlimeField.init(.{ .rows = 1, .cols = 3 }, res, test_bal, rng.random());
+    try testing.expectEqual(c.SlimeCell.empty, field.grid.get(0));
+    try testing.expectEqual(c.SlimeCell{ .special = .egg }, field.grid.get(1));
+}
+
+test "no special is ever seated in the door column (the default)" {
+    // All-rock reservoir (an unrestricted kind) on a 2x3 grid: the two
+    // door-column cells are SKIPPED — left empty, no draw spent — while the
+    // four other cells fill.
+    var rng = prng(11);
+    const res = c.SlimeReservoir{ .special = .{ 0, 0, 20, 0, 0 } };
+    var field = SlimeField.init(.{ .rows = 2, .cols = 3 }, res, test_bal, rng.random());
+
+    try testing.expectEqual(@as(u16, 4), field.grid.occupied());
+    var row: u8 = 0;
+    while (row < 2) : (row += 1) {
+        var col: u8 = 0;
+        while (col < 3) : (col += 1) {
+            const expected: c.SlimeCell = if (col == 0) .empty else .{ .special = .rock };
+            try testing.expectEqual(expected, field.grid.at(row, col));
+        }
+    }
+    try testing.expectEqual(@as(u32, 16), field.reservoir.total());
+}
+
+test "specials_avoid_door_column off lets a special seat in column 0" {
+    var bal = fixtures.test_config.balance;
+    bal.specials_avoid_door_column = false;
+
+    var rng = prng(9);
+    const res = c.SlimeReservoir{ .special = .{ 0, 1, 0, 0, 0 } };
+    const field = SlimeField.init(.{ .rows = 1, .cols = 3 }, res, &bal, rng.random());
     try testing.expectEqual(c.SlimeCell{ .special = .egg }, field.grid.get(0));
 }
 

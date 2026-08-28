@@ -1,0 +1,11 @@
+{
+  "frame_w": 32,
+  "frame_h": 32,
+  "frames": {
+    "rose": 0,
+    "mint": 1,
+    "sky": 2,
+    "gold": 3,
+    "plum": 4
+  }
+}

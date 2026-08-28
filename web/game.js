@@ -278,9 +278,12 @@ const LIL_GUY_SPRITE = "lilguy";
  *  shared with the e-paper badge.  Frames are picked by NAME from its json
  *  (hard/medium/soft/goo + *_invert for selected cells). */
 const SLIME_SPRITE = "slime";
+/** The baby atlas (scripts/gen_babies.py): the authored critters, one frame
+ *  per BabyType, picked by NAME from its json (rose..plum). */
+const BABY_SPRITE = "babies";
 
-/** Sprite sheets to load: the Lil Guys and the slime tile atlas. */
-const CLASSES = [LIL_GUY_SPRITE, SLIME_SPRITE];
+/** Sprite sheets to load: the Lil Guys, the slime tile atlas and the brood. */
+const CLASSES = [LIL_GUY_SPRITE, SLIME_SPRITE, BABY_SPRITE];
 
 const sprites = new Map();
 
@@ -1389,11 +1392,13 @@ const BOMB_COLOR = "rgba(225,110,40,1)";
  *  did. */
 let BOMB_ROCKS_ONLY = false;
 
-/** BabyType ordinal → placeholder colour name; matches components.BabyType.
- *  These are the 5 baby kinds until real assets/identities arrive. */
+/** BabyType ordinal → type name; matches components.BabyType.  Each has
+ *  authored art in the baby atlas (BABY_SPRITE), keyed by these names. */
 const BABY_TYPES = ["rose", "mint", "sky", "gold", "plum"];
 
-/** Baby glyph colours by type — the 5 placeholder circle styles. */
+/** Colour per baby type.  The critters draw as black-and-white sprites for
+ *  now; this table is the fallback dot when the atlas has not loaded, and
+ *  the palette for the per-type colour identity that is coming later. */
 const BABY_COLOR = {
   rose: "rgba(230,110,140,1)",
   mint: "rgba(110,210,160,1)",
@@ -3895,11 +3900,26 @@ function drawBabies(game) {
   if (babyViews.length === 0) return;
   const { rows, cols } = gridDims(game);
   const r = babyRadius(rows, cols);
+  const atlas = sprites.get(BABY_SPRITE);
   for (const b of babyViews) {
     const bob = Math.sin(babyClock * 2.2 + b.phase) * r * 0.18;
-    // A bite puffs the baby up for a beat — the circle's stand-in for the
-    // Lil Guys' attack clip until real assets arrive.
+    // A bite puffs the baby up for a beat — the sprite's stand-in for the
+    // Lil Guys' attack clip (the babies' sheet has no action frames).
     const puff = (b.chompT ?? 0) > 0 ? 1 + 0.45 * (b.chompT / BABY_CHOMP_S) : 1;
+    const idx = atlas?.meta.frames[b.type];
+    if (atlas !== undefined && idx !== undefined) {
+      // The authored critter, centred where the dot used to sit.  4r reads
+      // as half a Lil Guy: recognisably the same species, clearly a baby.
+      const s = r * 4 * puff;
+      const { frame_w, frame_h } = atlas.meta;
+      ctx.save();
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(atlas.img, idx * frame_w, 0, frame_w, frame_h,
+        b.x - s / 2, b.y + bob - s / 2, s, s);
+      ctx.restore();
+      continue;
+    }
+    // Atlas not loaded: the old placeholder dot, so the brood never vanishes.
     ctx.save();
     ctx.fillStyle = BABY_COLOR[b.type] ?? NEUTRAL_COLOR;
     ctx.beginPath();

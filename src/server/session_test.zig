@@ -2111,8 +2111,10 @@ test "a refilled line of neutralizers stays put: matches are dormant" {
     const bottom = grid.rows - 1;
     // A red on the floor keeps the encounter alive; the reservoir holds
     // EXACTLY three neutralizers, so the refill lands them on the top row's
-    // first three cells — a line the moment they arrive.  Nothing fires:
-    // match machinery is dormant, and refills are never eaten same-turn.
+    // first three ELIGIBLE cells — the door column (col 0) never takes a
+    // special, so they seat at cols 1..3, a line the moment they arrive.
+    // Nothing fires: match machinery is dormant, and refills are never
+    // eaten same-turn.
     grid.set(bottom, 0, tiered(.red));
     s.sess.field.reservoir = .{};
     s.sess.field.reservoir.special[@intFromEnum(c.SpecialKind.neutralizer)] = 3;
@@ -2120,9 +2122,10 @@ test "a refilled line of neutralizers stays put: matches are dormant" {
     s.p[0].clear();
     try end_turn_idly(&s.sess);
 
-    try std.testing.expectEqual(SC(.{ .special = .neutralizer }), grid.get(0));
+    try std.testing.expectEqual(SC(.empty), grid.get(0));
     try std.testing.expectEqual(SC(.{ .special = .neutralizer }), grid.get(1));
     try std.testing.expectEqual(SC(.{ .special = .neutralizer }), grid.get(2));
+    try std.testing.expectEqual(SC(.{ .special = .neutralizer }), grid.get(3));
     try std.testing.expectEqual(@as(u16, 3), grid.special_count());
 
     const msgs = try drain(s.p[0].buf.items, arena);
@@ -2132,7 +2135,7 @@ test "a refilled line of neutralizers stays put: matches are dormant" {
     const fr = try proto.decode_field_refilled(fbs.reader());
     try std.testing.expectEqual(@as(u8, 0), fr.pass);
     try std.testing.expectEqual(@as(u16, 3), fr.count);
-    try std.testing.expectEqualSlices(u16, &[_]u16{ 0, 1, 2 }, fr.cells[0..3]);
+    try std.testing.expectEqualSlices(u16, &[_]u16{ 1, 2, 3 }, fr.cells[0..3]);
     for (fr.contents[0..3]) |cell| {
         try std.testing.expectEqual(SC(.{ .special = .neutralizer }), cell);
     }

@@ -9,6 +9,7 @@
   },
   "casts_per_turn": 1,
   "baby_hunger": 10,
+  "specials_avoid_door_column": true,
   "specials": {
     "neutralizer": {
       "match_len": 3

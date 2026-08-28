@@ -235,6 +235,14 @@ pub const Balance = struct {
     /// Hunger capacity each baby Lil Guy in the encounter adds to the pool —
     /// babies a board brought AND babies hatched mid-game alike.
     baby_hunger: u16 = DEFAULT_BABY_HUNGER,
+    /// When true, NO special kind may ever ENTER the field in column 0 —
+    /// the feast's door on the left edge.  Collapse never moves a cell
+    /// sideways, so the door column stays special-free for the whole game.
+    /// A fill whose reservoir holds only specials leaves door cells empty
+    /// rather than seating one (see slime.fill).  Mirrored by the board
+    /// firmware (board/src/game/balance.c), so a change here should be made
+    /// there too.
+    specials_avoid_door_column: bool = true,
     /// Per-SpecialKind tuning, indexed by SpecialKind ordinal.
     specials: [c.SpecialKind.size]SpecialTuning =
         [_]SpecialTuning{.{}} ** c.SpecialKind.size,

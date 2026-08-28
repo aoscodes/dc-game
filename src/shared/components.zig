@@ -214,9 +214,10 @@ pub const SpecialEffect = enum(u8) {
     explode = 3,
 };
 
-/// The five types a hatched baby Lil Guy can be.  Placeholder colour names
-/// until real assets/identities arrive; the ordinal is the wire and flash
-/// identity, so ORDER IS PERMANENT even when the names improve.
+/// The five types a hatched baby Lil Guy can be.  Each has authored art
+/// (board/src/render/assets/art/babies, LilGuys-Baby1..5 in this order);
+/// the colour names are working labels, and the ordinal is the wire and
+/// flash identity, so ORDER IS PERMANENT even when the names improve.
 ///
 /// Babies are purely visual this pass except for one number: each baby in
 /// the encounter (brought by a board or hatched mid-game) adds
