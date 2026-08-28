@@ -25,6 +25,9 @@ pub const Writer = struct {
         game.recipe_count = 0;
         game.turn_ended = null;
         game.shape_cast_count = 0;
+        game.special_match_count = 0;
+        game.eggs_hatched = null;
+        game.refill_count = 0;
     }
 
     pub fn write_send(self: Writer, bytes: []const u8) void {
@@ -78,6 +81,18 @@ pub const GameState = struct {
     /// cells the server hit without re-deriving placement.
     shape_casts: [16]proto.ShapeCast = undefined,
     shape_cast_count: u8 = 0,
+    /// Special matches resolved since the last render write (transient):
+    /// the popped run and the effect it released, per match.
+    special_matches: [16]proto.SpecialMatched = undefined,
+    special_match_count: u8 = 0,
+    /// The eggs the turn's feast hatched, if any hatched since the last
+    /// render write (transient) — at most one batch per turn end.
+    eggs_hatched: ?proto.EggsHatched = null,
+    /// Per-pass reservoir refills since the last render write (transient),
+    /// in pass order — the one part of a cascading settle the renderer
+    /// cannot derive.  16 passes is far beyond any real cascade.
+    refills: [16]proto.FieldRefilled = undefined,
+    refill_count: u8 = 0,
 };
 
 fn write_render_inner(
@@ -104,6 +119,7 @@ fn write_render_inner(
             .selected_shape = e.selected_shape,
             .cursor_row = e.cursor_row,
             .cursor_col = e.cursor_col,
+            .babies = babies(e.babies),
         };
     }
 
@@ -149,6 +165,52 @@ fn write_render_inner(
         .walls = te.walls,
         .score_added = te.score_added,
         .charges_left = te.charges_left,
+        .passes = te.passes,
+    } else null;
+
+    // Convert transient special matches for JSON.  Cell lists pass through
+    // verbatim: the server resolved the runs, the renderer just pops them.
+    var match_buf: [16]JsonSpecialMatched = undefined;
+    var match_cells_bufs: [16][proto.MAX_MATCH_CELLS_WIRE]u16 = undefined;
+    for (game.special_matches[0..game.special_match_count], 0..) |sm, i| {
+        @memcpy(match_cells_bufs[i][0..sm.cell_count], sm.cells[0..sm.cell_count]);
+        match_buf[i] = .{
+            .kind = @tagName(sm.kind),
+            .pass = sm.pass,
+            .center = sm.center,
+            .cells = match_cells_bufs[i][0..sm.cell_count],
+            .downgraded = tiers(sm.downgraded),
+            .neutralized = sm.neutralized,
+        };
+    }
+
+    // Convert transient per-pass refills for JSON: cells plus their contents
+    // as the same names the grid uses, so the renderer can drop them onto its
+    // replay board verbatim.
+    var refill_buf: [16]JsonRefill = undefined;
+    var refill_cells_bufs: [16][proto.MAX_REFILL_WIRE]u16 = undefined;
+    var refill_names_bufs: [16][proto.MAX_REFILL_WIRE][]const u8 = undefined;
+    for (game.refills[0..game.refill_count], 0..) |fr, i| {
+        @memcpy(refill_cells_bufs[i][0..fr.count], fr.cells[0..fr.count]);
+        for (fr.contents[0..fr.count], 0..) |cell, j| {
+            refill_names_bufs[i][j] = cell_name(cell);
+        }
+        refill_buf[i] = .{
+            .pass = fr.pass,
+            .cells = refill_cells_bufs[i][0..fr.count],
+            .contents = refill_names_bufs[i][0..fr.count],
+        };
+    }
+
+    // Convert this frame's hatches (if any) for JSON: parallel cell/type
+    // lists, types by placeholder colour name.
+    var hatch_types_buf: [proto.MAX_HATCHES_WIRE][]const u8 = undefined;
+    const eggs_hatched: ?JsonEggsHatched = if (game.eggs_hatched) |eh| blk: {
+        for (eh.types[0..eh.count], 0..) |t, i| hatch_types_buf[i] = @tagName(t);
+        break :blk .{
+            .cells = eh.cells[0..eh.count],
+            .types = hatch_types_buf[0..eh.count],
+        };
     } else null;
 
     // The slime grid as one compact string per cell (row-major, row 0 = top),
@@ -184,10 +246,12 @@ fn write_render_inner(
                     .sheltered = ms.feast.sheltered,
                     .neutral = ms.feast.neutral_consumed,
                     .defused = ms.feast.defused_consumed,
+                    .agents = ms.feast.agents_consumed,
                     .hunger_normal = ms.feast.hunger_normal,
                     .charges_spent = ms.feast.charges_spent,
                     .charges_left = ms.feast.charges_left,
                 },
+                .eggs_hatched = babies_u16(ms.eggs_hatched),
                 .players = pstats_buf[0..ms.player_count],
                 .player_recipe_hits = ms.player_recipe_hits[0..ms.player_recipe_count],
                 .team_recipe_hits = ms.team_recipe_hits[0..ms.team_recipe_count],
@@ -227,6 +291,7 @@ fn write_render_inner(
             .grid_cols = game.snapshot.grid_cols,
             .grid = grid_buf[0..grid_len],
             .reservoir = game.snapshot.reservoir,
+            .hatched = babies_u16(game.snapshot.hatched),
             .pending = pending_buf[0..game.snapshot.pending_count],
             .over_budget = if (game.over_budget) |ob|
                 JsonOverBudget{ .needed = ob.needed, .have = ob.have }
@@ -235,6 +300,9 @@ fn write_render_inner(
             .recipes_fired = recipes_buf[0..game.recipe_count],
             .turn_ended = turn_ended,
             .shape_casts = shape_cast_buf[0..game.shape_cast_count],
+            .special_matches = match_buf[0..game.special_match_count],
+            .eggs_hatched = eggs_hatched,
+            .refills = refill_buf[0..game.refill_count],
         } else null,
         .score = if (phase == .game_over) game.final_score else null,
         .stats = json_stats,
@@ -246,14 +314,18 @@ fn write_render_inner(
 /// One slime cell as a compact renderer-facing name.  Hazards are named by
 /// their difficulty TIER ("red" = 3 casts from harmless, "green" = 1);
 /// "defused" is a fully neutralized cell, which is harmless but still edible.
-/// "special" is the objective slime: inert to casts, inedible, and a permanent
-/// wall, so the renderer must never draw it as either food or a hazard.
+/// Specials are named per kind: "special_neutralizer" is inert to casts,
+/// inedible and a wall (and pops when matched); "special_egg" is edible and
+/// hatches a baby, so the renderer must draw it as food with a prize inside.
 fn cell_name(cell: c.SlimeCell) []const u8 {
     return switch (cell) {
         .empty => "empty",
         .neutral => "neutral",
         .neutralized => "defused",
-        .special => "special",
+        .special => |kind| switch (kind) {
+            .neutralizer => "special_neutralizer",
+            .egg => "special_egg",
+        },
         .tiered => |t| switch (t) {
             .red => "red",
             .yellow => "yellow",
@@ -268,6 +340,28 @@ fn tiers(values: [c.Tier.size]u16) JsonTiers {
         .red = values[0],
         .yellow = values[1],
         .green = values[2],
+    };
+}
+
+/// Convert a per-BabyType u32 array into named JSON fields.
+fn babies(values: c.BabyCounts) JsonBabies {
+    return .{
+        .rose = values[0],
+        .mint = values[1],
+        .sky = values[2],
+        .gold = values[3],
+        .plum = values[4],
+    };
+}
+
+/// Same, from the u16 tallies (session hatches, match stats).
+fn babies_u16(values: [c.BabyType.size]u16) JsonBabies {
+    return .{
+        .rose = values[0],
+        .mint = values[1],
+        .sky = values[2],
+        .gold = values[3],
+        .plum = values[4],
     };
 }
 
@@ -303,6 +397,17 @@ const JsonTiers = struct {
     green: u16,
 };
 
+/// Per-baby-type counts with named fields (BabyType ordinal order).  The
+/// names are the placeholder colours; the renderer keys its 5 glyph styles
+/// off them.
+const JsonBabies = struct {
+    rose: u32,
+    mint: u32,
+    sky: u32,
+    gold: u32,
+    plum: u32,
+};
+
 /// Match-wide feast totals over the whole encounter.  `covered` counts cells a
 /// stamp downgraded, bucketed by the tier they were BEFORE the downgrade.
 const JsonFeastStats = struct {
@@ -313,6 +418,8 @@ const JsonFeastStats = struct {
     sheltered: u32,
     neutral: u16,
     defused: u16,
+    /// Neutralizers swallowed — free equipment, never scored.
+    agents: u16,
     hunger_normal: u16,
     charges_spent: u32,
     charges_left: u32,
@@ -337,6 +444,9 @@ const JsonMatchStats = struct {
     slime_total: u32,
     slime_left: u32,
     feast: JsonFeastStats,
+    /// Babies hatched over the whole encounter, per type — what every board
+    /// that completed it banks into its flash.
+    eggs_hatched: JsonBabies,
     players: []const JsonPlayerStats,
     player_recipe_hits: []const u16,
     team_recipe_hits: []const u16,
@@ -377,6 +487,9 @@ const JsonGame = struct {
     grid: []const []const u8,
     /// Slime still waiting off-grid; it refills the field after each feast.
     reservoir: u32,
+    /// Babies hatched so far this encounter, per type.  Session-owned — a
+    /// reconnecting renderer rebuilds its brood from this.
+    hatched: JsonBabies,
     /// Casts locked in this turn and not yet resolved, in lock-in order.  This
     /// IS the turn as it stands: the renderer marks each one on the board and
     /// previews the whole list plus the viewer's own live aim.
@@ -395,6 +508,46 @@ const JsonGame = struct {
     /// Shapes stamped since the previous frame (transient), one per landed
     /// cast.
     shape_casts: []const JsonShapeCast,
+    /// Special matches resolved since the previous frame (transient): the
+    /// renderer pops `cells` and flashes the effect at `center`.
+    special_matches: []const JsonSpecialMatched,
+    /// The eggs the turn's feast hatched, if any hatched since the previous
+    /// frame (transient).  Parallel lists: `cells[i]` hatched a `types[i]`.
+    eggs_hatched: ?JsonEggsHatched,
+    /// Per-pass reservoir refills (transient), in pass order.  A turn's
+    /// settle CASCADES while matches keep re-opening the feast; these are
+    /// the only unknowable step, so with them the renderer replays every
+    /// pass exactly.
+    refills: []const JsonRefill,
+};
+
+/// One settle pass's refill: `cells[i]` was filled with a unit whose grid
+/// name is `contents[i]`.
+const JsonRefill = struct {
+    pass: u8,
+    cells: []const u16,
+    contents: []const []const u8,
+};
+
+/// One resolved special match.  `cells` are absolute flat grid indices (the
+/// popped run, already resolved server-side); `center` is where the effect
+/// landed; `downgraded`/`neutralized` describe what a neutralize_block did;
+/// `pass` is the settle pass it fired in.
+const JsonSpecialMatched = struct {
+    /// SpecialKind name, e.g. "neutralizer".
+    kind: []const u8,
+    pass: u8,
+    center: u16,
+    cells: []const u16,
+    downgraded: JsonTiers,
+    neutralized: u16,
+};
+
+/// One turn's hatches: `cells[i]` (flat grid index of the eaten egg) hatched
+/// a baby of `types[i]` (BabyType placeholder colour name).
+const JsonEggsHatched = struct {
+    cells: []const u16,
+    types: []const []const u8,
 };
 
 /// One landed stamp.  `cells` are ABSOLUTE flat grid indices, already clipped
@@ -446,6 +599,8 @@ const JsonTurnEnded = struct {
     score_added: u32,
     /// The shared pool AFTER this turn: the client's running budget readout.
     charges_left: u32,
+    /// Settle passes the turn took (>= 1; matches re-open the feast).
+    passes: u8,
 };
 
 const JsonEntity = struct {
@@ -463,4 +618,7 @@ const JsonEntity = struct {
     /// teammates can see each other's aim.
     cursor_row: u8,
     cursor_col: u8,
+    /// The babies this player's board brought, per type — drawn beside their
+    /// owner and gone when they leave.
+    babies: JsonBabies,
 };

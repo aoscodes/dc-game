@@ -59,7 +59,8 @@ const RATE_FIELDS = [
  * @type {{
  *   balance: object,
  *   encounter: { charges: number,
- *                slime: { tiered: object, neutral: number, special: number } },
+ *                slime: { tiered: object, neutral: number,
+ *                         special: {neutralizer: number, egg: number} } },
  * }}
  * `encounter.slime` is the ONE slime pool of the encounter: whatever does not
  * fit on the grid waits in the reservoir and refills from the top.
@@ -88,16 +89,30 @@ const tiersFrom = (sparse) =>
 const sparseTiers = (dense) =>
   Object.fromEntries(TIERS.filter((t) => (dense?.[t] ?? 0) > 0).map((t) => [t, dense[t]]));
 
+/** Special kinds, mirroring components.SpecialKind (ordinal order).
+ *  `neutralizer` is the inert wall that pops when a line matches; `egg` is
+ *  edible and hatches a baby. */
+const SPECIAL_KINDS = ["neutralizer", "egg"];
+
+const specialsFrom = (obj) =>
+  Object.fromEntries(SPECIAL_KINDS.map((k) => [k, obj?.[k] ?? 0]));
+
+const sparseSpecials = (dense) =>
+  Object.fromEntries(SPECIAL_KINDS.filter((k) => (dense?.[k] ?? 0) > 0).map((k) => [k, dense[k]]));
+
+const sumSpecials = (obj) =>
+  SPECIAL_KINDS.reduce((n, k) => n + (obj?.[k] ?? 0), 0);
+
 /**
  * Collapse a legacy `zones` array into the one slime pool, mirroring
  * config.zig: per-tier hazard counts and neutral units are summed.
  */
 function sumZones(zones) {
-  const pool = { tiered: tiersFrom(null), neutral: 0, special: 0 };
+  const pool = { tiered: tiersFrom(null), neutral: 0, special: specialsFrom(null) };
   for (const z of zones) {
     for (const t of TIERS) pool.tiered[t] += (z.tiered ?? {})[t] ?? 0;
     pool.neutral += z.neutral ?? 0;
-    pool.special += z.special ?? 0;
+    for (const k of SPECIAL_KINDS) pool.special[k] += (z.special ?? {})[k] ?? 0;
   }
   return pool;
 }
@@ -473,12 +488,15 @@ function renderEncounter() {
     el("div", { class: "row" },
       el("span", { class: "muted" }, "neutral slime units "),
       numInput(pool, "neutral", 0, 65535, 1, "", renderSlimeTotal)),
-    // Specials are the objective: inert to every cast, inedible, and a
-    // permanent wall.  They are counted apart from the pool totals below for
-    // that reason — they are scenery the team must plan around, not content.
+    // Special kinds: the neutralizer is inert to every cast; the feast
+    // swallows it for free and it fires a 3x3 Neutralizing Agent block as it
+    // goes down.  The egg is ordinary food and hatches a baby when eaten.
     el("div", { class: "row" },
-      el("span", { class: "muted" }, "special slime units (objective — inert, inedible, permanent wall) "),
-      numInput(pool, "special", 0, 65535, 1, "", renderSlimeTotal)),
+      el("span", { class: "muted" }, "neutralizer specials (free pickup; fires a 3x3 Agent block when eaten) "),
+      numInput(pool.special, "neutralizer", 0, 65535, 1, "", renderSlimeTotal)),
+    el("div", { class: "row" },
+      el("span", { class: "muted" }, "egg specials (edible; hatches a baby when eaten) "),
+      numInput(pool.special, "egg", 0, 65535, 1, "", renderSlimeTotal)),
   ));
   renderSlimeTotal();
 }
@@ -487,7 +505,7 @@ function renderEncounter() {
 function renderSlimeTotal() {
   const pool = state.encounter.slime;
   const grid = state.balance.slime_grid;
-  const total = TIERS.reduce((n, t) => n + pool.tiered[t], 0) + pool.neutral + pool.special;
+  const total = TIERS.reduce((n, t) => n + pool.tiered[t], 0) + pool.neutral + sumSpecials(pool.special);
   const cells = grid.rows * grid.cols;
   const reserved = Math.max(0, total - cells);
   document.getElementById("slime-total").textContent = reserved > 0
@@ -568,8 +586,8 @@ document.getElementById("save").addEventListener("click", async () => {
           zones: [{
             tiered: sparseTiers(state.encounter.slime.tiered),
             neutral: state.encounter.slime.neutral,
-            ...(state.encounter.slime.special > 0
-              ? { special: state.encounter.slime.special } : {}),
+            ...(sumSpecials(state.encounter.slime.special) > 0
+              ? { special: sparseSpecials(state.encounter.slime.special) } : {}),
           }],
         },
       }),

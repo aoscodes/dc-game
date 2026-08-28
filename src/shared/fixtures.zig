@@ -131,19 +131,20 @@ pub const team_recipes = [_]balance.TeamRecipe{
 };
 
 /// Default fixture encounter.  Totals: 112 units — 30 neutral, 80 hazard and 2
-/// specials.  Every unit eaten costs 1 hunger against a 200 bar for the usual
-/// two-player test session (2 × the fixture `hunger_base` of 100), so hunger
-/// is deliberately NOT the binding constraint here: the fixture exists to
-/// exercise the path and the charge economy.  The 6×10 fixture grid holds 60,
-/// so 52 units always start in the reservoir, and the 2 specials guarantee
-/// tests meet a cell nothing can remove.
+/// neutralizer specials.  Every unit eaten costs 1 hunger against a 200 bar
+/// for the usual two-player test session (2 × the fixture `hunger_base` of
+/// 100), so hunger is deliberately NOT the binding constraint here: the
+/// fixture exists to exercise the path and the charge economy.  The 6×10
+/// fixture grid holds 60, so 52 units always start in the reservoir, and the
+/// 2 neutralizers guarantee tests meet a cell nothing can remove.  No eggs:
+/// hatch-path tests seed their own so the baseline totals stay hatch-free.
 pub const encounters = [_]enc.Encounter{
     .{
         .label = "slime_feast_01",
         // Enough charges to matter but not enough to ignore: 40 charges against
         // 80 hazards means the team cannot simply defuse everything.
         .charges = 40,
-        .slime = .{ .tiered = .{ 35, 25, 20 }, .neutral = 30, .special = 2 },
+        .slime = .{ .tiered = .{ 35, 25, 20 }, .neutral = 30, .special = .{ 2, 0 } },
     },
 };
 

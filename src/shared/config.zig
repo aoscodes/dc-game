@@ -74,6 +74,7 @@ pub const ConfigError = error{
     TooManyZones,
     NoSlime,
     InvalidHungerFormula,
+    InvalidMatchLen,
     UnknownDefaultEncounter,
 };
 
@@ -135,9 +136,33 @@ comptime {
     std.debug.assert(@intFromEnum(c.Tier.red) == 0);
     std.debug.assert(@intFromEnum(c.Tier.yellow) == 1);
     std.debug.assert(@intFromEnum(c.Tier.green) == 2);
+    // The special-kind JSON structs likewise map named fields onto
+    // SpecialKind-ordinal arrays.
+    std.debug.assert(@intFromEnum(c.SpecialKind.neutralizer) == 0);
+    std.debug.assert(@intFromEnum(c.SpecialKind.egg) == 1);
 }
 
 const TiersU16Json = struct { red: u16 = 0, yellow: u16 = 0, green: u16 = 0 };
+
+/// Tuning knobs for one special kind (see balance.SpecialTuning).
+const SpecialTuningJson = struct {
+    match_len: u8 = balance.DEFAULT_MATCH_LEN,
+};
+
+/// Per-kind tuning table.  Every kind defaults, so `"specials"` and any kind
+/// inside it are strictly opt-in.
+const SpecialsJson = struct {
+    neutralizer: SpecialTuningJson = .{},
+    egg: SpecialTuningJson = .{},
+};
+
+/// Per-kind special unit counts for one zone.  An OBJECT, not a scalar: the
+/// old `"special": 3` form named no kind and is rejected by the JSON parser,
+/// forcing configs to say which specials they mean.
+const SpecialCountsJson = struct {
+    neutralizer: u16 = 0,
+    egg: u16 = 0,
+};
 
 const PlayerRecipeJson = struct {
     label: []const u8,
@@ -180,6 +205,12 @@ const BalanceJson = struct {
     hunger_base: u16 = balance.DEFAULT_HUNGER_BASE,
     appetite_scale: u16 = balance.DEFAULT_APPETITE_SCALE,
     hunger_player_cap: u16 = balance.DEFAULT_HUNGER_PLAYER_CAP,
+    /// Hunger capacity per baby Lil Guy; defaulted so configs written before
+    /// babies keep validating.
+    baby_hunger: u16 = balance.DEFAULT_BABY_HUNGER,
+    /// Per-special-kind tuning; defaulted so configs written before special
+    /// kinds keep validating.
+    specials: SpecialsJson = .{},
     player_recipes: []const PlayerRecipeJson,
     team_recipes: []const TeamRecipeJson,
 };
@@ -190,9 +221,10 @@ const ZoneJson = struct {
     /// Hazard slime per difficulty tier.
     tiered: TiersU16Json = .{},
     neutral: u16 = 0,
-    /// Objective placeholders (components.SlimeCell.special).  Absent = none,
-    /// so existing configs stay valid and specials are strictly opt-in.
-    special: u16 = 0,
+    /// Special units per kind (components.SlimeCell.special).  Absent = none,
+    /// so configs without specials stay valid and specials are strictly
+    /// opt-in.
+    special: SpecialCountsJson = .{},
 };
 
 const EncounterJson = struct {
@@ -249,6 +281,25 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         });
         return ConfigError.InvalidHungerFormula;
     }
+    // A match_len of 0/1 would fire on every lone special, and one longer
+    // than the grid's longest line could never fire at all — both are always
+    // config mistakes.
+    const specials = [c.SpecialKind.size]balance.SpecialTuning{
+        .{ .match_len = raw.specials.neutralizer.match_len },
+        .{ .match_len = raw.specials.egg.match_len },
+    };
+    const longest_line = @max(raw.slime_grid.rows, raw.slime_grid.cols);
+    for (specials, 0..) |tuning, k| {
+        if (tuning.match_len < 2 or tuning.match_len > longest_line) {
+            fail("{s}: specials.{s} match_len {} outside 2..{} (grid's longest line)", .{
+                BALANCE_FILE,
+                @tagName(@as(c.SpecialKind, @enumFromInt(k))),
+                tuning.match_len,
+                longest_line,
+            });
+            return ConfigError.InvalidMatchLen;
+        }
+    }
     if (raw.player_recipes.len > balance.MAX_PLAYER_RECIPES) {
         fail("{s}: {} player recipes exceeds cap {}", .{ BALANCE_FILE, raw.player_recipes.len, balance.MAX_PLAYER_RECIPES });
         return ConfigError.TooManyRecipes;
@@ -304,6 +355,8 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         .hunger_base = raw.hunger_base,
         .appetite_scale = raw.appetite_scale,
         .hunger_player_cap = raw.hunger_player_cap,
+        .baby_hunger = raw.baby_hunger,
+        .specials = specials,
         .player_recipes = players,
         .team_recipes = teams,
     };
@@ -350,7 +403,8 @@ fn parse_encounters(a: std.mem.Allocator, bytes: []const u8) !enc.EncounterSet {
         var slime = c.SlimeReservoir{};
         for (e.zones) |z| {
             slime.neutral +|= z.neutral;
-            slime.special +|= z.special;
+            const per_kind = [_]u16{ z.special.neutralizer, z.special.egg };
+            for (&slime.special, per_kind) |*acc, add| acc.* +|= add;
             const per_tier = [_]u16{ z.tiered.red, z.tiered.yellow, z.tiered.green };
             for (&slime.tiered, per_tier) |*acc, add| acc.* +|= add;
         }
@@ -1027,33 +1081,107 @@ test "legacy multi-zone encounters are summed into one slime total" {
     try std.testing.expectEqual(@as(u32, 15), e.total_units());
 }
 
-test "specials are summed from the zones and default to none" {
+test "specials are summed per kind from the zones and default to none" {
     const doc =
         \\{"default":"e1","encounters":[
         \\ {"label":"e1","zones":[
-        \\   {"neutral":4,"special":1},
-        \\   {"tiered":{"red":2},"special":2}]}]}
+        \\   {"neutral":4,"special":{"neutralizer":1,"egg":1}},
+        \\   {"tiered":{"red":2},"special":{"neutralizer":2}}]}]}
     ;
     var loaded = try parse(std.testing.allocator, minimal_balance, doc);
     defer loaded.deinit();
     const e = loaded.config.encounters.default();
-    try std.testing.expectEqual(@as(u16, 3), e.slime.special);
-    // Specials count as supply — they occupy grid cells — but not as playable
-    // slime, which is what the win condition measures.
-    try std.testing.expectEqual(@as(u32, 9), e.total_units());
-    try std.testing.expectEqual(@as(u32, 6), e.slime.non_special());
+    try std.testing.expectEqual(@as(u16, 3), e.slime.special[@intFromEnum(c.SpecialKind.neutralizer)]);
+    try std.testing.expectEqual(@as(u16, 1), e.slime.special[@intFromEnum(c.SpecialKind.egg)]);
+    // Every special counts as supply — they occupy grid cells — and every
+    // current kind is CONSUMABLE, so all of them stay in the playable count
+    // the win condition measures.
+    try std.testing.expectEqual(@as(u32, 10), e.total_units());
+    try std.testing.expectEqual(@as(u32, 10), e.slime.playable());
 }
 
 test "an encounter of nothing but specials is still 'slime' for validation" {
-    // Degenerate but legal: an all-objective field.  Nothing to eat, so the
+    // Degenerate but legal: an all-neutralizer field.  Nothing to eat, so the
     // team wins the moment it starts — the loader's job is not to judge design.
     const doc =
         \\{"default":"e1","encounters":[
-        \\ {"label":"e1","zones":[{"special":3}]}]}
+        \\ {"label":"e1","zones":[{"special":{"neutralizer":3}}]}]}
     ;
     var loaded = try parse(std.testing.allocator, minimal_balance, doc);
     defer loaded.deinit();
-    try std.testing.expectEqual(@as(u16, 3), loaded.config.encounters.default().slime.special);
+    const slime = loaded.config.encounters.default().slime;
+    try std.testing.expectEqual(@as(u16, 3), slime.special[@intFromEnum(c.SpecialKind.neutralizer)]);
+}
+
+test "the old scalar special count is rejected: configs must name a kind" {
+    const bad =
+        \\{"default":"e1","encounters":[
+        \\ {"label":"e1","zones":[{"special":3}]}]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidEncountersJson,
+        parse(std.testing.allocator, minimal_balance, bad),
+    );
+}
+
+test "special tuning defaults, is read, and bad match_len is rejected" {
+    // Absent entirely: every kind gets DEFAULT_MATCH_LEN.
+    var defaulted = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
+    defer defaulted.deinit();
+    for (defaulted.config.balance.specials) |tuning| {
+        try std.testing.expectEqual(balance.DEFAULT_MATCH_LEN, tuning.match_len);
+    }
+
+    const doc =
+        \\{"hunger_cost_normal":1,
+        \\ "specials":{"neutralizer":{"match_len":4}},
+        \\ "player_recipes":[{"label":"poke","shape":["#"]}],
+        \\ "team_recipes":[]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u8, 4), loaded.config.balance.special_tuning(.neutralizer).match_len);
+    try std.testing.expectEqual(balance.DEFAULT_MATCH_LEN, loaded.config.balance.special_tuning(.egg).match_len);
+
+    // 1 would fire on every lone special; longer than the grid's longest line
+    // could never fire at all.
+    const too_short =
+        \\{"hunger_cost_normal":1,
+        \\ "specials":{"egg":{"match_len":1}},
+        \\ "player_recipes":[{"label":"poke","shape":["#"]}],
+        \\ "team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidMatchLen,
+        parse(std.testing.allocator, too_short, minimal_encounters),
+    );
+    const too_long =
+        \\{"hunger_cost_normal":1,
+        \\ "slime_grid":{"rows":3,"cols":4},
+        \\ "specials":{"neutralizer":{"match_len":5}},
+        \\ "player_recipes":[{"label":"poke","shape":["#"]}],
+        \\ "team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidMatchLen,
+        parse(std.testing.allocator, too_long, minimal_encounters),
+    );
+}
+
+test "baby_hunger defaults and is read" {
+    var defaulted = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
+    defer defaulted.deinit();
+    try std.testing.expectEqual(balance.DEFAULT_BABY_HUNGER, defaulted.config.balance.baby_hunger);
+
+    const doc =
+        \\{"hunger_cost_normal":1,
+        \\ "baby_hunger":25,
+        \\ "player_recipes":[{"label":"poke","shape":["#"]}],
+        \\ "team_recipes":[]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u16, 25), loaded.config.balance.baby_hunger);
 }
 
 test "encounter charges default, are read, and 0 is rejected" {

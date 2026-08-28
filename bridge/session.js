@@ -22,6 +22,7 @@
  *   stdin  <- WIRE:<hex>\n  raw server bytes    stdin <- KEY:<name>\n
  *   stdin  <- READY\n       server WS is open   stdin <- JOIN\n  take a seat
  *   stdin  <- STAT:appetite=<n>\n board flash stat
+ *   stdin  <- STAT:babies=<a,b,c,d,e>\n board flash babies (BabyType order)
  *   stdin  <- RESTART\n     start the next round (tab button click)
  *   stdout -> {"tag":"render",...}\n            stdout -> {"tag":"send","bytes":"<hex>"}\n
  */

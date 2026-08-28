@@ -12,7 +12,10 @@
             "green": 100
           },
           "neutral": 0,
-          "special": 3
+          "special": {
+            "neutralizer": 4,
+            "egg": 3
+          }
         }
       ]
     }

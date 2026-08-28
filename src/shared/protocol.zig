@@ -26,6 +26,25 @@ pub const MsgTag = enum(u8) {
     recipe_fired = 0x18,
     shape_cast = 0x1c,
     turn_ended = 0x1d,
+    /// A run of matchable specials lined up and fired: the matched cells
+    /// popped and the kind's effect landed.  One message per match, broadcast
+    /// before `turn_ended` so clients animate the reaction on the settled
+    /// field they are about to summarize.  Tagged with the settle PASS it
+    /// fired in (see field_refilled): a match re-opens the feast, so a turn
+    /// settles in passes and the client replays them in order.
+    special_matched = 0x1e,
+    /// The feast ate one or more eggs: a baby hatched per entry.  Broadcast
+    /// before `turn_ended`; carries cells + rolled types so every client
+    /// hatches identical babies in identical places.  Aggregated over every
+    /// pass of the turn's settle.
+    eggs_hatched = 0x1f,
+    /// One settle pass's reservoir refill: which cells filled and with what.
+    /// The draw comes out of the session's PRNG, so this is the ONE part of
+    /// a settle a client cannot derive — and with it, a client can replay a
+    /// whole cascading settle exactly (flood, collapse and match effects are
+    /// all mirrored rules).  One message per pass, in pass order, before
+    /// `turn_ended`.
+    field_refilled = 0x20,
 };
 
 /// The `player_id` a connection holds while it is only OBSERVING: it receives
@@ -42,6 +61,11 @@ pub const TakeSlot = struct {
     /// (browsers, bots).  The server folds it into the hunger bar's capacity
     /// via game_logic.player_hunger.
     appetite: u32 = 0,
+    /// The babies banked on the joining player's board, per BabyType — they
+    /// join the encounter with their owner (and leave with them), each adding
+    /// balance.baby_hunger to the bar's capacity.  All zero for boardless
+    /// players.
+    babies: components.BabyCounts = [_]u32{0} ** components.BabyType.size,
 };
 
 /// One step of the shape wheel.  A DIRECTION, not a destination, for the same
@@ -137,6 +161,11 @@ pub const TurnEnded = struct {
     /// Charges left in the shared pool after the turn.  Sent here as well as in
     /// GameState so the end-of-turn summary is self-contained.
     charges_left: u32,
+    /// Settle passes this turn took (>= 1).  Every special match re-opens the
+    /// feast, so a turn is a CASCADE of eat/collapse/fill passes; the summary
+    /// numbers above are totals over all of them, and the per-pass events
+    /// (field_refilled, special_matched) preceded this message.
+    passes: u8 = 1,
 };
 
 pub fn decode_turn_ended(reader: anytype) !TurnEnded {
@@ -148,7 +177,103 @@ pub fn decode_turn_ended(reader: anytype) !TurnEnded {
         .walls = try reader.readInt(u16, .little),
         .score_added = try reader.readInt(u32, .little),
         .charges_left = try reader.readInt(u32, .little),
+        .passes = try reader.readByte(),
     };
+}
+
+/// Wire cap on one matched run's cell list: a run lives in a single row or
+/// column, so the grid's longest possible line bounds it.
+pub const MAX_MATCH_CELLS_WIRE: u8 =
+    @max(components.MAX_GRID_ROWS, components.MAX_GRID_COLS);
+
+/// One special-kind match, resolved server-side and broadcast so every client
+/// can pop the same cells and flash the same effect.  Cells travel absolute
+/// (already resolved), like ShapeCast's, so clients never re-derive the run.
+pub const SpecialMatched = struct {
+    kind: components.SpecialKind,
+    /// Which settle pass this match fired in (0-based; see field_refilled).
+    /// Matches re-open the feast, so the client replays passes in order and
+    /// this is how it knows which meal the reaction belongs to.
+    pass: u8 = 0,
+    /// The run's central cell — where the effect landed.
+    center: u16 = 0,
+    /// The popped cells, in line order.
+    cell_count: u8 = 0,
+    cells: [MAX_MATCH_CELLS_WIRE]u16 = [_]u16{0} ** MAX_MATCH_CELLS_WIRE,
+    /// What the effect downgraded, per tier it was AT (neutralize_block).
+    downgraded: [components.Tier.size]u16 = [_]u16{0} ** components.Tier.size,
+    /// Of those, cells taken all the way to defused.
+    neutralized: u16 = 0,
+};
+
+pub fn decode_special_matched(reader: anytype) !SpecialMatched {
+    const kind_byte = try reader.readByte();
+    var p = SpecialMatched{
+        .kind = std.meta.intToEnum(components.SpecialKind, kind_byte) catch
+            return DecodeError.InvalidSpecialKind,
+    };
+    p.pass = try reader.readByte();
+    p.center = try reader.readInt(u16, .little);
+    p.cell_count = try reader.readByte();
+    if (p.cell_count > MAX_MATCH_CELLS_WIRE) return DecodeError.TooManyMatchCells;
+    for (p.cells[0..p.cell_count]) |*cell| cell.* = try reader.readInt(u16, .little);
+    p.downgraded = try decode_u16_tiers(reader);
+    p.neutralized = try reader.readInt(u16, .little);
+    return p;
+}
+
+/// Wire cap on hatches in one feast: every egg occupies a grid cell, so the
+/// grid bounds how many can be eaten at once.
+pub const MAX_HATCHES_WIRE: u16 = components.MAX_GRID_CELLS;
+
+/// The turn's hatches: where each eaten egg sat and what type of baby came
+/// out.  Types are rolled server-side (uniform, from the session's seed) so
+/// every client — and every board banking them at game_over — agrees.
+pub const EggsHatched = struct {
+    count: u16 = 0,
+    cells: [MAX_HATCHES_WIRE]u16 = [_]u16{0} ** MAX_HATCHES_WIRE,
+    types: [MAX_HATCHES_WIRE]components.BabyType =
+        [_]components.BabyType{.rose} ** MAX_HATCHES_WIRE,
+};
+
+pub fn decode_eggs_hatched(reader: anytype) !EggsHatched {
+    var p = EggsHatched{};
+    p.count = try reader.readInt(u16, .little);
+    if (p.count > MAX_HATCHES_WIRE) return DecodeError.TooManyHatches;
+    for (p.cells[0..p.count]) |*cell| cell.* = try reader.readInt(u16, .little);
+    for (p.types[0..p.count]) |*t| {
+        t.* = std.meta.intToEnum(components.BabyType, try reader.readByte()) catch
+            return DecodeError.InvalidBabyType;
+    }
+    return p;
+}
+
+/// Wire cap on one refill: a fill can at most cover the grid.
+pub const MAX_REFILL_WIRE: u16 = components.MAX_GRID_CELLS;
+
+/// One settle pass's reservoir refill, resolved server-side.  `cells[i]` was
+/// filled with `contents[i]`.  Cells travel in fill order (row-major from the
+/// top), and contents use the same one-byte encoding as the grid, so a client
+/// can apply the refill to its replay board verbatim.
+pub const FieldRefilled = struct {
+    /// Which settle pass this refill belongs to (0-based).  A turn settles in
+    /// passes while special matches keep re-opening the feast; every pass
+    /// fills, so a turn broadcasts `passes` of these, in order.
+    pass: u8 = 0,
+    count: u16 = 0,
+    cells: [MAX_REFILL_WIRE]u16 = [_]u16{0} ** MAX_REFILL_WIRE,
+    contents: [MAX_REFILL_WIRE]components.SlimeCell =
+        [_]components.SlimeCell{.empty} ** MAX_REFILL_WIRE,
+};
+
+pub fn decode_field_refilled(reader: anytype) !FieldRefilled {
+    var p = FieldRefilled{};
+    p.pass = try reader.readByte();
+    p.count = try reader.readInt(u16, .little);
+    if (p.count > MAX_REFILL_WIRE) return DecodeError.TooManyRefills;
+    for (p.cells[0..p.count]) |*cell| cell.* = try reader.readInt(u16, .little);
+    for (p.contents[0..p.count]) |*c| c.* = try decode_slime_cell(try reader.readByte());
+    return p;
 }
 
 pub const RecipeKind = enum(u8) {
@@ -266,6 +391,10 @@ pub const EntitySnapshot = struct {
     /// see each other's cursors and shape previews.
     cursor_row: u8,
     cursor_col: u8,
+    /// The babies this player's board brought to the encounter, per BabyType
+    /// (from take_slot).  Snapshotted so every client renders every player's
+    /// babies — and a reconnect recovers them.
+    babies: components.BabyCounts,
 
     pub const blank = EntitySnapshot{
         .entity = 0,
@@ -275,6 +404,7 @@ pub const EntitySnapshot = struct {
         .selected_shape = 0,
         .cursor_row = 0,
         .cursor_col = 0,
+        .babies = [_]u32{0} ** components.BabyType.size,
     };
 };
 
@@ -323,8 +453,12 @@ pub const GameState = struct {
     grid_cols: u8,
     grid: [components.MAX_GRID_CELLS]components.SlimeCell,
     /// Slime still waiting off-grid — drives the "incoming" indicator.  The win
-    /// needs this AND the grid to hold nothing but specials.
+    /// needs this AND the grid to hold nothing but inconsumable specials.
     reservoir: u32,
+    /// Babies hatched so far THIS encounter, per BabyType.  Session-owned (a
+    /// hatched baby belongs to no player), so it travels beside the other
+    /// session totals and a reconnect recovers the brood.
+    hatched: [components.BabyType.size]u16,
     /// Casts locked in this turn and not yet resolved, in lock-in order.
     pending_count: u8,
     pending: [MAX_PENDING_WIRE]PendingCast,
@@ -341,6 +475,7 @@ pub const GameState = struct {
         .grid_cols = 0,
         .grid = [_]components.SlimeCell{.empty} ** components.MAX_GRID_CELLS,
         .reservoir = 0,
+        .hatched = [_]u16{0} ** components.BabyType.size,
         .pending_count = 0,
         .pending = [_]PendingCast{.{ .player_id = 0, .move = 0, .square = 0 }} ** MAX_PENDING_WIRE,
     };
@@ -391,6 +526,10 @@ pub const FeastStats = struct {
     sheltered: u32 = 0,
     neutral_consumed: u16 = 0,
     defused_consumed: u16 = 0,
+    /// Neutralizers the feasts swallowed — free equipment, not food, so they
+    /// appear here and never in the score.  With them the ledger closes:
+    /// slime_total = score + slime_left + agents_consumed.
+    agents_consumed: u16 = 0,
     hunger_normal: u16 = 0,
     /// Charges spent over the whole encounter, and what was left at the end.
     charges_spent: u32 = 0,
@@ -428,6 +567,11 @@ pub const MatchStats = struct {
     team_recipe_hits: [balance.MAX_TEAM_RECIPES]u16 =
         [_]u16{0} ** balance.MAX_TEAM_RECIPES,
     casts_total: u16 = 0,
+    /// Babies hatched over the whole encounter, per BabyType.  Every board
+    /// that COMPLETES the encounter (receives game_over) banks these into its
+    /// flash — each hatched baby is saved to every connected board.
+    eggs_hatched: [components.BabyType.size]u16 =
+        [_]u16{0} ** components.BabyType.size,
 };
 
 pub const GameOver = struct {
@@ -443,7 +587,10 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
     if (T == void) return;
 
     switch (tag) {
-        .take_slot => try writer.writeInt(u32, payload.appetite, .little),
+        .take_slot => {
+            try writer.writeInt(u32, payload.appetite, .little);
+            for (payload.babies) |b| try writer.writeInt(u32, b, .little);
+        },
         .leave_slot => {},
         .restart => {},
         .cycle_shape => try writer.writeByte(@intFromEnum(payload.dir)),
@@ -478,6 +625,30 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
             try writer.writeInt(u16, p.walls, .little);
             try writer.writeInt(u32, p.score_added, .little);
             try writer.writeInt(u32, p.charges_left, .little);
+            try writer.writeByte(p.passes);
+        },
+        .special_matched => {
+            const p: SpecialMatched = payload;
+            try writer.writeByte(@intFromEnum(p.kind));
+            try writer.writeByte(p.pass);
+            try writer.writeInt(u16, p.center, .little);
+            try writer.writeByte(p.cell_count);
+            for (p.cells[0..p.cell_count]) |cell| try writer.writeInt(u16, cell, .little);
+            try encode_u16_tiers(writer, p.downgraded);
+            try writer.writeInt(u16, p.neutralized, .little);
+        },
+        .eggs_hatched => {
+            const p: EggsHatched = payload;
+            try writer.writeInt(u16, p.count, .little);
+            for (p.cells[0..p.count]) |cell| try writer.writeInt(u16, cell, .little);
+            for (p.types[0..p.count]) |t| try writer.writeByte(@intFromEnum(t));
+        },
+        .field_refilled => {
+            const p: FieldRefilled = payload;
+            try writer.writeByte(p.pass);
+            try writer.writeInt(u16, p.count, .little);
+            for (p.cells[0..p.count]) |cell| try writer.writeInt(u16, cell, .little);
+            for (p.contents[0..p.count]) |c| try writer.writeByte(encode_slime_cell(c));
         },
 
         .game_start => try encode_game_start(writer, payload),
@@ -508,14 +679,16 @@ fn encode_bar_summary(w: anytype, s: BarSummary) !void {
 }
 
 /// One slime cell as a single byte: 0x00 empty, 0x01 neutral,
-/// 0x02 neutralized, 0x03 special, 0x10|t tiered (see components.SlimeCell).
+/// 0x02 neutralized, 0x10|t tiered, 0x20|k special of kind k (see
+/// components.SlimeCell).  0x03 was the old kindless special; retired, so a
+/// stale sender fails loudly rather than rendering the wrong kind.
 fn encode_slime_cell(cell: components.SlimeCell) u8 {
     return switch (cell) {
         .empty => 0x00,
         .neutral => 0x01,
         .neutralized => 0x02,
-        .special => 0x03,
         .tiered => |t| 0x10 | @intFromEnum(t),
+        .special => |k| 0x20 | @intFromEnum(k),
     };
 }
 
@@ -525,12 +698,15 @@ fn decode_slime_cell(byte: u8) !components.SlimeCell {
             0x00 => .empty,
             0x01 => .neutral,
             0x02 => .neutralized,
-            0x03 => .special,
             else => DecodeError.InvalidSlimeCell,
         },
         0x10 => .{
             .tiered = std.meta.intToEnum(components.Tier, byte & 0x0F) catch
                 return DecodeError.InvalidTier,
+        },
+        0x20 => .{
+            .special = std.meta.intToEnum(components.SpecialKind, byte & 0x0F) catch
+                return DecodeError.InvalidSpecialKind,
         },
         else => DecodeError.InvalidSlimeCell,
     };
@@ -550,6 +726,7 @@ fn encode_game_state(w: anytype, p: GameState) !void {
         try w.writeByte(e.selected_shape);
         try w.writeByte(e.cursor_row);
         try w.writeByte(e.cursor_col);
+        for (e.babies) |b| try w.writeInt(u32, b, .little);
     }
     try encode_bar_summary(w, p.hunger);
     try w.writeInt(u32, p.charges, .little);
@@ -558,6 +735,7 @@ fn encode_game_state(w: anytype, p: GameState) !void {
     try w.writeByte(p.grid_cols);
     for (p.grid[0..p.grid_len()]) |cell| try w.writeByte(encode_slime_cell(cell));
     try w.writeInt(u32, p.reservoir, .little);
+    for (p.hatched) |h| try w.writeInt(u16, h, .little);
     try w.writeByte(p.pending_count);
     for (p.pending[0..p.pending_count]) |pc| {
         try w.writeByte(pc.player_id);
@@ -582,6 +760,7 @@ fn encode_feast_stats(w: anytype, rs: FeastStats) !void {
     try w.writeInt(u32, rs.sheltered, .little);
     try w.writeInt(u16, rs.neutral_consumed, .little);
     try w.writeInt(u16, rs.defused_consumed, .little);
+    try w.writeInt(u16, rs.agents_consumed, .little);
     try w.writeInt(u16, rs.hunger_normal, .little);
     try w.writeInt(u32, rs.charges_spent, .little);
     try w.writeInt(u32, rs.charges_left, .little);
@@ -594,6 +773,7 @@ fn decode_feast_stats(r: anytype) !FeastStats {
         .sheltered = try r.readInt(u32, .little),
         .neutral_consumed = try r.readInt(u16, .little),
         .defused_consumed = try r.readInt(u16, .little),
+        .agents_consumed = try r.readInt(u16, .little),
         .hunger_normal = try r.readInt(u16, .little),
         .charges_spent = try r.readInt(u32, .little),
         .charges_left = try r.readInt(u32, .little),
@@ -633,6 +813,7 @@ fn encode_match_stats(w: anytype, ms: MatchStats) !void {
     try w.writeByte(ms.team_recipe_count);
     for (ms.team_recipe_hits[0..ms.team_recipe_count]) |h| try w.writeInt(u16, h, .little);
     try w.writeInt(u16, ms.casts_total, .little);
+    for (ms.eggs_hatched) |h| try w.writeInt(u16, h, .little);
 }
 
 fn decode_match_stats(r: anytype) !MatchStats {
@@ -657,6 +838,7 @@ fn decode_match_stats(r: anytype) !MatchStats {
     if (ms.team_recipe_count > balance.MAX_TEAM_RECIPES) return DecodeError.TooManyRecipes;
     for (ms.team_recipe_hits[0..ms.team_recipe_count]) |*h| h.* = try r.readInt(u16, .little);
     ms.casts_total = try r.readInt(u16, .little);
+    for (&ms.eggs_hatched) |*h| h.* = try r.readInt(u16, .little);
     return ms;
 }
 
@@ -683,6 +865,11 @@ pub const DecodeError = error{
     InvalidRecipeKind,
     InvalidSlimeCell,
     InvalidGridDims,
+    InvalidSpecialKind,
+    InvalidBabyType,
+    TooManyMatchCells,
+    TooManyHatches,
+    TooManyRefills,
 };
 
 pub fn read_tag(reader: anytype) !MsgTag {
@@ -691,7 +878,9 @@ pub fn read_tag(reader: anytype) !MsgTag {
 }
 
 pub fn decode_take_slot(reader: anytype) !TakeSlot {
-    return .{ .appetite = try reader.readInt(u32, .little) };
+    var p = TakeSlot{ .appetite = try reader.readInt(u32, .little) };
+    for (&p.babies) |*b| b.* = try reader.readInt(u32, .little);
+    return p;
 }
 
 pub fn decode_game_start(reader: anytype) !GameStart {
@@ -741,6 +930,7 @@ pub fn decode_game_state(reader: anytype) !GameState {
         e.selected_shape = try reader.readByte();
         e.cursor_row = try reader.readByte();
         e.cursor_col = try reader.readByte();
+        for (&e.babies) |*b| b.* = try reader.readInt(u32, .little);
         p.entities[i] = e;
     }
     p.hunger = try decode_bar_summary(reader);
@@ -754,6 +944,7 @@ pub fn decode_game_state(reader: anytype) !GameState {
     for (p.grid[0..p.grid_len()]) |*cell|
         cell.* = try decode_slime_cell(try reader.readByte());
     p.reservoir = try reader.readInt(u32, .little);
+    for (&p.hatched) |*h| h.* = try reader.readInt(u16, .little);
     p.pending_count = try reader.readByte();
     if (p.pending_count > MAX_PENDING_WIRE) return DecodeError.TooManyPending;
     p.pending = [_]PendingCast{.{ .player_id = 0, .move = 0, .square = 0 }} ** MAX_PENDING_WIRE;
@@ -809,6 +1000,7 @@ test "round-trip: game_over carries score and match stats" {
         .sheltered = 21,
         .neutral_consumed = 15,
         .defused_consumed = 9,
+        .agents_consumed = 2,
         .hunger_normal = 38,
         .charges_spent = 27,
         .charges_left = 13,
@@ -821,6 +1013,7 @@ test "round-trip: game_over carries score and match stats" {
     go.stats.player_recipe_hits[0] = 1;
     go.stats.team_recipe_hits[0] = 2;
     go.stats.casts_total = 5;
+    go.stats.eggs_hatched = .{ 3, 0, 0, 1, 0 };
 
     try encode(fbs.writer(), .game_over, go);
     fbs.reset();
@@ -838,6 +1031,7 @@ test "round-trip: game_over carries score and match stats" {
     try std.testing.expectEqual(@as(u32, 21), d.stats.feast.sheltered);
     try std.testing.expectEqual(@as(u16, 15), d.stats.feast.neutral_consumed);
     try std.testing.expectEqual(@as(u16, 9), d.stats.feast.defused_consumed);
+    try std.testing.expectEqual(@as(u16, 2), d.stats.feast.agents_consumed);
     try std.testing.expectEqual(@as(u32, 27), d.stats.feast.charges_spent);
     try std.testing.expectEqual(@as(u32, 13), d.stats.feast.charges_left);
     try std.testing.expectEqual(@as(u8, 2), d.stats.player_count);
@@ -851,17 +1045,23 @@ test "round-trip: game_over carries score and match stats" {
     try std.testing.expectEqual(@as(u16, 1), d.stats.player_recipe_hits[0]);
     try std.testing.expectEqual(@as(u16, 2), d.stats.team_recipe_hits[0]);
     try std.testing.expectEqual(@as(u16, 5), d.stats.casts_total);
+    // The brood every completing board banks: per-type hatch counts.
+    try std.testing.expectEqual([_]u16{ 3, 0, 0, 1, 0 }, d.stats.eggs_hatched);
 }
 
-test "round-trip: take_slot carries the appetite stat" {
-    var buf: [16]u8 = undefined;
+test "round-trip: take_slot carries the appetite stat and the board's babies" {
+    var buf: [32]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
 
-    try encode(fbs.writer(), .take_slot, TakeSlot{ .appetite = 17 });
+    try encode(fbs.writer(), .take_slot, TakeSlot{
+        .appetite = 17,
+        .babies = .{ 1, 0, 2, 0, 5 },
+    });
     fbs.reset();
     try std.testing.expectEqual(MsgTag.take_slot, try read_tag(fbs.reader()));
     const decoded = try decode_take_slot(fbs.reader());
     try std.testing.expectEqual(@as(u32, 17), decoded.appetite);
+    try std.testing.expectEqual([_]u32{ 1, 0, 2, 0, 5 }, decoded.babies);
 }
 
 test "round-trip: leave_slot carries no payload" {
@@ -899,12 +1099,13 @@ test "round-trip: game_state — turn, hunger, score, grid, and selection surviv
     gs.grid[0] = .empty;
     gs.grid[1] = .neutral;
     gs.grid[2] = .{ .tiered = .red };
-    gs.grid[3] = .special;
+    gs.grid[3] = .{ .special = .neutralizer };
     gs.grid[4] = .{ .tiered = .green };
     gs.grid[5] = .neutralized;
     gs.grid[6] = .{ .tiered = .yellow };
-    gs.grid[7] = .special;
+    gs.grid[7] = .{ .special = .egg };
     gs.reservoir = 44;
+    gs.hatched = .{ 2, 0, 1, 0, 0 };
     gs.entities[0] = EntitySnapshot{
         .entity = 7,
         .kind = .player,
@@ -913,6 +1114,7 @@ test "round-trip: game_state — turn, hunger, score, grid, and selection surviv
         .selected_shape = 4,
         .cursor_row = 2,
         .cursor_col = 5,
+        .babies = .{ 0, 4, 0, 0, 1 },
     };
 
     try encode(fbs.writer(), .game_state, gs);
@@ -939,12 +1141,15 @@ test "round-trip: game_state — turn, hunger, score, grid, and selection surviv
     // Cells beyond the live 2x4 area stay empty rather than carrying stale data.
     try std.testing.expectEqual(components.SlimeCell.empty, decoded.grid[8]);
     try std.testing.expectEqual(@as(u32, 44), decoded.reservoir);
+    try std.testing.expectEqual([_]u16{ 2, 0, 1, 0, 0 }, decoded.hatched);
     // The move this player would fire travels with them, so teammates can see
     // it before anyone spends a cast.
     try std.testing.expectEqual(@as(u8, 4), decoded.entities[0].selected_shape);
     // The aiming cursor travels with the rest of the player's state.
     try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].cursor_row);
     try std.testing.expectEqual(@as(u8, 5), decoded.entities[0].cursor_col);
+    // The board's babies travel with their owner.
+    try std.testing.expectEqual([_]u32{ 0, 4, 0, 0, 1 }, decoded.entities[0].babies);
 }
 
 test "round-trip: game_start — join code, grid dims and cast buffer survive" {
@@ -1040,7 +1245,7 @@ test "round-trip: a full MAX grid of every cell kind survives" {
     var gs = GameState.blank;
     gs.grid_rows = components.MAX_GRID_ROWS;
     gs.grid_cols = components.MAX_GRID_COLS;
-    // Cycle through all 6 distinct cell values so every encoding is covered.
+    // Cycle through all 8 distinct cell values so every encoding is covered.
     const kinds = [_]components.SlimeCell{
         .empty,
         .neutral,
@@ -1048,6 +1253,8 @@ test "round-trip: a full MAX grid of every cell kind survives" {
         .{ .tiered = .red },
         .{ .tiered = .yellow },
         .{ .tiered = .green },
+        .{ .special = .neutralizer },
+        .{ .special = .egg },
     };
     for (gs.grid[0..gs.grid_len()], 0..) |*cell, i| cell.* = kinds[i % kinds.len];
 
@@ -1070,13 +1277,131 @@ test "decode_game_state: an unknown slime cell byte is rejected" {
     gs.grid_cols = 1;
     try encode(fbs.writer(), .game_state, gs);
     const written = fbs.getWritten();
-    // The single grid cell sits just before the tail: the u32 reservoir and
-    // the pending-cast count, which is 0 here so no entries follow it.
-    const tail = @sizeOf(u32) + 1;
+    // The single grid cell sits just before the tail: the u32 reservoir, the
+    // per-type hatched u16s, and the pending-cast count (0 here, so no
+    // entries follow it).
+    const tail = @sizeOf(u32) + 2 * components.BabyType.size + 1;
     written[written.len - tail - 1] = 0x7F;
     fbs.reset();
     _ = try read_tag(fbs.reader());
     try std.testing.expectError(DecodeError.InvalidSlimeCell, decode_game_state(fbs.reader()));
+}
+
+test "decode_game_state: the retired kindless special byte 0x03 is rejected" {
+    var buf: [512]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var gs = GameState.blank;
+    gs.grid_rows = 1;
+    gs.grid_cols = 1;
+    try encode(fbs.writer(), .game_state, gs);
+    const written = fbs.getWritten();
+    const tail = @sizeOf(u32) + 2 * components.BabyType.size + 1;
+    written[written.len - tail - 1] = 0x03;
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    try std.testing.expectError(DecodeError.InvalidSlimeCell, decode_game_state(fbs.reader()));
+}
+
+test "round-trip: special_matched carries the run, its centre and its effect" {
+    var buf: [128]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var sm = SpecialMatched{ .kind = .neutralizer, .pass = 2, .center = 22, .cell_count = 3 };
+    sm.cells[0] = 21;
+    sm.cells[1] = 22;
+    sm.cells[2] = 23;
+    sm.downgraded[@intFromEnum(components.Tier.red)] = 12;
+    sm.neutralized = 4;
+    try encode(fbs.writer(), .special_matched, sm);
+    fbs.reset();
+    try std.testing.expectEqual(MsgTag.special_matched, try read_tag(fbs.reader()));
+    const got = try decode_special_matched(fbs.reader());
+    try std.testing.expectEqual(components.SpecialKind.neutralizer, got.kind);
+    try std.testing.expectEqual(@as(u8, 2), got.pass);
+    try std.testing.expectEqual(@as(u16, 22), got.center);
+    try std.testing.expectEqual(@as(u8, 3), got.cell_count);
+    try std.testing.expectEqualSlices(u16, sm.cells[0..3], got.cells[0..3]);
+    try std.testing.expectEqual(@as(u16, 12), got.downgraded[@intFromEnum(components.Tier.red)]);
+    try std.testing.expectEqual(@as(u16, 4), got.neutralized);
+}
+
+test "round-trip: eggs_hatched carries each hatch's cell and rolled type" {
+    var buf: [128]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var eh = EggsHatched{ .count = 2 };
+    eh.cells[0] = 5;
+    eh.cells[1] = 40;
+    eh.types[0] = .plum;
+    eh.types[1] = .mint;
+    try encode(fbs.writer(), .eggs_hatched, eh);
+    fbs.reset();
+    try std.testing.expectEqual(MsgTag.eggs_hatched, try read_tag(fbs.reader()));
+    const got = try decode_eggs_hatched(fbs.reader());
+    try std.testing.expectEqual(@as(u16, 2), got.count);
+    try std.testing.expectEqual(@as(u16, 5), got.cells[0]);
+    try std.testing.expectEqual(@as(u16, 40), got.cells[1]);
+    try std.testing.expectEqual(components.BabyType.plum, got.types[0]);
+    try std.testing.expectEqual(components.BabyType.mint, got.types[1]);
+}
+
+test "round-trip: field_refilled carries each cell and its contents, per pass" {
+    var buf: [128]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var fr = FieldRefilled{ .pass = 1, .count = 3 };
+    fr.cells[0] = 0;
+    fr.cells[1] = 5;
+    fr.cells[2] = 9;
+    fr.contents[0] = .neutral;
+    fr.contents[1] = .{ .tiered = .red };
+    fr.contents[2] = .{ .special = .egg };
+    try encode(fbs.writer(), .field_refilled, fr);
+    fbs.reset();
+    try std.testing.expectEqual(MsgTag.field_refilled, try read_tag(fbs.reader()));
+    const got = try decode_field_refilled(fbs.reader());
+    try std.testing.expectEqual(@as(u8, 1), got.pass);
+    try std.testing.expectEqual(@as(u16, 3), got.count);
+    try std.testing.expectEqualSlices(u16, fr.cells[0..3], got.cells[0..3]);
+    try std.testing.expectEqualSlices(
+        components.SlimeCell,
+        fr.contents[0..3],
+        got.contents[0..3],
+    );
+}
+
+test "decode_field_refilled: a bad cell byte or oversize count is rejected" {
+    var buf: [64]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var fr = FieldRefilled{ .pass = 0, .count = 1 };
+    fr.cells[0] = 4;
+    fr.contents[0] = .neutral;
+    try encode(fbs.writer(), .field_refilled, fr);
+    const written = fbs.getWritten();
+    written[written.len - 1] = 0x7F; // the lone contents byte is the tail
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    try std.testing.expectError(
+        DecodeError.InvalidSlimeCell,
+        decode_field_refilled(fbs.reader()),
+    );
+
+    var big: [8]u8 = .{ 0, 0xFF, 0xFF, 0, 0, 0, 0, 0 }; // pass 0, count 0xFFFF
+    var bfbs = std.io.fixedBufferStream(big[0..]);
+    try std.testing.expectError(
+        DecodeError.TooManyRefills,
+        decode_field_refilled(bfbs.reader()),
+    );
+}
+
+test "decode_eggs_hatched: an unknown baby type is rejected" {
+    var buf: [16]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    var eh = EggsHatched{ .count = 1 };
+    eh.cells[0] = 3;
+    try encode(fbs.writer(), .eggs_hatched, eh);
+    const written = fbs.getWritten();
+    written[written.len - 1] = 0xEE; // the lone type byte is the tail
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    try std.testing.expectError(DecodeError.InvalidBabyType, decode_eggs_hatched(fbs.reader()));
 }
 
 test "round-trip: turn_ended carries the feast and what walled it off" {
@@ -1090,6 +1415,7 @@ test "round-trip: turn_ended carries the feast and what walled it off" {
         .walls = 7,
         .score_added = 41,
         .charges_left = 18,
+        .passes = 3,
     });
     fbs.reset();
     try std.testing.expectEqual(MsgTag.turn_ended, try read_tag(fbs.reader()));
@@ -1101,6 +1427,8 @@ test "round-trip: turn_ended carries the feast and what walled it off" {
     try std.testing.expectEqual(@as(u16, 7), decoded.walls);
     try std.testing.expectEqual(@as(u32, 41), decoded.score_added);
     try std.testing.expectEqual(@as(u32, 18), decoded.charges_left);
+    // A cascade turn: three settle passes preceded this summary.
+    try std.testing.expectEqual(@as(u8, 3), decoded.passes);
 }
 
 test "decode_game_state: oversized grid dimensions are rejected" {

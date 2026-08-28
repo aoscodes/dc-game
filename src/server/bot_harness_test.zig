@@ -229,7 +229,8 @@ pub const BotHarness = struct {
 /// both count up from 0.  Returns the seat id, or null when the game is full.
 fn seat_bot(sess: *Session, transport: shared.Transport) ?u8 {
     const conn_id = sess.connect(transport) orelse return null;
-    sess.take_slot(conn_id, 0) catch return null;
+    const no_babies = [_]u32{0} ** shared.components.BabyType.size;
+    sess.take_slot(conn_id, 0, no_babies) catch return null;
     return sess.connections[conn_id].player_id;
 }
 
@@ -374,10 +375,13 @@ test "mixed team makes real progress on the default encounter" {
     try std.testing.expect(h.session.score > 0);
     // Casts landed: the tuning report saw them.
     try std.testing.expect(h.session.stats.casts_total > 0);
-    // Conservation holds mid-run as well as at the end.
+    // Conservation holds mid-run as well as at the end.  Neutralizers are
+    // swallowed WITHOUT scoring (they are equipment, not food), so the ledger
+    // closes over score + what is left + the agents consumed.
     try std.testing.expectEqual(
         DEFAULT_ENC.total_units(),
-        h.session.score + h.session.field.remaining(),
+        h.session.score + h.session.field.remaining() +
+            h.session.stats.feast.agents_consumed,
     );
 }
 

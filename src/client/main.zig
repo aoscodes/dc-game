@@ -14,6 +14,10 @@ const KEY_PREFIX  = "KEY:";
 /// Player stats fed in from hardware, e.g. "STAT:appetite=7" — the board's
 /// persistent appetite counter, forwarded by the bridge (controllers.js).
 const STAT_APPETITE_PREFIX = "STAT:appetite=";
+/// The board's banked babies as a comma list per BabyType ordinal, e.g.
+/// "STAT:babies=1,0,2,0,0".  Same lifecycle as the appetite line: sent by the
+/// bridge before JOIN.
+const STAT_BABIES_PREFIX = "STAT:babies=";
 
 const RENDER_HZ: u64 = 60;
 const TICK_NS: u64 = std.time.ns_per_s / RENDER_HZ;
@@ -99,6 +103,9 @@ var g_key_queue: inp.KeyQueue = .{};
 // the JOIN line (hardware controller sessions send it right after spawn).
 // Written and read only on the stdin thread, so no synchronisation needed.
 var g_appetite: u32 = 0;
+// Babies for take_slot, set via the STAT:babies= stdio line; same lifecycle
+// and threading story as g_appetite.
+var g_babies: c.BabyCounts = [_]u32{0} ** c.BabyType.size;
 
 var g_stdout_mu: std.Thread.Mutex = .{};
 
@@ -155,6 +162,11 @@ fn stdin_reader(_: void) void {
                 std.log.warn("bad appetite stat line: {s}", .{trimmed});
                 continue;
             };
+        } else if (std.mem.startsWith(u8, trimmed, STAT_BABIES_PREFIX)) {
+            g_babies = parse_baby_counts(trimmed[STAT_BABIES_PREFIX.len..]) orelse {
+                std.log.warn("bad babies stat line: {s}", .{trimmed});
+                continue;
+            };
         }
     }
 }
@@ -163,13 +175,30 @@ fn emit_send(bytes: []const u8) void {
     stdout_writer().write_send(bytes);
 }
 
-/// Ask for a player seat, carrying the appetite stat (0 for browsers).  The
-/// server grants it with a personalized game_start, or silently ignores the
-/// request when all seats are taken — either way this connection keeps
+/// Parse a "n,n,n,n,n" comma list into per-type baby counts.  Null on any
+/// malformed or miscounted list, so a garbled stat line is ignored whole
+/// rather than half-applied.
+fn parse_baby_counts(list: []const u8) ?c.BabyCounts {
+    var counts: c.BabyCounts = [_]u32{0} ** c.BabyType.size;
+    var it = std.mem.splitScalar(u8, list, ',');
+    for (&counts) |*count| {
+        const field = it.next() orelse return null;
+        count.* = std.fmt.parseInt(u32, std.mem.trim(u8, field, " "), 10) catch return null;
+    }
+    if (it.next() != null) return null;
+    return counts;
+}
+
+/// Ask for a player seat, carrying the board's stats (all zero for browsers).
+/// The server grants it with a personalized game_start, or silently ignores
+/// the request when all seats are taken — either way this connection keeps
 /// receiving the game.
 fn send_take_slot() void {
     var fbs = std.io.fixedBufferStream(&g_state.send_buf);
-    proto.encode(fbs.writer(), .take_slot, proto.TakeSlot{ .appetite = g_appetite }) catch return;
+    proto.encode(fbs.writer(), .take_slot, proto.TakeSlot{
+        .appetite = g_appetite,
+        .babies = g_babies,
+    }) catch return;
     emit_send(fbs.getWritten());
 }
 
@@ -312,6 +341,31 @@ fn process_recv() void {
                 // animation off this.  A later turn end in the same frame wins
                 // — it describes the field the next snapshot will show.
                 g_state.game.turn_ended = p;
+            },
+            .special_matched => {
+                const p = proto.decode_special_matched(r) catch continue;
+                // Record for the renderer (transient, drained per frame).
+                const gs = &g_state.game;
+                if (gs.special_match_count < gs.special_matches.len) {
+                    gs.special_matches[gs.special_match_count] = p;
+                    gs.special_match_count += 1;
+                }
+            },
+            .eggs_hatched => {
+                const p = proto.decode_eggs_hatched(r) catch continue;
+                // Transient, drained per frame — at most one per turn end.
+                g_state.game.eggs_hatched = p;
+            },
+            .field_refilled => {
+                const p = proto.decode_field_refilled(r) catch continue;
+                // Record for the renderer (transient, drained per frame): one
+                // per settle pass, and the renderer replays the cascade from
+                // exactly these.
+                const gs = &g_state.game;
+                if (gs.refill_count < gs.refills.len) {
+                    gs.refills[gs.refill_count] = p;
+                    gs.refill_count += 1;
+                }
             },
             else => {},
         }

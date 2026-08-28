@@ -77,13 +77,13 @@ pub const EncounterSet = struct {
 const testing = std.testing;
 
 test "Encounter total_units sums every slime bucket, specials included" {
-    var slime = c.SlimeReservoir{ .neutral = 5, .special = 2 };
+    var slime = c.SlimeReservoir{ .neutral = 5, .special = .{ 2, 1 } };
     slime.tiered[@intFromEnum(c.Tier.red)] = 10;
     slime.tiered[@intFromEnum(c.Tier.green)] = 3;
     const e = Encounter{ .label = "t", .slime = slime };
-    // Specials occupy grid cells, so they are part of the supply even though
-    // they are never eaten.
-    try testing.expectEqual(@as(u32, 20), e.total_units());
+    // Specials of every kind occupy grid cells, so they are part of the
+    // supply — even the neutralizers, which are never eaten.
+    try testing.expectEqual(@as(u32, 21), e.total_units());
 }
 
 test "EncounterSet default and find resolve by label" {

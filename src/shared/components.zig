@@ -14,9 +14,9 @@
 //! Play is TURN-BASED.  Each player gets `casts_per_turn` casts; once every
 //! connected player has spent theirs the turn ends and the field is EATEN
 //! ALONG A PATH: the feast enters from the LEFT edge and consumes every
-//! edible unit it can reach, so live hazards and `special` units wall it off
-//! and protect whatever hides behind them.  Survivors then fall to the bottom
-//! of their column and the reservoir refills from the top.
+//! edible unit it can reach, so live hazards wall it off and protect whatever
+//! hides behind them.  Survivors then fall to the bottom of their column and
+//! the reservoir refills from the top.
 //!
 //! Casting costs CHARGES from one team-shared, whole-game pool (each recipe
 //! prices its own cost), so the campaign's real resource is charges and the
@@ -99,6 +99,114 @@ pub const Tier = enum(u8) {
     }
 };
 
+/// Kind of a `special` slime unit.  Kinds are HARD-CODED behaviour — data
+/// files tune their numbers (see balance.SpecialTuning) but cannot invent new
+/// kinds.  Three axes define a kind:
+///
+///   consumable   — whether the feast can eat it.  A consumable special
+///                  conducts the flood and leaves the grid when consumed; an
+///                  inconsumable one is a permanent wall no cast can touch.
+///                  Every current kind is consumable.
+///   eat_effect   — what CONSUMING one does, beyond emptying the cell.
+///   match_effect — whether LINING UP `match_len` of the kind in a row or
+///                  column (after the turn-end refill) fires an effect.
+///                  DORMANT: no current kind matches, but the machinery
+///                  (slime.resolve_matches, the wire's special_matched, the
+///                  session's settle cascade) is kept live for a future kind.
+pub const SpecialKind = enum(u8) {
+    /// Consumable.  Eating one is FREE — no score, no hunger — and releases
+    /// a 3x3 block of Neutralizing Agent around its cell, downgrading every
+    /// covered hazard one tier exactly like a cast.  Fired INLINE, mid-flood,
+    /// so the same feast eats straight through whatever it defused.
+    neutralizer = 0,
+    /// Consumable.  Eating one is ordinary food (scores, costs hunger) and
+    /// HATCHES a baby Lil Guy (uniform-random BabyType) who joins the
+    /// encounter and grows the hunger pool.
+    egg = 1,
+
+    pub const size = @typeInfo(SpecialKind).@"enum".fields.len;
+
+    /// True if the feast can eat this kind.  Consumable specials count as
+    /// PLAYABLE slime: they can be cleared, so they do not exempt a field
+    /// from the win check the way an inconsumable one would.
+    pub fn consumable(self: SpecialKind) bool {
+        return switch (self) {
+            .neutralizer => true,
+            .egg => true,
+        };
+    }
+
+    /// The effect consuming one fires, or null for a kind that is nothing
+    /// but food.  Only meaningful for consumable kinds.
+    pub fn eat_effect(self: SpecialKind) ?SpecialEffect {
+        return switch (self) {
+            .neutralizer => .neutralize_block,
+            .egg => .hatch,
+        };
+    }
+
+    /// True if eating this kind feeds the team — normal score and normal
+    /// hunger.  A neutralizer is equipment, not food: consuming one is free.
+    pub fn eat_is_food(self: SpecialKind) bool {
+        return switch (self) {
+            .neutralizer => false,
+            .egg => true,
+        };
+    }
+
+    /// The effect a line-up of this kind fires, or null when the kind has no
+    /// match behaviour.  DORMANT: null for every current kind — kept (with
+    /// slime.resolve_matches and the special_matched wire) so a future
+    /// matchable kind slots back in without re-plumbing.
+    pub fn match_effect(self: SpecialKind) ?SpecialEffect {
+        return switch (self) {
+            .neutralizer => null,
+            .egg => null,
+        };
+    }
+};
+
+/// What a special kind's effect does — shared by on-eat effects and the
+/// (dormant) match effects.  Enumerated and hard-coded: slime.zig switches on
+/// this to apply the effect, so adding a variant means writing its resolution
+/// there.
+pub const SpecialEffect = enum(u8) {
+    /// Stamp a block of Neutralizing Agent (3x3 on-eat; the dormant match
+    /// path stamps 5x5) centred on the firing cell: one tier downgrade per
+    /// covered hazard, same as a cast.
+    neutralize_block = 0,
+    /// Hatch a baby Lil Guy of a uniform-random BabyType.
+    hatch = 1,
+};
+
+/// The five types a hatched baby Lil Guy can be.  Placeholder colour names
+/// until real assets/identities arrive; the ordinal is the wire and flash
+/// identity, so ORDER IS PERMANENT even when the names improve.
+///
+/// Babies are purely visual this pass except for one number: each baby in
+/// the encounter (brought by a board or hatched mid-game) adds
+/// `balance.baby_hunger` to the hunger pool's capacity.
+pub const BabyType = enum(u8) {
+    rose = 0,
+    mint = 1,
+    sky = 2,
+    gold = 3,
+    plum = 4,
+
+    pub const size = @typeInfo(BabyType).@"enum".fields.len;
+};
+
+/// Per-type baby counts, indexed by BabyType ordinal — the shape baby tallies
+/// travel in everywhere (take_slot, game_state, match stats, board flash).
+pub const BabyCounts = [BabyType.size]u32;
+
+/// Sum of a per-type baby tally.
+pub fn baby_total(counts: BabyCounts) u32 {
+    var n: u32 = 0;
+    for (counts) |b| n +|= b;
+    return n;
+}
+
 /// Upper bounds on the slime grid (wire + array sizing).  The config loader
 /// rejects `slime_grid` dimensions exceeding these.
 pub const MAX_GRID_ROWS: u8 = 16;
@@ -118,22 +226,22 @@ pub const MAX_GRID_CELLS: u16 = @as(u16, MAX_GRID_ROWS) * @as(u16, MAX_GRID_COLS
 ///   neutralized — defused: a `tiered` cell downgraded past green.  Edible and
 ///                 scores like neutral, but kept distinct so the render can
 ///                 show the team earned it.
-///   special     — an objective placeholder.  PERMANENT: no cast affects it,
-///                 the feast never eats it, and it blocks the path like a live
-///                 hazard.  Objective behaviour will be built on top of this
-///                 cell later; until then it is terrain.
+///   special     — a special slime unit of a hard-coded `SpecialKind`.  No
+///                 cast affects any special.  What eating one does — and
+///                 whether it feeds the team at all — is the kind's own
+///                 rulebook (see SpecialKind).
 ///
 /// The edible/blocking split is the heart of the game: see `is_edible` and
 /// `blocks_feast`, which `slime.eat_all` flood-fills over.
 ///
 /// Wire encoding (one byte, see protocol.zig):
-///   0x00 = empty, 0x01 = neutral, 0x02 = neutralized, 0x03 = special,
-///   0x10|t = tiered.
+///   0x00 = empty, 0x01 = neutral, 0x02 = neutralized, 0x10|t = tiered,
+///   0x20|k = special of kind k.
 pub const SlimeCell = union(enum) {
     empty,
     neutral,
     neutralized,
-    special,
+    special: SpecialKind,
     tiered: Tier,
 
     /// True if this cell holds a slime unit of any kind — anything that
@@ -144,16 +252,27 @@ pub const SlimeCell = union(enum) {
 
     /// True if the turn-end feast will eat this unit once it can reach it.
     /// Defused slime counts: taking a hazard to `neutralized` is precisely
-    /// what turns it into food.
+    /// what turns it into food.  So does a CONSUMABLE special — an egg is
+    /// food with a hatch attached, a neutralizer is free equipment the feast
+    /// picks up on its way through.
     pub fn is_edible(self: SlimeCell) bool {
-        return self == .neutral or self == .neutralized;
+        return switch (self) {
+            .neutral, .neutralized => true,
+            .special => |kind| kind.consumable(),
+            .empty, .tiered => false,
+        };
     }
 
-    /// True if this cell stops the feast advancing through it — a live hazard
-    /// or a special.  Everything else (empty, edible) conducts the path, since
-    /// an edible cell is eaten and therefore opens.
+    /// True if this cell stops the feast advancing through it — a live
+    /// hazard, or an inconsumable special (none currently exist).  Everything
+    /// else (empty, edible) conducts the path, since an edible cell is eaten
+    /// and therefore opens.
     pub fn blocks_feast(self: SlimeCell) bool {
-        return self == .tiered or self == .special;
+        return switch (self) {
+            .tiered => true,
+            .special => |kind| !kind.consumable(),
+            .empty, .neutral, .neutralized => false,
+        };
     }
 
     /// True if this cell still needs neutralizing — the only kind a cast
@@ -269,8 +388,7 @@ pub const SlimeGrid = struct {
         return n;
     }
 
-    /// Count of `special` cells — objective placeholders, which no play can
-    /// remove.
+    /// Count of `special` cells, of any kind.
     pub fn special_count(self: *const SlimeGrid) u16 {
         var n: u16 = 0;
         for (self.live()) |cell| {
@@ -279,10 +397,27 @@ pub const SlimeGrid = struct {
         return n;
     }
 
-    /// Occupied cells that are not specials: the slime still genuinely in play.
-    /// Zero here (with an equally special-only reservoir) is the win.
-    pub fn non_special_count(self: *const SlimeGrid) u16 {
-        return self.occupied() - self.special_count();
+    /// Count of `special` cells of one kind.
+    pub fn special_kind_count(self: *const SlimeGrid, kind: SpecialKind) u16 {
+        var n: u16 = 0;
+        for (self.live()) |cell| {
+            if (cell == .special and cell.special == kind) n += 1;
+        }
+        return n;
+    }
+
+    /// Occupied cells the team can still clear: everything except
+    /// INCONSUMABLE specials, which no play can remove.  Consumable specials
+    /// (eggs) are food, so they count.  Zero here (with an equally
+    /// playable-free reservoir) is the win.
+    pub fn playable_count(self: *const SlimeGrid) u16 {
+        var n: u16 = 0;
+        for (self.live()) |cell| {
+            if (!cell.is_slime()) continue;
+            if (cell == .special and !cell.special.consumable()) continue;
+            n += 1;
+        }
+        return n;
     }
 };
 
@@ -290,17 +425,18 @@ pub const SlimeGrid = struct {
 ///
 /// The reservoir only ever holds slime in its ORIGINAL state — neutralizing
 /// happens on the grid, so no `neutralized` bucket exists here.  `tiered[t]`
-/// is indexed by Tier ordinal.  Specials enter from here too, so an encounter
-/// can hold its objectives back rather than opening with all of them.
+/// is indexed by Tier ordinal, `special[k]` by SpecialKind ordinal.  Specials
+/// enter from here too, so an encounter can hold them back rather than
+/// opening with all of them.
 pub const SlimeReservoir = struct {
     tiered: [Tier.size]u16 = [_]u16{0} ** Tier.size,
     neutral: u16 = 0,
-    /// Objective placeholders waiting to enter (see SlimeCell.special).
-    special: u16 = 0,
+    /// Special units waiting to enter, per kind (see SlimeCell.special).
+    special: [SpecialKind.size]u16 = [_]u16{0} ** SpecialKind.size,
 
     pub fn total(self: SlimeReservoir) u32 {
         var n: u32 = self.neutral;
-        n += self.special;
+        for (self.special) |m| n += m;
         for (self.tiered) |m| n += m;
         return n;
     }
@@ -309,11 +445,17 @@ pub const SlimeReservoir = struct {
         return self.total() == 0;
     }
 
-    /// Units here that are NOT specials.  The win condition asks whether
-    /// anything but objectives is left in play, and the reservoir half of that
-    /// question is this.
-    pub fn non_special(self: SlimeReservoir) u32 {
-        return self.total() - self.special;
+    /// Units here the team can still clear once they arrive — everything
+    /// except INCONSUMABLE specials.  The win condition asks whether anything
+    /// clearable is left in play, and the reservoir half of that question is
+    /// this.
+    pub fn playable(self: SlimeReservoir) u32 {
+        var n: u32 = self.total();
+        for (self.special, 0..) |m, k| {
+            const kind: SpecialKind = @enumFromInt(k);
+            if (!kind.consumable()) n -= m;
+        }
+        return n;
     }
 };
 
@@ -402,37 +544,38 @@ test "SlimeCell.is_slime is false only for empty" {
     try testing.expect(!empty.is_slime());
     const neutral: SlimeCell = .neutral;
     const neutralized: SlimeCell = .neutralized;
-    const special: SlimeCell = .special;
     try testing.expect(neutral.is_slime());
     try testing.expect((SlimeCell{ .tiered = .red }).is_slime());
     try testing.expect(neutralized.is_slime());
     // A special occupies its cell like any other unit — it falls, and it is
-    // never "nothing".
-    try testing.expect(special.is_slime());
+    // never "nothing".  Every kind.
+    try testing.expect((SlimeCell{ .special = .neutralizer }).is_slime());
+    try testing.expect((SlimeCell{ .special = .egg }).is_slime());
 }
 
 test "SlimeCell.is_hazard is true only for a live tiered cell" {
-    // Only hazards are worth casting at.  A special looks immovable in the same
-    // way a red does, but no cast can ever touch it, so it is NOT a hazard.
+    // Only hazards are worth casting at.  A neutralizer looks immovable in the
+    // same way a red does, but no cast can ever touch it, so it is NOT a hazard.
     try testing.expect((SlimeCell{ .tiered = .red }).is_hazard());
     try testing.expect((SlimeCell{ .tiered = .green }).is_hazard());
     const neutralized: SlimeCell = .neutralized;
     const neutral: SlimeCell = .neutral;
     const empty: SlimeCell = .empty;
-    const special: SlimeCell = .special;
     try testing.expect(!neutralized.is_hazard());
     try testing.expect(!neutral.is_hazard());
     try testing.expect(!empty.is_hazard());
-    try testing.expect(!special.is_hazard());
+    try testing.expect(!(SlimeCell{ .special = .neutralizer }).is_hazard());
+    try testing.expect(!(SlimeCell{ .special = .egg }).is_hazard());
 }
 
 test "edible and blocking are exact opposites over the occupied cells" {
     // The feast's whole rulebook: an occupied cell either feeds it or stops it,
     // never both and never neither.  Empty conducts without feeding.
     const cases = [_]SlimeCell{
-        .neutral,                 .neutralized,
-        .special,                 .{ .tiered = .red },
-        .{ .tiered = .yellow },   .{ .tiered = .green },
+        .neutral,                        .neutralized,
+        .{ .special = .neutralizer },    .{ .special = .egg },
+        .{ .tiered = .red },             .{ .tiered = .yellow },
+        .{ .tiered = .green },
     };
     for (cases) |cell| {
         try testing.expect(cell.is_edible() != cell.blocks_feast());
@@ -440,6 +583,33 @@ test "edible and blocking are exact opposites over the occupied cells" {
     const empty: SlimeCell = .empty;
     try testing.expect(!empty.is_edible());
     try testing.expect(!empty.blocks_feast());
+}
+
+test "special kind rulebook: both kinds are food-shaped, neither matches" {
+    const egg = SlimeCell{ .special = .egg };
+    try testing.expect(egg.is_edible());
+    try testing.expect(!egg.blocks_feast());
+    try testing.expect(SpecialKind.egg.consumable());
+    try testing.expect(SpecialKind.egg.eat_is_food());
+    try testing.expectEqual(SpecialEffect.hatch, SpecialKind.egg.eat_effect().?);
+
+    // The neutralizer conducts and is consumed like food, but it is
+    // equipment: eating it is free and fires the 3x3 Agent block.
+    const agent = SlimeCell{ .special = .neutralizer };
+    try testing.expect(agent.is_edible());
+    try testing.expect(!agent.blocks_feast());
+    try testing.expect(SpecialKind.neutralizer.consumable());
+    try testing.expect(!SpecialKind.neutralizer.eat_is_food());
+    try testing.expectEqual(
+        SpecialEffect.neutralize_block,
+        SpecialKind.neutralizer.eat_effect().?,
+    );
+
+    // Matching is DORMANT: no current kind lines up.
+    inline for (@typeInfo(SpecialKind).@"enum".fields) |f| {
+        const kind: SpecialKind = @enumFromInt(f.value);
+        try testing.expectEqual(@as(?SpecialEffect, null), kind.match_effect());
+    }
 }
 
 test "SlimeReservoir totals across tiers, neutral and specials" {
@@ -452,20 +622,50 @@ test "SlimeReservoir totals across tiers, neutral and specials" {
     res.tiered[@intFromEnum(Tier.green)] = 3;
     try testing.expect(!res.is_empty());
     try testing.expectEqual(@as(u32, 10), res.total());
-    try testing.expectEqual(@as(u32, 10), res.non_special());
+    try testing.expectEqual(@as(u32, 10), res.playable());
 
-    // Specials count toward the total (they still have to enter the grid) but
-    // are excluded from `non_special`, which is what the win check reads.
-    res.special = 4;
-    try testing.expectEqual(@as(u32, 14), res.total());
-    try testing.expectEqual(@as(u32, 10), res.non_special());
+    // Every special kind counts toward the total (they still have to enter
+    // the grid), and only INCONSUMABLE ones would be excluded from
+    // `playable`, which is what the win check reads.  Every current kind is
+    // consumable — the feast can clear them all — so nothing is excluded.
+    res.special[@intFromEnum(SpecialKind.neutralizer)] = 4;
+    res.special[@intFromEnum(SpecialKind.egg)] = 2;
+    try testing.expectEqual(@as(u32, 16), res.total());
+    try testing.expectEqual(@as(u32, 16), res.playable());
 }
 
-test "a reservoir of nothing but specials is not empty, but has no real slime" {
-    // The win condition: nothing left in play except objectives.
-    var res = SlimeReservoir{ .special = 3 };
+test "a reservoir of nothing but specials is still clearable slime" {
+    // Both kinds are consumable, so a specials-only reservoir is all still
+    // in play: the encounter is not won until the feast eats them too.
+    var res = SlimeReservoir{};
+    res.special[@intFromEnum(SpecialKind.neutralizer)] = 3;
     try testing.expect(!res.is_empty());
-    try testing.expectEqual(@as(u32, 0), res.non_special());
+    try testing.expectEqual(@as(u32, 3), res.playable());
+
+    var eggs = SlimeReservoir{};
+    eggs.special[@intFromEnum(SpecialKind.egg)] = 3;
+    try testing.expectEqual(@as(u32, 3), eggs.playable());
+}
+
+test "grid playable_count counts every consumable special" {
+    var grid = SlimeGrid.init(2, 3);
+    grid.set(0, 0, .neutral);
+    grid.set(0, 1, .{ .tiered = .red });
+    grid.set(0, 2, .{ .special = .neutralizer });
+    grid.set(1, 0, .{ .special = .egg });
+    grid.set(1, 1, .neutralized);
+
+    try testing.expectEqual(@as(u16, 5), grid.occupied());
+    try testing.expectEqual(@as(u16, 2), grid.special_count());
+    try testing.expectEqual(@as(u16, 1), grid.special_kind_count(.neutralizer));
+    try testing.expectEqual(@as(u16, 1), grid.special_kind_count(.egg));
+    // Every kind is consumable, so every occupied cell is still in play.
+    try testing.expectEqual(@as(u16, 5), grid.playable_count());
+}
+
+test "baby_total sums the per-type tallies, saturating" {
+    try testing.expectEqual(@as(u32, 0), baby_total([_]u32{0} ** BabyType.size));
+    try testing.expectEqual(@as(u32, 15), baby_total(.{ 1, 2, 3, 4, 5 }));
 }
 
 test "grid capacity bounds agree" {

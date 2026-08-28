@@ -8,9 +8,14 @@
  *   board  -> bridge:  CTRL:HELLO v=1          link accept (reply to GAME:HELLO)
  *                      CTRL:HB                 1s keepalive
  *                      CTRL:BTN <name> <D|U>   button press/release edges
- *                      CTRL:STAT appetite=<u32> persistent flash stat, sent
- *                                              once after CTRL:HELLO; feeds
- *                                              the player's hunger capacity
+ *                      CTRL:STAT appetite=<u32> babies=<a,b,c,d,e>
+ *                                              persistent flash stats, sent
+ *                                              once after CTRL:HELLO; appetite
+ *                                              feeds the player's hunger
+ *                                              capacity, babies (per BabyType,
+ *                                              ordinal order) join the game
+ *                                              with their owner.  `babies` is
+ *                                              absent on old firmware = all 0.
  *                      CTRL:SCORE_ACK g=<u32>  score banked to flash (sent
  *                                              AFTER the save; re-sent on retries)
  *   bridge -> board:   GAME:HELLO v=1          link request (repeated until acked)
@@ -22,9 +27,13 @@
  *                                              sent whenever it changes so the
  *                                              board only parks on its
  *                                              controller screen mid-game.
- *                      GAME:SCORE s=<u32> g=<u32>  final team score of a finished
- *                                              game (g = per-game id; retried
- *                                              every 1s until acked, bounded)
+ *                      GAME:SCORE s=<u32> g=<u32> b=<a,b,c,d,e>
+ *                                              final team score of a finished
+ *                                              game plus the babies it hatched
+ *                                              (per BabyType, ordinal order;
+ *                                              the board banks both).  g =
+ *                                              per-game id; retried every 1s
+ *                                              until acked, bounded.
  *                      FB:SHAPE <label|->      selected-shape feedback (e-paper)
  *
  * Unknown lines in either direction are ignored (the board emits unrelated
@@ -41,6 +50,23 @@
  * everyone else.  A replugged board is a NEW player: the same controller can
  * never rejoin a game it left.
  */
+
+// BabyType ordinal order — must match the Zig components.BabyType enum and
+// the board's flash layout. The wire carries counts as a bare comma list in
+// exactly this order.
+const BABY_TYPE_COUNT = 5;
+
+/** Parse "a,b,c,d,e" into 5 u32s, or null when malformed/miscounted. */
+function parseBabyList(text) {
+  const parts = text.split(",");
+  if (parts.length !== BABY_TYPE_COUNT) return null;
+  const counts = [];
+  for (const p of parts) {
+    if (!/^\d+$/.test(p.trim())) return null;
+    counts.push(Number(p.trim()) >>> 0);
+  }
+  return counts;
+}
 
 const { SerialPort } = require("serialport");
 const { ReadlineParser } = require("@serialport/parser-readline");
@@ -107,6 +133,18 @@ function finalScoreFromRender(msg, prevPhase) {
   return msg.score >>> 0;
 }
 
+/**
+ * Babies hatched over the finished encounter, per BabyType ordinal, from a
+ * game_over render frame's stats. Zeros when absent (old client / no stats).
+ * @param {object} msg  a "render" frame from the Zig client
+ * @returns {number[]}
+ */
+function hatchedFromRender(msg) {
+  const names = ["rose", "mint", "sky", "gold", "plum"]; // BabyType ordinals
+  const hatched = msg.stats?.eggs_hatched ?? {};
+  return names.map((n) => (hatched[n] ?? 0) >>> 0);
+}
+
 // Per-report id for the board's dedupe (it remembers the last BANKED id per
 // power cycle). Wall-clock seeded and monotonically bumped, so neither a
 // bridge restart nor several boards reported in the same millisecond can
@@ -138,6 +176,9 @@ class Controller {
      *  Forwarded to the board's player — it scales that player's share of
      *  the game's hunger bar (see the Zig server's game_logic.player_hunger). */
     this.appetite = 0;
+    /** Babies banked on the board (CTRL:STAT), per BabyType; zeros until the
+     *  stat arrives (and forever, for old firmware that never sends it). */
+    this.babies = new Array(BABY_TYPE_COUNT).fill(0);
     this.lastShape = null; // last FB:SHAPE payload sent (dedupe)
     /** Last GAME:PHASE activity sent (boolean), or null before the first. */
     this.lastActive = null;
@@ -226,18 +267,37 @@ class Controller {
     }
 
     if (line.startsWith("CTRL:STAT ")) {
-      // Persistent flash stats, reported once after the link comes up.
-      const arg = line.slice("CTRL:STAT ".length).trim();
-      const m = arg.match(/^appetite=(\d+)$/);
-      if (m === null) {
-        console.warn(`[ctrl] unknown stat '${arg}' from ${this.path}`);
+      // Persistent flash stats, reported once after the link comes up, as
+      // space-separated key=value pairs. Unknown keys are ignored and a
+      // missing `babies` (old firmware) means all zero.
+      const args = line.slice("CTRL:STAT ".length).trim().split(/\s+/);
+      let known = false;
+      for (const arg of args) {
+        const appetite = arg.match(/^appetite=(\d+)$/);
+        if (appetite !== null) {
+          this.appetite = Number(appetite[1]) >>> 0;
+          known = true;
+          continue;
+        }
+        const babies = arg.match(/^babies=([\d,]+)$/);
+        if (babies !== null) {
+          const counts = parseBabyList(babies[1]);
+          if (counts !== null) {
+            this.babies = counts;
+            known = true;
+          }
+          continue;
+        }
+      }
+      if (!known) {
+        console.warn(`[ctrl] unknown stat line '${line}' from ${this.path}`);
         return;
       }
-      this.appetite = Number(m[1]) >>> 0;
-      // Forward to the player; the stat only counts if it lands before the
+      // Forward to the player; the stats only count if they land before the
       // seat is taken (the server freezes the share at count time).
       if (this.playerSession !== null) {
         this.playerSession.writeToZig(`STAT:appetite=${this.appetite}\n`);
+        this.playerSession.writeToZig(`STAT:babies=${this.babies.join(",")}\n`);
       }
       return;
     }
@@ -275,18 +335,25 @@ class Controller {
   }
 
   /**
-   * Report a finished game's final team score for the board to bank into
-   * its flash lifetime total: GAME:SCORE retried until CTRL:SCORE_ACK (or
-   * the bounded attempts run out). The board dedupes by the id, so retries
-   * - and a replay across a relink - can never double-bank.
+   * Report a finished game's final team score — and the babies it hatched —
+   * for the board to bank into its flash: GAME:SCORE retried until
+   * CTRL:SCORE_ACK (or the bounded attempts run out). The board dedupes by
+   * the id, so retries - and a replay across a relink - can never
+   * double-bank. Every board that completes the encounter banks the SAME
+   * hatch counts: each hatched baby is saved to every connected board.
    * @param {number} score  final team score (u32)
+   * @param {number[]} hatched  babies hatched, per BabyType ordinal
    */
-  sendScore(score) {
+  sendScore(score, hatched) {
     if (!this.linked) return;
     const gid = nextScoreId();
+    const counts = Array.from(
+      { length: BABY_TYPE_COUNT },
+      (_, i) => (hatched?.[i] ?? 0) >>> 0,
+    );
     this.clearScoreRetry(); // a newer game's report supersedes any in flight
     this.scorePending = {
-      line: `GAME:SCORE s=${score >>> 0} g=${gid}`,
+      line: `GAME:SCORE s=${score >>> 0} g=${gid} b=${counts.join(",")}`,
       gid,
       attempts: 0,
     };
@@ -362,9 +429,10 @@ class ControllerSession extends PlayerSession {
   // ---- PlayerSession hooks --------------------------------------------------
 
   onZigSpawned() {
-    // Before READY/JOIN so the take_slot carries the board's appetite.
+    // Before READY/JOIN so the take_slot carries the board's stats.
     if (this.controller !== null) {
       this.writeToZig(`STAT:appetite=${this.controller.appetite}\n`);
+      this.writeToZig(`STAT:babies=${this.controller.babies.join(",")}\n`);
     }
   }
 
@@ -384,8 +452,9 @@ class ControllerSession extends PlayerSession {
         this.controller.sendShape(
           shapeFromRender(msg, this.manager.moveLabels(this.room.configHash)),
         );
-        // Game just ended: bank the final team score on the board.
-        if (score !== null) this.controller.sendScore(score);
+        // Game just ended: bank the final team score — and the encounter's
+        // hatched babies — on the board.
+        if (score !== null) this.controller.sendScore(score, hatchedFromRender(msg));
       }
     } else {
       console.warn(`[bridge] unknown Zig frame tag (${this.label}):`, msg.tag);

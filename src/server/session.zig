@@ -164,6 +164,10 @@ pub const PlayerSlot = struct {
     /// flash counter, or 0 for browsers/bots.  Read when the player is folded
     /// into the hunger bar.
     appetite: u32 = 0,
+    /// The babies banked on this player's board, per BabyType (take_slot).
+    /// They join the encounter with their owner — each adds baby_hunger to
+    /// the bar via the owner's share — and leave with them.
+    babies: c.BabyCounts = [_]u32{0} ** c.BabyType.size,
     entity: ecs.Entity = std.math.maxInt(ecs.Entity),
     /// Index into the session's connection registry; meaningful only while
     /// occupied.
@@ -206,6 +210,11 @@ pub const Session = struct {
     /// config.zig validates hunger_base >= 1, so a contribution is always
     /// positive and 0 is unambiguous.
     hunger_share: [MAX_PLAYERS]u16 = [_]u16{0} ** MAX_PLAYERS,
+    /// Babies hatched THIS encounter, per BabyType.  Session-owned: a hatched
+    /// baby belongs to no player, its capacity is never given back mid-game,
+    /// and the brood resets with the next encounter.  At game_over every
+    /// board that completes the encounter banks these (stats.eggs_hatched).
+    hatched: [c.BabyType.size]u16 = [_]u16{0} ** c.BabyType.size,
     /// The team's shared charge pool for the WHOLE game.  Seeded from
     /// `encounter.charges` and never replenished: every charge spent is gone
     /// for good, which is what makes an efficient shape worth aiming.
@@ -370,6 +379,7 @@ pub const Session = struct {
         }
         slot.occupied = false;
         slot.appetite = 0;
+        slot.babies = [_]u32{0} ** c.BabyType.size;
         self.connections[slot.conn].player_id = null;
     }
 
@@ -407,6 +417,9 @@ pub const Session = struct {
             .team_recipe_count = @intCast(self.cfg.balance.team_recipes.len),
         };
         self.tick_count = 0;
+        // Hatched babies live for one encounter; the boards banked them at
+        // the last game_over, so the next brood starts empty.
+        self.hatched = [_]u16{0} ** c.BabyType.size;
 
         self.restart_pending = false;
         self.prematch = false;
@@ -471,7 +484,12 @@ pub const Session = struct {
     fn count_hunger_share(self: *Session, player_id: u8) void {
         if (player_id >= MAX_PLAYERS) return;
         if (self.hunger_share[player_id] != 0) return;
-        const share = logic.player_hunger(&self.cfg.balance, self.players[player_id].appetite);
+        const slot = &self.players[player_id];
+        const share = logic.player_hunger(
+            &self.cfg.balance,
+            slot.appetite,
+            c.baby_total(slot.babies),
+        );
         self.hunger_share[player_id] = share;
         self.hunger.max +|= share;
     }
@@ -679,7 +697,8 @@ pub const Session = struct {
         try self.end_turn();
     }
 
-    /// Settle the turn: eat, collapse, refill, then refill budgets.
+    /// Settle the turn: eat, collapse, refill, resolve special matches, then
+    /// refill budgets.
     ///
     /// The turn's stamps have already landed (see `resolve_pending`), so the
     /// board this reads is the one the team bought.
@@ -687,15 +706,121 @@ pub const Session = struct {
     /// Order matters and is the whole mechanic.  `eat_all` is priced against
     /// the field exactly as the casts left it, `collapse` drags the survivors
     /// down into the holes it made, and only then does `fill` top the field up
-    /// — so refills always land ABOVE the survivors.  The end condition is
-    /// checked last, because "field cleared" means the reservoir had nothing
-    /// left to send either.
+    /// — so refills always land ABOVE the survivors.  Matches resolve LAST,
+    /// on the refilled field, because the refill is what lines new specials
+    /// up.  The end condition is checked after all of it, because "field
+    /// cleared" means the reservoir had nothing left to send either.
+    /// Hard ceiling on settle passes, purely defensive.  Every pass past the
+    /// first requires a match, every match pops at least two specials, and
+    /// specials only ever leave play — so the real bound is half the
+    /// encounter's special count.  This cap exists so a future rule change
+    /// cannot turn end_turn into an infinite loop.
+    const MAX_SETTLE_PASSES: u8 = 64;
+
     fn end_turn(self: *Session) !void {
-        const feast = self.field.eat_all(&self.cfg.balance);
-        const hunger_added = feast.hunger_total();
-        logic.add_hunger(&self.hunger, hunger_added);
-        self.score += feast.score;
-        self.record_feast(feast);
+        // The turn settles as a CASCADE: eat, collapse, refill, resolve
+        // matches — and when a match fired, its pops and its 5x5 opened
+        // walls, so the Lil Guys eat AGAIN.  The loop runs until a pass ends
+        // with no match; the summary numbers total over every pass.
+        var cells_total: u16 = 0;
+        var hunger_total: u32 = 0;
+        var score_total: u32 = 0;
+        // What survived: the LAST feast's view of the walls and what they
+        // saved — the numbers the next turn is planned around.
+        var last_sheltered: u16 = 0;
+        var last_walls: u16 = 0;
+        var hatch_msg = proto.EggsHatched{};
+        var passes: u8 = 0;
+
+        // Groups form within a turn only.  Resolution already emptied this;
+        // clearing it again costs nothing and keeps the invariant local to
+        // the turn boundary that owns it.
+        self.pending_count = 0;
+
+        while (passes < MAX_SETTLE_PASSES) {
+            const feast = self.field.eat_all(&self.cfg.balance);
+
+            // Hatch BEFORE the hunger lands: the babies joined the feast
+            // that freed them, so their capacity is on the bar when it
+            // fills.  Types are rolled here (uniform, from the session's
+            // seed) so every client and every board sees the same brood.
+            for (feast.hatched_cells[0..feast.hatched]) |cell| {
+                const t = self.rand().enumValue(c.BabyType);
+                if (hatch_msg.count < proto.MAX_HATCHES_WIRE) {
+                    hatch_msg.cells[hatch_msg.count] = cell;
+                    hatch_msg.types[hatch_msg.count] = t;
+                    hatch_msg.count += 1;
+                }
+                self.hatched[@intFromEnum(t)] +|= 1;
+                self.stats.eggs_hatched[@intFromEnum(t)] +|= 1;
+            }
+            if (feast.hatched > 0) {
+                self.hunger.max +|= logic.hatch_hunger(&self.cfg.balance, feast.hatched);
+            }
+
+            logic.add_hunger(&self.hunger, feast.hunger_total());
+            self.score += feast.score;
+            self.record_feast(feast);
+            cells_total +|= feast.cells;
+            hunger_total +|= feast.hunger_total();
+            score_total +|= feast.score;
+            last_sheltered = feast.sheltered;
+            last_walls = feast.walls;
+
+            // The feast already left the board settled (it collapses at
+            // neutralizers and at every dry pass), so this is a safety no-op
+            // today — except after a (dormant) match pass popped holes,
+            // which is exactly what it exists to tidy.  Then
+            // the refill: the one part of a settle a client cannot derive
+            // (it comes out of the session's PRNG), so which cells filled —
+            // and with what — is captured and broadcast.
+            _ = self.field.collapse();
+            var was_empty = [_]bool{false} ** c.MAX_GRID_CELLS;
+            for (0..self.field.grid.len()) |flat| {
+                was_empty[flat] = !self.field.grid.get(@intCast(flat)).is_slime();
+            }
+            _ = self.field.fill(self.rand());
+            var refill = proto.FieldRefilled{ .pass = passes };
+            for (0..self.field.grid.len()) |flat| {
+                const cell = self.field.grid.get(@intCast(flat));
+                if (!was_empty[flat] or !cell.is_slime()) continue;
+                refill.cells[refill.count] = @intCast(flat);
+                refill.contents[refill.count] = cell;
+                refill.count += 1;
+            }
+            var rbuf: [1024]u8 = undefined;
+            var rfbs = std.io.fixedBufferStream(&rbuf);
+            try proto.encode(rfbs.writer(), .field_refilled, refill);
+            try self.broadcast_raw(rfbs.getWritten());
+
+            // Matches fire on the REFILLED field — the refill is what lines
+            // new specials up.  Pops leave holes; whether the next turn's
+            // collapse tidies them or the next PASS eats through them is
+            // decided right here.
+            const matched = self.field.resolve_matches(&self.cfg.balance);
+            for (matched.matches[0..matched.count]) |m| {
+                var msg = proto.SpecialMatched{
+                    .kind = m.kind,
+                    .pass = passes,
+                    .center = m.center,
+                    .cell_count = m.len,
+                    .downgraded = m.downgraded,
+                    .neutralized = m.neutralized,
+                };
+                @memcpy(msg.cells[0..m.len], m.cells[0..m.len]);
+                var mbuf: [80]u8 = undefined;
+                var mfbs = std.io.fixedBufferStream(&mbuf);
+                try proto.encode(mfbs.writer(), .special_matched, msg);
+                try self.broadcast_raw(mfbs.getWritten());
+                std.log.info("special match (pass {}): {} {s}s popped at cell {}", .{
+                    passes, m.len, @tagName(m.kind), m.center,
+                });
+            }
+
+            passes += 1;
+            // No match: nothing re-opened, the meal is over.
+            if (matched.count == 0) break;
+        }
 
         // The feast is the ONLY thing that adds hunger, so it is the only
         // damage event in the game — announced pool-level (no actor).  Sent
@@ -705,39 +830,43 @@ pub const Session = struct {
             .tag = .damage,
             .actor_entity = std.math.maxInt(u32),
             .target_entity = std.math.maxInt(u32),
-            .value = stat_u16(hunger_added),
+            .value = stat_u16(hunger_total),
         });
 
-        // Groups form within a turn only.  Resolution already emptied this;
-        // clearing it again costs nothing and keeps the invariant local to the
-        // turn boundary that owns it.
-        self.pending_count = 0;
-
-        // Gravity, THEN the refill: survivors settle to the bottom of their
-        // column first so the new slime has the cleared top rows to land in.
-        _ = self.field.collapse();
-        _ = self.field.fill(self.rand());
+        // Announce the turn's hatches (aggregated over every pass) before
+        // the summary, so clients animate them on the board it describes.
+        if (hatch_msg.count > 0) {
+            var hbuf: [1024]u8 = undefined;
+            var hfbs = std.io.fixedBufferStream(&hbuf);
+            try proto.encode(hfbs.writer(), .eggs_hatched, hatch_msg);
+            try self.broadcast_raw(hfbs.getWritten());
+            std.log.info("hatched {} bab{s} from the feast's eggs", .{
+                hatch_msg.count, if (hatch_msg.count == 1) "y" else "ies",
+            });
+        }
 
         var buf: [32]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
         try proto.encode(fbs.writer(), .turn_ended, proto.TurnEnded{
             .turn = self.turn,
-            .cells_eaten = feast.cells,
-            .hunger_added = stat_u16(hunger_added),
-            .sheltered = feast.sheltered,
-            .walls = feast.walls,
-            .score_added = feast.score,
+            .cells_eaten = cells_total,
+            .hunger_added = stat_u16(hunger_total),
+            .sheltered = last_sheltered,
+            .walls = last_walls,
+            .score_added = score_total,
             .charges_left = self.charges,
+            .passes = passes,
         });
         try self.broadcast_raw(fbs.getWritten());
 
-        std.log.info("turn {} ended — ate {} sheltered {} behind {} walls, hunger+{} score+{} charges={} reservoir={}", .{
+        std.log.info("turn {} ended — ate {} over {} pass(es), sheltered {} behind {} walls, hunger+{} score+{} charges={} reservoir={}", .{
             self.turn,
-            feast.cells,
-            feast.sheltered,
-            feast.walls,
-            hunger_added,
-            feast.score,
+            cells_total,
+            passes,
+            last_sheltered,
+            last_walls,
+            hunger_total,
+            score_total,
             self.charges,
             self.field.reservoir.total(),
         });
@@ -824,6 +953,7 @@ pub const Session = struct {
         fs.sheltered +|= feast.sheltered;
         fs.neutral_consumed +|= feast.neutral;
         fs.defused_consumed +|= feast.defused;
+        fs.agents_consumed +|= feast.agents;
         fs.charges_left = self.charges;
     }
 
@@ -886,7 +1016,7 @@ pub const Session = struct {
         switch (tag) {
             .take_slot => {
                 const p = try proto.decode_take_slot(fbs.reader());
-                try self.take_slot(conn_id, p.appetite);
+                try self.take_slot(conn_id, p.appetite, p.babies);
             },
             .leave_slot => {
                 const pid = seat orelse return;
@@ -1022,7 +1152,7 @@ pub const Session = struct {
     ///
     /// Public as a test seam: in play this runs from the `take_slot` wire
     /// message.
-    pub fn take_slot(self: *Session, conn_id: usize, appetite: u32) !void {
+    pub fn take_slot(self: *Session, conn_id: usize, appetite: u32, babies: c.BabyCounts) !void {
         const conn = &self.connections[conn_id];
         if (conn.player_id != null) return;
         const slot = for (&self.players) |*p| {
@@ -1034,6 +1164,7 @@ pub const Session = struct {
 
         slot.occupied = true;
         slot.appetite = appetite;
+        slot.babies = babies;
         slot.conn = conn_id;
         conn.player_id = slot.player_id;
         // A freed seat keeps nothing of its previous owner.
@@ -1045,8 +1176,8 @@ pub const Session = struct {
         self.count_hunger_share(slot.player_id);
         try self.spawn_player_midgame(slot.player_id);
         try self.send_game_start_to_conn(conn_id);
-        std.log.info("player {} took a seat (appetite {}, {} seated)", .{
-            slot.player_id, appetite, self.seated_players(),
+        std.log.info("player {} took a seat (appetite {}, babies {}, {} seated)", .{
+            slot.player_id, appetite, c.baby_total(babies), self.seated_players(),
         });
     }
 
@@ -1217,6 +1348,7 @@ pub const Session = struct {
         snap.grid_cols = self.field.grid.cols;
         @memcpy(snap.grid[0..self.field.grid.len()], self.field.grid.cells[0..self.field.grid.len()]);
         snap.reservoir = self.field.reservoir.total();
+        snap.hatched = self.hatched;
 
         // The turn as it stands.  Sent to everyone: a player deciding what to
         // add needs to see what is already committed, and the client previews
@@ -1246,6 +1378,7 @@ pub const Session = struct {
                 .selected_shape = self.selected[own],
                 .cursor_row = self.field.grid.row_of(self.cursors[own]),
                 .cursor_col = self.field.grid.col_of(self.cursors[own]),
+                .babies = self.players[own].babies,
             };
             snap.entity_count += 1;
         }

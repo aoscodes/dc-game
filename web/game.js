@@ -438,6 +438,7 @@ function clearEntityState() {
   lastScoreSeen = 0;
   lastHungerSeen = 0;
   lilGuys.clear();
+  babyViews.length = 0; // re-derived from the next frame's counts
   lastBitePos = null;
   // Grid animation state is per-match: a new game's first frame must adopt its
   // grid silently rather than diff it against the last game's board.  A replay
@@ -1358,9 +1359,32 @@ const SHAPE_COLOR = "rgba(40,120,200,1)";
  *  bar's fill. */
 const NEUTRAL_COLOR = "rgba(150,150,162,1)";
 
-/** Special slime: the objective. Violet, shared with nothing, because it is
- *  neither food nor hazard and no cast can touch it. */
+/** Neutralizer special: inert to casts, swallowed for free by the feast,
+ *  firing a 3x3 Agent block as it goes down.  Violet, shared with nothing,
+ *  because it is neither ordinary food nor hazard. */
 const SPECIAL_COLOR = "rgba(140,70,210,1)";
+
+/** Egg special: edible, hatches a baby when eaten.  Warm cream so it reads
+ *  as a prize rather than a threat. */
+const EGG_COLOR = "rgba(235,200,120,1)";
+
+/** BabyType ordinal → placeholder colour name; matches components.BabyType.
+ *  These are the 5 baby kinds until real assets/identities arrive. */
+const BABY_TYPES = ["rose", "mint", "sky", "gold", "plum"];
+
+/** Baby glyph colours by type — the 5 placeholder circle styles. */
+const BABY_COLOR = {
+  rose: "rgba(230,110,140,1)",
+  mint: "rgba(110,210,160,1)",
+  sky: "rgba(110,170,230,1)",
+  gold: "rgba(220,180,70,1)",
+  plum: "rgba(160,110,200,1)",
+};
+
+/** Sum a per-baby-type {rose,...,plum} object. */
+function sumBabies(obj) {
+  return BABY_TYPES.reduce((t, name) => t + (obj?.[name] ?? 0), 0);
+}
 
 /**
  * Restate an `rgba(r,g,b,a)` color at a new alpha.
@@ -1533,8 +1557,8 @@ function fieldCenter() {
 // --- Feast reachability ------------------------------------------------------
 //
 // MIRRORS slime.eat_all.  The Lil Guys enter along the LEFT edge and flood
-// 4-connected through empty cells and food; live hazards and specials stop
-// them dead.  Everything the flood misses survives the turn.
+// 4-connected through empty cells and food; live hazards and neutralizer
+// specials stop them dead (eggs are food).  Everything the flood misses survives the turn.
 //
 // The client recomputes this rather than being told, because it needs the
 // answer for a HYPOTHETICAL board — the one the player's pending cast would
@@ -1558,35 +1582,93 @@ let reachCacheVal = null;
  * @param {number} cols
  * @param {Map<number,string>} [overrides] - flat → replacement cell name,
  *   used to ask "what would this cast open up?" without mutating the board.
- * @returns {{eaten: Set<number>, order: number[], sheltered: Set<number>,
- *            walls: Set<number>}}
+ * @returns {{eaten: Set<number>, order: number[],
+ *            settles: Map<number, Array<number|null>>,
+ *            sheltered: Set<number>, walls: Set<number>}}
  *   `eaten` is food the flood reaches and `order` the same cells in the order
- *   the flood found them (the route the Lil Guys walk); `sheltered` is food it
- *   cannot reach, and `walls` is every blocker still standing.
+ *   the flood found them (the route the Lil Guys walk); `settles` maps a bite
+ *   index to the settles that follow it — each entry a swallowed
+ *   neutralizer's cell (collapse, then its 3x3 fires there) or null (a plain
+ *   dry-pass settle); `sheltered` is food the flood cannot reach, and `walls`
+ *   is every blocker still standing.
  */
 function floodFeast(board, rows, cols, overrides) {
-  const at = (flat) => overrides?.get(flat) ?? board[flat];
+  // A full SIMULATION of the meal.  MIRRORS slime.eat_all pass for pass:
+  // eat every reachable edible cell with the board HELD STILL — gravity
+  // never plugs an open route — settling only when a neutralizer is
+  // swallowed (collapse FIRST, then its 3x3 fires on the settled board and
+  // the flood re-enters) and when a pass runs dry (falls that open new food
+  // resume the meal).  Same flood order, same settle timing, same falls —
+  // so `order` is the exact sequence of bite POSITIONS the server took (a
+  // flat can appear twice: a settle can refill a slot a later pass eats).
+  const work = board.slice(0, rows * cols);
+  if (overrides) for (const [flat, name] of overrides) work[flat] = name;
 
-  const eaten = new Set();
-  /** Eaten cells in flood-discovery order: the front advancing from the door. */
+  /** Bite positions in the order they were taken. */
   const order = [];
-  const walls = new Set();
-  const seen = new Uint8Array(rows * cols);
-  /** @type {number[]} */
-  const queue = [];
-
-  const visit = (flat) => {
-    if (seen[flat]) return;
-    const name = at(flat);
-    if (cellBlocksFeast(name)) return; // a wall is never entered, only noted
-    seen[flat] = 1;
-    if (cellIsEdible(name)) {
-      eaten.add(flat);
-      order.push(flat);
+  /** Settles after order[i]: neutralizer cell (3x3 center) or null. */
+  const settles = new Map();
+  const settle = (effect) => {
+    let moved = 0;
+    collapseBoard(work, rows, cols, () => { moved++; });
+    if (effect !== null) {
+      for (const cell of agentBlockCells(effect, rows, cols)) {
+        const next = downgradeName(work[cell]);
+        if (next !== null) work[cell] = next;
+      }
     }
-    queue.push(flat);
+    // A settle that neither moved nor fired is invisible: not recorded.
+    if (effect !== null || moved > 0) {
+      const at = order.length - 1;
+      if (!settles.has(at)) settles.set(at, []);
+      settles.get(at).push(effect);
+    }
+    return moved;
   };
 
+  feast: for (;;) {
+    let ateAny = false;
+    for (;;) {
+      const flat = nextBiteOn(work, rows, cols);
+      if (flat === null) break;
+      const name = work[flat];
+      work[flat] = "empty";
+      order.push(flat);
+      ateAny = true;
+      if (name === "special_neutralizer") {
+        settle(flat);
+        continue feast;
+      }
+    }
+    if (!ateAny) break;
+    if (settle(null) === 0) break;
+  }
+
+  const eaten = new Set(order);
+  const walls = new Set();
+  const sheltered = new Set();
+  const seen = floodReach(work, rows, cols);
+  for (let flat = 0; flat < rows * cols; flat++) {
+    const name = work[flat];
+    if (cellBlocksFeast(name)) walls.add(flat);
+    else if (cellIsEdible(name) && !seen[flat]) sheltered.add(flat);
+  }
+
+  return { eaten, order, settles, sheltered, walls };
+}
+
+/** BFS reachability over `board` from the left edge: door cells top-down,
+ *  then up/down/left/right FIFO — the visit order MIRRORS slime.flood, which
+ *  is what keeps every bite on the same cell as the server's. */
+function floodReach(board, rows, cols) {
+  const seen = new Uint8Array(rows * cols);
+  const queue = [];
+  const visit = (flat) => {
+    if (seen[flat]) return;
+    if (cellBlocksFeast(board[flat])) return;
+    seen[flat] = 1;
+    queue.push(flat);
+  };
   for (let r = 0; r < rows; r++) visit(r * cols);
   for (let head = 0; head < queue.length; head++) {
     const flat = queue[head];
@@ -1596,15 +1678,55 @@ function floodFeast(board, rows, cols, overrides) {
     if (cl > 0) visit(flat - 1);
     if (cl + 1 < cols) visit(flat + 1);
   }
+  seen.queue = queue;
+  return seen;
+}
 
-  const sheltered = new Set();
-  for (let flat = 0; flat < rows * cols; flat++) {
-    const name = at(flat);
-    if (cellBlocksFeast(name)) walls.add(flat);
-    else if (cellIsEdible(name) && !eaten.has(flat)) sheltered.add(flat);
+/** The next unit the feast eats on `board`: the first EDIBLE cell in flood
+ *  order, or null when nothing edible is reachable. */
+function nextBiteOn(board, rows, cols) {
+  const seen = floodReach(board, rows, cols);
+  for (const flat of seen.queue) {
+    if (cellIsEdible(board[flat])) return flat;
   }
+  return null;
+}
 
-  return { eaten, order, sheltered, walls };
+/**
+ * Pack every column of `board` against the floor — MIRRORS slime.collapse.
+ * When `onMove` is given it is called (destFlat, fellRows) per moved unit,
+ * which is how the replay turns falls into drop animations.
+ */
+function collapseBoard(board, rows, cols, onMove) {
+  for (let col = 0; col < cols; col++) {
+    let write = rows - 1;
+    for (let read = rows - 1; read >= 0; read--) {
+      const flat = read * cols + col;
+      if (!cellIsSlime(board[flat])) continue;
+      if (read !== write) {
+        const dest = write * cols + col;
+        board[dest] = board[flat];
+        board[flat] = "empty";
+        if (onMove) onMove(dest, write - read);
+      }
+      write--;
+    }
+  }
+}
+
+/** The 3x3 Agent block around `center`, clipped, in row-major offset order —
+ *  MIRRORS slime.AGENT_BLOCK, so effects apply in the server's order. */
+function agentBlockCells(center, rows, cols) {
+  const cr = Math.floor(center / cols), cc = center % cols;
+  const cells = [];
+  for (let dr = -1; dr <= 1; dr++) {
+    for (let dc = -1; dc <= 1; dc++) {
+      const r = cr + dr, cl = cc + dc;
+      if (r < 0 || r >= rows || cl < 0 || cl >= cols) continue;
+      cells.push(r * cols + cl);
+    }
+  }
+  return cells;
 }
 
 /**
@@ -1657,16 +1779,19 @@ function parseRgb(str) {
 const TILE_RGB = {
   ...Object.fromEntries(TIER_NAMES.map((n) => [n, parseRgb(TIER_COLOR[n])])),
   neutral: parseRgb(NEUTRAL_COLOR),
-  special: parseRgb(SPECIAL_COLOR),
+  special_neutralizer: parseRgb(SPECIAL_COLOR),
+  special_egg: parseRgb(EGG_COLOR),
 };
 
 /**
  * Decode a wire cell name into what to draw.
- *   "empty"    → null (no tile; the socket shows through)
- *   "neutral"  → grey body, no glyph        (harmless filler)
- *   "red"      → red body + ≡ glyph         (hazard, 3 stamps from harmless)
- *   "defused"  → grey body + a dim ring     (was a hazard, now harmless)
- *   "special"  → violet body + ★ glyph      (the objective: inert, inedible)
+ *   "empty"               → null (no tile; the socket shows through)
+ *   "neutral"             → grey body, no glyph  (harmless filler)
+ *   "red"                 → red body + ≡ glyph   (hazard, 3 stamps from harmless)
+ *   "defused"             → grey body + a dim ring (was a hazard, now harmless)
+ *   "special_neutralizer" → violet body + ★ glyph (free pickup: eaten for no
+ *                            score, fires a 3x3 Agent block)
+ *   "special_egg"         → cream body + ○ glyph  (food with a baby inside)
  * A defused cell is safe to eat, so its BODY is grey like neutral; the ring
  * distinguishes "someone defused this" from "this was never a threat".
  */
@@ -1674,7 +1799,8 @@ function cellStyle(name) {
   if (!name || name === "empty") return null;
   if (name === "neutral") return { body: "neutral", glyph: null, ring: false };
   if (name === "defused") return { body: "neutral", glyph: null, ring: false };
-  if (name === "special") return { body: "special", glyph: "\u2605", ring: false };
+  if (name === "special_neutralizer") return { body: "special_neutralizer", glyph: "\u2605", ring: false };
+  if (name === "special_egg") return { body: "special_egg", glyph: "\u25cb", ring: false };
   return TIER_NAMES.includes(name)
     ? { body: name, glyph: TIER_CHAR[name], ring: false }
     : { body: "neutral", glyph: null, ring: false };
@@ -1685,17 +1811,20 @@ function cellIsSlime(name) {
   return cellStyle(name) !== null;
 }
 
-/** True when the flood can EAT this cell.  Live hazards and specials are walls;
- *  empty space conducts but is not food. */
+/** True when the flood can EAT this cell.  Live hazards are walls; empty
+ *  space conducts but is not food.  Both specials are consumed en route: an
+ *  egg is food with a baby inside, a neutralizer is free equipment that
+ *  fires a 3x3 Agent block as it is swallowed. */
 function cellIsEdible(name) {
-  return name === "neutral" || name === "defused";
+  return name === "neutral" || name === "defused" ||
+    name === "special_egg" || name === "special_neutralizer";
 }
 
 /** True when this cell stops the flood dead.  The single rule the whole board
  *  is read through: a wall is not just uneaten, it shelters everything the
- *  flood would have reached through it. */
+ *  flood would have reached through it.  Only live hazards wall. */
 function cellBlocksFeast(name) {
-  return name === "special" || TIER_NAMES.includes(name);
+  return TIER_NAMES.includes(name);
 }
 
 /** The tier of a cell that is still a HAZARD, or null for anything else
@@ -1711,8 +1840,8 @@ let tileCacheSize = -1;
 
 /** Tile body → slime atlas frame stem (see scripts/gen_slime_tiles.py).
  *  Hard/Medium/Soft/Goo are the authored red/yellow/green/grey; neutral and
- *  defused both map to goo, matching the badge.  `special` has no authored
- *  art and keeps the procedural drawing. */
+ *  defused both map to goo, matching the badge.  The special kinds have no
+ *  authored art and keep the procedural drawing. */
 const SLIME_FRAME = {
   red: "hard",
   yellow: "medium",
@@ -1744,7 +1873,7 @@ function roundRectPath(c, x, y, w, h, r) {
  *
  * Slime bodies blit the authored SlimeBlock atlas (black-and-white, shared
  * with the e-paper badge); `selected` swaps in the *_invert frame — the mark
- * for a cell covered by the cast preview or a cursor.  `special` (and the
+ * for a cell covered by the cast preview or a cursor.  The special kinds (and the
  * unlikely case of the atlas not having loaded) falls back to the original
  * procedural gel tile.
  */
@@ -2314,7 +2443,7 @@ function lilGuyPost(i, count, rows, cols) {
  * the surviving views back in `game.entities` order.
  *
  * Shared by the idle milling below and the cinematic, which needs the same
- * roster to hand out eat queues.
+ * roster to hand out the bite script.
  *
  * @param {number[]} spawnAt - flat index each new guy should appear standing on,
  *   by roster position.  A guy is born on its cell rather than sprinting in from
@@ -2434,14 +2563,20 @@ function drawLilGuys(game, dt) {
 // the player aimed at is simply replaced.
 //
 // So the client replays it.  It has both boards (`prevGrid` before, the frame's
-// grid after) and both rules (the flood mirrored in floodFeast, the gravity
-// mirrored below), which is everything needed to reconstruct the three steps in
-// between.  A synthetic `board` is drawn instead of the frame's grid until the
-// replay lands exactly on it:
+// grid after), the rules (the flood mirrored in floodFeast, the gravity and the
+// match effects mirrored below), and the per-pass refill events — the one step
+// only the server's PRNG knows.  A synthetic `board` is drawn instead of the
+// frame's grid until the replay lands exactly on it.  Each settle PASS plays:
 //
-//   eat      — the Lil Guys walk the flood's own route, cell to cell, biting
+//   eat      — the Lil Guys (and the babies) walk the flood's own route,
+//              biting; the board settles mid-meal only where the server's
+//              did (after a swallowed neutralizer, and between passes)
 //   collapse — survivors fall to the bottom of their column
-//   fill     — reservoir units rain into the holes from above
+//   fill     — the pass's refill event rains into the holes from above
+//   matchFx  — the pass's special matches pop and fire their effects
+//
+// A pass that matched RE-OPENED the feast, so the next pass's eat begins; the
+// pass that matched nothing is the last, and the replay lands.
 //
 // The replay is authoritative about NOTHING: it starts from a server board and
 // ends on a server board, and every intermediate step is derived from the same
@@ -2455,14 +2590,29 @@ function drawLilGuys(game, dt) {
 
 /**
  * @typedef {object} Cinematic
- * @property {"eat"|"collapse"|"fill"} stage
+ * @property {"eat"|"collapse"|"fill"|"matchFx"} stage
  * @property {number} rows
  * @property {number} cols
  * @property {string[]} board  - what is DRAWN: the replay's current board
- * @property {string[]} target - the server's post-feast board, adopted at the end
- * @property {Map<number, number[]>} queues - player id → cells left to eat, in
- *   flood order.  A queue outliving its player is drained instantly.
- * @property {Map<number, number>} chomps - player id → chomp pause remaining
+ * @property {string[]} target - the server's post-settle board, adopted at the end
+ * @property {number} pass     - the settle pass now playing (0-based)
+ * @property {number} passes   - passes the server's settle took (turn_ended)
+ * @property {Map<number, object>} refillsByPass - pass → its refill event
+ * @property {Map<number, object[]>} matchesByPass - pass → its match events
+ * @property {object} frame    - the freshest render frame (entity roster for
+ *   re-queueing the next pass's mouths)
+ * @property {number[]} script - bite POSITIONS in server order.  Bites are
+ *   strictly sequential (a settle between passes re-aims the ones after it),
+ *   so the meal is a single global script rather than per-eater queues.
+ * @property {Map<number, Array<number|null>>} settles - settles owed after
+ *   each script index (see floodFeast); applied by settleAfterBite the
+ *   moment that bite lands
+ * @property {number} biteIdx - the next script entry to take
+ * @property {number} holdT   - chomp pause remaining after the last bite
+ * @property {{owner?: number, baby?: object}[]} eaters - every mouth, Lil
+ *   Guys first then the babies (by REFERENCE, so hatches and departures
+ *   cannot repoint them).  Bite k belongs to eaters[k % eaters.length];
+ *   everyone else walks toward their NEXT assigned bite in anticipation.
  * @property {number} speed    - walk speed (px/s) fitted to LAYOUT.cinematic.eatCapS
  * @property {number} chompS   - per-bite pause, shortened on a crowded board
  * @property {number} t        - seconds left in a timed stage (collapse, fill)
@@ -2538,7 +2688,6 @@ function startFeastCinematic(game) {
     return false;
   }
 
-  const C = LAYOUT.cinematic;
   const board = before.slice();
   // The cast that ENDED the turn resolved in the same server tick as the feast,
   // so `prevGrid` predates it: the meal has to start from the board that cast
@@ -2555,39 +2704,118 @@ function startFeastCinematic(game) {
       cellAnim.set(flat, { kind: "flash", dur: FIELD.flashS, t: FIELD.flashS });
     }
   }
-  const order = floodFeast(board, rows, cols).order;
 
-  const queues = new Map();
-  const chomps = new Map();
+  // The turn settled in PASSES: matches re-open the feast, so the server ran
+  // eat/collapse/fill/match until no match fired, and sent the per-pass data
+  // the replay cannot derive — each pass's refill (PRNG) — plus each match.
+  // Everything else (floods, falls, the 5x5s) is mirrored rules, so the
+  // replay walks the whole cascade exactly.
+  const refillsByPass = new Map();
+  for (const fr of game.refills ?? []) refillsByPass.set(fr.pass, fr);
+  const matchesByPass = new Map();
+  for (const sm of game.special_matches ?? []) {
+    const list = matchesByPass.get(sm.pass ?? 0);
+    if (list === undefined) matchesByPass.set(sm.pass ?? 0, [sm]);
+    else list.push(sm);
+  }
+  const passes = Math.max(1, te?.passes ?? 1);
+
+  cinematic = {
+    stage: "eat",
+    rows, cols,
+    board,
+    target,
+    pass: 0,
+    passes,
+    refillsByPass,
+    matchesByPass,
+    frame: game,
+    script: [],
+    settles: new Map(),
+    biteIdx: 0,
+    holdT: 0,
+    eaters: [],
+    speed: LAYOUT.lilGuys.speed,
+    chompS: LAYOUT.cinematic.chompPauseS,
+    t: 0,
+    deferred: { score: 0, hunger: 0, stamps: [] },
+    tally,
+  };
+
+  const ate = armEatPass(game);
+  if (ate) {
+    const { x, y } = fieldCenter();
+    // Ink, not the light cast-event cyan: this headline floats over the paper
+    // field, where light colors vanish.
+    spawnFloater("Lil Guys Eating!", x, y - LAYOUT.floater.stack - 8,
+      "rgba(40,36,60,0.95)", LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
+  }
+  return true;
+}
+
+/**
+ * Arm the current pass's eat stage: flood the replay board, split the route
+ * round robin over every mouth (Lil Guys first, then the babies), and fit the
+ * shared walk speed and per-bite hold to this pass's meal.
+ *
+ * Returns true when an eat stage was armed; false when there was nothing to
+ * walk (or nobody to walk it), in which case the pass's cells are taken at
+ * once and the replay goes straight to the fall.  No headline in that case:
+ * announcing an eat stage that is never played is the one thing worse than
+ * showing nothing.
+ */
+function armEatPass(game) {
+  const c = cinematic;
+  const { rows, cols } = c;
+  const C = LAYOUT.cinematic;
+  const feast = floodFeast(c.board, rows, cols);
+  const order = feast.order;
+
   const players = (game.entities ?? []).filter((e) => e.owner !== undefined);
-  players.forEach((e, i) => {
-    // Round robin over the flood's route: every guy walks the same advancing
-    // front, so the meal spreads out from the door however many are eating.
-    const mine = order.filter((_, n) => n % players.length === i);
-    queues.set(e.owner, mine);
-    chomps.set(e.owner, 0);
-  });
-  const guys = syncLilGuys(game, players.map((e) => queues.get(e.owner)?.[0] ?? null));
+  // Every mouth, Lil Guys first then the brood (babies by reference: a hatch
+  // or a departure mid-meal reshuffles babyViews, not this roster).
+  const eaters = [
+    ...players.map((e) => ({ owner: e.owner })),
+    ...babyViews.map((b) => ({ baby: b })),
+  ];
+  c.script = order;
+  c.settles = feast.settles;
+  c.biteIdx = 0;
+  c.holdT = 0;
+  c.eaters = eaters;
+  const guys = syncLilGuys(game, players.map((e, i) =>
+    nextAssignedBite(order, 0, i, eaters.length)));
 
-  // Bites are shortened when the board is crowded enough that the pauses alone
-  // would blow the budget; walking gets whatever is left, never less than half
-  // the cap.
-  const longest = Math.max(0, ...[...queues.values()].map((q) => q.length));
-  let chompS = longest > 0
-    ? Math.min(C.chompPauseS, (C.eatCapS * 0.5) / longest)
+  // Bites resolve one at a time (a settle between passes can re-aim the
+  // ones after it), so the HOLD budget is global: shortened when the meal is
+  // long enough that the pauses alone would blow the cap.
+  const bites = order.length;
+  let chompS = bites > 0
+    ? Math.min(C.chompPauseS, (C.eatCapS * 0.5) / bites)
     : C.chompPauseS;
-  const walkBudget = Math.max(C.eatCapS - chompS * longest, C.eatCapS * 0.5);
+  const walkBudget = Math.max(C.eatCapS - chompS * bites, C.eatCapS * 0.5);
 
-  // The longest route any one guy has to walk, measured from where he is now.
+  // The longest route any one mouth walks over its ASSIGNED bites, measured
+  // from where it stands.  Off-duty mouths walk toward their next bite in
+  // anticipation, so routes overlap the holds and this estimate holds up.
   let farthest = 0;
   const guySize = lilGuySize(rows, cols);
-  guys.forEach((g, i) => {
-    const queue = queues.get(players[i]?.owner) ?? [];
-    let px = g.x, py = g.y, len = 0;
-    for (const flat of queue) {
-      const at = cellCenter(flat, rows, cols);
-      const tx = at.x - guySize / 2;
-      const ty = at.y - guySize / 2;
+  eaters.forEach((eater, i) => {
+    let px, py;
+    if (eater.baby !== undefined) {
+      px = eater.baby.x;
+      py = eater.baby.y;
+    } else {
+      const g = guys[i];
+      if (g === undefined) return;
+      px = g.x;
+      py = g.y;
+    }
+    let len = 0;
+    for (let k = i; k < order.length; k += eaters.length) {
+      const at = cellCenter(order[k], rows, cols);
+      const tx = eater.baby !== undefined ? at.x : at.x - guySize / 2;
+      const ty = eater.baby !== undefined ? at.y : at.y - guySize / 2;
       len += Math.hypot(tx - px, ty - py);
       px = tx; py = ty;
     }
@@ -2600,49 +2828,41 @@ function startFeastCinematic(game) {
   // within a single frame: the animation ran and nobody could see it.  Holding
   // each bite longer is the honest fix, since on a short meal the bites ARE the
   // animation.  Capped so a long route is not slowed past the ceiling.
+  //
+  // The speed is fast enough to finish inside the cap: a full board's route is
+  // long, and the guys sprint it rather than letting the pause scale with the
+  // meal.
   const speed = Math.max(LAYOUT.lilGuys.speed, farthest / walkBudget);
-  if (longest > 0) {
+  if (bites > 0) {
     const walkS = farthest / speed;
-    const floorHold = (C.eatMinS - walkS) / longest;
-    chompS = Math.min(Math.max(chompS, floorHold), C.eatCapS / longest);
+    const floorHold = (C.eatMinS - walkS) / bites;
+    chompS = Math.min(Math.max(chompS, floorHold), C.eatCapS / bites);
   }
+  c.speed = speed;
+  c.chompS = chompS;
 
-  cinematic = {
-    stage: "eat",
-    rows, cols,
-    board,
-    target,
-    queues,
-    chomps,
-    // Fast enough to finish inside the cap: a full board's route is long, and
-    // the guys sprint it rather than letting the pause scale with the meal.
-    // Making a SHORT meal watchable is NOT this number's job — the guys idle on
-    // the very cell they will eat first, so a one-cell meal has no distance to
-    // cover at any speed.  The per-bite hold does that (see `chompS` above).
-    speed,
-    chompS,
-    t: 0,
-    deferred: { score: 0, hunger: 0, stamps: [] },
-    tally,
-  };
-
-  // Nothing to walk, or nobody to walk it (every player gone the moment the turn
-  // ended): the field was still devoured, so take it and go straight to the fall.
-  // No headline in either case: it announces an eat stage, and none is played —
-  // the cells are taken in this frame and the board drops.  Saying "Eating!" over
-  // a meal the screen never shows is the one thing worse than showing nothing.
-  if (order.length === 0 || guys.length === 0) {
-    for (const flat of order) bite(flat, null);
+  if (order.length === 0 || eaters.length === 0) {
+    // Nothing to walk, or nobody to walk it: take the meal at once (settles
+    // applied between bites, so positions stay true) and drop.
+    while (c.biteIdx < c.script.length) {
+      bite(c.script[c.biteIdx], null);
+      settleAfterBite(c.biteIdx);
+      c.biteIdx++;
+    }
     beginCollapse();
-    return true;
+    return false;
   }
-
-  const { x, y } = fieldCenter();
-  // Ink, not the light cast-event cyan: this headline floats over the paper
-  // field, where light colors vanish.
-  spawnFloater("Lil Guys Eating!", x, y - LAYOUT.floater.stack - 8,
-    "rgba(40,36,60,0.95)", LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
+  c.stage = "eat";
   return true;
+}
+
+/** The script index of eater `idx`'s next assigned bite at/after `from`, or
+ *  null when their share of the meal is finished. */
+function nextAssignedBite(script, from, idx, eaterCount) {
+  for (let k = Math.max(from, 0); k < script.length; k++) {
+    if (k % eaterCount === idx) return script[k];
+  }
+  return null;
 }
 
 /**
@@ -2666,95 +2886,129 @@ function boardStep(dt) {
 /** Advance the replay one frame.  Drives the Lil Guys for its duration. */
 function tickCinematic(game, dt) {
   if (!cinematic) return;
+  // The freshest frame, for the entity roster the next pass's queues need.
+  cinematic.frame = game;
   switch (cinematic.stage) {
     case "eat": tickEat(game, dt); break;
     case "collapse":
-      // The meal is over: the crew files back to the door while the board
-      // settles behind them, so the replay ends with everyone at the edge.
+      // This pass's meal is over: the crew files back to the door while the
+      // board settles behind them.  A later pass calls them right back in.
       tickLilGuys(game, dt);
       cinematic.t -= dt;
-      if (cinematic.t <= 0) beginFill();
+      if (cinematic.t <= 0) beginFillPass();
       break;
     case "fill":
       tickLilGuys(game, dt);
       cinematic.t -= dt;
-      if (cinematic.t <= 0) finishFill();
+      if (cinematic.t <= 0) beginMatchFx();
+      break;
+    case "matchFx":
+      tickLilGuys(game, dt);
+      cinematic.t -= dt;
+      if (cinematic.t <= 0) nextPassOrFinish();
       break;
   }
 }
 
-/** One frame of the eat stage: every guy walks to its next cell and bites it. */
+/**
+ * One frame of the eat stage.
+ *
+ * Bites are strictly SEQUENTIAL — a settle between passes can re-aim every
+ * bite after it — so exactly one mouth is "on duty" (the eater assigned to
+ * script[biteIdx]); it walks to the bite cell and takes it.  Everyone else
+ * walks toward their own next assigned bite in anticipation (or home, when
+ * their share is done), which keeps the crew swarming even though the meal
+ * resolves one mouthful at a time.
+ */
 function tickEat(game, dt) {
   const c = cinematic;
   const { rows, cols } = c;
+  const E = c.eaters.length;
   const players = (game.entities ?? []).filter((e) => e.owner !== undefined);
   const roster = new Set(players.map((e) => e.owner));
+  const guys = syncLilGuys(game, players.map((e) => {
+    const idx = c.eaters.findIndex((eater) => eater.owner === e.owner);
+    return idx >= 0 ? nextAssignedBite(c.script, c.biteIdx, idx, E) : null;
+  }));
 
-  // A guy whose player left mid-meal cannot finish it, and the cells it was
-  // walking to WERE eaten — the server said so.  Take them at once rather than
-  // stalling the replay on a sprite that no longer exists.
-  for (const [pid, queue] of c.queues) {
-    if (roster.has(pid)) continue;
-    for (const flat of queue) bite(flat, null);
-    c.queues.delete(pid);
-    c.chomps.delete(pid);
+  // Resolve an eater entry to something that can walk, or null when it left
+  // mid-meal (player gone, baby reconciled away).
+  const resolve = (eater) => {
+    if (eater.baby !== undefined) {
+      return babyViews.includes(eater.baby) ? eater.baby : null;
+    }
+    if (!roster.has(eater.owner)) return null;
+    const pi = players.findIndex((e) => e.owner === eater.owner);
+    return guys[pi] ?? null;
+  };
+
+  // The duty chain: spend the frame's slice on holds, walks and bites.  A
+  // duty eater who vanished cannot finish — the cells WERE eaten, the server
+  // said so — so its bites are taken instantly and the duty moves on.
+  let left = dt;
+  while (left > 0 && c.biteIdx < c.script.length) {
+    if (c.holdT > 0) {
+      const used = Math.min(left, c.holdT);
+      c.holdT -= used;
+      left -= used;
+      continue;
+    }
+    const flat = c.script[c.biteIdx];
+    const eater = c.eaters[c.biteIdx % E];
+    const body = resolve(eater);
+    if (body === null) {
+      bite(flat, null);
+      settleAfterBite(c.biteIdx);
+      c.biteIdx++;
+      continue;
+    }
+    const walk = eater.baby !== undefined
+      ? walkBaby(body, flat, rows, cols, c.speed, left)
+      : walkLilGuy(body, flat, rows, cols, c.speed, left);
+    if (!walk.arrived) break;
+    if (eater.baby !== undefined) {
+      biteByBaby(flat, body);
+    } else {
+      body.target = flat;
+      bite(flat, body);
+    }
+    settleAfterBite(c.biteIdx);
+    c.holdT = c.chompS;
+    c.biteIdx++;
+    left = walk.left;
   }
 
-  const guys = syncLilGuys(game, players.map((e) => c.queues.get(e.owner)?.[0] ?? null));
-  players.forEach((e, i) => {
-    const queue = c.queues.get(e.owner);
-    if (!queue) return;
-    if (queue.length === 0) {
-      // Done eating, but a hold may still be owed on the last bite.  Drain it
-      // here, since the walk loop below is skipped once the queue is empty;
-      // after that, head back to the door while the others finish.
-      const pause = c.chomps.get(e.owner) ?? 0;
-      if (pause > 0) {
-        c.chomps.set(e.owner, Math.max(0, pause - dt));
-      } else if (guys[i] !== undefined) {
-        void walkLilGuyHome(guys[i], i, players.length, rows, cols, dt);
-      }
+  // Everyone off duty: walk toward the next assigned bite, or file home.
+  c.eaters.forEach((eater, i) => {
+    if (c.biteIdx < c.script.length && i === c.biteIdx % E) return; // on duty
+    const body = resolve(eater);
+    if (body === null) return;
+    const next = nextAssignedBite(c.script, c.biteIdx, i, E);
+    if (eater.baby !== undefined) {
+      if (next !== null) void walkBaby(body, next, rows, cols, c.speed, dt);
+      // A finished baby stands down: tickBabies drifts it home.
       return;
     }
-    const g = guys[i];
-    if (g === undefined) return;
-
-    // Spend the frame's whole slice: walk, bite, hold the beat, and walk on with
-    // whatever is left.  A slice big enough for several cells takes several,
-    // which is what keeps a crowded board inside the cap instead of stretching
-    // the pause out one frame per bite.
-    let left = dt;
-    while (left > 0 && queue.length > 0) {
-      const pause = c.chomps.get(e.owner) ?? 0;
-      if (pause > 0) {
-        c.chomps.set(e.owner, Math.max(0, pause - left));
-        left -= Math.min(left, pause);
-        continue;
-      }
-
-      const flat = queue[0];
-      g.target = flat;
-      const walk = walkLilGuy(g, flat, rows, cols, c.speed, left);
-      if (!walk.arrived) break;
-
-      bite(flat, g);
-      c.chomps.set(e.owner, c.chompS);
-      queue.shift();
-      left = walk.left;
+    const pi = players.findIndex((e) => e.owner === eater.owner);
+    if (next !== null) {
+      body.target = next;
+      void walkLilGuy(body, next, rows, cols, c.speed, dt);
+    } else {
+      void walkLilGuyHome(body, pi, players.length, rows, cols, dt);
     }
   });
 
-  for (const queue of c.queues.values()) {
-    if (queue.length > 0) return;
+  // The last bite's hold is still owed once the script is spent: the duty
+  // loop above is skipped when biteIdx reaches the end, so drain it here —
+  // without waiting it out the final cell would pop and the board drop in
+  // the same frame, and a one-cell meal would be over before it was seen.
+  if (c.biteIdx >= c.script.length && c.holdT > 0) {
+    c.holdT = Math.max(0, c.holdT - dt);
   }
-  // Everything is eaten, but the LAST bite's hold is still owed: without waiting
-  // it out the final cell pops and the board collapses in the same frame, which
-  // on a one- or two-cell meal is the whole animation gone in an instant.  Every
-  // other bite gets its beat; so does this one.
-  for (const pause of c.chomps.values()) {
-    if (pause > 0) return;
+
+  if (c.biteIdx >= c.script.length && c.holdT <= 0) {
+    finishEat();
   }
-  finishEat();
 }
 
 /**
@@ -2767,6 +3021,7 @@ function bite(flat, g) {
   const was = c.board[flat];
   c.board[flat] = "empty";
   cellAnim.set(flat, { kind: "pop", dur: FIELD.popS, t: FIELD.popS, from: was });
+
   if (g === null) return;
 
   const at = cellCenter(flat, c.rows, c.cols);
@@ -2774,6 +3029,49 @@ function bite(flat, g) {
   g.pendingClip = "attack";
   spawnFloater("chomp", at.x, at.y - LAYOUT.floater.stack,
     "rgba(40,36,60,0.85)", 0.8); // ink, not white: it floats over the paper field
+}
+
+/**
+ * Apply the settles scripted after bite `idx` to the replay board — MIRRORS
+ * slime.eat_all's settle points, the only moments gravity runs during the
+ * meal.  Each settle collapses first; a swallowed neutralizer's 3x3 Agent
+ * block then fires on the SETTLED board at the cell it was eaten from, so
+ * the replay opens exactly where the server's flood re-entered.
+ */
+function settleAfterBite(idx) {
+  const c = cinematic;
+  const list = c.settles?.get(idx);
+  if (!list) return;
+  for (const effect of list) {
+    collapseBoard(c.board, c.rows, c.cols, (dest, fell) => {
+      cellAnim.set(dest, {
+        kind: "drop", dur: LAYOUT.cinematic.collapseS,
+        t: LAYOUT.cinematic.collapseS, cells: fell,
+      });
+    });
+    if (effect === null) continue;
+    for (const cell of agentBlockCells(effect, c.rows, c.cols)) {
+      const next = downgradeName(c.board[cell]);
+      if (next === null) continue;
+      c.board[cell] = next;
+      cellAnim.set(cell, { kind: "flash", dur: FIELD.flashS, t: FIELD.flashS });
+    }
+    const fx = cellCenter(effect, c.rows, c.cols);
+    spawnFloater("neutralized!", fx.x, fx.y - LAYOUT.floater.stack,
+      SPECIAL_COLOR, 0.9);
+  }
+}
+
+/** A baby eats one cell: same bite, with the circle's puff standing in for
+ *  the Lil Guys' attack clip (see drawBabies). */
+function biteByBaby(flat, b) {
+  const c = cinematic;
+  bite(flat, null);
+  const at = cellCenter(flat, c.rows, c.cols);
+  lastBitePos = at;
+  b.chompT = BABY_CHOMP_S;
+  spawnFloater("chomp", at.x, at.y - LAYOUT.floater.stack,
+    "rgba(40,36,60,0.85)", 0.8);
 }
 
 /** The board is picked clean: pay out the deltas the meal earned, then drop. */
@@ -2817,7 +3115,7 @@ function beginCollapse() {
 
   c.stage = "collapse";
   c.t = longest > 0 ? LAYOUT.cinematic.collapseS : 0;
-  if (c.t === 0) beginFill(); // nothing moved: no fall to watch
+  if (c.t === 0) beginFillPass(); // nothing moved: no fall to watch
 }
 
 /**
@@ -2836,38 +3134,136 @@ function beginCollapse() {
  * starts off-grid, so a single unit drops in from the edge rather than sailing
  * down from wherever the column happens to be empty.
  */
-function beginFill() {
+function beginFillPass() {
   const c = cinematic;
   const { rows, cols } = c;
   const S = LAYOUT.cinematic;
   let any = false;
 
-  for (let col = 0; col < cols; col++) {
-    const stack = [];
-    for (let row = 0; row < rows; row++) {
-      const flat = row * cols + col;
-      if (cellIsSlime(c.board[flat])) continue;
-      // The reservoir ran dry partway down the board: this hole stays open, and
-      // so does everything under it.  Nothing below is arriving, so the stack
-      // above it is the whole fall.
-      if (!cellIsSlime(c.target[flat])) break;
-      stack.push(flat);
+  const fr = c.refillsByPass.get(c.pass);
+  if (fr !== undefined) {
+    // The server told us exactly which cells this pass filled and with what
+    // — the one step of a settle the client cannot derive.  A column's new
+    // units fall as one rigid stack, exactly one cell apart, queued in the
+    // order they land.
+    const byCol = new Map();
+    (fr.cells ?? []).forEach((flat, i) => {
+      const col = flat % cols;
+      const entry = { flat, name: fr.contents?.[i] ?? "neutral" };
+      const list = byCol.get(col);
+      if (list === undefined) byCol.set(col, [entry]);
+      else list.push(entry);
+    });
+    for (const [, list] of byCol) {
+      for (const { flat, name } of list) {
+        c.board[flat] = name;
+        cellAnim.set(flat, {
+          kind: "drop", dur: S.collapseS, t: S.collapseS,
+          cells: list.length,
+        });
+      }
+      any = true;
     }
-    if (stack.length === 0) continue;
+  } else {
+    // No refill event (an older server): derive the pour from the target
+    // board, which is only sound on a single-pass settle.  Collapse leaves
+    // every hole at the TOP of its column and the server fills in flat
+    // order, so a column's refill is a contiguous stack of new units.
+    for (let col = 0; col < cols; col++) {
+      const stack = [];
+      for (let row = 0; row < rows; row++) {
+        const flat = row * cols + col;
+        if (cellIsSlime(c.board[flat])) continue;
+        // The reservoir ran dry partway down the board: this hole stays
+        // open, and so does everything under it.
+        if (!cellIsSlime(c.target[flat])) break;
+        stack.push(flat);
+      }
+      if (stack.length === 0) continue;
 
-    for (const flat of stack) {
-      c.board[flat] = c.target[flat];
-      cellAnim.set(flat, {
-        kind: "drop", dur: S.collapseS, t: S.collapseS,
-        cells: stack.length,
-      });
+      for (const flat of stack) {
+        c.board[flat] = c.target[flat];
+        cellAnim.set(flat, {
+          kind: "drop", dur: S.collapseS, t: S.collapseS,
+          cells: stack.length,
+        });
+      }
+      any = true;
     }
-    any = true;
   }
 
   c.stage = "fill";
   c.t = any ? S.collapseS : 0;
-  if (c.t === 0) finishFill(); // nothing left to pour
+  if (c.t === 0) beginMatchFx(); // nothing left to pour
+}
+
+/**
+ * Enter the match stage: this pass's special matches pop and fire.
+ *
+ * MIRRORS field_resolve_matches: every matched cell pops first (the union —
+ * a cell shared by a row and a column run pops once), then the effects land
+ * in message order — the neutralizer's 5x5 downgrading exactly like a cast.
+ * The server resolved the runs; the client just performs them.
+ *
+ * A pass with matches is exactly a pass that RE-OPENS the feast, so the
+ * stage after this one is the next pass's eat.
+ */
+function beginMatchFx() {
+  const c = cinematic;
+  const events = c.matchesByPass.get(c.pass) ?? [];
+  if (events.length === 0) {
+    nextPassOrFinish();
+    return;
+  }
+
+  for (const ev of events) {
+    for (const flat of ev.cells ?? []) {
+      if (c.board[flat] === "empty") continue;
+      cellAnim.set(flat, {
+        kind: "pop", dur: FIELD.popS, t: FIELD.popS, from: c.board[flat],
+      });
+      c.board[flat] = "empty";
+    }
+  }
+  events.forEach((ev, i) => {
+    for (const flat of matchBlockCells(ev.center, c.rows, c.cols)) {
+      const next = downgradeName(c.board[flat]);
+      if (next === null) continue;
+      c.board[flat] = next;
+      cellAnim.set(flat, { kind: "flash", dur: FIELD.flashS, t: FIELD.flashS });
+    }
+    const at = cellCenter(ev.center, c.rows, c.cols);
+    const hits = sumTiers(ev.downgraded);
+    const head = hits > 0
+      ? `${ev.kind} match! ${hits} downgraded${(ev.neutralized ?? 0) > 0 ? `, ${ev.neutralized} defused` : ""}`
+      : `${ev.kind} match!`;
+    spawnFloater(head, at.x, at.y - i * LAYOUT.floater.stack, SPECIAL_COLOR,
+      LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
+  });
+
+  c.stage = "matchFx";
+  // A beat to read the reaction before the feast re-opens.
+  c.t = LAYOUT.cinematic.collapseS;
+}
+
+/**
+ * A pass just finished settling.  A pass that MATCHED re-opened the feast, so
+ * the next pass's meal begins; the pass that matched nothing was the last —
+ * verify the replay landed on the server's board and stand down.
+ */
+function nextPassOrFinish() {
+  const c = cinematic;
+  const matched = (c.matchesByPass.get(c.pass) ?? []).length > 0;
+  c.pass++;
+  if (matched && c.pass < c.passes) {
+    if (armEatPass(c.frame)) {
+      const { x, y } = fieldCenter();
+      spawnFloater("The feast continues!", x, y - LAYOUT.floater.stack - 8,
+        "rgba(40,36,60,0.95)", LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
+    }
+    return;
+  }
+  finishSettle();
 }
 
 /**
@@ -2878,7 +3274,7 @@ function beginFill() {
  * the whole point of replaying is that it is derivable, so a mismatch is a bug
  * to see in the console, not a board to keep.
  */
-function finishFill() {
+function finishSettle() {
   const c = cinematic;
   for (let flat = 0; flat < c.target.length; flat++) {
     if (c.board[flat] === c.target[flat]) continue;
@@ -3161,6 +3557,201 @@ function drawSpellShape(cx, cy, maxW, maxH, rows, dim) {
  *  object, so identity is exact and needs no monotonicity assumption. */
 let lastTransientGame = null;
 
+// --- Special matches ---------------------------------------------------------
+//
+// `game.special_matches` (transient): the server popped a lined-up run of
+// specials and fired its effect.  The popped cells vanish from the grid on
+// this same frame (the diff shows them), so the client's job is the reaction
+// shot: a floater at the run's centre, and marking the effect's footprint so
+// the downgraded cells bloom in place instead of reading as refills.
+
+/** The neutralize_block footprint around `center` — MIRRORS the hard-coded
+ *  5x5 in slime.NEUTRALIZE_BLOCK, clipped at the grid edge. */
+function matchBlockCells(center, rows, cols) {
+  const cr = Math.floor(center / cols), cc = center % cols;
+  const cells = [];
+  for (let dr = -2; dr <= 2; dr++) {
+    for (let dc = -2; dc <= 2; dc++) {
+      const r = cr + dr, cl = cc + dc;
+      if (r < 0 || r >= rows || cl < 0 || cl >= cols) continue;
+      cells.push(r * cols + cl);
+    }
+  }
+  return cells;
+}
+
+/** One floater per resolved match, anchored at the run's centre. */
+function spawnMatchFloaters(game) {
+  const events = game.special_matches ?? [];
+  if (events.length === 0) return;
+  const { rows, cols } = gridDims(game);
+  events.forEach((ev, i) => {
+    for (const flat of matchBlockCells(ev.center, rows, cols)) {
+      stampedThisFrame.add(flat);
+    }
+    const at = cellCenter(ev.center, rows, cols);
+    const hits = sumTiers(ev.downgraded);
+    const head = hits > 0
+      ? `${ev.kind} match! ${hits} downgraded${ev.neutralized > 0 ? `, ${ev.neutralized} defused` : ""}`
+      : `${ev.kind} match!`;
+    spawnFloater(head, at.x, at.y - i * LAYOUT.floater.stack, SPECIAL_COLOR,
+      LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
+  });
+}
+
+// --- Babies -------------------------------------------------------------------
+//
+// Hatched from eaten eggs, and brought along by boards that banked them.
+// PURELY VISUAL for now (their one mechanical effect — hunger capacity — is
+// server-side): small circles in the 5 placeholder type colours, idling on
+// posts under the field.  The TARGET brood is re-derived from every frame —
+// each seated player's board babies plus the session's hatched tally — so
+// joins, leaves, hatches, restarts and reconnects all reconcile to the same
+// picture.  A hatch additionally animates: the new baby spawns at the eaten
+// egg's cell and wanders down to its post.
+
+/** @type {{type: string, x: number, y: number, phase: number}[]} */
+const babyViews = [];
+
+/** Wall clock for the babies' idle bob. */
+let babyClock = 0;
+
+/** Per-type target counts for the current frame. */
+function babyTargets(game) {
+  const counts = Object.fromEntries(BABY_TYPES.map((n) => [n, 0]));
+  for (const e of game.entities ?? []) {
+    for (const n of BABY_TYPES) counts[n] += e.babies?.[n] ?? 0;
+  }
+  for (const n of BABY_TYPES) counts[n] += game.hatched?.[n] ?? 0;
+  return counts;
+}
+
+function babyRadius(rows, cols) {
+  return Math.max(4, gridRect(rows, cols).cell * 0.16);
+}
+
+/** Resting spot for the i-th baby: a row of posts under the field. */
+function babyPost(i, rows, cols) {
+  const g = gridRect(rows, cols);
+  const r = babyRadius(rows, cols);
+  const pitch = r * 3;
+  const perRow = Math.max(1, Math.floor(g.w / pitch));
+  const row = Math.floor(i / perRow);
+  const col = i % perRow;
+  return {
+    x: g.x0 + r * 1.5 + col * pitch,
+    y: g.y0 + g.h + r * 2 + row * r * 2.6,
+  };
+}
+
+/** Step one baby toward the centre of cell `flat` (babies draw centred on
+ *  their x/y, so no size offset).  Same contract as walkLilGuy. */
+function walkBaby(b, flat, rows, cols, speed, dt) {
+  const at = cellCenter(flat, rows, cols);
+  return walkLilGuyTo(b, at.x, at.y, speed, dt);
+}
+
+/** Babies the running feast replay is driving: they walk the flood route,
+ *  so the idle drift must leave them alone until their queue drains. */
+function cinematicBusyBabies() {
+  const busy = new Set();
+  if (!cinematic || cinematic.stage !== "eat") return busy;
+  const c = cinematic;
+  const E = c.eaters?.length ?? 0;
+  c.eaters?.forEach((eater, i) => {
+    if (eater.baby === undefined) return;
+    if (nextAssignedBite(c.script, c.biteIdx, i, E) !== null) busy.add(eater.baby);
+  });
+  return busy;
+}
+
+/**
+ * Reconcile the on-screen brood with the frame, then idle it.
+ * `fresh` gates the transient hatch event, exactly like the floaters.
+ */
+function tickBabies(game, dt, fresh) {
+  babyClock += dt;
+  const { rows, cols } = gridDims(game);
+
+  // Where this frame's hatches burst out, per type, consumed as spawns.
+  const hatchAt = new Map();
+  if (fresh && game.eggs_hatched) {
+    const eh = game.eggs_hatched;
+    (eh.cells ?? []).forEach((flat, i) => {
+      const type = eh.types?.[i];
+      if (!type) return;
+      const at = cellCenter(flat, rows, cols);
+      const list = hatchAt.get(type);
+      if (list === undefined) hatchAt.set(type, [at]); else list.push(at);
+    });
+  }
+
+  const counts = babyTargets(game);
+  for (const n of BABY_TYPES) {
+    let have = 0;
+    for (const b of babyViews) if (b.type === n) have++;
+    // Surplus leaves with its owner (or the old encounter): newest first.
+    for (let i = babyViews.length - 1; i >= 0 && have > counts[n]; i--) {
+      if (babyViews[i].type === n) {
+        babyViews.splice(i, 1);
+        have--;
+      }
+    }
+    // Deficit spawns: at the eaten egg when this frame hatched one, else
+    // straight onto a post (board babies arriving with a joiner).
+    while (have < counts[n]) {
+      const burst = hatchAt.get(n)?.shift();
+      const post = babyPost(babyViews.length, rows, cols);
+      babyViews.push({
+        type: n,
+        x: burst?.x ?? post.x,
+        y: burst?.y ?? post.y,
+        phase: Math.random() * Math.PI * 2,
+      });
+      have++;
+    }
+  }
+
+  // Everyone drifts toward their post; new hatches visibly wander down.
+  // Babies the feast replay is walking across the board are its to move —
+  // they come home through this drift once their queue is eaten dry.
+  const busy = cinematicBusyBabies();
+  babyViews.forEach((b, i) => {
+    if (b.chompT !== undefined && b.chompT > 0) {
+      b.chompT = Math.max(0, b.chompT - dt);
+    }
+    if (busy.has(b)) return;
+    const post = babyPost(i, rows, cols);
+    const ease = Math.min(1, dt * 3);
+    b.x += (post.x - b.x) * ease;
+    b.y += (post.y - b.y) * ease;
+  });
+}
+
+function drawBabies(game) {
+  if (babyViews.length === 0) return;
+  const { rows, cols } = gridDims(game);
+  const r = babyRadius(rows, cols);
+  for (const b of babyViews) {
+    const bob = Math.sin(babyClock * 2.2 + b.phase) * r * 0.18;
+    // A bite puffs the baby up for a beat — the circle's stand-in for the
+    // Lil Guys' attack clip until real assets arrive.
+    const puff = (b.chompT ?? 0) > 0 ? 1 + 0.45 * (b.chompT / BABY_CHOMP_S) : 1;
+    ctx.save();
+    ctx.fillStyle = BABY_COLOR[b.type] ?? NEUTRAL_COLOR;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y + bob, r * puff, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = "rgba(20,20,28,0.8)";
+    ctx.lineWidth = Math.max(1, r * 0.18);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+/** How long a baby's bite puff lasts (seconds). */
+const BABY_CHOMP_S = 0.25;
+
 function drawGame(game, dt) {
   // The render loop redraws `latestMsg` every animation frame (~60Hz) while
   // server frames arrive at ~20Hz, so the same frame is drawn ~3 times.
@@ -3208,8 +3799,13 @@ function drawGame(game, dt) {
   if (fresh) {
     spawnRefusalFloater(game);
     //spawnRecipeFloaters(game);
+    // Match reactions belong to the replay's pass structure — it pops and
+    // flashes them at the moment they fired.  Only when a frame could not be
+    // replayed (no prior board) do they float here, over the board as sent.
+    if (!startedReplay && !cinematicActive()) spawnMatchFloaters(game);
     updateMenuFx(game);
   }
+  tickBabies(game, dt, fresh);
   tickMenuFx(dt);
 
   clear();
@@ -3237,6 +3833,7 @@ function drawGame(game, dt) {
   drawChargeBar(game);
   drawSlimeField(game);
   drawLilGuys(game, dt);
+  drawBabies(game);
   drawPlayerMenus(game);
 
   // Floaters drawn last so they appear on top of everything.

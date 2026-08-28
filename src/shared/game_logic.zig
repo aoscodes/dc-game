@@ -233,23 +233,41 @@ pub fn hunger_full(hunger: c.Health) bool {
 }
 
 /// THE appetite → hunger formula: what ONE player adds to the game's hunger
-/// bar capacity.  Linear in the player's appetite stat, capped per player:
+/// bar capacity.  Linear in the player's appetite stat, capped per player,
+/// plus the babies their board brings along — each baby is another (small)
+/// eater, so babies sit OUTSIDE the cap:
 ///
 ///     contribution = min(hunger_base + appetite * appetite_scale,
 ///                        hunger_player_cap)
+///                    + babies * baby_hunger
 ///
 /// The game's hunger max is the SUM of this over every player in the game,
 /// whatever kind of game it is — so group hunger is always the players'
 /// hunger totals added together.  A player with no board (or a board with a
-/// fresh flash) has appetite 0 and contributes exactly `hunger_base`.
+/// fresh flash) has appetite 0, babies 0, and contributes exactly
+/// `hunger_base`.  Babies hatched MID-game belong to no player and are added
+/// straight onto the bar by the session instead (see `hatch_hunger`).
 ///
 /// MIRRORED by the board firmware for its on-board game
 /// (board/src/game/balance.c `balance_player_hunger`); change both together.
-pub fn player_hunger(bal: *const balance.Balance, appetite: u32) u16 {
-    // 64-bit so no appetite a board can bank (u32) can overflow the product.
+pub fn player_hunger(bal: *const balance.Balance, appetite: u32, babies: u32) u16 {
+    // 64-bit so no stat a board can bank (u32) can overflow the products.
     const raw = @as(u64, bal.hunger_base) +
         @as(u64, appetite) * @as(u64, bal.appetite_scale);
-    return @intCast(@min(raw, @as(u64, bal.hunger_player_cap)));
+    const capped = @min(raw, @as(u64, bal.hunger_player_cap));
+    const with_babies = capped + @as(u64, babies) * @as(u64, bal.baby_hunger);
+    return @intCast(@min(with_babies, std.math.maxInt(u16)));
+}
+
+/// Hunger capacity `count` freshly-hatched babies add to the bar.  Hatched
+/// babies belong to the ENCOUNTER, not to a player's share: they are never
+/// given back when someone leaves, and they reset with the next game.
+///
+/// Mirrored by the board firmware (board/src/game/balance.c); change both
+/// together.
+pub fn hatch_hunger(bal: *const balance.Balance, count: u32) u16 {
+    const raw = @as(u64, count) * @as(u64, bal.baby_hunger);
+    return @intCast(@min(raw, std.math.maxInt(u16)));
 }
 
 /// A player carrying `contribution` of the bar's capacity left mid-game:
@@ -586,9 +604,9 @@ test "player_hunger: linear in appetite from the base" {
     bal.hunger_base = 30;
     bal.appetite_scale = 5;
     bal.hunger_player_cap = 500;
-    try std.testing.expectEqual(@as(u16, 30), player_hunger(&bal, 0));
-    try std.testing.expectEqual(@as(u16, 35), player_hunger(&bal, 1));
-    try std.testing.expectEqual(@as(u16, 80), player_hunger(&bal, 10));
+    try std.testing.expectEqual(@as(u16, 30), player_hunger(&bal, 0, 0));
+    try std.testing.expectEqual(@as(u16, 35), player_hunger(&bal, 1, 0));
+    try std.testing.expectEqual(@as(u16, 80), player_hunger(&bal, 10, 0));
 }
 
 test "player_hunger: capped per player, even for an absurd appetite" {
@@ -597,10 +615,38 @@ test "player_hunger: capped per player, even for an absurd appetite" {
     bal.appetite_scale = 5;
     bal.hunger_player_cap = 500;
     // 30 + 94*5 = 500 exactly; one more point changes nothing.
-    try std.testing.expectEqual(@as(u16, 500), player_hunger(&bal, 94));
-    try std.testing.expectEqual(@as(u16, 500), player_hunger(&bal, 95));
+    try std.testing.expectEqual(@as(u16, 500), player_hunger(&bal, 94, 0));
+    try std.testing.expectEqual(@as(u16, 500), player_hunger(&bal, 95, 0));
     // The full u32 range must not overflow the arithmetic either.
-    try std.testing.expectEqual(@as(u16, 500), player_hunger(&bal, std.math.maxInt(u32)));
+    try std.testing.expectEqual(@as(u16, 500), player_hunger(&bal, std.math.maxInt(u32), 0));
+}
+
+test "player_hunger: babies add baby_hunger each, OUTSIDE the appetite cap" {
+    var bal = test_bal.*;
+    bal.hunger_base = 30;
+    bal.appetite_scale = 5;
+    bal.hunger_player_cap = 500;
+    bal.baby_hunger = 10;
+    try std.testing.expectEqual(@as(u16, 40), player_hunger(&bal, 0, 1));
+    try std.testing.expectEqual(@as(u16, 80), player_hunger(&bal, 0, 5));
+    // A capped appetite still gets its babies on top.
+    try std.testing.expectEqual(@as(u16, 530), player_hunger(&bal, 95, 3));
+    // An absurd baby hoard saturates the u16 rather than overflowing.
+    try std.testing.expectEqual(
+        @as(u16, std.math.maxInt(u16)),
+        player_hunger(&bal, 0, std.math.maxInt(u32)),
+    );
+}
+
+test "hatch_hunger: baby_hunger per hatch, saturating" {
+    var bal = test_bal.*;
+    bal.baby_hunger = 10;
+    try std.testing.expectEqual(@as(u16, 0), hatch_hunger(&bal, 0));
+    try std.testing.expectEqual(@as(u16, 30), hatch_hunger(&bal, 3));
+    try std.testing.expectEqual(
+        @as(u16, std.math.maxInt(u16)),
+        hatch_hunger(&bal, std.math.maxInt(u32)),
+    );
 }
 
 test "shrink_hunger_max: removes the leaver's share of the UNUSED capacity" {

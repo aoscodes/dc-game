@@ -163,7 +163,7 @@ test "replay: record then play back" {
     gs1.grid[1] = .{ .tiered = .red };
     gs1.grid[2] = .neutralized;
     gs1.grid[3] = .empty;
-    gs1.grid[4] = .special;
+    gs1.grid[4] = .{ .special = .neutralizer };
     gs1.grid[5] = .{ .tiered = .green };
     gs1.reservoir = 15;
     gs1.entities[0] = proto.EntitySnapshot.blank;
@@ -197,7 +197,7 @@ test "replay: record then play back" {
     try std.testing.expectEqual(c.SlimeCell{ .tiered = .red }, f1.grid[1]);
     try std.testing.expectEqual(c.SlimeCell.neutralized, f1.grid[2]);
     try std.testing.expectEqual(c.SlimeCell.empty, f1.grid[3]);
-    try std.testing.expectEqual(c.SlimeCell.special, f1.grid[4]);
+    try std.testing.expectEqual(c.SlimeCell{ .special = .neutralizer }, f1.grid[4]);
     try std.testing.expectEqual(c.SlimeCell{ .tiered = .green }, f1.grid[5]);
     try std.testing.expectEqual(@as(u8, 1), f1.entities[0].cursor_row);
     try std.testing.expectEqual(@as(u8, 0), f1.entities[0].cursor_col);

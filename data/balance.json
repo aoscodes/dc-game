@@ -8,6 +8,15 @@
     "cols": 10
   },
   "casts_per_turn": 1,
+  "baby_hunger": 10,
+  "specials": {
+    "neutralizer": {
+      "match_len": 3
+    },
+    "egg": {
+      "match_len": 3
+    }
+  },
   "player_recipes": [
     {
       "label": "poke",

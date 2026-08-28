@@ -150,6 +150,27 @@ pub const DEFAULT_HUNGER_BASE: u16 = 30;
 pub const DEFAULT_APPETITE_SCALE: u16 = 5;
 pub const DEFAULT_HUNGER_PLAYER_CAP: u16 = 500;
 
+/// Default run length a matchable special kind needs, used when a kind is
+/// absent from balance.json's `specials` table.
+pub const DEFAULT_MATCH_LEN: u8 = 3;
+
+/// Default hunger capacity each baby Lil Guy adds to the pool, used when
+/// `baby_hunger` is absent from balance.json.  Mirrored by the board firmware
+/// (board/src/game/balance.c), so a change here should be made there too.
+pub const DEFAULT_BABY_HUNGER: u16 = 10;
+
+/// Designer knobs for one SpecialKind.  What a kind DOES is hard-coded
+/// (components.SpecialKind); this tunes only its numbers.
+pub const SpecialTuning = struct {
+    /// Same-kind cells that must sit contiguously in one row or column
+    /// (after the turn-end refill) to fire the kind's match effect.  Ignored
+    /// for kinds with no match behaviour — which today is EVERY kind: the
+    /// match machinery is dormant, and this knob waits with it.  The loader
+    /// keeps it within 2..max(grid rows, cols) so a match is always
+    /// physically possible.
+    match_len: u8 = DEFAULT_MATCH_LEN,
+};
+
 /// All designer-tunable balance numbers.  Loaded from `data/balance.json`
 /// (see config.zig); tests use the frozen fixture in fixtures.zig.
 pub const Balance = struct {
@@ -182,8 +203,19 @@ pub const Balance = struct {
     /// Ceiling on ONE player's hunger contribution, however large their
     /// appetite has grown — keeps a veteran board from trivialising the bar.
     hunger_player_cap: u16 = DEFAULT_HUNGER_PLAYER_CAP,
+    /// Hunger capacity each baby Lil Guy in the encounter adds to the pool —
+    /// babies a board brought AND babies hatched mid-game alike.
+    baby_hunger: u16 = DEFAULT_BABY_HUNGER,
+    /// Per-SpecialKind tuning, indexed by SpecialKind ordinal.
+    specials: [c.SpecialKind.size]SpecialTuning =
+        [_]SpecialTuning{.{}} ** c.SpecialKind.size,
     player_recipes: []const PlayerRecipe,
     team_recipes: []const TeamRecipe,
+
+    /// Tuning for one special kind.
+    pub fn special_tuning(self: *const Balance, kind: c.SpecialKind) SpecialTuning {
+        return self.specials[@intFromEnum(kind)];
+    }
 
     /// The cheapest cast in the whole move list.  A team holding fewer charges
     /// than this can never affect the grid again, which is how the session

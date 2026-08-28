@@ -56,6 +56,9 @@ const DEFAULT_ENC = fixtures.test_config.encounters.default();
 /// grid placement and target selection replay identically run to run.
 const SEED: u64 = 0x5EED_FEA57;
 
+/// A boardless player's baby tally: all zero.
+const NO_BABIES = [_]u32{0} ** c.BabyType.size;
+
 const RED: usize = @intFromEnum(c.Tier.red);
 const YELLOW: usize = @intFromEnum(c.Tier.yellow);
 const GREEN: usize = @intFromEnum(c.Tier.green);
@@ -79,6 +82,11 @@ const TRIAD = fixtures.TRIAD; // poke x3, deliberately unaffordable
 /// A live hazard cell of the given tier — the thing casts downgrade.
 fn tiered(tier: c.Tier) c.SlimeCell {
     return .{ .tiered = tier };
+}
+
+/// Shorthand for a SlimeCell expectation: `SC(.empty)`, `SC(.{ .special = … })`.
+fn SC(cell: c.SlimeCell) c.SlimeCell {
+    return cell;
 }
 
 // ---------------------------------------------------------------------------
@@ -220,6 +228,9 @@ fn consume_payload(tag: proto.MsgTag, r: anytype) bool {
         .shape_cast => if (proto.decode_shape_cast(r)) |_| true else |_| false,
         .move_cursor => if (proto.decode_move_cursor(r)) |_| true else |_| false,
         .turn_ended => if (proto.decode_turn_ended(r)) |_| true else |_| false,
+        .special_matched => if (proto.decode_special_matched(r)) |_| true else |_| false,
+        .eggs_hatched => if (proto.decode_eggs_hatched(r)) |_| true else |_| false,
+        .field_refilled => if (proto.decode_field_refilled(r)) |_| true else |_| false,
     };
 }
 
@@ -407,7 +418,7 @@ fn init_two_player_session_cfg(
 /// which equals the connection id for sessions built strictly this way.
 fn seat_player(sess: *Session, transport: shared.Transport, appetite: u32) !u8 {
     const conn_id = sess.connect(transport) orelse return error.JoinFailed;
-    try sess.take_slot(conn_id, appetite);
+    try sess.take_slot(conn_id, appetite, NO_BABIES);
     const pid = sess.connections[conn_id].player_id orelse return error.JoinFailed;
     std.debug.assert(@as(usize, pid) == conn_id);
     return pid;
@@ -571,7 +582,7 @@ test "the session starts its encounter with the configured grid and seats sum th
 
     // The bar is the players' appetite contributions summed — two appetite-0
     // players here, so twice the base.
-    try std.testing.expectEqual(2 * logic.player_hunger(BAL, 0), s.sess.hunger.max);
+    try std.testing.expectEqual(2 * logic.player_hunger(BAL, 0, 0), s.sess.hunger.max);
     try std.testing.expectEqual(@as(u16, 0), s.sess.hunger.current);
     try std.testing.expectEqual(DEFAULT_ENC.total_units(), s.sess.slime_total);
 }
@@ -589,14 +600,14 @@ test "the fifth take_slot is silently ignored" {
     for (&extra_conns) |*cid| {
         cid.* = s.sess.connect(s.p[0].transport()) orelse return error.JoinFailed;
     }
-    try s.sess.take_slot(extra_conns[0], 0);
-    try s.sess.take_slot(extra_conns[1], 0);
+    try s.sess.take_slot(extra_conns[0], 0, NO_BABIES);
+    try s.sess.take_slot(extra_conns[1], 0, NO_BABIES);
     try std.testing.expectEqual(@as(u8, 4), s.sess.seated_players());
 
     // The fifth asker: no error, no seat, still an observer.
     const bar_before = s.sess.hunger.max;
     const charges_before = s.sess.charges;
-    try s.sess.take_slot(extra_conns[2], 0);
+    try s.sess.take_slot(extra_conns[2], 0, NO_BABIES);
     try std.testing.expectEqual(@as(u8, 4), s.sess.seated_players());
     try std.testing.expectEqual(@as(?u8, null), s.sess.connections[extra_conns[2]].player_id);
     try std.testing.expectEqual(bar_before, s.sess.hunger.max);
@@ -1902,6 +1913,254 @@ test "a turn with no slime on the field is a free turn" {
     try std.testing.expectEqual(@as(u16, 2), s.sess.turn);
 }
 
+test "eating an egg hatches a baby: capacity grows, the brood is tallied and announced" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_twenty_green);
+    // One egg and one neutral at the door; reserves keep the game alive.
+    paint_grid(&s.sess, .empty);
+    s.sess.field.reservoir = .{ .neutral = 3 };
+    const grid = &s.sess.field.grid;
+    grid.set(0, 0, .{ .special = .egg });
+    grid.set(0, 1, .neutral);
+    const egg_cell = grid.index(0, 0);
+    const max_before = s.sess.hunger.max;
+
+    s.p[1].clear();
+    try end_turn_idly(&s.sess);
+
+    // The egg was ordinary food (flat rate, ordinary score) plus a hatch.
+    try std.testing.expectEqual(
+        @as(u16, @intCast(2 * BAL.hunger_cost_normal)),
+        s.sess.hunger.current,
+    );
+    try std.testing.expectEqual(@as(u32, 2), s.sess.score);
+    // The baby joined the feast that freed it: the bar grew by baby_hunger,
+    // and the brood is tallied for the game_over banking.
+    try std.testing.expectEqual(max_before + BAL.baby_hunger, s.sess.hunger.max);
+    var brood: u32 = 0;
+    for (s.sess.hatched) |n| brood += n;
+    try std.testing.expectEqual(@as(u32, 1), brood);
+    var banked: u32 = 0;
+    for (s.sess.stats.eggs_hatched) |n| banked += n;
+    try std.testing.expectEqual(@as(u32, 1), banked);
+
+    // The hatch was announced — cell and rolled type — BEFORE the turn
+    // summary, so clients animate it on the board turn_ended describes.
+    const msgs = try drain(s.p[1].buf.items, arena);
+    var hatch_at: ?usize = null;
+    var turn_at: ?usize = null;
+    for (msgs, 0..) |m, i| {
+        if (m.tag == .eggs_hatched and hatch_at == null) hatch_at = i;
+        if (m.tag == .turn_ended and turn_at == null) turn_at = i;
+    }
+    const hi = hatch_at orelse return error.NoEggsHatched;
+    const ti_ = turn_at orelse return error.NoTurnEnded;
+    try std.testing.expect(hi < ti_);
+    var fbs = std.io.fixedBufferStream(msgs[hi].payload);
+    const eh = try proto.decode_eggs_hatched(fbs.reader());
+    try std.testing.expectEqual(@as(u16, 1), eh.count);
+    try std.testing.expectEqual(egg_cell, eh.cells[0]);
+    try std.testing.expectEqual(@as(u32, 1), s.sess.hatched[@intFromEnum(eh.types[0])]);
+
+    // The next game_state carries the brood, so a reconnect recovers it.
+    const gs_msg = find_tag(msgs, .game_state) orelse return error.NoGameState;
+    var gs_fbs = std.io.fixedBufferStream(gs_msg.payload);
+    const gs = try proto.decode_game_state(gs_fbs.reader());
+    try std.testing.expectEqual(s.sess.hatched, gs.hatched);
+}
+
+test "eaten neutralizers fire 3x3 Agent blocks and are FREE food" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_twenty_green);
+    // Bottom row: a red at col 2, then three reachable neutralizers.  The
+    // feast swallows all three for FREE; the first one's 3x3 (rows 4-5,
+    // cols 2-4) steps the red one tier.
+    paint_grid(&s.sess, .empty);
+    s.sess.field.reservoir = .{};
+    const grid = &s.sess.field.grid;
+    const bottom = grid.rows - 1;
+    grid.set(bottom, 2, tiered(.red));
+    grid.set(bottom, 3, .{ .special = .neutralizer });
+    grid.set(bottom, 4, .{ .special = .neutralizer });
+    grid.set(bottom, 5, .{ .special = .neutralizer });
+
+    s.p[0].clear();
+    try end_turn_idly(&s.sess);
+
+    // All three swallowed; the yellow (still a wall) is the only survivor.
+    try std.testing.expectEqual(tiered(.yellow), grid.at(bottom, 2));
+    try std.testing.expectEqual(@as(u16, 0), grid.special_count());
+    try std.testing.expectEqual(@as(u32, 0), s.sess.score);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.hunger.current);
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+    // Match machinery is DORMANT: nothing lined-up fires, so no
+    // special_matched ever leaves the server.
+    try std.testing.expectEqual(@as(?Msg, null), find_tag(msgs, .special_matched));
+    const te_msg = find_tag(msgs, .turn_ended) orelse return error.NoTurnEnded;
+    var fbs = std.io.fixedBufferStream(te_msg.payload);
+    const te = try proto.decode_turn_ended(fbs.reader());
+    try std.testing.expectEqual(@as(u16, 3), te.cells_eaten);
+    try std.testing.expectEqual(@as(u32, 0), te.score_added);
+    try std.testing.expectEqual(@as(u16, 0), te.hunger_added);
+    try std.testing.expectEqual(@as(u8, 1), te.passes);
+}
+
+test "a swallowed neutralizer opens a sealed wall and the SAME feast eats through" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_twenty_green);
+    paint_grid(&s.sess, .empty);
+    s.sess.field.reservoir = .{};
+    const grid = &s.sess.field.grid;
+    const bottom = grid.rows - 1;
+    // A neutral sealed into the bottom of column 1 by three green walls; a
+    // reachable neutralizer sits above the seal.  Swallowing it fires the
+    // 3x3 (rows bottom-2..bottom, cols 0..2... anchored at (bottom-2,1):
+    // rows bottom-3..bottom-1) that defuses the green at (bottom-1,1) — and
+    // the same flood pours through the hole it just opened.
+    grid.set(bottom, 0, tiered(.green));
+    grid.set(bottom - 1, 1, tiered(.green));
+    grid.set(bottom, 1, .neutral);
+    grid.set(bottom, 2, tiered(.green));
+    grid.set(bottom - 2, 1, .{ .special = .neutralizer });
+
+    s.p[0].clear();
+    try end_turn_idly(&s.sess);
+
+    // One pass, one continuous meal: the neutralizer (free), the defused
+    // wall, and the neutral it had sealed in.  The two uncovered greens
+    // stand; the settle then collapses them to the floor of their columns.
+    try std.testing.expectEqual(tiered(.green), grid.at(bottom, 0));
+    try std.testing.expectEqual(tiered(.green), grid.at(bottom, 2));
+    try std.testing.expectEqual(SC(.empty), grid.at(bottom, 1));
+    try std.testing.expectEqual(SC(.empty), grid.at(bottom - 1, 1));
+    try std.testing.expectEqual(SC(.empty), grid.at(bottom - 2, 1));
+    try std.testing.expectEqual(@as(u32, 2), s.sess.score); // defused + neutral
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+    const te_msg = find_tag(msgs, .turn_ended) orelse return error.NoTurnEnded;
+    var fbs = std.io.fixedBufferStream(te_msg.payload);
+    const te = try proto.decode_turn_ended(fbs.reader());
+    // Three cells left the board in ONE pass — the continuation is inline,
+    // not a cascade of settle passes.
+    try std.testing.expectEqual(@as(u16, 3), te.cells_eaten);
+    try std.testing.expectEqual(@as(u8, 1), te.passes);
+    try std.testing.expectEqual(@as(u16, 2), te.walls);
+    try std.testing.expectEqual(@as(u16, 0), te.sheltered);
+}
+
+test "a refilled line of neutralizers stays put: matches are dormant" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_twenty_green);
+    paint_grid(&s.sess, .empty);
+    const grid = &s.sess.field.grid;
+    const bottom = grid.rows - 1;
+    // A red on the floor keeps the encounter alive; the reservoir holds
+    // EXACTLY three neutralizers, so the refill lands them on the top row's
+    // first three cells — a line the moment they arrive.  Nothing fires:
+    // match machinery is dormant, and refills are never eaten same-turn.
+    grid.set(bottom, 0, tiered(.red));
+    s.sess.field.reservoir = .{};
+    s.sess.field.reservoir.special[@intFromEnum(c.SpecialKind.neutralizer)] = 3;
+
+    s.p[0].clear();
+    try end_turn_idly(&s.sess);
+
+    try std.testing.expectEqual(SC(.{ .special = .neutralizer }), grid.get(0));
+    try std.testing.expectEqual(SC(.{ .special = .neutralizer }), grid.get(1));
+    try std.testing.expectEqual(SC(.{ .special = .neutralizer }), grid.get(2));
+    try std.testing.expectEqual(@as(u16, 3), grid.special_count());
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+    try std.testing.expectEqual(@as(?Msg, null), find_tag(msgs, .special_matched));
+    const fr_msg = find_tag(msgs, .field_refilled) orelse return error.NoRefill;
+    var fbs = std.io.fixedBufferStream(fr_msg.payload);
+    const fr = try proto.decode_field_refilled(fbs.reader());
+    try std.testing.expectEqual(@as(u8, 0), fr.pass);
+    try std.testing.expectEqual(@as(u16, 3), fr.count);
+    try std.testing.expectEqualSlices(u16, &[_]u16{ 0, 1, 2 }, fr.cells[0..3]);
+    for (fr.contents[0..3]) |cell| {
+        try std.testing.expectEqual(SC(.{ .special = .neutralizer }), cell);
+    }
+
+    const te_msg = find_tag(msgs, .turn_ended) orelse return error.NoTurnEnded;
+    var tfbs = std.io.fixedBufferStream(te_msg.payload);
+    const te = try proto.decode_turn_ended(tfbs.reader());
+    try std.testing.expectEqual(@as(u8, 1), te.passes);
+    try std.testing.expectEqual(@as(u16, 0), te.cells_eaten);
+}
+
+test "a board's babies join the bar with their owner and leave with them" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, DEFAULT_ENC);
+    const max_before = s.sess.hunger.max;
+
+    // A third player sits down with a board carrying 3 babies: their share is
+    // the appetite formula plus baby_hunger per baby.
+    var extra = TestPlayer{};
+    extra.init(allocator);
+    defer extra.deinit(allocator);
+    const conn_id = s.sess.connect(extra.transport()) orelse return error.JoinFailed;
+    try s.sess.take_slot(conn_id, 2, .{ 1, 0, 2, 0, 0 });
+
+    const share = logic.player_hunger(BAL, 2, 3);
+    try std.testing.expectEqual(max_before + share, s.sess.hunger.max);
+    try std.testing.expectEqual(
+        share,
+        logic.player_hunger(BAL, 2, 0) + 3 * BAL.baby_hunger,
+    );
+
+    // The babies travel in game_state with their owner...
+    try s.sess.tick(1.0 / 60.0);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const msgs = try drain(extra.buf.items, arena_state.allocator());
+    const gs_msg = find_tag(msgs, .game_state) orelse return error.NoGameState;
+    var fbs = std.io.fixedBufferStream(gs_msg.payload);
+    const gs = try proto.decode_game_state(fbs.reader());
+    const pid = s.sess.connections[conn_id].player_id orelse return error.JoinFailed;
+    const snap = for (gs.entities[0..gs.entity_count]) |e| {
+        if (e.owner == pid) break e;
+    } else return error.NoSnapshot;
+    try std.testing.expectEqual([_]u32{ 1, 0, 2, 0, 0 }, snap.babies);
+
+    // ...and leave with him: the unused share (untouched bar) comes back off.
+    s.sess.disconnect(conn_id);
+    try std.testing.expectEqual(max_before, s.sess.hunger.max);
+}
+
 // ---------------------------------------------------------------------------
 // Casting: the per-turn budget
 //
@@ -2811,7 +3070,7 @@ test "the end screen holds — no new game, no broadcasts — until a restart ar
     try std.testing.expectEqual(@as(u16, 1), s.sess.turn);
     try std.testing.expectEqual(@as(u16, 0), s.sess.hunger.current);
     try std.testing.expectEqual(@as(u8, 2), s.sess.seated_players());
-    try std.testing.expectEqual(2 * logic.player_hunger(BAL, 0), s.sess.hunger.max);
+    try std.testing.expectEqual(2 * logic.player_hunger(BAL, 0, 0), s.sess.hunger.max);
     try std.testing.expectEqual(DEFAULT_ENC.total_units(), s.sess.slime_total);
     // The pool re-seeds exactly as if the pair had taken fresh seats one by
     // one: seed, grown once for the second player.
@@ -2925,9 +3184,9 @@ test "match stats: feast tallies, players and recipes are reported" {
 
     var s: TwoPlayerSession = undefined;
     // Same 25-unit mix as `enc_mixed`, but with a hunger bar the single feast
-    // below fills exactly (hunger_base 4 × two players = 8) — that is what
-    // makes the game end and the report get sent inside one turn.
-    try init_two_player_session_cfg(&s, allocator, SEED, &HungerBase(4).cfg);
+    // below OVERFILLS (hunger_base 2 × two players = 4, against 5 eaten) —
+    // that is what makes the game end and the report get sent in one turn.
+    try init_two_player_session_cfg(&s, allocator, SEED, &HungerBase(2).cfg);
     defer s.deinit();
     const enc_stats_mixed = enc.Encounter{
         .label = "test_stats_mixed",
@@ -2961,11 +3220,17 @@ test "match stats: feast tallies, players and recipes are reported" {
     try enqueue_cast_as(&s.sess, s.p[1].pid, SWEEP);
     try flush(&s.sess);
 
-    // The turn ends.  The flood enters at column 0 and finds:
-    //   (0,0) defused by Alice -> eaten, but boxed in by green and red.
-    //   (2,0) neutral -> eaten, and it opens the row-2 corridor rightwards,
-    //         which wraps up column 9 to eat the two neutrals at (1,8)/(1,9).
-    //   Bob's three defused cells at (0,3..5) are walled off on every side.
+    // The turn ends.  Gravity runs BETWEEN passes (never mid-route), so the
+    // meal plays out:
+    //   pass 1: (0,0), defused by Alice — the door's first edible — then the
+    //           five row-2 neutrals along the floor and, through the empty
+    //           rows beneath, the two neutrals at (1,8)/(1,9).  Eight cells,
+    //           with the board holding still throughout.
+    //   settle: every column packs onto row 4-5 — greens and Bob's three
+    //           defused cells land on row 4, the red layer on row 5.
+    //   pass 2: Bob's three defused cells, now exposed from ABOVE; gravity
+    //           turned his casts into food.  The next settle moves nothing
+    //           and the meal ends: nothing edible remains anywhere.
     try end_turn_idly(&s.sess);
 
     const go = try game_over_msg(try drain(s.p[0].buf.items, arena));
@@ -2973,8 +3238,8 @@ test "match stats: feast tallies, players and recipes are reported" {
 
     try std.testing.expectEqual(proto.EndReason.hunger_full, st.reason);
     try std.testing.expectEqual(@as(u32, 25), st.slime_total);
-    // 8 of 25 eaten; the other 17 are walls or shut in behind them.
-    try std.testing.expectEqual(@as(u32, 17), st.slime_left);
+    // 11 of 25 eaten; the other 14 are all walls (greens and reds).
+    try std.testing.expectEqual(@as(u32, 14), st.slime_left);
     try std.testing.expectEqual(@as(u16, 2), st.casts_total);
 
     // Coverage: 4 green cells covered (1 poke + 3 sweep), all defused since
@@ -2982,19 +3247,19 @@ test "match stats: feast tallies, players and recipes are reported" {
     try std.testing.expectEqual(@as(u16, 4), st.feast.cells_covered[GREEN]);
     try std.testing.expectEqual(@as(u16, 0), st.feast.cells_covered[RED]);
     try std.testing.expectEqual(@as(u16, 4), st.feast.neutralized[GREEN]);
-    // Eaten: 7 neutral plus Alice's single defused cell.
+    // Eaten: all seven neutrals plus all four defused cells.
     try std.testing.expectEqual(@as(u16, 7), st.feast.neutral_consumed);
-    try std.testing.expectEqual(@as(u16, 1), st.feast.defused_consumed);
-    // Bob defused three cells that nothing could reach.  Work that scores
-    // nothing is the report's most useful number, so it is tracked on its own.
-    try std.testing.expectEqual(@as(u16, 3), st.feast.sheltered);
-    try std.testing.expectEqual(@as(u16, @intCast(8 * BAL.hunger_cost_normal)), st.feast.hunger_normal);
+    try std.testing.expectEqual(@as(u16, 4), st.feast.defused_consumed);
+    // Nothing edible survives: the board holds still while a route is open,
+    // so every neutral was eaten before the red layer could seal it.
+    try std.testing.expectEqual(@as(u16, 0), st.feast.sheltered);
+    try std.testing.expectEqual(@as(u16, @intCast(11 * BAL.hunger_cost_normal)), st.feast.hunger_normal);
     // Two casts at the fixture default of 1 charge each, out of a pool of
     // 100 (the encounter's 50, grown once for the second seat).
     try std.testing.expectEqual(@as(u16, 2), st.feast.charges_spent);
     try std.testing.expectEqual(@as(u32, 98), st.feast.charges_left);
     // Score = every unit eaten, defused or neutral alike.
-    try std.testing.expectEqual(@as(u32, 8), go.score);
+    try std.testing.expectEqual(@as(u32, 11), go.score);
 
     // Players: dense, coverage attribution + recipe participation.
     try std.testing.expectEqual(@as(u8, 2), st.player_count);
@@ -3050,7 +3315,7 @@ test "game_state carries the whole grid, the reservoir and the hunger bar" {
 
     // The off-grid remainder drives the client's "incoming" indicator.
     try std.testing.expectEqual(s.sess.field.reservoir.total(), gs.reservoir);
-    try std.testing.expectEqual(2 * logic.player_hunger(BAL, 0), gs.hunger.max);
+    try std.testing.expectEqual(2 * logic.player_hunger(BAL, 0, 0), gs.hunger.max);
     try std.testing.expectEqual(@as(u16, 0), gs.hunger.current);
     try std.testing.expectEqual(@as(u32, 0), gs.score);
 }
@@ -3446,7 +3711,7 @@ test "the hunger bar sums each player's appetite contribution" {
     try start(&s, &enc_fifty_green);
 
     // 100 + 4*5 = 120 for Alice, 100 for Bob.
-    const want = logic.player_hunger(BAL, 4) + logic.player_hunger(BAL, 0);
+    const want = logic.player_hunger(BAL, 4, 0) + logic.player_hunger(BAL, 0, 0);
     try std.testing.expectEqual(want, s.sess.hunger.max);
     try std.testing.expectEqual(@as(u16, 220), s.sess.hunger.max);
 }
@@ -3488,7 +3753,7 @@ test "a mid-game joiner grows the bar by their contribution and the pool by thei
     try flush(&s.sess);
 
     try std.testing.expectEqual(
-        before + logic.player_hunger(BAL, 2),
+        before + logic.player_hunger(BAL, 2, 0),
         s.sess.hunger.max,
     );
     // The pool grows by the joiner's proportion of what remains: 60/2 = 30,
@@ -3565,7 +3830,7 @@ test "the last player out leaves the pool in trust for the next taker" {
     next.init(allocator);
     defer next.deinit(allocator);
     const conn_id = s.sess.connect(next.transport()) orelse return error.JoinFailed;
-    try s.sess.take_slot(conn_id, 0);
+    try s.sess.take_slot(conn_id, 0, NO_BABIES);
     try std.testing.expectEqual(@as(u32, 12), s.sess.charges);
 }
 
