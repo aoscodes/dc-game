@@ -11,16 +11,16 @@
 //! (`SlimeGrid` of `SlimeCell`), plus an off-grid `SlimeReservoir` that
 //! refills emptied cells from the top row.  One grid per game.
 //!
-//! Play is TURN-BASED.  Each player gets `casts_per_turn` casts; once every
-//! connected player has spent theirs the turn ends and the field is EATEN
-//! ALONG A PATH: the feast enters from the LEFT edge and consumes every
-//! edible unit it can reach, so live hazards wall it off and protect whatever
-//! hides behind them.  Survivors then fall to the bottom of their column and
-//! the reservoir refills from the top.
+//! Play is REALTIME.  Casts resolve the moment they are pressed (throttled
+//! by `cast_cooldown_ms`), and every `bite_interval_ms` — sped up by the
+//! crowd — the field is EATEN ALONG A PATH: the feast enters from the LEFT
+//! edge and consumes every edible unit it can reach, so live hazards wall it
+//! off and protect whatever hides behind them.  Survivors then fall to the
+//! bottom of their column and the reservoir refills from the top.
 //!
 //! Casting costs CHARGES from one team-shared, whole-game pool (each recipe
 //! prices its own cost), so the campaign's real resource is charges and the
-//! per-turn cast budget only paces how fast they can be spent.
+//! cast cooldown only paces how fast they can be spent.
 //!
 //! The "Lil Guys" who do the eating are a CLIENT-SIDE animation over that bulk
 //! feast — there is no Lil Guy entity, timer or target anywhere on the server.

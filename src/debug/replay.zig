@@ -151,7 +151,7 @@ test "replay: record then play back" {
     // Build two dummy Slime Feast GameState frames.
     var gs1 = proto.GameState.blank;
     gs1.tick = 1;
-    gs1.turn = 3;
+    gs1.bite = 3;
     gs1.entity_count = 1;
     gs1.hunger = .{ .current = 40, .max = 200 };
     gs1.charges = 137;
@@ -172,11 +172,11 @@ test "replay: record then play back" {
     // An off-centre aim cursor, to prove cursors survive the round-trip.
     gs1.entities[0].cursor_row = 1;
     gs1.entities[0].cursor_col = 0;
-    // A partly spent cast budget, to prove per-player turn state survives too.
-    gs1.entities[0].casts_left = 2;
+    // A running cast cooldown, to prove per-player realtime state survives too.
+    gs1.entities[0].cooldown_ms = 450;
     var gs2 = gs1;
     gs2.tick = 2;
-    gs2.turn = 4;
+    gs2.bite = 4;
 
     try rec.record(gs1);
     try rec.record(gs2);
@@ -188,7 +188,7 @@ test "replay: record then play back" {
 
     const f1 = (try play.next()) orelse return error.ExpectedFrame;
     try std.testing.expectEqual(@as(u32, 1), f1.tick);
-    try std.testing.expectEqual(@as(u16, 3), f1.turn);
+    try std.testing.expectEqual(@as(u16, 3), f1.bite);
     try std.testing.expectEqual(@as(u16, 40), f1.hunger.current);
     try std.testing.expectEqual(@as(u32, 137), f1.charges);
     try std.testing.expectEqual(@as(u32, 25), f1.score);
@@ -202,11 +202,11 @@ test "replay: record then play back" {
     try std.testing.expectEqual(@as(u8, 1), f1.entities[0].cursor_row);
     try std.testing.expectEqual(@as(u8, 0), f1.entities[0].cursor_col);
     try std.testing.expectEqual(@as(u32, 15), f1.reservoir);
-    try std.testing.expectEqual(@as(u8, 2), f1.entities[0].casts_left);
+    try std.testing.expectEqual(@as(u32, 450), f1.entities[0].cooldown_ms);
 
     const f2 = (try play.next()) orelse return error.ExpectedFrame;
     try std.testing.expectEqual(@as(u32, 2), f2.tick);
-    try std.testing.expectEqual(@as(u16, 4), f2.turn);
+    try std.testing.expectEqual(@as(u16, 4), f2.bite);
 
     try std.testing.expect((try play.next()) == null);
 }

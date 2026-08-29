@@ -1,22 +1,19 @@
 //! Pure resolution logic for the Slime Feast encounter: everything that maps
 //! player CASTS onto game effects.
 //!
-//! Cast pipeline (driven by session):
-//!   1. a cast is LOCKED IN — appended to the turn's pending list.  Nothing is
-//!      charged and nothing touches the grid yet.
-//!   2. once every connected player has locked in, `resolve_batch` turns the
-//!      WHOLE pending list into the stamps it produces and the single price
-//!      they cost together: same-square casts by distinct players collapse into
-//!      the group moves they spell, and only the group's price is paid for
-//!      them.
-//!   3. the session debits that price once and hands each stamp to
-//!      `slime.SlimeField.apply_shape` at its square, which owns all slime
-//!      state.
-//!
-//! Resolving the turn as a BATCH rather than cast by cast is what makes a group
-//! a joint purchase: the contributors never pay for their own moves, so the
-//! team is quoted one price for the turn and can back out (see the session's
-//! cancel path) before any of it is spent.
+//! Cast pipeline (driven by session, REALTIME):
+//!   1. a cast RESOLVES THE MOMENT it is pressed: the session prices it,
+//!      debits the pool and hands the move's stamp to
+//!      `slime.SlimeField.apply_shape` at the aimed square.
+//!   2. the landed cast joins a rolling WINDOW of recent casts
+//!      (`balance.team_window_ms` deep).  `complete_group` checks whether the
+//!      new cast just completed a team recipe's bag on its square — DISTINCT
+//!      players, same square, all within the window.  If so the group's
+//!      shape fires too, and the completing cast pays the GROUP's cost
+//!      instead of its own: the contributors already paid their own way as
+//!      they landed, so the group price is the price of the upgrade.
+//!   3. consumed contributors leave the window — a cast feeds at most one
+//!      group.
 //!
 //! All functions here are pure/deterministic and unit-testable without a
 //! session.  Slime-field mutation lives in `slime.zig`; hunger/score
@@ -49,18 +46,23 @@ pub fn cycle_selection(current: u8, dir: c.CycleDir, len: usize) u8 {
 // Casts → shapes
 // ---------------------------------------------------------------------------
 
-/// One cast locked in this turn: who cast what, and where it is aimed.
-/// Group moves are found among these (see `resolve_batch`).
-pub const TurnCast = struct {
+/// One cast that has already LANDED, kept in the session's rolling window so
+/// later casts can complete a team recipe with it (see `complete_group`).
+pub const RecentCast = struct {
     player_id: u8,
     /// Index into balance.player_recipes — the move that was cast.
     move: u8,
     /// Flat grid index the cast was anchored at.
     square: u16,
+    /// Session clock (ms) when the cast landed.  The window is measured
+    /// between landing times, so lag between two contributors is exactly the
+    /// time between their stamps.
+    at_ms: u64,
 };
 
-/// Cap on the per-turn cast log: max players × casts each, with headroom.
-pub const MAX_CASTS: usize = 64;
+/// Cap on the rolling recent-cast window: max players × a generous burst,
+/// with headroom.  The session evicts oldest-first past this.
+pub const MAX_RECENT: usize = 64;
 
 /// The shape a cast resolves to: its footprint, its price, and what fired.
 pub const ShapeCast = struct {
@@ -89,8 +91,8 @@ pub fn move_stamp(bal: *const balance.Balance, move: u8, player_id: u8) ShapeCas
 }
 
 /// The stamp a fired group produces: the group's shape, priced as the group,
-/// credited to `player_id` (the contributor who locked in last — see
-/// `resolve_batch`).
+/// credited to `player_id` (the contributor whose cast completed the bag —
+/// see `complete_group`).
 pub fn group_stamp(bal: *const balance.Balance, recipe_index: u8, player_id: u8) ShapeCast {
     const tr = bal.team_recipes[recipe_index];
     return .{
@@ -103,112 +105,82 @@ pub fn group_stamp(bal: *const balance.Balance, recipe_index: u8, player_id: u8)
 }
 
 // ---------------------------------------------------------------------------
-// Batch resolution
+// Group completion (realtime window)
 // ---------------------------------------------------------------------------
 
-/// One stamp the turn produces, and the square it lands on.
-pub const BatchStamp = struct {
-    stamp: ShapeCast,
-    /// Flat grid index this stamp is anchored at.
-    square: u16,
+/// What a completing cast fired: which team recipe, and which entries of the
+/// recent-cast window it consumed as contributors.
+pub const GroupFire = struct {
+    /// Index into balance.team_recipes.
+    recipe_index: u8,
+    /// Indices INTO THE `recent` SLICE handed to `complete_group` — the
+    /// contributors the group consumed.  The completing cast itself is not
+    /// in `recent` and so not listed.  The session must evict these from its
+    /// window: a cast feeds at most one group.
+    consumed: [balance.MAX_TEAM_COMPONENTS]usize = undefined,
+    consumed_count: usize = 0,
 };
 
-/// Everything a turn's locked-in casts resolve to.
-pub const Batch = struct {
-    stamps: [MAX_CASTS]BatchStamp = undefined,
-    count: usize = 0,
-    /// What the whole turn costs the shared pool — group prices INSTEAD of
-    /// their components', not on top of them.
-    total_cost: u32 = 0,
-
-    pub fn slice(self: *const Batch) []const BatchStamp {
-        return self.stamps[0..self.count];
-    }
-
-    fn push(self: *Batch, stamp: ShapeCast, square: u16) void {
-        // Unreachable for any sane config: a batch produces at most one stamp
-        // per cast, and `casts` is already capped at MAX_CASTS.
-        if (self.count >= MAX_CASTS) return;
-        self.stamps[self.count] = .{ .stamp = stamp, .square = square };
-        self.count += 1;
-        self.total_cost += stamp.cost;
-    }
-};
-
-/// Resolve a whole turn's locked-in casts into the stamps they produce and the
-/// single price they cost together.
+/// Did `cast` just complete a team recipe?
 ///
-/// GROUPS FIRST.  A group needs its whole component bag on ONE square, each
-/// component from a DIFFERENT player — that is what makes it a coordination
-/// move rather than a long combo.  Squares are visited in the order they first
-/// appear, groups are tried in table order, and each is fired REPEATEDLY while
-/// its bag can still be filled from the casts left on that square; so an
-/// earlier table entry shadows a later one whose bag it contains, and six
-/// players on one square can spell the same pair three times.
+/// A group needs its whole component bag on ONE square, each component from a
+/// DIFFERENT player, every contribution landing within `team_window_ms` of
+/// the completing cast — that is what makes it a coordination move rather
+/// than a long combo.  Groups are tried in TABLE ORDER and the first whose
+/// bag fills wins, so an earlier entry shadows a later one whose bag it
+/// contains — the same designer-visible tiebreak the turn loop had.
 ///
-/// A fired group CONSUMES its contributors: they do not also stamp their own
-/// moves, and they pay nothing.  Only the group's price is charged, which is
-/// what makes coordinating a discount on the whole bag rather than on its last
-/// member.  The group is credited to the contributor who locked in LAST — the
-/// one whose choice completed it — which is who the client shows as the caster.
+/// The NEW cast must itself supply one component (a group completes on a
+/// contribution, never on a bystander), and the rest are drawn oldest-first
+/// from `recent` casts on the same square.  One player can supply only one
+/// component, however many casts they have in the window — including the
+/// completer: their window entries never feed a group they are completing.
 ///
-/// Everything not swallowed by a group stamps its own move, in lock-in order.
-/// Every stamp on a square lands at that square, so ordering matters only where
-/// two stamps overlap: groups resolve before plain moves.
-pub fn resolve_batch(bal: *const balance.Balance, casts: []const TurnCast) Batch {
-    std.debug.assert(casts.len <= MAX_CASTS);
-    var out = Batch{};
-    var consumed = [_]bool{false} ** MAX_CASTS;
+/// Pure: nothing is consumed here.  The session evicts `consumed` from its
+/// window and fires `group_stamp(recipe_index, cast.player_id)` — the group
+/// is credited (and billed) to the player who completed it.
+pub fn complete_group(
+    bal: *const balance.Balance,
+    recent: []const RecentCast,
+    cast: RecentCast,
+) ?GroupFire {
+    std.debug.assert(recent.len <= MAX_RECENT);
+    for (bal.team_recipes, 0..) |tr, ti| {
+        // A componentless group is spelled by nothing.  config.zig rejects
+        // one; guard rather than trust.
+        if (tr.components.len == 0) continue;
 
-    for (casts, 0..) |head, hi| {
-        // One hunt per square: a later cast on a square already searched would
-        // only re-run the same search over the same remaining casts.
-        const first_on_square = for (casts[0..hi]) |earlier| {
-            if (earlier.square == head.square) break false;
+        // The new cast must cover one instance of its own move in the bag.
+        const own = for (tr.components, 0..) |comp, i| {
+            if (comp == cast.move) break i;
+        } else continue;
+
+        var fire = GroupFire{ .recipe_index = @intCast(ti) };
+        const filled = for (tr.components, 0..) |comp, slot| {
+            if (slot == own) continue;
+            const found = for (recent, 0..) |cand, ci| {
+                if (cand.square != cast.square) continue;
+                if (cand.move != comp) continue;
+                // Within the window, measured landing-to-landing.  The
+                // session prunes its window every tick, but check anyway so
+                // correctness never depends on pruning cadence.
+                if (cand.at_ms + bal.team_window_ms < cast.at_ms) continue;
+                // Distinct players: one player supplies one component, and
+                // the completer's own earlier casts never count.
+                if (cand.player_id == cast.player_id) continue;
+                const taken = for (fire.consumed[0..fire.consumed_count]) |pi| {
+                    if (recent[pi].player_id == cand.player_id) break true;
+                } else false;
+                if (taken) continue;
+                break ci;
+            } else break false;
+            fire.consumed[fire.consumed_count] = found;
+            fire.consumed_count += 1;
         } else true;
-        if (!first_on_square) continue;
 
-        for (bal.team_recipes, 0..) |tr, ti| {
-            // A componentless group is spelled by nothing, so it would fire
-            // forever.  config.zig rejects one; guard rather than trust.
-            if (tr.components.len == 0) continue;
-            fire: while (true) {
-                var picks: [balance.MAX_TEAM_COMPONENTS]usize = undefined;
-                var picked: usize = 0;
-                for (tr.components) |comp| {
-                    const found = for (casts, 0..) |cand, ci| {
-                        if (consumed[ci]) continue;
-                        if (cand.square != head.square) continue;
-                        if (cand.move != comp) continue;
-                        // Distinct players: one player cannot supply two
-                        // components of the same group, however many casts
-                        // they have locked in.
-                        const taken = for (picks[0..picked]) |pi| {
-                            if (casts[pi].player_id == cand.player_id) break true;
-                        } else false;
-                        if (taken) continue;
-                        break ci;
-                    } else break :fire;
-                    picks[picked] = found;
-                    picked += 1;
-                }
-
-                var last: usize = picks[0];
-                for (picks[0..picked]) |pi| {
-                    consumed[pi] = true;
-                    last = @max(last, pi);
-                }
-                out.push(group_stamp(bal, @intCast(ti), casts[last].player_id), head.square);
-            }
-        }
+        if (filled) return fire;
     }
-
-    for (casts, 0..) |cast, ci| {
-        if (consumed[ci]) continue;
-        out.push(move_stamp(bal, cast.move, cast.player_id), cast.square);
-    }
-
-    return out;
+    return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -384,219 +356,165 @@ test "cheapest_cost is the floor of the whole move list" {
     try std.testing.expectEqual(@as(u16, 0), test_bal.cheapest_cost());
 }
 
-// --- batch resolution ------------------------------------------------------
+// --- group completion --------------------------------------------------------
 
-/// The single stamp `casts` resolves to, or an error if it produced any other
-/// number — every batch test below is about exactly what came out.
-fn only_stamp(bal: *const balance.Balance, casts: []const TurnCast) !BatchStamp {
-    const batch = resolve_batch(bal, casts);
-    try std.testing.expectEqual(@as(usize, 1), batch.count);
-    return batch.stamps[0];
+/// A recent poke by `player` at `square`, landed at `at_ms`.
+fn rc(player: u8, move: u8, square: u16, at_ms: u64) RecentCast {
+    return .{ .player_id = player, .move = move, .square = square, .at_ms = at_ms };
 }
 
-test "resolve_batch: an empty turn resolves to nothing, for nothing" {
-    const batch = resolve_batch(test_bal, &.{});
-    try std.testing.expectEqual(@as(usize, 0), batch.count);
-    try std.testing.expectEqual(@as(u32, 0), batch.total_cost);
+test "complete_group: a lone cast against an empty window fires nothing" {
+    try std.testing.expectEqual(
+        @as(?GroupFire, null),
+        complete_group(test_bal, &.{}, rc(0, POKE, SQ, 100)),
+    );
 }
 
-test "resolve_batch: a lone cast is just its own move, at its own square" {
-    const one = [_]TurnCast{.{ .player_id = 0, .move = POKE, .square = SQ }};
-    const got = try only_stamp(test_bal, &one);
-    try std.testing.expect(!got.stamp.is_team);
-    try std.testing.expectEqual(POKE, got.stamp.recipe_index);
-    try std.testing.expectEqual(SQ, got.square);
+test "complete_group: two players on one square within the window fire the group" {
+    const recent = [_]RecentCast{rc(0, POKE, SQ, 100)};
+    const fire = complete_group(test_bal, &recent, rc(1, POKE, SQ, 300)) orelse
+        return error.TestExpectedGroup;
+    try std.testing.expectEqual(TWIN_BLOOM, fire.recipe_index);
+    try std.testing.expectEqual(@as(usize, 1), fire.consumed_count);
+    try std.testing.expectEqual(@as(usize, 0), fire.consumed[0]);
+    // The completer is credited (and billed): group_stamp carries the
+    // group's own cost, INSTEAD of the completing move's.
+    const stamp = group_stamp(test_bal, fire.recipe_index, 1);
+    try std.testing.expect(stamp.is_team);
+    try std.testing.expectEqual(@as(u8, 1), stamp.anchor_player);
+    try std.testing.expectEqual(@as(u16, 4), stamp.cost);
+    try std.testing.expectEqual(@as(usize, 13), stamp.shape.size());
 }
 
-test "resolve_batch: the turn's price is the sum of what actually lands" {
-    const two = [_]TurnCast{
-        .{ .player_id = 0, .move = POKE, .square = SQ },
-        .{ .player_id = 1, .move = DELUGE, .square = OTHER_SQ },
-    };
-    const batch = resolve_batch(test_bal, &two);
-    try std.testing.expectEqual(@as(usize, 2), batch.count);
-    try std.testing.expectEqual(@as(u32, 1 + 9), batch.total_cost);
+test "complete_group: a contribution outside the window has expired" {
+    // Fixture window is 500ms.  599 - 98 > 500: too stale to coordinate with.
+    const recent = [_]RecentCast{rc(0, POKE, SQ, 98)};
+    try std.testing.expectEqual(
+        @as(?GroupFire, null),
+        complete_group(test_bal, &recent, rc(1, POKE, SQ, 599)),
+    );
+    // Exactly AT the window edge still counts: the window is inclusive.
+    const edge = [_]RecentCast{rc(0, POKE, SQ, 99)};
+    try std.testing.expect(complete_group(test_bal, &edge, rc(1, POKE, SQ, 599)) != null);
 }
 
-test "resolve_batch: two players on one square fire the group instead" {
-    const pair = [_]TurnCast{
-        .{ .player_id = 0, .move = POKE, .square = SQ },
-        .{ .player_id = 1, .move = POKE, .square = SQ },
-    };
-    const got = try only_stamp(test_bal, &pair);
-    try std.testing.expect(got.stamp.is_team);
-    try std.testing.expectEqual(TWIN_BLOOM, got.stamp.recipe_index);
-    try std.testing.expectEqual(SQ, got.square);
-    try std.testing.expectEqual(@as(usize, 13), got.stamp.shape.size());
-}
-
-test "resolve_batch: a group is charged INSTEAD of its components, not on top" {
-    // The whole point of locking casts in: contributors never pay their own
-    // way, so coordinating is a discount on the entire bag.
-    const pair = [_]TurnCast{
-        .{ .player_id = 0, .move = POKE, .square = SQ },
-        .{ .player_id = 1, .move = POKE, .square = SQ },
-    };
-    // twin_bloom costs 4; the two pokes it swallowed would have cost 1 each.
-    try std.testing.expectEqual(@as(u32, 4), resolve_batch(test_bal, &pair).total_cost);
-}
-
-test "resolve_batch: the last contributor to lock in is credited with the group" {
-    const pair = [_]TurnCast{
-        .{ .player_id = 3, .move = POKE, .square = SQ },
-        .{ .player_id = 1, .move = POKE, .square = SQ },
-    };
-    // Player 1 completed it, so player 1 is the caster the clients see.
-    try std.testing.expectEqual(@as(u8, 1), (try only_stamp(test_bal, &pair)).stamp.anchor_player);
-}
-
-test "resolve_batch: an asymmetric group fires from either lock-in order" {
-    const sweep_first = [_]TurnCast{
-        .{ .player_id = 0, .move = SWEEP, .square = SQ },
-        .{ .player_id = 1, .move = BLOCK, .square = SQ },
-    };
-    try std.testing.expectEqual(CROSSFIRE, (try only_stamp(test_bal, &sweep_first)).stamp.recipe_index);
-
-    const block_first = [_]TurnCast{
-        .{ .player_id = 0, .move = BLOCK, .square = SQ },
-        .{ .player_id = 1, .move = SWEEP, .square = SQ },
-    };
-    try std.testing.expectEqual(CROSSFIRE, (try only_stamp(test_bal, &block_first)).stamp.recipe_index);
-}
-
-test "resolve_batch: scattered casts coordinate nothing" {
+test "complete_group: scattered casts coordinate nothing" {
     // A group is casts CONVERGING on one cell; two pokes on two squares are
     // two pokes.
-    const apart = [_]TurnCast{
-        .{ .player_id = 0, .move = POKE, .square = SQ },
-        .{ .player_id = 1, .move = POKE, .square = OTHER_SQ },
-    };
-    const batch = resolve_batch(test_bal, &apart);
-    try std.testing.expectEqual(@as(usize, 2), batch.count);
-    for (batch.slice()) |b| try std.testing.expect(!b.stamp.is_team);
+    const recent = [_]RecentCast{rc(0, POKE, OTHER_SQ, 100)};
+    try std.testing.expectEqual(
+        @as(?GroupFire, null),
+        complete_group(test_bal, &recent, rc(1, POKE, SQ, 200)),
+    );
 }
 
-test "resolve_batch: one player cannot spell a group alone" {
-    // A group is a COOPERATION requirement, not a repeat-press — true however
-    // many casts a single player has locked in.
-    const solo = [_]TurnCast{
-        .{ .player_id = 0, .move = POKE, .square = SQ },
-        .{ .player_id = 0, .move = POKE, .square = SQ },
-    };
-    const batch = resolve_batch(test_bal, &solo);
-    try std.testing.expectEqual(@as(usize, 2), batch.count);
-    for (batch.slice()) |b| try std.testing.expect(!b.stamp.is_team);
+test "complete_group: one player cannot spell a group alone" {
+    // A group is a COOPERATION requirement, not a repeat-press — the
+    // completer's own earlier casts never feed their group.
+    const recent = [_]RecentCast{rc(0, POKE, SQ, 100)};
+    try std.testing.expectEqual(
+        @as(?GroupFire, null),
+        complete_group(test_bal, &recent, rc(0, POKE, SQ, 200)),
+    );
 }
 
-test "resolve_batch: a distinct player still groups alongside a duplicate" {
-    const casts = [_]TurnCast{
-        .{ .player_id = 0, .move = POKE, .square = SQ },
-        .{ .player_id = 0, .move = POKE, .square = SQ }, // same player again
-        .{ .player_id = 1, .move = POKE, .square = SQ },
+test "complete_group: a distinct player still groups alongside a duplicate" {
+    // Player 0 poked twice; player 1's poke completes with ONE of them —
+    // oldest first — and the duplicate stays in the window.
+    const recent = [_]RecentCast{
+        rc(0, POKE, SQ, 100),
+        rc(0, POKE, SQ, 150),
     };
-    const batch = resolve_batch(test_bal, &casts);
-    // The group takes one cast from each player; the duplicate is left over and
-    // lands as a plain poke.
-    try std.testing.expectEqual(@as(usize, 2), batch.count);
-    try std.testing.expectEqual(TWIN_BLOOM, batch.stamps[0].stamp.recipe_index);
-    try std.testing.expect(batch.stamps[0].stamp.is_team);
-    try std.testing.expect(!batch.stamps[1].stamp.is_team);
-    try std.testing.expectEqual(@as(u32, 4 + 1), batch.total_cost);
+    const fire = complete_group(test_bal, &recent, rc(1, POKE, SQ, 300)) orelse
+        return error.TestExpectedGroup;
+    try std.testing.expectEqual(TWIN_BLOOM, fire.recipe_index);
+    try std.testing.expectEqual(@as(usize, 1), fire.consumed_count);
+    try std.testing.expectEqual(@as(usize, 0), fire.consumed[0]);
 }
 
-test "resolve_batch: an incomplete bag fires nothing" {
+test "complete_group: an asymmetric group fires from either landing order" {
+    const sweep_first = [_]RecentCast{rc(0, SWEEP, SQ, 100)};
+    const a = complete_group(test_bal, &sweep_first, rc(1, BLOCK, SQ, 200)) orelse
+        return error.TestExpectedGroup;
+    try std.testing.expectEqual(CROSSFIRE, a.recipe_index);
+
+    const block_first = [_]RecentCast{rc(0, BLOCK, SQ, 100)};
+    const b = complete_group(test_bal, &block_first, rc(1, SWEEP, SQ, 200)) orelse
+        return error.TestExpectedGroup;
+    try std.testing.expectEqual(CROSSFIRE, b.recipe_index);
+}
+
+test "complete_group: an incomplete bag fires nothing" {
     // crossfire needs a block too; two sweeps spell no group at all.
-    const casts = [_]TurnCast{
-        .{ .player_id = 0, .move = SWEEP, .square = SQ },
-        .{ .player_id = 1, .move = SWEEP, .square = SQ },
-    };
-    const batch = resolve_batch(test_bal, &casts);
-    try std.testing.expectEqual(@as(usize, 2), batch.count);
-    for (batch.slice()) |b| try std.testing.expect(!b.stamp.is_team);
+    const recent = [_]RecentCast{rc(0, SWEEP, SQ, 100)};
+    try std.testing.expectEqual(
+        @as(?GroupFire, null),
+        complete_group(test_bal, &recent, rc(1, SWEEP, SQ, 200)),
+    );
 }
 
-test "resolve_batch: an earlier group shadows a later one containing its bag" {
+test "complete_group: a bystander's cast completes nothing" {
+    // The completing cast must itself supply a component: a wedge landing on
+    // two pokes is just a wedge, however ripe the square.
+    const recent = [_]RecentCast{
+        rc(0, POKE, SQ, 100),
+        rc(1, POKE, SQ, 150),
+    };
+    try std.testing.expectEqual(
+        @as(?GroupFire, null),
+        complete_group(test_bal, &recent, rc(2, fixtures.WEDGE, SQ, 200)),
+    );
+}
+
+test "complete_group: an earlier group shadows a later one containing its bag" {
     // triad (3 pokes) contains twin_bloom's bag (2 pokes) and is listed after
-    // it, so three pokes fire twin_bloom and leave a poke over rather than
-    // reaching triad.  Table order is the tiebreak, which is why it is
-    // designer-visible.
-    const three = [_]TurnCast{
-        .{ .player_id = 0, .move = POKE, .square = SQ },
-        .{ .player_id = 1, .move = POKE, .square = SQ },
-        .{ .player_id = 2, .move = POKE, .square = SQ },
+    // it, so a third poke on two ripe pokes fires twin_bloom — table order is
+    // the tiebreak, which is why it is designer-visible.
+    const recent = [_]RecentCast{
+        rc(0, POKE, SQ, 100),
+        rc(1, POKE, SQ, 150),
     };
-    const batch = resolve_batch(test_bal, &three);
-    try std.testing.expectEqual(@as(usize, 2), batch.count);
-    try std.testing.expectEqual(TWIN_BLOOM, batch.stamps[0].stamp.recipe_index);
-    try std.testing.expect(!batch.stamps[1].stamp.is_team);
+    const fire = complete_group(test_bal, &recent, rc(2, POKE, SQ, 200)) orelse
+        return error.TestExpectedGroup;
+    try std.testing.expectEqual(TWIN_BLOOM, fire.recipe_index);
+    try std.testing.expectEqual(@as(usize, 1), fire.consumed_count);
 }
 
-test "resolve_batch: a group repeats while the square can still spell it" {
-    // Four pokes on one square are TWO twin_blooms, not one plus leftovers.
-    const four = [_]TurnCast{
-        .{ .player_id = 0, .move = POKE, .square = SQ },
-        .{ .player_id = 1, .move = POKE, .square = SQ },
-        .{ .player_id = 2, .move = POKE, .square = SQ },
-        .{ .player_id = 3, .move = POKE, .square = SQ },
-    };
-    const batch = resolve_batch(test_bal, &four);
-    try std.testing.expectEqual(@as(usize, 2), batch.count);
-    for (batch.slice()) |b| try std.testing.expectEqual(TWIN_BLOOM, b.stamp.recipe_index);
-    try std.testing.expectEqual(@as(u32, 8), batch.total_cost);
-}
-
-test "resolve_batch: groups land before the plain moves they share a turn with" {
-    // Two stamps can overlap, so the order they are applied in is observable.
-    // Groups first: the coordinated shape is the turn's headline, and the
-    // leftovers step down whatever it leaves standing.
-    const casts = [_]TurnCast{
-        .{ .player_id = 0, .move = SWEEP, .square = OTHER_SQ },
-        .{ .player_id = 1, .move = POKE, .square = SQ },
-        .{ .player_id = 2, .move = POKE, .square = SQ },
-    };
-    const batch = resolve_batch(test_bal, &casts);
-    try std.testing.expectEqual(@as(usize, 2), batch.count);
-    try std.testing.expect(batch.stamps[0].stamp.is_team);
-    try std.testing.expectEqual(SWEEP, batch.stamps[1].stamp.recipe_index);
-}
-
-test "resolve_batch: an empty group table leaves every cast as its own move" {
+test "complete_group: an empty group table completes nothing" {
     var bal = test_bal.*;
     bal.team_recipes = &.{};
-    const pair = [_]TurnCast{
-        .{ .player_id = 0, .move = POKE, .square = SQ },
-        .{ .player_id = 1, .move = POKE, .square = SQ },
-    };
-    const batch = resolve_batch(&bal, &pair);
-    try std.testing.expectEqual(@as(usize, 2), batch.count);
-    for (batch.slice()) |b| try std.testing.expect(!b.stamp.is_team);
+    const recent = [_]RecentCast{rc(0, POKE, SQ, 100)};
+    try std.testing.expectEqual(
+        @as(?GroupFire, null),
+        complete_group(&bal, &recent, rc(1, POKE, SQ, 200)),
+    );
 }
 
-test "resolve_batch: a three-component group needs three distinct players" {
+test "complete_group: a three-component group needs three distinct players" {
     var bal = test_bal.*;
     // Only `triad` loaded, so nothing shadows it.
     bal.team_recipes = fixtures.team_recipes[fixtures.TRIAD..];
-    const three = [_]TurnCast{
-        .{ .player_id = 0, .move = POKE, .square = SQ },
-        .{ .player_id = 1, .move = POKE, .square = SQ },
-        .{ .player_id = 2, .move = POKE, .square = SQ },
+    const recent = [_]RecentCast{
+        rc(0, POKE, SQ, 100),
+        rc(1, POKE, SQ, 150),
     };
-    const fired = try only_stamp(&bal, &three);
-    try std.testing.expect(fired.stamp.is_team);
+    const fire = complete_group(&bal, &recent, rc(2, POKE, SQ, 200)) orelse
+        return error.TestExpectedGroup;
     // Index into the table AS LOADED, which here starts at triad.
-    try std.testing.expectEqual(@as(u8, 0), fired.stamp.recipe_index);
-    try std.testing.expectEqual(@as(u16, 12), fired.stamp.cost);
+    try std.testing.expectEqual(@as(u8, 0), fire.recipe_index);
+    try std.testing.expectEqual(@as(usize, 2), fire.consumed_count);
+    try std.testing.expectEqual(@as(u16, 12), group_stamp(&bal, fire.recipe_index, 2).cost);
 
-    // The same three casts with player 1 supplying two of them leaves the bag
-    // one player short, so all three land as plain pokes.
-    const dup = [_]TurnCast{
-        .{ .player_id = 0, .move = POKE, .square = SQ },
-        .{ .player_id = 1, .move = POKE, .square = SQ },
-        .{ .player_id = 1, .move = POKE, .square = SQ },
+    // The same square with player 1 supplying both ripe pokes leaves the bag
+    // one player short.
+    const dup = [_]RecentCast{
+        rc(1, POKE, SQ, 100),
+        rc(1, POKE, SQ, 150),
     };
-    const batch = resolve_batch(&bal, &dup);
-    try std.testing.expectEqual(@as(usize, 3), batch.count);
-    for (batch.slice()) |b| try std.testing.expect(!b.stamp.is_team);
+    try std.testing.expectEqual(
+        @as(?GroupFire, null),
+        complete_group(&bal, &dup, rc(2, POKE, SQ, 200)),
+    );
 }
 
 test "player_hunger: linear in appetite from the base" {

@@ -1,6 +1,6 @@
 # Slime Feast
 
-Co-op turn-based support game. Up to 6 players feed a crew of Lil Guys parked at the left edge of a slime conveyor: every turn the field drifts into their mouths and they bite the front columns whole. Cast shapes to defuse the hazards before they reach the front — a defused cell is consumed for a point, a live one is only nibbled, filling the shared Hunger bar (the game's clock) for nothing. Score = slime consumed; clear the field before the bar fills.
+Co-op realtime support game. Up to 6 players feed a crew of Lil Guys parked at the left edge of a slime conveyor: on a tuneable clock — sped up by every extra Lil Guy and every baby at the table — the field drifts into their mouths and they bite the front columns whole. Cast shapes (throttled by a per-player cooldown) to defuse the hazards before they reach the front — a defused cell is consumed for a point, a live one is only nibbled, filling the shared Hunger bar (the game's clock) for nothing. Score = slime consumed; clear the field before the bar fills.
 
 Authoritative Zig server. Browser canvas renderer. Zig headless client ↔ Node bridge ↔ browser.
 
@@ -113,7 +113,9 @@ Until you have a domain, the game is playable over plain `http://`.
 
 All designer-tunable data lives in two JSON files:
 
-- `data/balance.json` — grid size, hunger cost per unit eaten, casts per turn, and the
+- `data/balance.json` — grid size, hunger cost per unit eaten, the realtime
+  pacing (`bite_interval_ms`, `bite_speedup_per_guy_pct`,
+  `bite_speedup_per_baby_pct`, `cast_cooldown_ms`, `team_window_ms`), and the
   move + group tables (a move has a `shape` and a `cost`; a group names its
   component moves by label, e.g. `"moves": ["poke","sweep"]`).
 - `data/encounters.json` — encounters (the reservoir's zones and what slime
@@ -131,7 +133,8 @@ can't silently default.  Caps enforced by the loader: 64 recipes per table,
 
 ### /tune — in-browser config editor
 
-Open **`/tune`** for a form with every knob: grid and costs, casts per turn,
+Open **`/tune`** for a form with every knob: grid and costs, the bite clock
+and cast cooldown,
 moves and groups (add/remove, paint shapes, pick a group's component moves)
 and the encounter (add/remove reservoir zones, the slime each holds, charge
 pool, hunger budget).  Saving POSTs to `/api/tune/save`:
@@ -154,10 +157,11 @@ Saved configs are never garbage-collected (tiny JSON dirs).
 | ------- | ------------ |
 | `Enter` | Toggle ready |
 
-**Turns (shape wheel)**
+**Play (shape wheel, realtime)**
 
-Each player has a fixed budget of casts per turn.  A move is picked off a
-**shape wheel** — the move table in file order — and cast at the aimed square:
+Casting is throttled by a per-player cooldown (`cast_cooldown_ms`).  A move
+is picked off a **shape wheel** — the move table in file order — and cast at
+the aimed square:
 
 | Key                   | Action                                       |
 | --------------------- | -------------------------------------------- |
@@ -166,17 +170,22 @@ Each player has a fixed budget of casts per turn.  A move is picked off a
 | `Enter`               | Cast the selected move at the cursor         |
 | `← ↑ ↓ →`             | Aim the cursor                               |
 
-Selection is **server-authoritative** and persists across casts and turns
-(there is no client-side selection state to disagree with the server), so
-every player's current pick is visible to the whole team.
+Selection is **server-authoritative** and persists across casts (there is no
+client-side selection state to disagree with the server), so every player's
+current pick is visible to the whole team.
 
-A cast **stamps** its shape onto the field, downgrading every covered hazard
-cell one tier (red → yellow → green → defused).  Coverage off the grid edge, or
-on a cell with nothing left to downgrade, is wasted; a stamp never empties a
-cell outright.
+A cast resolves the **moment it is pressed**: it **stamps** its shape onto
+the field, downgrading every covered hazard cell one tier (red → yellow →
+green → defused).  Coverage off the grid edge, or on a cell with nothing left
+to downgrade, is wasted; a stamp never empties a cell outright.  A press
+inside the cooldown is silently dropped; a cast the pool cannot pay is
+refused and costs nothing — not even the cooldown.
 
-Once every connected player's budget is spent the field settles in three
-ordered steps, and the order is the whole mechanic:
+The Lil Guys bite on their own **clock**: every `bite_interval_ms` — sped up
+by `bite_speedup_per_guy_pct` per seated Lil Guy past the first and
+`bite_speedup_per_baby_pct` per baby at the table (board-brought and hatched
+alike) — the field settles in three ordered steps, and the order is the
+whole mechanic:
 
 1. **Bite** — the Lil Guys stand at the **left** edge and chew the front
    `feast_columns` columns (plus `feast_columns_per_guy` per seated player)
@@ -193,24 +202,24 @@ nibbled, so the Hunger bar is the game's **clock**: a full bar simply calls
 time on the encounter.  Nibbles are the loss that hurts — clock spent on a
 cell that scored nothing.  Clearing the field before the bar fills is the win.
 
-Casting also composes: when 2+ **distinct** players cast a **group**'s
-component moves on the **same square** within one turn, the group fires at the
-completing player's square, for the group's cost, and consumes its whole bag —
-contributors included, so a grouped cast is not also billed as a solo move.
+Casting also composes: every landed cast stays **ripe** for
+`team_window_ms`, and when a **distinct** player's cast completes a
+**group**'s component bag on the **same square** within that window, the
+group's shape fires too, at the completing player's square.  The completer
+pays the **group's** cost instead of their own — the contributors already
+paid their way as they landed — and the consumed contributions leave the
+window, so a cast feeds at most one group.
 
-The encounter ends **at turn end**, on the first of:
+The encounter ends **when a bite settles**, on the first of:
 
 | Reason | Condition |
 | --- | --- |
 | `field_cleared` | the field and the reservoir hold nothing playable — a win, and it beats the clock on a tie |
 | `hunger_full` | the Hunger bar — the game's clock — filled |
 
-Running the charge pool dry does **not** end the game: a broke team's cast
-presses become passes (budget spent, nothing stamped), and the bite's nibbles
-keep chewing the field down until the clock or the cleared field calls it.
-Going broke mid-turn also strands the casts still owed: every one of them
-could only fizzle, so the turn settles immediately rather than asking for
-input that cannot matter.
+Running the charge pool dry does **not** end the game: a broke team's casts
+are refused while the bite's nibbles keep chewing the field down until the
+clock or the cleared field calls it.
 
 The final shared score and a match report are broadcast either way.
 

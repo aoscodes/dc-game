@@ -149,21 +149,25 @@ const LAYOUT = {
   // never overlaps the first column of cells.
   lilGuys: { scale: 1.25, speed: 220, snap: 3, doorGap: 6 },
 
-  // The turn-end bite, played out cell by cell (see the cinematic section).
-  // The whole sequence is a deliberate pause in play: input is dead until it
-  // finishes, because the board on screen is mid-replay and nothing aimed at it
-  // would mean anything.
+  // The bite, played out column by column — each column lands whole (see
+  // the cinematic section).  Play stays LIVE underneath — the bite recurs on
+  // a realtime clock, so the replay is a flourish over the board, never a
+  // pause — which is why the whole sequence is fitted SHORT: it must land
+  // well inside the bite interval, and a new bite arriving mid-replay
+  // snap-finishes the old one.
   cinematic: {
     // Wall clock the EAT stage is fitted BETWEEN, whatever the bite's width,
-    // so the pause never scales with the meal: a wide bite hurries and a
-    // one-cell nibble lingers instead of finishing before the eye catches
-    // it.  A small meal is the common case and the one most worth watching,
-    // so it gets the same beat as a feast.
-    eatMinS: 2,
-    eatCapS: 5,
-    chompPauseS: 0.1,   // beat held on each bitten cell, so a bite is legible
+    // so the flourish never scales with the meal: a wide bite hurries and a
+    // one-column nibble lingers instead of finishing before the eye catches
+    // it.
+    eatMinS: 0.8,
+    eatCapS: 2,
+    chompPauseS: 0.1,   // beat held on each bitten column, so a bite is legible
     collapseS: 0.4,     // one advance: survivors sliding left, refills sliding in
-    effectStepS: 0.15,  // stagger between a swallowed neutralizer's affected cells
+    // Stagger of the COSMETIC ring sweep over a swallowed neutralizer's
+    // cells (the downgrades land instantly with the bite): short enough that
+    // a full 3x3 finishes inside even the minimum eat stage.
+    effectStepS: 0.05,
     ringS: 0.4,         // one affected cell's border flash, fading out
     // Longest frame the replay will honour.  requestAnimationFrame stops firing
     // in a hidden tab, so returning to one delivers a single frame worth however
@@ -382,7 +386,8 @@ async function loadBalanceData(hash = PAGE_CONFIG_HASH) {
   const res = await fetch(balanceUrl(hash));
   if (!res.ok) throw new Error(`fetch ${balanceUrl(hash)}: HTTP ${res.status}`);
   const bal = await res.json();
-  CASTS_PER_TURN = bal.casts_per_turn ?? 3;
+  CAST_COOLDOWN_MS = bal.cast_cooldown_ms ?? 750;
+  TEAM_WINDOW_MS = bal.team_window_ms ?? 3000;
   BOMB_ROCKS_ONLY = bal.specials?.bomb?.explode_rocks_only ?? false;
   FEAST_COLUMNS = bal.feast_columns ?? 1;
   FEAST_COLUMNS_PER_GUY = bal.feast_columns_per_guy ?? 0;
@@ -478,7 +483,6 @@ function clearEntityState() {
   lastHungerSeen = 0;
   lilGuys.clear();
   babyViews.length = 0; // re-derived from the next frame's counts
-  lastBitePos = null;
   // Grid animation state is per-match: a new game's first frame must adopt its
   // grid silently rather than diff it against the last game's board.  A replay
   // in flight is abandoned outright — it is animating a board this session has
@@ -489,6 +493,8 @@ function clearEntityState() {
   cinematic = null;
   prevGrid = [];
   cellAnim.clear();
+  ringQueue.length = 0;
+  ringT = 0;
   stampedThisFrame.clear();
   lastTransientGame = null;
   chargesSeenMax = 0;
@@ -678,12 +684,12 @@ function drawRecipeGuide() {
 
   y += L.guideLineH;
   const descColor = "rgba(70,70,85,0.95)";
-  // The turn loop: a fixed budget of casts each, all of them resolving
-  // together once the last player has chosen, then the whole field is eaten.
+  // The realtime loop: casts resolve the moment they are pressed (throttled
+  // by the cooldown), and the Lil Guys bite on their own clock.
   const castingLine = [
-    { str: `Press A to LOCK IN`, color: descColor },
-    { str: "Once all Researchers have LOCKED IN their selection the SD2 will disperse", color: RECIPE_COLOR_TEAM },
-    { str: "Neutralizing Agent over the Substance field", color: RECIPE_COLOR_TEAM },
+    { str: `Press A to CAST`, color: descColor },
+    { str: "Each cast disperses Neutralizing Agent the instant it fires; the", color: RECIPE_COLOR_TEAM },
+    { str: "Lil Guys bite the field on their own clock", color: RECIPE_COLOR_TEAM },
   ];
   const descLines = [
     [
@@ -1018,13 +1024,13 @@ const CAST_EVENT_COLOR = "rgba(0,130,200,1)";
 /**
  * Compact per-player shape-wheel rows (bottom-left UI panel).  No player
  * sprites are rendered — the wheel selection is the only per-player element on
- * screen.  The local player's row is highlighted, and every row shows how many
- * casts that player has left this turn: the turn cannot end until they are all
- * spent, so a row with casts left is a row the team is waiting on.
+ * screen.  The local player's row is highlighted, and every row shows that
+ * player's cast COOLDOWN: a row still cooling is a row that cannot fire yet,
+ * so "who can act right now" is readable at a glance.
  *
  * Showing EVERY player's selection (not just the local one) is what makes
  * groups playable: you can see a teammate is holding the move your group needs
- * before you spend a cast on the square.
+ * before you spend a charge on the square.
  */
 function drawWheelPanel(game) {
   const CP = LAYOUT.wheelPanel;
@@ -1039,23 +1045,24 @@ function drawWheelPanel(game) {
     const move = PLAYER_RECIPES[e.selected_shape ?? 0] ?? PLAYER_RECIPES[0];
     text(move?.label ?? "-", CP.x + CP.nameW, y, CP.font, RECIPE_COLOR_PLAYER);
 
-    // Casts left this turn: a filled pip per remaining cast, so "who are we
-    // waiting on" is readable at a glance.  A player with none left has LOCKED
-    // IN — the turn resolves the moment the last of them does.
+    // The cast cooldown, as the server reports it: "ready" the instant it
+    // hits zero, otherwise a draining pip bar (each pip a fifth of the full
+    // cooldown, so the bar's LENGTH is the wait at a glance).
     const usedX = CP.x + CP.nameW + CP.labelW;
-    const left = e.casts_left ?? 0;
-    if (left > 0) {
-      text("◆".repeat(left), usedX, y, CP.font, CAST_EVENT_COLOR);
+    const cd = e.cooldown_ms ?? 0;
+    if (cd <= 0) {
+      text("ready", usedX, y, CP.font, SHAPE_COLOR);
     } else {
-      text("locked in", usedX, y, CP.font, SHAPE_COLOR);
+      const pips = Math.max(1, Math.ceil((cd / Math.max(1, CAST_COOLDOWN_MS)) * 5));
+      text("◆".repeat(Math.min(pips, 5)), usedX, y, CP.font, CAST_EVENT_COLOR);
     }
-    // Where that player is aimed.  Once they have locked in, their cursor is
-    // just a cursor: show the square their last commitment is actually ON,
-    // because that is the one a group has to be aimed at.
-    const mine = (game.pending ?? []).filter((pc) => pc.player_id === e.owner);
+    // Where that player is aimed — and, if they have a cast still ripe in
+    // the group window, the square it is waiting on (the one a partner has
+    // to aim at).
+    const mine = (game.recent ?? []).filter((rc) => rc.player_id === e.owner);
     const last = mine.length > 0 ? mine[mine.length - 1] : null;
     const cols = gridDims(game).cols;
-    const at = last !== null && left === 0
+    const at = last !== null
       ? `!${Math.floor(last.square / cols)},${last.square % cols}`
       : `@${e.cursor_row ?? 0},${e.cursor_col ?? 0}`;
     text(at, usedX + 60, y, CP.font, playerColor(e.owner));
@@ -1268,10 +1275,12 @@ function drawScoreHud(game) {
 // These tables are the complete move list, both here and on the server: the
 // wheel can only ever be pointing at one of them.
 
-/** Casts each player gets per turn, from balance.json.  The server announces
- *  the same number in game_start; this copy is what the LOBBY reads, before
- *  any game_start has arrived. */
-let CASTS_PER_TURN = 3;
+/** Ms between one player's casts, from balance.json.  The server announces
+ *  the same number in game_start; this copy is what the UI reads before any
+ *  game_start has arrived. */
+let CAST_COOLDOWN_MS = 750;
+/** Ms a landed cast stays able to complete a team recipe, from balance.json. */
+let TEAM_WINDOW_MS = 3000;
 /** @typedef {{dRow: number, dCol: number}} ShapeOffset */
 /** @type {Array<{label: string, rows: string[],
  *   offsets: ShapeOffset[], cost: number}>} */
@@ -1308,33 +1317,34 @@ function addOutput(sum, recipe, anchor, owner, pending) {
 }
 
 /**
- * The turn as the viewer can best guess it: every cast already LOCKED IN,
- * plus EVERY seated player's live aim while they still have a cast to spend.
+ * The board as the viewer can best guess it: every cast still RIPE in the
+ * team-recipe window, plus EVERY seated player's live aim.
  *
- * Locked-in casts are facts — the server froze their square and move — so
- * they are taken verbatim and in order, and they render DOTTED.  Live aim is
- * a live wheel + cursor the server broadcasts for every seat, rendered SOLID
- * in that player's color: the whole table (and any observer screen) sees
- * where everyone is pointing before anything is committed.
+ * Window entries are facts — those casts already landed; what remains is
+ * their power to complete a group — so they are taken verbatim and in
+ * landing order, and they render DOTTED.  Live aim is a live wheel + cursor
+ * the server broadcasts for every seat, rendered SOLID in that player's
+ * color: the whole table (and any observer screen) sees where everyone is
+ * pointing before anything fires.
  *
  * @returns {Array<{owner: number, move: number, row: number, col: number,
- *   pending: boolean}>} lock-ins first in order, then live aim in seat
- *   order with the viewer's own last (it wins overlap precedence).
+ *   pending: boolean}>} window entries first in order (pending: true), then
+ *   live aim in seat order with the viewer's own last (it wins overlap
+ *   precedence).
  */
 function projectedCasts(game) {
   const { cols } = gridDims(game);
-  const casts = (game.pending ?? []).map((pc) => ({
-    owner: pc.player_id,
-    move: pc.move,
-    row: Math.floor(pc.square / cols),
-    col: pc.square % cols,
+  const casts = (game.recent ?? []).map((rc) => ({
+    owner: rc.player_id,
+    move: rc.move,
+    row: Math.floor(rc.square / cols),
+    col: rc.square % cols,
     pending: true,
   }));
 
   const live = [];
   let ownAim = null;
   for (const e of game.entities ?? []) {
-    if ((e.casts_left ?? 0) === 0) continue;
     const aim = {
       owner: e.owner,
       move: e.selected_shape ?? 0,
@@ -1349,18 +1359,17 @@ function projectedCasts(game) {
 }
 
 /**
- * Resolve a list of casts into the stamps and the price the turn would buy.
+ * Resolve the window + live aims into the stamps a press could buy.
  *
- * MIRROR OF game_logic.resolve_batch — keep the two in step.  Per square, in
- * first-appearance order, each group in table order fires as many times as its
- * component bag can be filled from the casts still unconsumed on that square,
- * each component from a DISTINCT player.  A group consumes its whole bag, so a
- * contributor does not also stamp their own move.  Whatever is left over
- * stamps itself, in lock-in order.  The total is what the pool is charged: a
- * group is priced at the group, never at its parts.
- *
- * The last entry may be the viewer's own uncommitted aim (see projectedCasts),
- * which is what makes this a preview rather than a readout.
+ * MIRROR OF game_logic.complete_group — keep the two in step.  Per square,
+ * in first-appearance order, each group in table order fires while its
+ * component bag can be filled from the casts still unconsumed on that
+ * square, each component from a DISTINCT player — but only when at least one
+ * component is a LIVE AIM: the server fires a group on the press that
+ * completes it, so a bag made entirely of already-landed window entries is a
+ * bag that already declined to fire (same player, or the window outlived a
+ * refusal) and must not be previewed as one.  Whatever is left over stamps
+ * itself: window entries dotted (their boards marks), live aim solid.
  *
  * @returns {{stamps: Array<{offsets: ShapeOffset[], label: string,
  *   anchor: {row: number, col: number}}>, cost: number, labels: string[]}}
@@ -1391,14 +1400,16 @@ function projectBatch(game) {
           picks.push(found);
         }
         if (picks.length < tr.components.length) break;
+        // A group needs a completing PRESS: with no live aim in the bag
+        // there is nothing left that could fire it.
+        if (picks.every((pi) => casts[pi].pending)) break;
         for (const pi of picks) consumed[pi] = true;
-        // Credited to the contributor who locked in LAST, exactly as the
-        // server resolves it (game_logic.resolve_batch).  The group is a
-        // FACT (dotted) only once every contribution is locked in; one live
-        // aim in the bag keeps it a solid could-be.
-        const last = Math.max(...picks);
-        addOutput(sum, tr, { row: head.row, col: head.col }, casts[last].owner,
-          picks.every((pi) => casts[pi].pending));
+        // Credited to the live aim that would complete it — a could-be, so
+        // it always draws solid.
+        const live = picks.filter((pi) => !casts[pi].pending);
+        const completer = live.length > 0 ? live[live.length - 1] : picks[picks.length - 1];
+        addOutput(sum, tr, { row: head.row, col: head.col },
+          casts[completer].owner, false);
       }
     }
   });
@@ -1492,7 +1503,7 @@ let lastHungerSeen = 0;
 
 /**
  * Call once per drawGame frame, right after any feast replay has been started.
- * Score and hunger ONLY move at the turn-end feast — nothing gives either of
+ * Score and hunger ONLY move when a bite settles — nothing gives either of
  * them back — so the deltas always belong over the cell that was just bitten.
  *
  * While the feast is being replayed the deltas are HELD: they are the payout of
@@ -1806,13 +1817,10 @@ let reachCacheVal = null;
  * @param {number} width - bite width in columns (see feastWidth)
  * @param {Map<number,string>} [overrides] - flat → replacement cell name,
  *   used to ask "what would this cast convert?" without mutating the board.
- * @returns {{eaten: Set<number>, nibbled: Set<number>, order: number[],
- *            settles: Map<number, number[]>}}
+ * @returns {{eaten: Set<number>, nibbled: Set<number>, order: number[]}}
  *   `order` is every bitten cell (consumed AND nibbled) in the server's
  *   column-major walk order; `eaten` is the consumed subset, `nibbled` the
- *   hazards that only stepped a tier; `settles` maps a bite index to the
- *   neutralizer blocks fired after it (each entry the swallowed
- *   neutralizer's cell — its 3x3 fires there, on the STANDING board).
+ *   hazards that only stepped a tier.
  */
 function biteFeast(board, rows, cols, width, overrides) {
   // A full SIMULATION of the meal.  MIRRORS slime.feast cell for cell: the
@@ -1828,8 +1836,6 @@ function biteFeast(board, rows, cols, width, overrides) {
   const order = [];
   const eaten = new Set();
   const nibbled = new Set();
-  /** Neutralizer blocks after order[i]: each the 3x3's center cell. */
-  const settles = new Map();
 
   const w = Math.min(width, cols);
   for (let col = 0; col < w; col++) {
@@ -1854,9 +1860,6 @@ function biteFeast(board, rows, cols, width, overrides) {
           const next = downgradeName(work[cell]);
           if (next !== null) work[cell] = next;
         }
-        const at = order.length - 1;
-        if (!settles.has(at)) settles.set(at, []);
-        settles.get(at).push(flat);
       } else if (name === "special_bomb") {
         // The blast levels its 3x3 where it was eaten, on the board AS IT
         // STANDS — a cell it empties ahead of the walk is skipped there.
@@ -1865,7 +1868,7 @@ function biteFeast(board, rows, cols, width, overrides) {
     }
   }
 
-  return { eaten, nibbled, order, settles };
+  return { eaten, nibbled, order };
 }
 
 /**
@@ -2433,9 +2436,10 @@ function drawSlimeField(game) {
       ctx.restore();
     }
 
-    // Agent-block ring: a violet border flashed on a cell the swallowed
-    // neutralizer's 3x3 just downgraded, fading as the next cell lands —
-    // the block sweeping its footprint one square at a time.
+    // Agent-block ring: a violet border flashed on a cell a swallowed
+    // neutralizer's 3x3 downgraded.  The downgrade itself landed with the
+    // bite; the rings sweep the footprint afterwards, one square at a time
+    // (see tickRingQueue), purely as a receipt.
     if (anim?.kind === "ring") {
       const p = animProgress(anim);
       ctx.save();
@@ -2447,9 +2451,9 @@ function drawSlimeField(game) {
     }
   }
 
-  // Locked-in casts, then cursors, so aim is never buried under a tile.
-  // Both hidden during the replay: nobody can aim while the feast plays out,
-  // and the pending list is already empty by then.
+  // Ripe window casts, then cursors, so aim is never buried under a tile.
+  // Both hidden during the replay so the feast reads clean; play stays LIVE
+  // underneath (input is never blocked in realtime).
   if (!replay) {
     drawPendingMarks(game, g, cols);
     drawCursors(game, g, cols);
@@ -2540,21 +2544,24 @@ function drawCursors(game, g, cols) {
 }
 
 /**
- * Mark every square with a cast LOCKED IN on it: one solid pip per cast, in a
- * row along the bottom of the cell.
+ * Mark every square with a cast still RIPE in the team-recipe window: one
+ * pip per cast, in a row along the bottom of the cell, fading as its window
+ * runs out.
  *
- * This is the turn's only public record before it resolves — the whole reason
- * a teammate can plan a group at all — so it is drawn for every player's
+ * This is the group mechanic's only public record — the whole reason a
+ * teammate can complete a group at all — so it is drawn for every player's
  * casts, not just the viewer's, and it is deliberately unlike the cursor: a
- * cursor is where somebody is looking, a pip is what they have already done.
+ * cursor is where somebody is looking, a pip is what they have already done
+ * (and what is still fresh enough to join).
  */
 function drawPendingMarks(game, g, cols) {
   const bySquare = new Map();
-  for (const pc of game.pending ?? []) {
-    const list = bySquare.get(pc.square);
-    if (list === undefined) bySquare.set(pc.square, [pc]); else list.push(pc);
+  for (const rc of game.recent ?? []) {
+    const list = bySquare.get(rc.square);
+    if (list === undefined) bySquare.set(rc.square, [rc]); else list.push(rc);
   }
 
+  const window = Math.max(1, TEAM_WINDOW_MS);
   const r = g.cell * FIELD.pendingDotFrac;
   const gap = g.cell * FIELD.pendingDotGap;
   for (const [square, list] of bySquare) {
@@ -2562,9 +2569,12 @@ function drawPendingMarks(game, g, cols) {
     const cy = g.y0 + Math.floor(square / cols) * g.cell + g.cell - r * 2;
     const span = list.length * r * 2 + (list.length - 1) * gap;
     let x = cx - span / 2 + r;
-    for (const pc of list) {
+    for (const rc of list) {
+      // Fade with age: a pip about to expire is a group about to miss.
+      const freshness = 1 - Math.min(1, (rc.age_ms ?? 0) / window);
       ctx.save();
-      ctx.fillStyle = playerColor(pc.player_id);
+      ctx.globalAlpha = 0.35 + 0.65 * freshness;
+      ctx.fillStyle = playerColor(rc.player_id);
       ctx.beginPath();
       ctx.arc(x, cy, r, 0, Math.PI * 2);
       ctx.fill();
@@ -2612,13 +2622,13 @@ function drawTile(name, x0, y0, cell, scale, dy, alpha, selected = false) {
 //
 // The Lil Guys are NOT simulated.  The server has no Lil Guy entities: their
 // one mechanical trace is the HEADCOUNT, which widens the bite (see
-// feastWidth).  Everything here is animation over the `turn_ended` fact.
+// feastWidth).  Everything here is animation over the `bite_settled` fact.
 //
 // One guy is shown per connected player (read off `game.entities`, which the
 // server already sends for the wheel panel).  They STAND at the left edge of
 // the field — the mouths the conveyor feeds into, so where they stand is a
 // true statement about where every meal happens.  They never walk the board:
-// when a `turn_ended` arrives the feast cinematic (below) chews the front
+// when a `bite_settled` arrives the feast cinematic (below) chews the front
 // columns while the guys chomp in place at their posts (the babies do the
 // running — see tickBabies).
 //
@@ -2642,10 +2652,6 @@ const lilGuys = new Map();
 
 /** Animator ids live far above entity ids so they cannot collide. */
 const LIL_GUY_ANIM_BASE = 1_000_000;
-
-/** Screen position of the most recent chomp — the anchor for score/hunger
- *  floaters (see updateFeastTracking).  null until the first feast. */
-let lastBitePos = null;
 
 /**
  * The sprite box for a Lil Guy: 1.5 slime blocks, whatever cell size the
@@ -2680,7 +2686,7 @@ function lilGuyPost(i, count, rows, cols) {
  * the surviving views back in `game.entities` order.
  *
  * Shared by the idle milling below and the cinematic, which needs the same
- * roster to hand out the bite script.
+ * roster to play the chomps on.
  *
  * @param {number[]} spawnAt - flat index each new guy should appear standing on,
  *   by roster position.  A guy is born on its cell rather than sprinting in from
@@ -2789,7 +2795,7 @@ function drawLilGuys(game, dt) {
 //
 // The server does the whole turn end in ONE tick — bite the front columns,
 // slide the survivors left, refill from the right — and sends only the
-// finished board plus a `turn_ended` event.  Shown as sent it is a jump cut:
+// finished board plus a `bite_settled` event.  Shown as sent it is a jump cut:
 // the board the player aimed at is simply replaced.
 //
 // So the client replays it.  It has both boards (`prevGrid` before, the frame's
@@ -2798,12 +2804,12 @@ function drawLilGuys(game, dt) {
 // only the server's PRNG knows.  A synthetic `board` is drawn instead of the
 // frame's grid until the replay lands exactly on it.  Each settle PASS plays:
 //
-//   eat      — the front columns are chewed cell by cell in the server's
-//              walk order (the Lil Guys chomp at their posts, the babies
-//              sprint the strip); consumed cells pop, nibbled hazards flash
-//              a tier softer in place; the board changes mid-meal only
-//              where the server's did (a swallowed neutralizer's block, a
-//              bomb's blast)
+//   eat      — the front columns are chewed COLUMN BY COLUMN, each landing
+//              whole in the server's walk order (the Lil Guys chomp at
+//              their posts, the babies sprint the strip); consumed cells
+//              pop, nibbled hazards flash a tier softer in place; the board
+//              changes mid-meal only where the server's did (a swallowed
+//              neutralizer's block, a bomb's blast)
 //   collapse — survivors pack LEFT along their rows: the conveyor advances
 //   fill     — the pass's refill event slides in from the RIGHT edge
 //   matchFx  — the pass's special matches pop and fire their effects
@@ -2823,35 +2829,23 @@ function drawLilGuys(game, dt) {
 
 /**
  * @typedef {object} Cinematic
- * @property {"eat"|"midEffect"|"collapse"|"fill"|"matchFx"} stage
- *   — `midEffect` is a swallowed neutralizer's block landing one cell at a
- *   time on the STANDING board; it pauses the meal, which resumes after
+ * @property {"eat"|"collapse"|"fill"|"matchFx"} stage
  * @property {number} rows
  * @property {number} cols
  * @property {string[]} board  - what is DRAWN: the replay's current board
  * @property {string[]} target - the server's post-settle board, adopted at the end
  * @property {number} pass     - the settle pass now playing (0-based)
- * @property {number} passes   - passes the server's settle took (turn_ended)
+ * @property {number} passes   - passes the server's settle took (bite_settled)
  * @property {Map<number, object>} refillsByPass - pass → its refill event
  * @property {Map<number, object[]>} matchesByPass - pass → its match events
  * @property {object} frame    - the freshest render frame (entity roster for
  *   the chompers)
- * @property {number[]} script - bite POSITIONS (consumed AND nibbled) in the
- *   server's column-major walk order.  Bites are strictly sequential, so the
- *   meal is a single global script.
- * @property {Map<number, number[]>} settles - neutralizer blocks owed after
- *   each script index (see biteFeast); each pauses the meal and plays as
- *   midEffect
- * @property {number[]} settleQueue - the current bite's blocks still to
- *   play (each the swallowed neutralizer's cell)
- * @property {number|null} pendingEffect - the 3x3 center midEffect is
- *   landing cell by cell
- * @property {number[]} effectCells - the pending block's covered cells, in
- *   the server's row-major application order
- * @property {number} effectIdx - the next effectCells entry to apply
- * @property {number} biteIdx - the next script entry to take
- * @property {number} holdT   - chomp pause remaining after the last bite
- * @property {number} chompS   - per-bite pause, fitted so the whole meal
+ * @property {number[][]} groups - bite positions (consumed AND nibbled)
+ *   grouped by COLUMN, each group in the server's walk order.  A whole
+ *   column lands in one step; the chomp pause falls BETWEEN columns.
+ * @property {number} groupIdx - the next groups entry to take
+ * @property {number} holdT   - chomp pause remaining after the last column
+ * @property {number} chompS   - per-column pause, fitted so the whole meal
  *   lands between eatMinS and eatCapS
  * @property {number} t        - seconds left in a timed stage (collapse, fill)
  * @property {{score: number, hunger: number, stamps: object[]}} deferred - things
@@ -2870,28 +2864,32 @@ function cinematicBoard() {
   return cinematic ? cinematic.board : null;
 }
 
-/** True while the feast is being replayed — the window in which input is dead. */
+/** True while a feast is being replayed.  Play is NOT suspended: the bite is
+ *  on a realtime clock and the server keeps taking input throughout — the
+ *  replay only decides what the BOARD draws. */
 function cinematicActive() {
   return cinematic !== null;
 }
 
 /**
- * True while the board is on screen but not playable: the feast replay, or the
- * end-of-match outro behind it (see `outroActive`).
+ * True while the board is on screen but not playable: the end-of-match outro
+ * (see `outroActive`).  A mid-game feast replay does NOT suspend play any
+ * more — realtime input stays live under it — so the aiming overlays merely
+ * hide while the board itself is mid-replay (the `replay` flag in drawField)
+ * and return the moment it lands.
  *
  * Every affordance the board offers — the cast preview, the cells it would
- * cover, the casts-left line — is a promise that pressing a key will do
- * something.  In both of these windows nothing will, so the promise has to come
- * off the screen rather than be quietly broken.  The keydown handler drops the
- * same two cases, and that is not a coincidence: this predicate is the visible
- * half of that one.
+ * cover — is a promise that pressing a key will do something.  In the outro
+ * nothing will, so the promise has to come off the screen rather than be
+ * quietly broken.  The keydown handler drops the same case, and that is not
+ * a coincidence: this predicate is the visible half of that one.
  */
 function playSuspended() {
-  return cinematicActive() || outroActive();
+  return outroActive();
 }
 
 /**
- * Begin replaying the feast announced by `game.turn_ended`.
+ * Begin replaying the feast announced by `game.bite_settled`.
  *
  * @param {object} game - the render frame carrying the event (and the board the
  *   feast produced)
@@ -2901,7 +2899,7 @@ function playSuspended() {
  *   the server's board as sent.
  */
 function startFeastCinematic(game) {
-  const te = game.turn_ended;
+  const te = game.bite_settled;
   const { rows, cols } = gridDims(game);
   const target = (game.grid ?? []).slice();
   const tally = {
@@ -2909,9 +2907,9 @@ function startFeastCinematic(game) {
     bitten: te?.hazards_bitten ?? 0,
   };
 
-  // A replay in flight when another turn ends: possible, since a player out of
-  // casts is not waiting on their own input.  Land the old one on its board
-  // first — half a meal is not a state to start a second one from.
+  // A replay in flight when another bite settles: routine on the realtime
+  // clock.  Land the old one on its board first — half a meal is not a
+  // state to start a second one from.
   if (cinematic) snapFinishCinematic();
 
   // Any cast on this frame is folded into the board the replay starts from
@@ -2967,13 +2965,8 @@ function startFeastCinematic(game) {
     refillsByPass,
     matchesByPass,
     frame: game,
-    script: [],
-    settles: new Map(),
-    settleQueue: [],
-    pendingEffect: null,
-    effectCells: [],
-    effectIdx: 0,
-    biteIdx: 0,
+    groups: [],
+    groupIdx: 0,
     holdT: 0,
     chompS: LAYOUT.cinematic.chompPauseS,
     t: 0,
@@ -2994,8 +2987,13 @@ function startFeastCinematic(game) {
 
 /**
  * Arm the current pass's eat stage: bite the replay board with the mirrored
- * rules and fit the per-bite hold so the whole meal lands between eatMinS
- * and eatCapS.
+ * rules, group the scripted cells by COLUMN — each column lands in one step
+ * — and fit the per-column hold so the whole meal lands between eatMinS and
+ * eatCapS.
+ *
+ * The grouping lives here rather than in biteFeast, which stays a pure
+ * mirror of slime.feast: how the replay PACES the walk is a presentation
+ * concern, not a rule.
  *
  * Nobody walks: the Lil Guys chomp in place at their posts and the babies
  * sprint the bite strip (see tickBabies), so the pacing is purely the holds.
@@ -3011,21 +3009,35 @@ function armEatPass(game) {
   const C = LAYOUT.cinematic;
   const feast = biteFeast(c.board, rows, cols, feastWidth(game, cols));
 
-  c.script = feast.order;
-  c.settles = feast.settles;
-  c.biteIdx = 0;
+  // Partition the walk into per-column groups, preserving the script order
+  // both across and within groups — application order is the rules mirror's.
+  const groups = [];
+  const byCol = new Map();
+  for (const flat of feast.order) {
+    const col = flat % cols;
+    let g = byCol.get(col);
+    if (g === undefined) {
+      g = [];
+      byCol.set(col, g);
+      groups.push(g);
+    }
+    g.push(flat);
+  }
+
+  c.groups = groups;
+  c.groupIdx = 0;
   c.holdT = 0;
   syncLilGuys(game, []);
 
-  const bites = feast.order.length;
-  if (bites === 0) {
+  const steps = groups.length;
+  if (steps === 0) {
     beginShift();
     return false;
   }
-  // Every bite is one hold, so the meal's wall clock is bites × chompS:
-  // stretched on a small meal (the bites ARE the animation) and shortened on
-  // a wide one so the pause never scales past the cap.
-  c.chompS = Math.min(Math.max(C.chompPauseS, C.eatMinS / bites), C.eatCapS / bites);
+  // Every column is one hold, so the meal's wall clock is columns × chompS:
+  // stretched on a narrow meal (the chomps ARE the animation) and shortened
+  // on a wide one so the pause never scales past the cap.
+  c.chompS = Math.min(Math.max(C.chompPauseS, C.eatMinS / steps), C.eatCapS / steps);
   c.stage = "eat";
   return true;
 }
@@ -3053,12 +3065,11 @@ function tickCinematic(game, dt) {
   if (!cinematic) return;
   // The freshest frame, for the entity roster the next pass's queues need.
   cinematic.frame = game;
+  // The cosmetic ring sweep runs in every stage: it gates nothing (see
+  // tickRingQueue), so the meal never waits on it.
+  tickRingQueue(dt);
   switch (cinematic.stage) {
     case "eat": tickEat(game, dt); break;
-    case "midEffect":
-      tickLilGuys(game, dt);
-      tickMidEffect(dt);
-      break;
     case "collapse":
       // This pass's meal is over: the conveyor advances (survivors pack
       // left) while the crew holds its posts.
@@ -3082,9 +3093,10 @@ function tickCinematic(game, dt) {
 /**
  * One frame of the eat stage.
  *
- * Bites are strictly SEQUENTIAL, paced by the fitted per-bite hold; each one
- * lands on the next scripted cell — consumed or nibbled — while the Lil Guys
- * chomp in place at their posts and the babies sprint the strip.
+ * Columns are strictly SEQUENTIAL, paced by the fitted per-column hold; each
+ * step lands a whole scripted column at once — consumed and nibbled cells
+ * together — while the Lil Guys chomp in place at their posts and the babies
+ * sprint the strip.
  */
 function tickEat(game, dt) {
   const c = cinematic;
@@ -3093,84 +3105,98 @@ function tickEat(game, dt) {
   tickLilGuys(game, dt);
 
   let left = dt;
-  while (left > 0 && c.biteIdx < c.script.length) {
+  while (left > 0 && c.groupIdx < c.groups.length) {
     if (c.holdT > 0) {
       const used = Math.min(left, c.holdT);
       c.holdT -= used;
       left -= used;
       continue;
     }
-    const flat = c.script[c.biteIdx];
-    biteAt(game, flat);
+    biteColumn(game, c.groups[c.groupIdx]);
     c.holdT = c.chompS;
-    c.biteIdx++;
-    // A block owed on this bite PAUSES the meal: it lands cell by cell on
-    // the standing board, and only then does the next bite get looked for.
-    // The rest of the frame's slice is forfeit — a pause is a pause.
-    if (pauseForSettles(c.biteIdx - 1)) return;
+    c.groupIdx++;
   }
 
-  // The last bite's hold is still owed once the script is spent: drain it —
-  // without waiting it out the final cell would pop and the board slide in
-  // the same frame, and a one-cell meal would be over before it was seen.
-  if (c.biteIdx >= c.script.length && c.holdT > 0) {
+  // The last column's hold is still owed once the script is spent: drain it —
+  // without waiting it out the final column would pop and the board slide in
+  // the same frame, and a one-column meal would be over before it was seen.
+  if (c.groupIdx >= c.groups.length && c.holdT > 0) {
     c.holdT = Math.max(0, c.holdT - dt);
   }
 
-  if (c.biteIdx >= c.script.length && c.holdT <= 0) {
+  if (c.groupIdx >= c.groups.length && c.holdT <= 0) {
     finishEat();
   }
 }
 
 /**
+ * One whole column lands at once: every scripted cell is bitten in the
+ * server's walk order within this single frame — order still matters, since
+ * a swallowed bomb's blast and a neutralizer's block fire on the STANDING
+ * board and open (or soften) cells later in the same walk — then the column
+ * chomps as one (see chompColumn).
+ */
+function biteColumn(game, cells) {
+  for (const flat of cells) biteAt(game, flat);
+  chompColumn(game, cells);
+}
+
+/**
  * One bite lands on `flat`: a hazard is NIBBLED (one tier softer, in place),
- * anything edible is consumed via `bite`.  Either way the nearest mouths
- * react — the Lil Guy whose post row is closest chomps in place, and the
- * baby sprinting nearest puffs.
+ * anything edible is consumed via `bite`.  Mouth feedback belongs to the
+ * COLUMN the bite is part of — see chompColumn.
  */
 function biteAt(game, flat) {
   const c = cinematic;
   const name = c.board[flat];
-  const at = cellCenter(flat, c.rows, c.cols);
 
   if (hazardTier(name) !== null) {
     // The NIBBLE: the survivor steps one tier in place and blooms.  No
     // score triangle — a nibble feeds nobody.
     c.board[flat] = downgradeName(name);
     cellAnim.set(flat, { kind: "flash", dur: FIELD.flashS, t: FIELD.flashS });
-    lastBitePos = at;
-    chompNearestMouths(game, flat);
     return;
   }
 
   bite(flat);
-  chompNearestMouths(game, flat);
 }
 
-/** Play the chomp on the mouths nearest the bitten cell: the Lil Guy whose
- *  post row is closest snaps its attack clip, and the nearest sprinting baby
- *  puffs.  Purely visual — the bite itself already landed. */
-function chompNearestMouths(game, flat) {
+/** Play the chomp on a whole bitten column: every mouth along it reacts —
+ *  per bitten cell, the Lil Guy whose post row is closest snaps its attack
+ *  clip and the nearest sprinting baby puffs — but ONE floater stands for
+ *  the column, at the mean of the bitten cells, so a tall bite is not a
+ *  stack of sixteen identical words.  Purely visual — the bites themselves
+ *  already landed. */
+function chompColumn(game, cells) {
   const c = cinematic;
-  const at = cellCenter(flat, c.rows, c.cols);
+  if (cells.length === 0) return;
 
-  let bestGuy = null;
-  let bestD = Infinity;
-  for (const g of lilGuys.values()) {
-    const d = Math.abs(g.y - at.y);
-    if (d < bestD) { bestD = d; bestGuy = g; }
+  let sumX = 0;
+  let sumY = 0;
+  for (const flat of cells) {
+    const at = cellCenter(flat, c.rows, c.cols);
+    sumX += at.x;
+    sumY += at.y;
+
+    let bestGuy = null;
+    let bestD = Infinity;
+    for (const g of lilGuys.values()) {
+      const d = Math.abs(g.y - at.y);
+      if (d < bestD) { bestD = d; bestGuy = g; }
+    }
+    if (bestGuy !== null) bestGuy.pendingClip = "attack";
+
+    let bestBaby = null;
+    bestD = Infinity;
+    for (const b of babyViews) {
+      const d = Math.abs(b.y - at.y);
+      if (d < bestD) { bestD = d; bestBaby = b; }
+    }
+    if (bestBaby !== null) bestBaby.chompT = BABY_CHOMP_S;
   }
-  if (bestGuy !== null) bestGuy.pendingClip = "attack";
 
-  let bestBaby = null;
-  bestD = Infinity;
-  for (const b of babyViews) {
-    const d = Math.abs(b.y - at.y);
-    if (d < bestD) { bestD = d; bestBaby = b; }
-  }
-  if (bestBaby !== null) bestBaby.chompT = BABY_CHOMP_S;
-
-  spawnFloater("chomp", at.x, at.y - LAYOUT.floater.stack,
+  spawnFloater("chomp", sumX / cells.length,
+    sumY / cells.length - LAYOUT.floater.stack,
     "rgba(40,36,60,0.85)", 0.8); // ink, not white: it floats over the paper field
 }
 
@@ -3188,7 +3214,6 @@ function bite(flat) {
   if (was && was !== "empty") {
     const sp = cellCenter(flat, c.rows, c.cols);
     spawnFlyTri(sp.x, sp.y);
-    lastBitePos = sp;
   }
 
   // A swallowed canister pours its agent energy back into the team pool —
@@ -3197,6 +3222,24 @@ function bite(flat) {
     const fx = cellCenter(flat, c.rows, c.cols);
     spawnFloater("agent refilled!", fx.x, fx.y - LAYOUT.floater.stack,
       CANISTER_COLOR, 0.9);
+  }
+
+  // A swallowed neutralizer's block fires the moment it goes down — MIRRORS
+  // the server's (and biteFeast's) inline application, row-major over the
+  // STANDING board, so a hazard later in the same walk can be defused in
+  // time to be consumed.  The board changes NOW; the ring flashes are purely
+  // cosmetic and sweep the footprint afterwards (see tickRingQueue), never
+  // gating the meal.
+  if (was === "special_neutralizer") {
+    for (const cell of agentBlockCells(flat, c.rows, c.cols)) {
+      const next = downgradeName(c.board[cell]);
+      if (next === null) continue;
+      c.board[cell] = next;
+      ringQueue.push(cell);
+    }
+    const fx = cellCenter(flat, c.rows, c.cols);
+    spawnFloater("neutralized!", fx.x, fx.y - LAYOUT.floater.stack,
+      SPECIAL_COLOR, 0.9);
   }
 
   // A swallowed bomb levels its 3x3 the moment it goes down — MIRRORS the
@@ -3211,76 +3254,24 @@ function bite(flat) {
   }
 }
 
-/**
- * Pause the meal on the neutralizer blocks owed after bite `idx`, if any.
- * Queues them and enters the midEffect stage; returns true when the meal
- * paused (the caller's eat frame is over).
- */
-function pauseForSettles(idx) {
-  const c = cinematic;
-  const list = c.settles?.get(idx);
-  if (!list || list.length === 0) return false;
-  c.settleQueue = list.slice();
-  nextMidSettleOrResume();
-  return true;
-}
+/** Cells owed a cosmetic neutralizer ring, flashed one per `effectStepS` so
+ *  the block reads as sweeping its footprint.  The downgrades themselves
+ *  already landed (see bite): this queue gates NOTHING — the meal, the slide
+ *  and the refill all run over it, and a ring landing on a cell a later bite
+ *  consumed is simply replaced by that cell's pop, the truer state. */
+let ringQueue = [];
+let ringT = 0;
 
-/**
- * The standing board takes the pending block.  Its cells are queued in the
- * server's row-major application order and land ONE AT A TIME (see
- * tickMidEffect), each flashing a border as its downgrade lands.
- */
-function beginMidEffect() {
-  const c = cinematic;
-  const effect = c.pendingEffect;
-  c.pendingEffect = null;
-  if (effect === null) {
-    nextMidSettleOrResume();
-    return;
-  }
-  c.effectCells = agentBlockCells(effect, c.rows, c.cols);
-  c.effectIdx = 0;
-  c.stage = "midEffect";
-  c.t = 0; // the first cell lands on the next tick
-  const fx = cellCenter(effect, c.rows, c.cols);
-  spawnFloater("neutralized!", fx.x, fx.y - LAYOUT.floater.stack,
-    SPECIAL_COLOR, 0.9);
-}
-
-/**
- * One frame of the effect stage: every `effectStepS`, the block's next cell
- * WITH SOMETHING TO DOWNGRADE takes its step — board updated, border flashed
- * — so the result of each cell is on screen before the next one lands.
- * Cells the block covers but cannot change are skipped silently.
- */
-function tickMidEffect(dt) {
-  const c = cinematic;
-  c.t -= dt;
-  if (c.t > 0) return;
-  while (c.effectIdx < c.effectCells.length) {
-    const cell = c.effectCells[c.effectIdx++];
-    const next = downgradeName(c.board[cell]);
-    if (next === null) continue;
-    c.board[cell] = next;
-    cellAnim.set(cell, {
-      kind: "ring", dur: LAYOUT.cinematic.ringS, t: LAYOUT.cinematic.ringS,
-    });
-    c.t = LAYOUT.cinematic.effectStepS;
-    return;
-  }
-  nextMidSettleOrResume();
-}
-
-/** The block in flight is done: play the next one owed on this bite, or
- *  hand the board back to the meal. */
-function nextMidSettleOrResume() {
-  const c = cinematic;
-  if (c.settleQueue.length > 0) {
-    c.pendingEffect = c.settleQueue.shift();
-    beginMidEffect();
-    return;
-  }
-  c.stage = "eat";
+/** Flash the next owed ring every `effectStepS`.  Ticked in every cinematic
+ *  stage; cleared with the meal it decorates (see endCinematic). */
+function tickRingQueue(dt) {
+  ringT -= dt;
+  if (ringT > 0 || ringQueue.length === 0) return;
+  const cell = ringQueue.shift();
+  cellAnim.set(cell, {
+    kind: "ring", dur: LAYOUT.cinematic.ringS, t: LAYOUT.cinematic.ringS,
+  });
+  ringT = LAYOUT.cinematic.effectStepS;
 }
 
 /** The strip is picked clean: pay out the deltas the meal earned, then slide. */
@@ -3498,6 +3489,10 @@ function snapFinishCinematic() {
 function endCinematic() {
   const c = cinematic;
   cinematic = null;
+  // Rings still owed belong to the meal that just ended: dropped with it,
+  // never carried into the next one.
+  ringQueue.length = 0;
+  ringT = 0;
   // The baseline is the board the replay reproduced, NOT whatever the latest
   // frame holds: teammates can cast while the replay runs, and those changes
   // must still be diffed and animated on the next frame rather than adopted
@@ -3534,28 +3529,28 @@ function spawnFeastTallyFloaters(tally) {
 // One menu box per SEAT — always LAYOUT.playerMenus.seats of them, with
 // unfilled seats drawn as dim placeholders, so the row never reflows as
 // players come and go.  Each menu shows exactly one thing: the SHAPE of the
-// spell its player's wheel is currently holding, plus that player's lock-in
-// state for the round.  Feedback is physical rather than textual:
+// spell its player's wheel is currently holding, plus that player's cast
+// cooldown.  Feedback is physical rather than textual:
 //
-//   pulse — the box swells once when its player locks in a VALID cast on the
-//           board (a new pending cast of theirs appears on the wire)
-//   shake — the box rattles when its player's attempt is REFUSED: the turn
-//           cannot afford it (`over_budget`), or they are already fully
-//           locked in and pressing ENTER anyway (detected locally, since the
-//           server has nothing to say about a key that does nothing)
+//   pulse — the box swells once when its player LANDS a cast (their casts
+//           tally on the wire grows)
+//   shake — the box rattles when its player's attempt is REFUSED: the pool
+//           cannot afford it (`over_budget`), or they pressed ENTER inside
+//           their cooldown (detected locally, since the server silently
+//           drops a press that does nothing)
 
 /** @typedef {{kind: "pulse"|"shake", t: number, dur: number}} MenuFx */
 
 /** player id → running feedback animation on their menu.  @type {Map<number, MenuFx>} */
 const menuFx = new Map();
 
-/** player id → pending-cast count last frame, for lock-in detection.
+/** player id → cooldown_ms last frame, for landed-cast detection.
  *  @type {Map<number, number>} */
 let prevMenuPending = new Map();
 
-/** The player whose committed cast is the round's most recent — their menu
- *  keeps a gentle pulse after the lock-in swell ends.  Cleared when their
- *  commitment goes away (undo, or the turn resolving).
+/** The player whose landed cast is the round's most recent — their menu
+ *  keeps a gentle pulse after the swell ends.  Cleared when someone else
+ *  lands one.
  *  @type {number|null} */
 let lastCommitPid = null;
 
@@ -3575,33 +3570,27 @@ function tickMenuFx(dt) {
 }
 
 /**
- * Diff this frame's pending casts against the last frame's, per player.
- * A count that GREW is a lock-in the server accepted — the valid-selection
- * pulse, for whichever player's menu it was.  A count that shrank is an undo
- * or the turn resolving, neither of which is feedback-worthy: the baseline
- * just moves.  `over_budget` is sent only to the player who tried, so it
- * always shakes the viewer's own menu.
+ * Watch each player's cooldown for the tell-tale RESTART that means a cast
+ * just landed: the server sets cooldown_ms back to its full value the
+ * instant a cast is accepted, so a cooldown that ROSE since last frame is a
+ * landed cast — the pulse, for whichever player's menu it was.  A cooldown
+ * merely draining is the baseline moving.  `over_budget` is sent only to
+ * the player who tried, so it always shakes the viewer's own menu.
  *
  * Call once per FRESH frame (transient events must be consumed exactly once).
  */
 function updateMenuFx(game) {
-  const counts = new Map();
-  for (const pc of game.pending ?? []) {
-    counts.set(pc.player_id, (counts.get(pc.player_id) ?? 0) + 1);
+  const cds = new Map();
+  for (const e of game.entities ?? []) {
+    cds.set(e.owner, e.cooldown_ms ?? 0);
   }
-  // The holder's commitment went away (undo, or the turn resolved): the
-  // "most recent action" marker has nothing to point at any more.
-  if (lastCommitPid !== null &&
-    (counts.get(lastCommitPid) ?? 0) < (prevMenuPending.get(lastCommitPid) ?? 0)) {
-    lastCommitPid = null;
-  }
-  for (const [pid, n] of counts) {
-    if (n > (prevMenuPending.get(pid) ?? 0)) {
+  for (const [pid, cd] of cds) {
+    if (cd > (prevMenuPending.get(pid) ?? 0)) {
       triggerMenuFx(pid, "pulse");
       lastCommitPid = pid;
     }
   }
-  prevMenuPending = counts;
+  prevMenuPending = cds;
 
   if (game.over_budget) triggerMenuFx(game.player_id, "shake");
 }
@@ -3638,11 +3627,13 @@ function drawEmptySeat(x, y, w, h) {
   ctx.restore();
 }
 
-/** One player's menu: their held spell's shape, and their lock-in state. */
+/** One player's menu: their held spell's shape, and their cast cooldown. */
 function drawPlayerMenu(game, e, x, y) {
   const P = LAYOUT.playerMenus;
   const own = e.owner === game.player_id;
-  const locked = (e.casts_left ?? 0) === 0;
+  // Cooling down: the spell is held but cannot fire yet — the same visual
+  // slot the old lock-in used, now a short breath instead of a turn.
+  const locked = (e.cooldown_ms ?? 0) > 0;
   const fx = menuFx.get(e.owner);
 
   ctx.save();
@@ -3674,8 +3665,8 @@ function drawPlayerMenu(game, e, x, y) {
   }
 
   rect(x, y, P.w, P.h, C_MENU_BG);
-  // Locked in: a solid bright frame plus a tint wash — the box itself is the
-  // state, readable across the room, with the label below as confirmation.
+  // Cooling: a solid bright frame plus a tint wash — the box itself is the
+  // state, readable across the room, with the bar below as the countdown.
   if (locked) rect(x, y, P.w, P.h, withAlpha(SHAPE_COLOR, 0.10));
   rectStroke(x, y, P.w, P.h, locked ? 4 : 2,
     locked ? SHAPE_COLOR : playerColor(e.owner));
@@ -3694,17 +3685,18 @@ function drawPlayerMenu(game, e, x, y) {
   drawSpellShape(x + P.w / 2, (shapeTop + shapeBottom) / 2,
     P.w - 20, shapeBottom - shapeTop, move?.rows ?? ["#"], locked);
 
-  // Lock-in state for the round: pips while casts remain (the same ◆
-  // language as the wheel panel), the banner once they are spent.
+  // The cooldown, as a draining bar: full the instant a cast lands, gone
+  // the instant the next press is legal.  READY replaces it at rest.
   const statusY = y + P.h - P.statusDy;
   if (locked) {
-    ctx.fillStyle = SHAPE_COLOR;
-    ctx.font = `bold ${P.statusFont}px monospace`;
-    ctx.fillText("LOCKED IN", x + P.w / 2, statusY);
+    const frac = Math.min(1, (e.cooldown_ms ?? 0) / Math.max(1, CAST_COOLDOWN_MS));
+    const barW = (P.w - 20) * frac;
+    ctx.fillStyle = withAlpha(CAST_EVENT_COLOR, 0.9);
+    ctx.fillRect(x + 10, statusY - P.statusFont + 3, barW, P.statusFont - 2);
   } else {
-    ctx.fillStyle = CAST_EVENT_COLOR;
+    ctx.fillStyle = SHAPE_COLOR;
     ctx.font = `${P.statusFont}px monospace`;
-    ctx.fillText("◆".repeat(e.casts_left ?? 0), x + P.w / 2, statusY);
+    ctx.fillText("READY", x + P.w / 2, statusY);
   }
   ctx.restore();
 }
@@ -3998,13 +3990,13 @@ function drawGame(game, dt) {
   // replay below starts from the board those same stamps produced.
   //if (fresh) spawnStampFloaters(game);
 
-  // A turn end starts the feast replay, which then owns the board and the Lil
-  // Guys until it lands.  It must start BEFORE anything reads the board, and its
-  // own board must not be diffed against the frame it is replaying toward — the
-  // replay produces that board itself, cell by cell.  A turn that ends while one
-  // is still running lands it early and replays from there, which is why this is
-  // not gated on there being no replay in flight.
-  const startedReplay = fresh && game.turn_ended
+  // A settled bite starts the feast replay, which then owns the board and the
+  // Lil Guys until it lands.  It must start BEFORE anything reads the board,
+  // and its own board must not be diffed against the frame it is replaying
+  // toward — the replay produces that board itself, column by column.  A bite
+  // that settles while one is still running lands it early and replays from
+  // there, which is why this is not gated on there being no replay in flight.
+  const startedReplay = fresh && game.bite_settled
     ? startFeastCinematic(game)
     : false;
   updateFeastTracking(game);
@@ -4044,8 +4036,14 @@ function drawGame(game, dt) {
   clear();
 
   const H = LAYOUT.headers;
-  text(`Turn ${game.turn ?? 1}`,
-    H.waveX, H.waveY, H.waveFont, C_HEADER);
+  // The bite countdown IS the game's heartbeat, so it sits where the turn
+  // counter used to: "Bite N in S.s" while the timer runs, a bare "Bite N"
+  // while it is disarmed (nobody seated, or a hold).
+  const nextMs = game.next_bite_ms ?? 0;
+  const biteLabel = nextMs > 0
+    ? `Bite ${game.bite ?? 1} in ${(nextMs / 1000).toFixed(1)}s`
+    : `Bite ${game.bite ?? 1}`;
+  text(biteLabel, H.waveX, H.waveY, H.waveFont, C_HEADER);
 
   // The game id (join code), tucked under the score HUD top right, so anyone
   // watching can tell others what to join.
@@ -4233,7 +4231,7 @@ function drawRestartButton(label) {
 // ended it.
 //
 // So the board is HELD.  The game_over frame carries the same payload a turn
-// end does (post-feast grid + turn_ended), the feast replays exactly as any
+// end does (post-feast grid + bite_settled), the feast replays exactly as any
 // other turn's does, and only once it has landed does the verdict float up.
 // The report waits behind it.  Input is dead for the duration — see the keydown
 // handler — because there is nothing to decide and a stray keypress would
@@ -4448,36 +4446,22 @@ document.addEventListener("keydown", (e) => {
 
   if (!FORWARDED_KEYS.has(e.key)) return;
   e.preventDefault();
-  // The feast replay is a pause in play: the board on screen is mid-meal, so
-  // neither aiming at it nor casting into it would mean anything.  Keys are
-  // dropped rather than queued — a cast the player cannot see land is worse
-  // than one they have to press again.
+  // Play is REALTIME: keys stay live even while a feast replay flourishes
+  // over the board — the server keeps chewing and keeps taking input, so
+  // dropping keys here would be the desync, not the courtesy.
   //
-  // The outro is the same pause with nothing behind it: the match is already
-  // decided, and the only key the Zig client still answers to is the one that
-  // dismisses the report — which must not be spent before the report is up.
-  if (cinematicActive() || outroActive()) return;
+  // The outro is the one true pause: the match is already decided, and the
+  // only key the Zig client still answers to is the one that dismisses the
+  // report — which must not be spent before the report is up.
+  if (outroActive()) return;
   if (latestMsg?.phase === "game" && latestMsg.game) {
     const g = latestMsg.game;
-    // A lock-in FREEZES its player: while any cast of theirs is pending, the
-    // cursor and the wheel are committed — aiming or re-rolling now would
-    // silently desync what they see from what they promised the round.  The
-    // keys are dropped HERE, not sent and refused: the server would happily
-    // move the cursor, and the lock is a client-honoured contract.  ESC is
-    // the one exception — cancelling is exactly how the player frees
-    // themselves back up.
-    const frozen = (g.pending ?? []).some((pc) => pc.player_id === g.player_id);
-    const steering = e.key === "1" || e.key === "2" || e.key.startsWith("Arrow");
-    if (frozen && steering) {
-      triggerMenuFx(g.player_id, "shake");
-      return;
-    }
-    // ENTER with every cast already spent is a refusal the server never
-    // answers (the key does nothing), so the invalid-selection shake is
-    // raised locally: the player asked, the answer is no, their menu says so.
+    // ENTER inside the cast cooldown is a press the server silently drops,
+    // so the too-eager shake is raised locally: the player asked, the
+    // answer is "not yet", their menu says so.
     if (e.key === "Enter") {
       const own = (g.entities ?? []).find((en) => en.owner === g.player_id);
-      if (own !== undefined && (own.casts_left ?? 0) === 0) {
+      if (own !== undefined && (own.cooldown_ms ?? 0) > 0) {
         triggerMenuFx(g.player_id, "shake");
       }
     }

@@ -23,7 +23,7 @@ pub const Writer = struct {
         game.last_action_count = 0;
         game.over_budget = null;
         game.recipe_count = 0;
-        game.turn_ended = null;
+        game.bite_settled = null;
         game.shape_cast_count = 0;
         game.special_match_count = 0;
         game.eggs_hatched = null;
@@ -53,9 +53,12 @@ pub const GameState = struct {
     player_id: u8 = proto.NO_PLAYER,
     /// The session's join code — the game id, from game_start.
     join_code: [6]u8 = [_]u8{'-'} ** 6,
-    /// Casts each player gets per turn, as announced in game_start.  Constant
-    /// for the whole encounter, so the renderer can draw a budget gauge.
-    casts_per_turn: u8 = 0,
+    /// Ms between one player's casts, as announced in game_start.  Constant
+    /// for the whole encounter, so the renderer can scale its cooldown dial.
+    cast_cooldown_ms: u32 = 0,
+    /// Ms a landed cast stays able to complete a team recipe, from
+    /// game_start.  Constant for the whole encounter.
+    team_window_ms: u32 = 0,
     encounter_label: [32]u8 = [_]u8{0} ** 32,
     encounter_label_len: u8 = 0,
     /// Final score from game_over (null until the encounter ends).
@@ -72,10 +75,10 @@ pub const GameState = struct {
     /// Recipes fired since the last render write (transient).
     recipes_fired: [16]proto.RecipeFired = undefined,
     recipe_count: u8 = 0,
-    /// The feast that settled the turn, if one settled since the last render
-    /// write (transient).  At most one per frame: a turn cannot end twice
-    /// without the frames in between being written.
-    turn_ended: ?proto.TurnEnded = null,
+    /// The feast that settled, if a bite settled since the last render
+    /// write (transient).  At most one per frame: when a slow frame swallows
+    /// two, the later wins — it describes the next snapshot's board.
+    bite_settled: ?proto.BiteSettled = null,
     /// Shapes stamped since the last render write (transient): the resolved
     /// footprint of each landed cast, so the renderer can flash exactly the
     /// cells the server hit without re-deriving placement.
@@ -114,7 +117,7 @@ fn write_render_inner(
             .id = e.entity,
             .kind = e.kind,
             .owner = e.owner,
-            .casts_left = e.casts_left,
+            .cooldown_ms = e.cooldown_ms,
             .last_action = anim,
             .selected_shape = e.selected_shape,
             .cursor_row = e.cursor_row,
@@ -123,13 +126,15 @@ fn write_render_inner(
         };
     }
 
-    // The turn as it stands: every cast locked in and still unresolved.
-    var pending_buf: [proto.MAX_PENDING_WIRE]JsonPending = undefined;
-    for (game.snapshot.pending[0..game.snapshot.pending_count], 0..) |pc, i| {
-        pending_buf[i] = .{
-            .player_id = pc.player_id,
-            .move = pc.move,
-            .square = pc.square,
+    // The group window as it stands: every cast still young enough to help
+    // a teammate spell a team recipe.
+    var recent_buf: [proto.MAX_RECENT_WIRE]JsonRecent = undefined;
+    for (game.snapshot.recent[0..game.snapshot.recent_count], 0..) |rc, i| {
+        recent_buf[i] = .{
+            .player_id = rc.player_id,
+            .move = rc.move,
+            .square = rc.square,
+            .age_ms = rc.age_ms,
         };
     }
 
@@ -156,15 +161,15 @@ fn write_render_inner(
         };
     }
 
-    // Convert this frame's turn end (if any) for JSON.
-    const turn_ended: ?JsonTurnEnded = if (game.turn_ended) |te| .{
-        .turn = te.turn,
-        .cells_eaten = te.cells_eaten,
-        .hunger_added = te.hunger_added,
-        .hazards_bitten = te.hazards_bitten,
-        .score_added = te.score_added,
-        .charges_left = te.charges_left,
-        .passes = te.passes,
+    // Convert this frame's settled bite (if any) for JSON.
+    const bite_settled: ?JsonBiteSettled = if (game.bite_settled) |bs| .{
+        .bite = bs.bite,
+        .cells_eaten = bs.cells_eaten,
+        .hunger_added = bs.hunger_added,
+        .hazards_bitten = bs.hazards_bitten,
+        .score_added = bs.score_added,
+        .charges_left = bs.charges_left,
+        .passes = bs.passes,
     } else null;
 
     // Convert transient special matches for JSON.  Cell lists pass through
@@ -264,11 +269,11 @@ fn write_render_inner(
         .phase = phase,
         // Carried in `game_over` too, not just `game`.  The renderer plays the
         // closing feast as its outro, and that needs the same payload a normal
-        // turn end gets: the post-feast board plus the `turn_ended` that
+        // settle gets: the post-feast board plus the `bite_settled` that
         // describes it.  Both are already on the snapshot — the server sends a
         // final `game_state` before `game_over` for exactly this — so it costs
-        // nothing but the bytes.  `turn_ended` is cleared after one write, so
-        // the outro starts once and the frames after it are static.
+        // nothing but the bytes.  `bite_settled` is cleared after one write,
+        // so the outro starts once and the frames after it are static.
         // Carried in `pre_match` too: the guide screen needs the game id and
         // the viewer's standing (seats can be taken while it holds).
         .game = if (phase != .connecting) JsonGame{
@@ -276,8 +281,10 @@ fn write_render_inner(
             .join_code = &game.join_code,
             .player_id = game.player_id,
             .observer = game.player_id == proto.NO_PLAYER,
-            .casts_per_turn = game.casts_per_turn,
-            .turn = game.snapshot.turn,
+            .cast_cooldown_ms = game.cast_cooldown_ms,
+            .team_window_ms = game.team_window_ms,
+            .bite = game.snapshot.bite,
+            .next_bite_ms = game.snapshot.next_bite_ms,
             .tick = game.snapshot.tick,
             .entities = entities_buf[0..game.snapshot.entity_count],
             .hunger = .{
@@ -291,13 +298,13 @@ fn write_render_inner(
             .grid = grid_buf[0..grid_len],
             .reservoir = game.snapshot.reservoir,
             .hatched = babies_u16(game.snapshot.hatched),
-            .pending = pending_buf[0..game.snapshot.pending_count],
+            .recent = recent_buf[0..game.snapshot.recent_count],
             .over_budget = if (game.over_budget) |ob|
                 JsonOverBudget{ .needed = ob.needed, .have = ob.have }
             else
                 null,
             .recipes_fired = recipes_buf[0..game.recipe_count],
-            .turn_ended = turn_ended,
+            .bite_settled = bite_settled,
             .shape_casts = shape_cast_buf[0..game.shape_cast_count],
             .special_matches = match_buf[0..game.special_match_count],
             .eggs_hatched = eggs_hatched,
@@ -474,10 +481,15 @@ const JsonGame = struct {
     player_id: u8,
     /// True while this connection holds no seat: input is P-to-join only.
     observer: bool,
-    /// Casts each player gets per turn, from game_start.
-    casts_per_turn: u8,
-    /// The turn now being played, 1-based.
-    turn: u16,
+    /// Ms between one player's casts, from game_start.
+    cast_cooldown_ms: u32,
+    /// Ms a landed cast stays able to complete a team recipe, from game_start.
+    team_window_ms: u32,
+    /// The bite now being chewed toward, 1-based.
+    bite: u16,
+    /// Ms until the Lil Guys bite again; 0 while the timer is disarmed
+    /// (nobody seated, or the session is holding).
+    next_bite_ms: u32,
     tick: u32,
     entities: []const JsonEntity,
     hunger: JsonHunger,
@@ -495,10 +507,10 @@ const JsonGame = struct {
     /// Babies hatched so far this encounter, per type.  Session-owned — a
     /// reconnecting renderer rebuilds its brood from this.
     hatched: JsonBabies,
-    /// Casts locked in this turn and not yet resolved, in lock-in order.  This
-    /// IS the turn as it stands: the renderer marks each one on the board and
-    /// previews the whole list plus the viewer's own live aim.
-    pending: []const JsonPending,
+    /// Casts still inside the team-recipe window, in landing order.  The
+    /// renderer marks each one on the board and previews group potential
+    /// from this list plus the viewer's own live aim.
+    recent: []const JsonRecent,
     /// The refusal the viewer's last cast earned, if any (transient).  Absent
     /// on every other frame, and never sent to anyone else — it is about a
     /// cast that never happened.
@@ -507,9 +519,9 @@ const JsonGame = struct {
     /// to the balance recipe table for `kind` (JS resolves labels from the
     /// fetched data/balance.json, same order).
     recipes_fired: []const JsonRecipeFired,
-    /// The feast that ended the turn, if the turn ended since the previous
-    /// frame (transient).  Absent on every other frame.
-    turn_ended: ?JsonTurnEnded,
+    /// The feast that settled, if a bite settled since the previous frame
+    /// (transient).  Absent on every other frame.
+    bite_settled: ?JsonBiteSettled,
     /// Shapes stamped since the previous frame (transient), one per landed
     /// cast.
     shape_casts: []const JsonShapeCast,
@@ -575,35 +587,36 @@ const JsonRecipeFired = struct {
     index: u8,
 };
 
-/// One cast locked in but not yet resolved.  `square` is a flat grid index
-/// (row * grid_cols + col), frozen when the cast was locked in.
-const JsonPending = struct {
+/// One landed cast still inside the team-recipe window.  `square` is a flat
+/// grid index (row * grid_cols + col); `age_ms` is how long ago it landed.
+const JsonRecent = struct {
     player_id: u8,
     move: u8,
     square: u16,
+    age_ms: u32,
 };
 
-/// A cast refused for price: what the turn would have cost with it, against
-/// what the shared pool actually holds.
+/// A cast refused for price: what it would have cost, against what the
+/// shared pool actually holds.
 const JsonOverBudget = struct {
     needed: u32,
     have: u32,
 };
 
-/// The turn-end feast: the Lil Guys bit the front columns of the field.
+/// A settled bite: the Lil Guys bit the front columns of the field.
 /// `hazards_bitten` counts the nibbles — hunger spent on hazards no cast
-/// defused in time, the number the next turn's casts exist to shrink.  This
+/// defused in time, the number the next bite's casts exist to shrink.  This
 /// drives the client's devour animation.
-const JsonTurnEnded = struct {
-    /// The turn that just ended (the frame after it carries turn + 1).
-    turn: u16,
+const JsonBiteSettled = struct {
+    /// The bite that just settled (the frame after it carries bite + 1).
+    bite: u16,
     cells_eaten: u16,
     hunger_added: u16,
     hazards_bitten: u16,
     score_added: u32,
-    /// The shared pool AFTER this turn: the client's running budget readout.
+    /// The shared pool AFTER this bite: the client's running budget readout.
     charges_left: u32,
-    /// Settle passes the turn took (>= 1; matches re-open the feast).
+    /// Settle passes the bite took (>= 1; matches re-open the feast).
     passes: u8,
 };
 
@@ -611,8 +624,8 @@ const JsonEntity = struct {
     id: u32,
     kind: c.EntityKind,
     owner: u8,
-    /// Casts this player has left in the current turn.
-    casts_left: u8,
+    /// Ms until this player may cast again; 0 = ready now.
+    cooldown_ms: u32,
     last_action: ?c.ActionAnimation,
     /// Index into the move table of the shape this player would cast.  Sent for
     /// every player, not just the local one: seeing what a teammate has chosen

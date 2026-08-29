@@ -101,7 +101,7 @@ const KEY_MAP = {
   A: "1", // shape wheel forward
   B: "2", // shape wheel backward
   C: "Enter", // cast (realtime) / dismiss (game over)
-  D: "Escape", // take back the newest lock-in
+  D: "Escape", // no-op in play (cancel is retired: casts resolve instantly)
 };
 
 /**

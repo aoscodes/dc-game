@@ -7,7 +7,11 @@
     "rows": 6,
     "cols": 10
   },
-  "casts_per_turn": 1,
+  "bite_interval_ms": 4000,
+  "bite_speedup_per_guy_pct": 15,
+  "bite_speedup_per_baby_pct": 5,
+  "cast_cooldown_ms": 750,
+  "team_window_ms": 3000,
   "baby_hunger": 10,
   "feast_columns": 1,
   "feast_columns_per_guy": 0,

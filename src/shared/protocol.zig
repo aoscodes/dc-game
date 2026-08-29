@@ -16,7 +16,9 @@ pub const MsgTag = enum(u8) {
     cycle_shape = 0x07,
     cast = 0x09,
     move_cursor = 0x0a,
-    cancel_cast = 0x0b,
+    // 0x0b was cancel_cast: retired with the turn loop — a realtime cast
+    // resolves the moment it is pressed, so there is nothing pending to take
+    // back.
     // 0x10 was lobby_update.
     game_start = 0x11,
     game_state = 0x12,
@@ -25,26 +27,29 @@ pub const MsgTag = enum(u8) {
     over_budget = 0x19,
     recipe_fired = 0x18,
     shape_cast = 0x1c,
-    turn_ended = 0x1d,
+    // 0x1d was turn_ended: retired with the turn loop — the same settle now
+    // arrives as bite_settled (0x21), on the bite clock instead of at a
+    // turn's end.
     /// A run of matchable specials lined up and fired: the matched cells
     /// popped and the kind's effect landed.  One message per match, broadcast
-    /// before `turn_ended` so clients animate the reaction on the settled
+    /// before `bite_settled` so clients animate the reaction on the settled
     /// field they are about to summarize.  Tagged with the settle PASS it
-    /// fired in (see field_refilled): a match re-opens the feast, so a turn
+    /// fired in (see field_refilled): a match re-opens the feast, so a bite
     /// settles in passes and the client replays them in order.
     special_matched = 0x1e,
     /// The feast ate one or more eggs: a baby hatched per entry.  Broadcast
-    /// before `turn_ended`; carries cells + rolled types so every client
+    /// before `bite_settled`; carries cells + rolled types so every client
     /// hatches identical babies in identical places.  Aggregated over every
-    /// pass of the turn's settle.
+    /// pass of the bite's settle.
     eggs_hatched = 0x1f,
     /// One settle pass's reservoir refill: which cells filled and with what.
     /// The draw comes out of the session's PRNG, so this is the ONE part of
     /// a settle a client cannot derive — and with it, a client can replay a
     /// whole cascading settle exactly (bite, shift and match effects are
     /// all mirrored rules).  One message per pass, in pass order, before
-    /// `turn_ended`.
+    /// `bite_settled`.
     field_refilled = 0x20,
+    bite_settled = 0x21,
 };
 
 /// The `player_id` a connection holds while it is only OBSERVING: it receives
@@ -114,13 +119,11 @@ pub fn decode_move_cursor(reader: anytype) !MoveCursor {
     return .{ .dir = dir };
 }
 
-/// A cast was refused because the turn's locked-in casts, WITH it, would cost
-/// more than the shared pool holds.
+/// A cast was refused because it would cost more than the shared pool holds.
 ///
-/// Sent only to the player who tried it: nobody else did anything, and the turn
-/// is unchanged — their cast simply never locked in.  The two numbers are the
-/// whole explanation, so the client can say what it would have cost and what is
-/// actually left without deriving either.
+/// Sent only to the player who tried it: nobody else did anything and nothing
+/// landed.  The two numbers are the whole explanation, so the client can say
+/// what it would have cost and what is actually left without deriving either.
 pub const OverBudget = struct {
     /// What the turn would have cost with this cast included.
     needed: u32,
@@ -135,21 +138,20 @@ pub fn decode_over_budget(reader: anytype) !OverBudget {
     };
 }
 
-/// The turn's cast phase is over and the Lil Guys have bitten the front
-/// columns of the field.
+/// The bite clock fired and the Lil Guys have bitten the front columns of
+/// the field.
 ///
 /// Sent after the bite, the shift and the refill, so a client can animate
 /// the devouring and float the resulting hunger/score without re-deriving any
-/// of it.  This is the only place hunger and score move in the turn loop:
-/// casting never feeds the Lil Guys, it only defuses what they are about to
-/// bite.
+/// of it.  This is the only place hunger and score move: casting never feeds
+/// the Lil Guys, it only defuses what they are about to bite.
 ///
 /// `hazards_bitten` is the message's most useful number for a player: every
 /// one is a nibble that filled the hunger clock and scored nothing — the
-/// front the turn's casts failed to defuse in time.
-pub const TurnEnded = struct {
-    /// The turn that just ended (1-based); the next turn is this + 1.
-    turn: u16,
+/// front the team's casts failed to defuse in time.
+pub const BiteSettled = struct {
+    /// The bite that just settled (1-based); the next bite is this + 1.
+    bite: u16,
     /// Slime units eaten off the grid.
     cells_eaten: u16,
     /// Total hunger added by the feast.
@@ -159,19 +161,19 @@ pub const TurnEnded = struct {
     hazards_bitten: u16,
     /// Score added by the feast.
     score_added: u32,
-    /// Charges left in the shared pool after the turn.  Sent here as well as in
-    /// GameState so the end-of-turn summary is self-contained.
+    /// Charges left in the shared pool after the bite.  Sent here as well as
+    /// in GameState so the settle summary is self-contained.
     charges_left: u32,
-    /// Settle passes this turn took (>= 1).  Every special match re-opens the
-    /// feast, so a turn is a CASCADE of bite/shift/fill passes; the summary
+    /// Settle passes this bite took (>= 1).  Every special match re-opens the
+    /// feast, so a bite is a CASCADE of bite/shift/fill passes; the summary
     /// numbers above are totals over all of them, and the per-pass events
     /// (field_refilled, special_matched) preceded this message.
     passes: u8 = 1,
 };
 
-pub fn decode_turn_ended(reader: anytype) !TurnEnded {
+pub fn decode_bite_settled(reader: anytype) !BiteSettled {
     return .{
-        .turn = try reader.readInt(u16, .little),
+        .bite = try reader.readInt(u16, .little),
         .cells_eaten = try reader.readInt(u16, .little),
         .hunger_added = try reader.readInt(u16, .little),
         .hazards_bitten = try reader.readInt(u16, .little),
@@ -362,9 +364,12 @@ pub const GameStart = struct {
     /// recipe guide): everything is set up and seats can be taken, but play
     /// waits for a browser tab's `restart` click.
     prematch: bool = false,
-    /// Casts each player gets per turn (balance.casts_per_turn).  Sent once at
-    /// start because it never changes mid-encounter.
-    casts_per_turn: u8 = 0,
+    /// Ms a player waits between casts (balance.cast_cooldown_ms).  Sent once
+    /// at start because it never changes mid-encounter.
+    cast_cooldown_ms: u32 = 0,
+    /// Ms window in which a team recipe's component casts must land
+    /// (balance.team_window_ms).  Sent once at start, like the cooldown.
+    team_window_ms: u32 = 0,
     /// Charges the team's shared pool starts with (encounter.charges), so the
     /// client can draw the gauge full before the first game_state arrives.
     charges: u32 = 0,
@@ -378,10 +383,9 @@ pub const EntitySnapshot = struct {
     entity: u32,
     kind: components.EntityKind,
     owner: u8,
-    /// Casts this player has left this turn.  The turn ends when this reaches
-    /// 0 for every connected player, so it is both a budget readout and the
-    /// only turn-progress signal a client needs.
-    casts_left: u8,
+    /// Ms until this player may cast again; 0 = ready now.  Server-owned so
+    /// every client draws the same cooldown, the owner's and teammates' alike.
+    cooldown_ms: u32,
     /// This player's index into `balance.player_recipes` — the move that `cast`
     /// will fire.  Snapshotted for EVERY player so teammates can see what each
     /// other is holding and coordinate a group before anyone spends a cast;
@@ -401,7 +405,7 @@ pub const EntitySnapshot = struct {
         .entity = 0,
         .kind = .player,
         .owner = 0xFF,
-        .casts_left = 0,
+        .cooldown_ms = 0,
         .selected_shape = 0,
         .cursor_row = 0,
         .cursor_col = 0,
@@ -411,24 +415,27 @@ pub const EntitySnapshot = struct {
 
 pub const MAX_ENTITIES_WIRE: u16 = 64;
 
-/// Cap on the pending-cast list carried in a `GameState`.  Matches
-/// `game_logic.MAX_CASTS`, which is itself max players x casts each with
-/// headroom; it is restated here because protocol.zig knows nothing of the
-/// game's resolution logic.
-pub const MAX_PENDING_WIRE: u16 = 64;
+/// Cap on the recent-cast list carried in a `GameState`.  Matches
+/// `game_logic.MAX_RECENT`; it is restated here because protocol.zig knows
+/// nothing of the game's resolution logic.
+pub const MAX_RECENT_WIRE: u16 = 64;
 
-/// One cast a player has LOCKED IN this turn but which has not resolved yet.
+/// One cast that LANDED recently — still inside the team-recipe window, so a
+/// teammate's matching cast on the same square could complete a group with it.
 ///
-/// Sent to everyone: the whole team needs to see what is already committed to
-/// decide what to add, and the client previews the turn from this list plus the
-/// viewer's own live aim.  Nothing here has been charged or stamped — a pending
-/// cast is a promise, and it can still be taken back (see `cancel_cast`).
-pub const PendingCast = struct {
+/// Sent to everyone: the whole team needs to see which squares are ripe to
+/// decide where to aim, and the client previews group potential from this
+/// list plus the viewer's own live aim.  Everything here has already been
+/// charged and stamped; what remains is only its power to coordinate.
+pub const RecentCastWire = struct {
     player_id: u8,
-    /// Index into balance.player_recipes — the move that was locked in.
+    /// Index into balance.player_recipes — the move that was cast.
     move: u8,
-    /// Flat grid index it is aimed at, frozen at lock-in.
+    /// Flat grid index it landed on.
     square: u16,
+    /// Ms since it landed.  The entry expires from the window when this
+    /// reaches the game_start's team_window_ms.
+    age_ms: u32,
 };
 
 pub const BarSummary = struct {
@@ -438,9 +445,9 @@ pub const BarSummary = struct {
 
 pub const GameState = struct {
     tick: u32,
-    /// The turn now being played (1-based).  Cast budgets refresh and the whole
-    /// field is replaced between turns, so this is the client's clock.
-    turn: u16,
+    /// The bite now being chewed toward (1-based): how many times the Lil
+    /// Guys have settled, plus one.
+    bite: u16,
     entity_count: u8,
     entities: [MAX_ENTITIES_WIRE]EntitySnapshot,
     hunger: BarSummary,
@@ -460,13 +467,15 @@ pub const GameState = struct {
     /// hatched baby belongs to no player), so it travels beside the other
     /// session totals and a reconnect recovers the brood.
     hatched: [components.BabyType.size]u16,
-    /// Casts locked in this turn and not yet resolved, in lock-in order.
-    pending_count: u8,
-    pending: [MAX_PENDING_WIRE]PendingCast,
+    /// Ms until the Lil Guys bite again — the countdown clients draw.
+    next_bite_ms: u32,
+    /// Casts still inside the team-recipe window, in landing order.
+    recent_count: u8,
+    recent: [MAX_RECENT_WIRE]RecentCastWire,
 
     pub const blank = GameState{
         .tick = 0,
-        .turn = 0,
+        .bite = 0,
         .entity_count = 0,
         .entities = [_]EntitySnapshot{EntitySnapshot.blank} ** MAX_ENTITIES_WIRE,
         .hunger = .{ .current = 0, .max = 0 },
@@ -477,8 +486,11 @@ pub const GameState = struct {
         .grid = [_]components.SlimeCell{.empty} ** components.MAX_GRID_CELLS,
         .reservoir = 0,
         .hatched = [_]u16{0} ** components.BabyType.size,
-        .pending_count = 0,
-        .pending = [_]PendingCast{.{ .player_id = 0, .move = 0, .square = 0 }} ** MAX_PENDING_WIRE,
+        .next_bite_ms = 0,
+        .recent_count = 0,
+        .recent = [_]RecentCastWire{
+            .{ .player_id = 0, .move = 0, .square = 0, .age_ms = 0 },
+        } ** MAX_RECENT_WIRE,
     };
 
     /// Live cell count of the transmitted grid.
@@ -596,7 +608,6 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
         .restart => {},
         .cycle_shape => try writer.writeByte(@intFromEnum(payload.dir)),
         .cast => {},
-        .cancel_cast => {},
         .over_budget => {
             try writer.writeInt(u32, payload.needed, .little);
             try writer.writeInt(u32, payload.have, .little);
@@ -617,9 +628,9 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
             try writer.writeByte(@intFromEnum(payload.kind));
             try writer.writeByte(payload.index);
         },
-        .turn_ended => {
-            const p: TurnEnded = payload;
-            try writer.writeInt(u16, p.turn, .little);
+        .bite_settled => {
+            const p: BiteSettled = payload;
+            try writer.writeInt(u16, p.bite, .little);
             try writer.writeInt(u16, p.cells_eaten, .little);
             try writer.writeInt(u16, p.hunger_added, .little);
             try writer.writeInt(u16, p.hazards_bitten, .little);
@@ -667,7 +678,8 @@ fn encode_game_start(w: anytype, p: GameStart) !void {
     try w.writeByte(p.player_id);
     try w.writeAll(&p.join_code);
     try w.writeByte(if (p.prematch) 1 else 0);
-    try w.writeByte(p.casts_per_turn);
+    try w.writeInt(u32, p.cast_cooldown_ms, .little);
+    try w.writeInt(u32, p.team_window_ms, .little);
     try w.writeInt(u32, p.charges, .little);
     try w.writeByte(p.grid_rows);
     try w.writeByte(p.grid_cols);
@@ -714,7 +726,7 @@ fn decode_slime_cell(byte: u8) !components.SlimeCell {
 
 fn encode_game_state(w: anytype, p: GameState) !void {
     try w.writeInt(u32, p.tick, .little);
-    try w.writeInt(u16, p.turn, .little);
+    try w.writeInt(u16, p.bite, .little);
     try w.writeByte(p.entity_count);
     var i: u8 = 0;
     while (i < p.entity_count) : (i += 1) {
@@ -722,7 +734,7 @@ fn encode_game_state(w: anytype, p: GameState) !void {
         try w.writeInt(u32, e.entity, .little);
         try w.writeByte(@intFromEnum(e.kind));
         try w.writeByte(e.owner);
-        try w.writeByte(e.casts_left);
+        try w.writeInt(u32, e.cooldown_ms, .little);
         try w.writeByte(e.selected_shape);
         try w.writeByte(e.cursor_row);
         try w.writeByte(e.cursor_col);
@@ -736,11 +748,13 @@ fn encode_game_state(w: anytype, p: GameState) !void {
     for (p.grid[0..p.grid_len()]) |cell| try w.writeByte(encode_slime_cell(cell));
     try w.writeInt(u32, p.reservoir, .little);
     for (p.hatched) |h| try w.writeInt(u16, h, .little);
-    try w.writeByte(p.pending_count);
-    for (p.pending[0..p.pending_count]) |pc| {
-        try w.writeByte(pc.player_id);
-        try w.writeByte(pc.move);
-        try w.writeInt(u16, pc.square, .little);
+    try w.writeInt(u32, p.next_bite_ms, .little);
+    try w.writeByte(p.recent_count);
+    for (p.recent[0..p.recent_count]) |rc| {
+        try w.writeByte(rc.player_id);
+        try w.writeByte(rc.move);
+        try w.writeInt(u16, rc.square, .little);
+        try w.writeInt(u32, rc.age_ms, .little);
     }
 }
 
@@ -859,7 +873,7 @@ pub const DecodeError = error{
     InvalidActionResultTag,
     NameTooLong,
     TooManyEntities,
-    TooManyPending,
+    TooManyRecent,
     InvalidEndReason,
     TooManyRecipes,
     InvalidRecipeKind,
@@ -893,7 +907,8 @@ pub fn decode_game_start(reader: anytype) !GameStart {
     p.player_id = try reader.readByte();
     _ = try reader.readAll(&p.join_code);
     p.prematch = (try reader.readByte()) != 0;
-    p.casts_per_turn = try reader.readByte();
+    p.cast_cooldown_ms = try reader.readInt(u32, .little);
+    p.team_window_ms = try reader.readInt(u32, .little);
     p.charges = try reader.readInt(u32, .little);
     p.grid_rows = try reader.readByte();
     p.grid_cols = try reader.readByte();
@@ -912,7 +927,7 @@ fn decode_bar_summary(reader: anytype) !BarSummary {
 pub fn decode_game_state(reader: anytype) !GameState {
     var p: GameState = undefined;
     p.tick = try reader.readInt(u32, .little);
-    p.turn = try reader.readInt(u16, .little);
+    p.bite = try reader.readInt(u16, .little);
     p.entity_count = try reader.readByte();
     if (p.entity_count > MAX_ENTITIES_WIRE) return DecodeError.TooManyEntities;
     var i: u8 = 0;
@@ -923,7 +938,7 @@ pub fn decode_game_state(reader: anytype) !GameState {
         e.kind = std.meta.intToEnum(components.EntityKind, kind_byte) catch
             return DecodeError.InvalidKind;
         e.owner = try reader.readByte();
-        e.casts_left = try reader.readByte();
+        e.cooldown_ms = try reader.readInt(u32, .little);
         // Not range-checked against the move table: protocol.zig does not see
         // the loaded balance.  The server only ever sends a valid index, and a
         // client that receives a stale one clamps at render time.
@@ -945,13 +960,17 @@ pub fn decode_game_state(reader: anytype) !GameState {
         cell.* = try decode_slime_cell(try reader.readByte());
     p.reservoir = try reader.readInt(u32, .little);
     for (&p.hatched) |*h| h.* = try reader.readInt(u16, .little);
-    p.pending_count = try reader.readByte();
-    if (p.pending_count > MAX_PENDING_WIRE) return DecodeError.TooManyPending;
-    p.pending = [_]PendingCast{.{ .player_id = 0, .move = 0, .square = 0 }} ** MAX_PENDING_WIRE;
-    for (p.pending[0..p.pending_count]) |*pc| {
-        pc.player_id = try reader.readByte();
-        pc.move = try reader.readByte();
-        pc.square = try reader.readInt(u16, .little);
+    p.next_bite_ms = try reader.readInt(u32, .little);
+    p.recent_count = try reader.readByte();
+    if (p.recent_count > MAX_RECENT_WIRE) return DecodeError.TooManyRecent;
+    p.recent = [_]RecentCastWire{
+        .{ .player_id = 0, .move = 0, .square = 0, .age_ms = 0 },
+    } ** MAX_RECENT_WIRE;
+    for (p.recent[0..p.recent_count]) |*rc| {
+        rc.player_id = try reader.readByte();
+        rc.move = try reader.readByte();
+        rc.square = try reader.readInt(u16, .little);
+        rc.age_ms = try reader.readInt(u32, .little);
     }
     return p;
 }
@@ -979,6 +998,17 @@ test "read_tag: retired lobby-era tags are UnknownTag" {
     // 0x01 join_lobby, 0x03 ready_up, 0x05 reconnect, 0x10 lobby_update: the
     // lobby is gone — games run from the moment the session exists.
     for ([_]u8{ 0x01, 0x03, 0x05, 0x10 }) |byte| {
+        var fbs = std.io.fixedBufferStream(&[_]u8{byte});
+        try std.testing.expectError(DecodeError.UnknownTag, read_tag(fbs.reader()));
+    }
+}
+
+test "read_tag: retired turn-era tags are UnknownTag" {
+    // 0x0b cancel_cast (nothing is pending in realtime, so nothing can be
+    // taken back) and 0x1d turn_ended (the settle now arrives as
+    // bite_settled): both retired with the turn loop, so a stale sender
+    // fails loudly rather than replaying the wrong shape of game.
+    for ([_]u8{ 0x0b, 0x1d }) |byte| {
         var fbs = std.io.fixedBufferStream(&[_]u8{byte});
         try std.testing.expectError(DecodeError.UnknownTag, read_tag(fbs.reader()));
     }
@@ -1082,13 +1112,13 @@ test "round-trip: restart carries no payload" {
     try std.testing.expectEqual(MsgTag.restart, try read_tag(fbs.reader()));
 }
 
-test "round-trip: game_state — turn, hunger, score, grid, and selection survive" {
+test "round-trip: game_state — bite, hunger, score, grid, and selection survive" {
     var buf: [1024]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
 
     var gs = GameState.blank;
     gs.tick = 42;
-    gs.turn = 3;
+    gs.bite = 3;
     gs.entity_count = 1;
     gs.hunger = .{ .current = 80, .max = 200 };
     gs.charges = 17;
@@ -1106,11 +1136,14 @@ test "round-trip: game_state — turn, hunger, score, grid, and selection surviv
     gs.grid[7] = .{ .special = .egg };
     gs.reservoir = 44;
     gs.hatched = .{ 2, 0, 1, 0, 0 };
+    gs.next_bite_ms = 1234;
+    gs.recent_count = 1;
+    gs.recent[0] = .{ .player_id = 1, .move = 2, .square = 5, .age_ms = 250 };
     gs.entities[0] = EntitySnapshot{
         .entity = 7,
         .kind = .player,
         .owner = 0,
-        .casts_left = 2,
+        .cooldown_ms = 450,
         .selected_shape = 4,
         .cursor_row = 2,
         .cursor_col = 5,
@@ -1124,9 +1157,16 @@ test "round-trip: game_state — turn, hunger, score, grid, and selection surviv
     const decoded = try decode_game_state(fbs.reader());
 
     try std.testing.expectEqual(@as(u32, 42), decoded.tick);
-    try std.testing.expectEqual(@as(u16, 3), decoded.turn);
+    try std.testing.expectEqual(@as(u16, 3), decoded.bite);
     try std.testing.expectEqual(@as(u8, 1), decoded.entity_count);
-    try std.testing.expectEqual(@as(u8, 2), decoded.entities[0].casts_left);
+    try std.testing.expectEqual(@as(u32, 450), decoded.entities[0].cooldown_ms);
+    // The bite countdown and the group window travel with every snapshot.
+    try std.testing.expectEqual(@as(u32, 1234), decoded.next_bite_ms);
+    try std.testing.expectEqual(@as(u8, 1), decoded.recent_count);
+    try std.testing.expectEqual(@as(u8, 1), decoded.recent[0].player_id);
+    try std.testing.expectEqual(@as(u8, 2), decoded.recent[0].move);
+    try std.testing.expectEqual(@as(u16, 5), decoded.recent[0].square);
+    try std.testing.expectEqual(@as(u32, 250), decoded.recent[0].age_ms);
     try std.testing.expectEqual(@as(u16, 80), decoded.hunger.current);
     try std.testing.expectEqual(@as(u16, 200), decoded.hunger.max);
     try std.testing.expectEqual(@as(u32, 17), decoded.charges);
@@ -1152,8 +1192,8 @@ test "round-trip: game_state — turn, hunger, score, grid, and selection surviv
     try std.testing.expectEqual([_]u32{ 0, 4, 0, 0, 1 }, decoded.entities[0].babies);
 }
 
-test "round-trip: game_start — join code, grid dims and cast buffer survive" {
-    var buf: [64]u8 = undefined;
+test "round-trip: game_start — join code, grid dims and realtime pacing survive" {
+    var buf: [80]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
 
     const label = "slime_feast_01";
@@ -1163,7 +1203,8 @@ test "round-trip: game_start — join code, grid dims and cast buffer survive" {
         .player_id = 3,
         .join_code = "ABCDEF".*,
         .prematch = true,
-        .casts_per_turn = 3,
+        .cast_cooldown_ms = 750,
+        .team_window_ms = 3000,
         .charges = 40,
         .grid_rows = 6,
         .grid_cols = 10,
@@ -1178,7 +1219,8 @@ test "round-trip: game_start — join code, grid dims and cast buffer survive" {
     try std.testing.expectEqual(@as(u8, 3), decoded.player_id);
     try std.testing.expectEqualSlices(u8, "ABCDEF", &decoded.join_code);
     try std.testing.expect(decoded.prematch);
-    try std.testing.expectEqual(@as(u8, 3), decoded.casts_per_turn);
+    try std.testing.expectEqual(@as(u32, 750), decoded.cast_cooldown_ms);
+    try std.testing.expectEqual(@as(u32, 3000), decoded.team_window_ms);
     try std.testing.expectEqual(@as(u32, 40), decoded.charges);
     try std.testing.expectEqual(@as(u8, 6), decoded.grid_rows);
     try std.testing.expectEqual(@as(u8, 10), decoded.grid_cols);
@@ -1278,9 +1320,9 @@ test "decode_game_state: an unknown slime cell byte is rejected" {
     try encode(fbs.writer(), .game_state, gs);
     const written = fbs.getWritten();
     // The single grid cell sits just before the tail: the u32 reservoir, the
-    // per-type hatched u16s, and the pending-cast count (0 here, so no
-    // entries follow it).
-    const tail = @sizeOf(u32) + 2 * components.BabyType.size + 1;
+    // per-type hatched u16s, the u32 bite countdown, and the recent-cast
+    // count (0 here, so no entries follow it).
+    const tail = @sizeOf(u32) + 2 * components.BabyType.size + @sizeOf(u32) + 1;
     written[written.len - tail - 1] = 0x7F;
     fbs.reset();
     _ = try read_tag(fbs.reader());
@@ -1295,7 +1337,7 @@ test "decode_game_state: the retired kindless special byte 0x03 is rejected" {
     gs.grid_cols = 1;
     try encode(fbs.writer(), .game_state, gs);
     const written = fbs.getWritten();
-    const tail = @sizeOf(u32) + 2 * components.BabyType.size + 1;
+    const tail = @sizeOf(u32) + 2 * components.BabyType.size + @sizeOf(u32) + 1;
     written[written.len - tail - 1] = 0x03;
     fbs.reset();
     _ = try read_tag(fbs.reader());
@@ -1404,11 +1446,11 @@ test "decode_eggs_hatched: an unknown baby type is rejected" {
     try std.testing.expectError(DecodeError.InvalidBabyType, decode_eggs_hatched(fbs.reader()));
 }
 
-test "round-trip: turn_ended carries the feast and what it nibbled" {
+test "round-trip: bite_settled carries the feast and what it nibbled" {
     var buf: [32]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
-    try encode(fbs.writer(), .turn_ended, TurnEnded{
-        .turn = 7,
+    try encode(fbs.writer(), .bite_settled, BiteSettled{
+        .bite = 7,
         .cells_eaten = 41,
         .hunger_added = 53,
         .hazards_bitten = 12,
@@ -1417,15 +1459,15 @@ test "round-trip: turn_ended carries the feast and what it nibbled" {
         .passes = 3,
     });
     fbs.reset();
-    try std.testing.expectEqual(MsgTag.turn_ended, try read_tag(fbs.reader()));
-    const decoded = try decode_turn_ended(fbs.reader());
-    try std.testing.expectEqual(@as(u16, 7), decoded.turn);
+    try std.testing.expectEqual(MsgTag.bite_settled, try read_tag(fbs.reader()));
+    const decoded = try decode_bite_settled(fbs.reader());
+    try std.testing.expectEqual(@as(u16, 7), decoded.bite);
     try std.testing.expectEqual(@as(u16, 41), decoded.cells_eaten);
     try std.testing.expectEqual(@as(u16, 53), decoded.hunger_added);
     try std.testing.expectEqual(@as(u16, 12), decoded.hazards_bitten);
     try std.testing.expectEqual(@as(u32, 41), decoded.score_added);
     try std.testing.expectEqual(@as(u32, 18), decoded.charges_left);
-    // A cascade turn: three settle passes preceded this summary.
+    // A cascade bite: three settle passes preceded this summary.
     try std.testing.expectEqual(@as(u8, 3), decoded.passes);
 }
 
@@ -1437,7 +1479,7 @@ test "decode_game_state: oversized grid dimensions are rejected" {
     gs.grid_cols = 1;
     try encode(fbs.writer(), .game_state, gs);
     const written = fbs.getWritten();
-    // grid_rows sits right after score: tick(4) turn(2) entity_count(1)
+    // grid_rows sits right after score: tick(4) bite(2) entity_count(1)
     // hunger(4) charges(4) score(4) = offset 19 after the tag byte.
     written[1 + 19] = components.MAX_GRID_ROWS + 1;
     fbs.reset();
@@ -1459,7 +1501,7 @@ test "round-trip: a blank game_state (pre-start, no grid) survives" {
 
     try std.testing.expectEqual(@as(u32, 7), decoded.tick);
     try std.testing.expectEqual(@as(u16, 0), decoded.grid_len());
-    try std.testing.expectEqual(@as(u16, 0), decoded.turn);
+    try std.testing.expectEqual(@as(u16, 0), decoded.bite);
 }
 
 test "round-trip: over_budget carries the quote and the pool" {

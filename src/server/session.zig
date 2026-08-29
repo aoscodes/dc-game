@@ -21,7 +21,7 @@
 //!   - The match PRNG: every random choice in the game comes from this one
 //!     seeded generator, so a session is reproducible from its seed.
 //!
-//! ## Slime Feast turn loop
+//! ## Slime Feast realtime loop
 //!
 //! There is ONE slime grid per game (`slime.SlimeField`), sized by the global
 //! `balance.slime_grid`.  The encounter's slime starts in the off-grid
@@ -29,65 +29,54 @@
 //! server-authoritative and transmitted whole in `game_state`, so every client
 //! renders identical slime.
 //!
-//! A TURN is: everyone spends their cast budget, then the Lil Guys BITE the
-//! front `feast_width` columns of the field and it settles.  Nothing is on a
-//! clock — `tick` only drains input and broadcasts, so a session advances
-//! solely by what players do.
+//! Everything runs on the SESSION CLOCK: `tick(dt)` accumulates wall time
+//! into `clock_ms`, and the clock drives two timers —
 //!
-//! ## Two currencies
+//!   THE BITE.  Every `balance.bite_interval_ms` (sped up by the crowd: each
+//!   seated Lil Guy past the first and each baby at the table adds its
+//!   percent, see balance.bite_interval_effective) the Lil Guys BITE the
+//!   front `feast_width` columns and the field settles.  An empty table
+//!   never bites: with nobody seated the timer disarms, and it re-arms from
+//!   scratch when someone sits down or a hold (pre-match, end screen) lifts.
 //!
-//! CASTS are per player, per turn (`balance.casts_per_turn`): they meter the
-//! pace of a turn and decide when it ends.
+//!   THE COOLDOWN.  Each player may cast once per `balance.cast_cooldown_ms`;
+//!   a press inside the cooldown is silently dropped (the client shows the
+//!   timer, so an early press is impatience, not a mistake).
 //!
 //! CHARGES are ONE pool shared by the whole team for the WHOLE GAME
 //! (`encounter.charges`, plus what swallowed canisters give back).  Every
 //! recipe has a `cost`, so the pool is the real resource: the team is not
-//! asked "what can you do this turn?" but "what is this play worth out of
+//! asked "what can you do right now?" but "what is this play worth out of
 //! everything you will ever have?".  Running the pool dry does NOT end the
-//! game — a broke team's cast presses become PASSES (budget spent, nothing
-//! stamped), so the turns keep coming and the bite keeps chewing; the
-//! hunger bar is the clock that eventually calls it.
+//! game — a broke team's casts are refused (`over_budget`) while the bite
+//! keeps chewing; the hunger bar is the clock that eventually calls it.
 //!
 //! SELECTING.  Each player holds ONE selected move: an index into
 //! `balance.player_recipes` that they step around with `cycle_shape` and fire
 //! with `cast`.  The selection is SERVER-OWNED — a client sends a direction,
 //! never a move — so no client can name a move that is not in the table.  It
-//! persists across turns (a player who found their move keeps it) and is
+//! persists across bites (a player who found their move keeps it) and is
 //! snapshotted for everyone, so a team can see what each other is holding and
 //! agree on a group before spending anything.
 //!
-//! CASTING.  A cast is LOCKED IN, not resolved: it joins the turn's pending
-//! list, and nothing is charged and nothing touches the grid until the whole
-//! team has committed.  Locking in spends a CAST, which is what moves the turn
-//! along; it spends no CHARGES.
+//! CASTING resolves IMMEDIATELY: the cast is priced, the pool debited, and
+//! the move's shape stamped at the aimed square in the same instant.
+//! Stamping downgrades every covered hazard cell one tier (red -> yellow ->
+//! green -> defused); coverage off the grid edge, or on a cell with nothing
+//! left to downgrade, is wasted.  A stamp never empties a cell.  A cast the
+//! pool cannot afford is REFUSED — nothing lands, no cooldown starts, and
+//! the caster alone is told `over_budget`.
 //!
-//! A pending cast can be taken back (`cancel_cast`), which returns the cast
-//! budget it spent.  A player cancels their OWN most recent pending, one per
-//! press — so a turn is a proposal the team can revise until the last player
-//! commits.
+//! GROUPS form in a rolling WINDOW.  Every landed cast is remembered for
+//! `balance.team_window_ms`; when a cast completes a team recipe's bag on
+//! its square — DISTINCT players, same square, all within the window (see
+//! game_logic.complete_group) — the group's shape fires too, and the
+//! completing cast pays the GROUP's cost INSTEAD of its own.  The
+//! contributors already paid their own way as they landed, so the group
+//! price is the price of the upgrade; consumed contributors leave the
+//! window, so a cast feeds at most one group.
 //!
-//! PRICING IS QUOTED FOR THE WHOLE TURN.  `game_logic.resolve_batch` reads the
-//! pending list and answers with the stamps it produces and the single price
-//! they cost together: same-square casts by DISTINCT players collapse into the
-//! group moves they spell, and only the group's price is charged for them.  So
-//! a group is a JOINT PURCHASE — its contributors never pay for their own moves
-//! — rather than a discount on whoever happened to cast last.
-//!
-//! Every lock-in re-quotes the turn, and one that would take the quote past the
-//! pool is REFUSED: the cast never joins the list, its budget is not spent, and
-//! the player is told `over_budget`.  The turn simply stays open, so the team
-//! can cancel something, aim somewhere cheaper, or spell a group that costs
-//! less than its parts.
-//!
-//! RESOLUTION.  The moment every connected player's budget is spent, the
-//! pending list is resolved: the quoted price is debited ONCE and each stamp is
-//! applied at its own square, groups before plain moves.  Stamping downgrades
-//! every covered hazard cell one tier (red -> yellow -> green -> defused);
-//! coverage off the grid edge, or on a cell with nothing left to downgrade, is
-//! wasted.  A stamp never empties a cell.
-//!
-//! TURN END.  Resolution runs straight into the feast, and the field settles
-//! in three ordered steps (see slime.zig):
+//! THE BITE settles the field in three ordered steps (see slime.zig):
 //!   1. BITE — the Lil Guys chew the front `feast_width` columns cell by
 //!      cell: edible units are consumed (scoring), live hazards are NIBBLED
 //!      one tier softer (hunger for nothing), rocks are skipped.  Defusing
@@ -95,16 +84,16 @@
 //!   2. SHIFT — every row's survivors pack LEFT into the space the bite
 //!      opened: the conveyor advances.
 //!   3. FILL — the reservoir tops the field up from the RIGHT edge.
-//! The pending list is then cleared — groups form WITHIN a turn only, so a
-//! contribution nobody joined is simply a move that landed on its own — budgets
-//! reset, and `turn_ended` is broadcast.
+//! `bite_settled` is broadcast and the next bite is scheduled at the
+//! crowd's CURRENT rate — seats taken and babies hatched since the last
+//! bite speed the very next one.
 //!
-//! The encounter's end is checked ONLY at turn end: the hunger bar is the
-//! game's CLOCK — every bite fills it, and a full bar simply calls time —
-//! while a field holding nothing but inconsumable specials is the win.
-//! Either way the settled board is broadcast FIRST and the final shared
-//! score follows via game_over, so the client can play the closing feast out
-//! before it shows the report.
+//! The encounter's end is checked ONLY when a bite settles: the hunger bar
+//! is the game's CLOCK — every bite fills it, and a full bar simply calls
+//! time — while a field holding nothing but inconsumable specials is the
+//! win.  Either way the settled board is broadcast FIRST and the final
+//! shared score follows via game_over, so the client can play the closing
+//! feast out before it shows the report.
 
 const std = @import("std");
 const ecs = @import("ecs_zig");
@@ -117,8 +106,8 @@ const cfg_mod = shared.config;
 const slime = shared.slime;
 const dbg = @import("debug_zig");
 
-/// Profiler phases of one tick.  The feast is not a tick phase: it happens at
-/// turn end, driven by input, not by elapsed time.
+/// Profiler phases of one tick.  The feast is not its own phase: a due bite
+/// settles between the two, and profiling has never needed to isolate it.
 pub const TickPhase = enum { drain, broadcast };
 
 pub const PlayerTeam = struct {};
@@ -230,11 +219,22 @@ pub const Session = struct {
     slime_total: u32 = 0,
     /// Shared team score: neutral slime units consumed.
     score: u32 = 0,
-    /// The turn now being played (1-based; 0 until the game starts).
-    turn: u16 = 0,
-    /// Casts each player has left this turn.  The turn ends when every
-    /// CONNECTED player's entry is 0, so this is the only turn-progress state.
-    casts_left: [MAX_PLAYERS]u8 = [_]u8{0} ** MAX_PLAYERS,
+    /// The bite now being chewed toward (1-based; 0 until the game starts):
+    /// how many times the field has settled, plus one.
+    bite: u16 = 0,
+    /// The session clock, in accumulated milliseconds of PLAY time.  Fed by
+    /// `tick(dt)` and FROZEN while the session holds (pre-match, end
+    /// screen), so cooldowns and the group window never expire while nobody
+    /// can play.  f64 so sub-ms ticks accumulate without loss; read through
+    /// `now_ms`.
+    clock_ms: f64 = 0,
+    /// Session clock time (ms) the next bite fires at, or 0 while the bite
+    /// timer is DISARMED (holding, or nobody seated).  0 is unambiguous: an
+    /// armed timer is always now + interval, and the interval is >= 100.
+    next_bite_at: u64 = 0,
+    /// Session clock time (ms) each player may cast again at.  A press
+    /// before this is silently dropped.
+    cooldown_until: [MAX_PLAYERS]u64 = [_]u64{0} ** MAX_PLAYERS,
     /// Each player's selected move, as an index into
     /// `balance.player_recipes`.  SERVER-OWNED: clients send a cycle DIRECTION,
     /// so this is always a valid index and no client can name a move outside
@@ -244,14 +244,13 @@ pub const Session = struct {
     /// client sends directions and this clamps, so a cursor is always a valid
     /// cell of the current grid and no client can aim out of bounds.
     cursors: [MAX_PLAYERS]u16 = [_]u16{0} ** MAX_PLAYERS,
-    /// Casts locked in THIS TURN and not yet resolved, in lock-in order.
-    ///
-    /// This is the turn: it is what `logic.resolve_batch` is quoted against,
-    /// what the clients preview, and what a cancel pops from.  Nothing in it
-    /// has been charged or stamped.  Emptied at turn end, because groups form
-    /// within a turn only.
-    pending: [logic.MAX_CASTS]logic.TurnCast = undefined,
-    pending_count: usize = 0,
+    /// The rolling recent-cast window, in landing order: every cast still
+    /// young enough (`balance.team_window_ms`) to help a teammate spell a
+    /// team recipe.  Everything in it has already been charged and stamped;
+    /// what remains is only its power to coordinate.  Pruned every tick,
+    /// and consumed contributors are evicted when a group fires.
+    recent: [logic.MAX_RECENT]logic.RecentCast = undefined,
+    recent_count: usize = 0,
     /// Tuning stats accumulated over the match; broadcast with game_over.
     /// `players` is indexed by player_id during play and compacted (dense)
     /// in end_game.
@@ -428,13 +427,16 @@ pub const Session = struct {
         self.restart_pending = false;
         self.prematch = false;
         self.current_encounter = encounter;
-        self.pending_count = 0;
+        self.recent_count = 0;
         // Everyone opens on the first move in the table: the encounter is a
         // fresh start, so a selection carried over from a previous game would
         // be state the players never chose here.
         self.selected = [_]u8{0} ** MAX_PLAYERS;
-        self.turn = 1;
-        self.reset_budgets();
+        self.bite = 1;
+        // Fresh timers: nobody owes a cooldown from a previous game, and the
+        // bite arms itself on the first live tick with someone seated.
+        self.cooldown_until = [_]u64{0} ** MAX_PLAYERS;
+        self.next_bite_at = 0;
 
         // The bar's capacity is the SUM of every seated player's
         // appetite-derived contribution — there is no per-encounter budget
@@ -470,14 +472,15 @@ pub const Session = struct {
         );
         self.cursors = [_]u16{centre} ** MAX_PLAYERS;
 
-        std.log.info("game start — encounter: {s} slime={} grid={}x{} hunger_max={} charges={} casts/turn={}", .{
+        std.log.info("game start — encounter: {s} slime={} grid={}x{} hunger_max={} charges={} bite_interval={}ms cooldown={}ms", .{
             encounter.label,
             self.slime_total,
             self.field.grid.rows,
             self.field.grid.cols,
             self.hunger.max,
             self.charges,
-            self.cfg.balance.casts_per_turn,
+            self.cfg.balance.bite_interval_ms,
+            self.cfg.balance.cast_cooldown_ms,
         });
         try self.spawn_players();
     }
@@ -519,8 +522,9 @@ pub const Session = struct {
     ///
     /// The Lil Guys have no server representation: their one mechanical
     /// trace is the HEADCOUNT, which widens the bite via
-    /// `balance.feast_width` — everything else about them is client
-    /// animation of `turn_ended`.
+    /// `balance.feast_width` and speeds it via
+    /// `balance.bite_interval_effective` — everything else about them is
+    /// client animation of `bite_settled`.
     fn spawn_players(self: *Session) !void {
         for (&self.players) |*p| {
             if (!p.occupied) {
@@ -535,40 +539,124 @@ pub const Session = struct {
         }
     }
 
-    /// Refill every player's cast budget for a new turn.  Budgets are set for
-    /// ALL slots, seated or not: a player who takes a seat mid-turn gets a
-    /// usable budget rather than a stuck 0.
-    fn reset_budgets(self: *Session) void {
-        self.casts_left = [_]u8{self.cfg.balance.casts_per_turn} ** MAX_PLAYERS;
+    /// The session clock, in whole milliseconds of play time.
+    pub fn now_ms(self: *const Session) u64 {
+        return @intFromFloat(self.clock_ms);
     }
 
-    /// One server tick: drain queued client input (which is what actually
-    /// advances the game) and broadcast the resulting state.
-    ///
-    /// `dt` is unused: the turn loop has no timers.  It stays in the signature
-    /// because the server's tick driver is time-based, and dropping it would
-    /// only push the same unused value up a layer.
-    pub fn tick(self: *Session, dt: f32) !void {
-        _ = dt;
+    /// All babies at the table: what every seated board brought, plus what
+    /// this encounter hatched.  Both kinds speed the bite alike.
+    fn babies_at_table(self: *const Session) u32 {
+        var n: u32 = 0;
+        for (&self.players) |*p| {
+            if (!p.occupied) continue;
+            n += c.baby_total(p.babies);
+        }
+        for (self.hatched) |h| n += h;
+        return n;
+    }
 
+    /// Ms between bites for the table as seated RIGHT NOW.
+    fn bite_interval_now(self: *const Session) u32 {
+        return self.cfg.balance.bite_interval_effective(
+            self.seated_players(),
+            self.babies_at_table(),
+        );
+    }
+
+    /// Drop every recent cast too old to help complete a group.  Run every
+    /// tick so the window clients see (and the one complete_group scans)
+    /// never carries expired entries.
+    fn prune_recent(self: *Session) void {
+        const now = self.now_ms();
+        const window = self.cfg.balance.team_window_ms;
+        var keep: usize = 0;
+        for (0..self.recent_count) |i| {
+            if (self.recent[i].at_ms + window < now) continue;
+            self.recent[keep] = self.recent[i];
+            keep += 1;
+        }
+        self.recent_count = keep;
+    }
+
+    /// Remember a landed cast so teammates can group with it.  A full window
+    /// evicts its OLDEST entry: the one nearest expiry is the least likely
+    /// to still complete anything.
+    fn push_recent(self: *Session, cast: logic.RecentCast) void {
+        if (self.recent_count >= logic.MAX_RECENT) {
+            std.mem.copyForwards(
+                logic.RecentCast,
+                self.recent[0 .. self.recent_count - 1],
+                self.recent[1..self.recent_count],
+            );
+            self.recent_count -= 1;
+        }
+        self.recent[self.recent_count] = cast;
+        self.recent_count += 1;
+    }
+
+    /// Evict the window entries a fired group consumed.  `fire.consumed`
+    /// indexes the window as it stood when `complete_group` scanned it, so
+    /// this must run before anything else reorders it.
+    fn consume_recent(self: *Session, fire: logic.GroupFire) void {
+        var gone = [_]bool{false} ** logic.MAX_RECENT;
+        for (fire.consumed[0..fire.consumed_count]) |i| gone[i] = true;
+        var keep: usize = 0;
+        for (0..self.recent_count) |i| {
+            if (gone[i]) continue;
+            self.recent[keep] = self.recent[i];
+            keep += 1;
+        }
+        self.recent_count = keep;
+    }
+
+    /// One server tick: drain queued client input, advance the session clock
+    /// by `dt` (seconds), fire any bite that came due, and broadcast the
+    /// resulting state.
+    pub fn tick(self: *Session, dt: f32) !void {
         self.profiler.begin(.drain);
         try self.drain_queues();
         self.profiler.end(.drain);
 
         // Holding — at the end screen (board final, already broadcast) or at
         // the pre-match guide (board seeded, nothing moving yet): nothing
-        // below has anything to add.  The drain above is what lets a
-        // `restart` (or a seat change) through — a restart clears its flag
-        // inside the drain and play resumes this same tick.
-        if (self.restart_pending or self.prematch) return;
+        // below has anything to add, and the CLOCK FREEZES so cooldowns and
+        // the group window cannot expire while nobody can play.  The drain
+        // above is what lets a `restart` (or a seat change) through — a
+        // restart clears its flag inside the drain and play resumes this
+        // same tick.  The bite timer disarms so the hold's dead time is not
+        // billed to the next meal.
+        if (self.restart_pending or self.prematch) {
+            self.next_bite_at = 0;
+            return;
+        }
 
         self.tick_count += 1;
+        self.clock_ms += @as(f64, dt) * std.time.ms_per_s;
+        self.prune_recent();
 
-        // A leave can be what makes every REMAINING player spent, and leaves
-        // arrive outside the cast path — so re-check here, after input is
-        // drained, rather than only on submit.
-        try self.maybe_end_turn();
-        if (self.restart_pending) return;
+        // The bite timer.  Disarmed while nobody is seated: with nobody to
+        // cast, biting would eat the encounter unattended — so an empty game
+        // simply idles until someone takes a seat, and the first seated tick
+        // arms the timer from now.
+        if (self.seated_players() == 0) {
+            self.next_bite_at = 0;
+        } else {
+            if (self.next_bite_at == 0) {
+                self.next_bite_at = self.now_ms() + self.bite_interval_now();
+            }
+            // A slow tick can owe more than one bite; each settles in turn
+            // (dt is capped by the driver, so this can never spin long).
+            while (self.now_ms() >= self.next_bite_at) {
+                try self.settle_bite();
+                if (self.restart_pending) return;
+                // Scheduled from the DUE time, not from now, so pacing does
+                // not drift with tick jitter — and at the CURRENT crowd's
+                // rate, so a seat taken or a baby hatched since the last
+                // bite speeds the very next one.
+                self.next_bite_at += self.bite_interval_now();
+            }
+        }
 
         self.profiler.begin(.broadcast);
         try self.broadcast_game_state();
@@ -579,136 +667,10 @@ pub const Session = struct {
         }
     }
 
-    /// What the turn's pending casts, plus `extra` if given, would cost the
-    /// shared pool — the quote a lock-in is judged against.
-    fn quote(self: *const Session, extra: ?logic.TurnCast) u32 {
-        var casts: [logic.MAX_CASTS]logic.TurnCast = undefined;
-        const n = @min(self.pending_count, logic.MAX_CASTS);
-        @memcpy(casts[0..n], self.pending[0..n]);
-        var len = n;
-        if (extra) |e| {
-            if (len >= logic.MAX_CASTS) return std.math.maxInt(u32);
-            casts[len] = e;
-            len += 1;
-        }
-        return logic.resolve_batch(&self.cfg.balance, casts[0..len]).total_cost;
-    }
-
-    /// Take back a player's most recent pending cast, refunding the budget it
-    /// spent.  Does nothing if they have none.
+    /// Settle one bite: bite, shift, refill, resolve special matches.
     ///
-    /// NEWEST FIRST, one per press: a player revising a plan undoes it in the
-    /// order they made it, and each press is one visible step.  Only their OWN
-    /// casts are reachable — a teammate's commitment is not yours to withdraw.
-    fn cancel_pending(self: *Session, player_id: u8) bool {
-        var i = self.pending_count;
-        while (i > 0) {
-            i -= 1;
-            if (self.pending[i].player_id != player_id) continue;
-            std.mem.copyForwards(
-                logic.TurnCast,
-                self.pending[i .. self.pending_count - 1],
-                self.pending[i + 1 .. self.pending_count],
-            );
-            self.pending_count -= 1;
-            self.casts_left[player_id] +|= 1;
-            return true;
-        }
-        return false;
-    }
-
-    /// Resolve the whole turn: debit the quoted price ONCE, then land every
-    /// stamp it bought.
-    ///
-    /// Public only as a test seam: in play this runs from `maybe_end_turn`, an
-    /// instant before the feast, and a test that wants to look at the board the
-    /// casts made needs to stop between the two.
-    ///
-    /// Called only when the lock-in phase is over, so the quote is final.  It is
-    /// affordable by construction — every lock-in that would have taken it past
-    /// the pool was refused — so there is no price check and no fallback here:
-    /// the team was quoted this turn and the team is buying it.
-    pub fn resolve_pending(self: *Session) !void {
-        const bal = &self.cfg.balance;
-        const batch = logic.resolve_batch(bal, self.pending[0..self.pending_count]);
-
-        self.charges -= @min(batch.total_cost, self.charges);
-        self.stats.feast.charges_spent +|= stat_u16(batch.total_cost);
-
-        for (batch.slice()) |b| {
-            const stamp = b.stamp;
-            if (stamp.is_team) {
-                self.stats.team_recipe_hits[stamp.recipe_index] +|= 1;
-            } else {
-                self.stats.player_recipe_hits[stamp.recipe_index] +|= 1;
-            }
-            self.stats.players[stamp.anchor_player].recipe_casts +|= 1;
-            const kind: proto.RecipeKind = if (stamp.is_team) .team else .player;
-            try self.broadcast_recipe_fired(kind, stamp.recipe_index, 1);
-            try self.stamp_shape(stamp, b.square);
-        }
-
-        self.pending_count = 0;
-    }
-
-    /// Close the lock-in phase early once the pool cannot afford anything more.
-    ///
-    /// Whatever headroom the quote leaves is all the turn has left to spend, so
-    /// once it is under the cheapest move in the table every further lock-in
-    /// could only be refused — leaving the turn waiting on players who have no
-    /// legal move to make.  Zeroing the remaining budgets settles the turn on
-    /// what is already committed instead of hanging on what cannot be.
-    ///
-    /// This only ends the TURN, never the game: from the next turn on the
-    /// broke team's cast presses become passes (see the cast handler), so
-    /// play continues on the bite's nibbles alone until the hunger clock or
-    /// the cleared field calls it.
-    ///
-    /// A zero-cost move config never reaches this: `cheapest_cost` is 0, so
-    /// there is always something the team can still add.
-    fn strand_budgets_if_broke(self: *Session) void {
-        const committed = self.quote(null);
-        const headroom = if (committed >= self.charges) 0 else self.charges - committed;
-        if (headroom >= self.cfg.balance.cheapest_cost()) return;
-        for (&self.casts_left) |*n| n.* = 0;
-    }
-
-    /// True once every SEATED player has spent their budget.  Released seats
-    /// are ignored, so a player leaving unblocks the turn instead of stalling
-    /// it forever.
-    ///
-    /// An EMPTY game is never "spent": with nobody to cast, ending turns
-    /// would spin the feast every tick and eat the encounter unattended — so
-    /// a game with no players simply idles until someone takes a seat.
-    fn budgets_spent(self: *const Session) bool {
-        var seated: u8 = 0;
-        for (&self.players, 0..) |*p, pid| {
-            if (!p.occupied) continue;
-            seated += 1;
-            if (self.casts_left[pid] > 0) return false;
-        }
-        return seated > 0;
-    }
-
-    /// Settle the turn once every seated player has locked in: resolve the
-    /// pending casts, then run the feast over the board they left.
-    ///
-    /// Called after each lock-in and whenever the seated set shrinks, because
-    /// both can make the condition true.  Casts locked in by a player who has
-    /// since left still resolve: they committed, and the team priced the turn
-    /// around them.
-    fn maybe_end_turn(self: *Session) !void {
-        if (self.restart_pending or self.prematch) return;
-        if (!self.budgets_spent()) return;
-        try self.resolve_pending();
-        try self.end_turn();
-    }
-
-    /// Settle the turn: bite, shift, refill, resolve special matches, then
-    /// refill budgets.
-    ///
-    /// The turn's stamps have already landed (see `resolve_pending`), so the
-    /// board this reads is the one the team bought.
+    /// Every cast has already landed the moment it was pressed, so the board
+    /// this reads is exactly what the team defused in time.
     ///
     /// Order matters and is the whole mechanic.  The bite is priced against
     /// the field exactly as the casts left it, `shift_left` packs the
@@ -718,15 +680,19 @@ pub const Session = struct {
     /// refill is what lines new specials up.  The end condition is checked
     /// after all of it, because "field cleared" means the reservoir had
     /// nothing left to send either.
+    ///
+    /// Public only as a test seam: in play this runs from `tick` when the
+    /// bite timer comes due, and a test that wants a settle without walking
+    /// the clock needs to invoke it directly.
     /// Hard ceiling on settle passes, purely defensive.  Every pass past the
     /// first requires a match, every match pops at least two specials, and
     /// specials only ever leave play — so the real bound is half the
     /// encounter's special count.  This cap exists so a future rule change
-    /// cannot turn end_turn into an infinite loop.
+    /// cannot turn settle_bite into an infinite loop.
     const MAX_SETTLE_PASSES: u8 = 64;
 
-    fn end_turn(self: *Session) !void {
-        // The turn settles as a CASCADE: bite, shift, refill, resolve
+    pub fn settle_bite(self: *Session) !void {
+        // The bite settles as a CASCADE: bite, shift, refill, resolve
         // matches — and when a match fired, its pops and its 5x5 changed the
         // front, so the Lil Guys bite AGAIN.  The loop runs until a pass
         // ends with no match; the summary numbers total over every pass.
@@ -738,13 +704,8 @@ pub const Session = struct {
         var passes: u8 = 0;
 
         // The bite's width is decided by the crowd at the table: the seats
-        // held at THIS settle, however the turn's casts were paced.
+        // held at THIS settle.
         const width = self.cfg.balance.feast_width(self.seated_players());
-
-        // Groups form within a turn only.  Resolution already emptied this;
-        // clearing it again costs nothing and keeps the invariant local to
-        // the turn boundary that owns it.
-        self.pending_count = 0;
 
         while (passes < MAX_SETTLE_PASSES) {
             const feast = self.field.feast(&self.cfg.balance, width);
@@ -853,7 +814,7 @@ pub const Session = struct {
             .value = stat_u16(hunger_total),
         });
 
-        // Announce the turn's hatches (aggregated over every pass) before
+        // Announce the bite's hatches (aggregated over every pass) before
         // the summary, so clients animate them on the board it describes.
         if (hatch_msg.count > 0) {
             var hbuf: [1024]u8 = undefined;
@@ -867,8 +828,8 @@ pub const Session = struct {
 
         var buf: [32]u8 = undefined;
         var fbs = std.io.fixedBufferStream(&buf);
-        try proto.encode(fbs.writer(), .turn_ended, proto.TurnEnded{
-            .turn = self.turn,
+        try proto.encode(fbs.writer(), .bite_settled, proto.BiteSettled{
+            .bite = self.bite,
             .cells_eaten = cells_total,
             .hunger_added = stat_u16(hunger_total),
             .hazards_bitten = bitten_total,
@@ -878,8 +839,8 @@ pub const Session = struct {
         });
         try self.broadcast_raw(fbs.getWritten());
 
-        std.log.info("turn {} ended — ate {} and nibbled {} over {} pass(es), hunger+{} score+{} charges={} reservoir={}", .{
-            self.turn,
+        std.log.info("bite {} settled — ate {} and nibbled {} over {} pass(es), hunger+{} score+{} charges={} reservoir={}", .{
+            self.bite,
             cells_total,
             bitten_total,
             passes,
@@ -892,14 +853,13 @@ pub const Session = struct {
         try self.check_end();
         if (self.restart_pending) return;
 
-        self.turn +|= 1;
-        self.reset_budgets();
+        self.bite +|= 1;
     }
 
     /// Tell one player their cast was refused, and by how much.
     ///
-    /// Sent to the caster alone: nothing about the turn changed, so there is
-    /// nothing for anyone else to redraw.
+    /// Sent to the caster alone: nothing landed, so there is nothing for
+    /// anyone else to redraw.
     fn send_over_budget(self: *Session, player_id: u8, needed: u32) !void {
         const slot = &self.players[player_id];
         if (!slot.occupied) return;
@@ -1092,54 +1052,47 @@ pub const Session = struct {
             .cast => {
                 const player_id = seat orelse return;
                 if (self.restart_pending or self.prematch) return;
-                // Out of casts this turn: silent ignore.  The turn is waiting
-                // on someone else, and this player has nothing left to say.
-                if (self.casts_left[player_id] == 0) return;
-                // BROKE: the pool cannot afford even the cheapest move, so
-                // no lock-in could ever be accepted — the press becomes a
-                // PASS.  The budget is spent (which is what paces and ends
-                // the turn) but nothing is quoted, charged or stamped: the
-                // team keeps playing on the bite alone, chewing the field
-                // down until the hunger clock or the cleared field ends it.
-                if (self.charges < self.cfg.balance.cheapest_cost()) {
-                    self.casts_left[player_id] -= 1;
-                    std.log.debug("player {} passed — pool {} cannot afford the cheapest move", .{
-                        player_id, self.charges,
-                    });
-                    try self.maybe_end_turn();
-                    return;
-                }
-                // The list is capped well above any real turn, so a full one
-                // means a pathological config rather than a play worth
-                // reporting.
-                if (self.pending_count >= logic.MAX_CASTS) return;
-                // Every selection names a real move, so there is no "this
-                // spells nothing" case: a cast always has something to lock in.
+                const bal = &self.cfg.balance;
+                const now = self.now_ms();
+                // Still cooling down: silent ignore.  The client draws the
+                // timer, so an early press is impatience, not a mistake —
+                // and it must not restart the cooldown.
+                if (now < self.cooldown_until[player_id]) return;
 
-                const cast = logic.TurnCast{
+                // Every selection names a real move, so there is no "this
+                // spells nothing" case: a cast always fires something.
+                const cast = logic.RecentCast{
                     .player_id = player_id,
                     .move = self.selected[player_id],
-                    // Freeze the aim now: this cast lands where the player was
-                    // pointing when they pressed it, however they move next.
                     .square = self.cursors[player_id],
+                    .at_ms = now,
                 };
 
-                // Re-quote the turn WITH this cast.  Refused rather than
-                // downgraded: the team is spending one pooled budget, and the
-                // player who tripped it is the one who can still choose
-                // differently.
-                const needed = self.quote(cast);
-                if (needed > self.charges) {
-                    std.log.debug("player {} cast refused — turn would cost {}, pool holds {}", .{
-                        player_id, needed, self.charges,
+                // Does this cast complete a team recipe?  Decided BEFORE the
+                // price check, because a completed group is priced as the
+                // group — the whole upgrade may be cheaper than the move.
+                self.prune_recent();
+                const fire = logic.complete_group(bal, self.recent[0..self.recent_count], cast);
+                const cost: u32 = if (fire) |f|
+                    bal.team_recipes[f.recipe_index].cost
+                else
+                    bal.player_recipes[cast.move].cost;
+
+                // The pool cannot pay: refused outright.  Nothing lands, no
+                // cooldown starts, and the caster alone is told what it
+                // would have taken.  The bite clock keeps the game moving,
+                // so a broke team plays on the nibbles alone.
+                if (cost > self.charges) {
+                    std.log.debug("player {} cast refused — costs {}, pool holds {}", .{
+                        player_id, cost, self.charges,
                     });
-                    try self.send_over_budget(player_id, needed);
+                    try self.send_over_budget(player_id, cost);
                     return;
                 }
 
-                self.pending[self.pending_count] = cast;
-                self.pending_count += 1;
-                self.casts_left[player_id] -= 1;
+                self.charges -= cost;
+                self.stats.feast.charges_spent +|= stat_u16(cost);
+                self.cooldown_until[player_id] = now + bal.cast_cooldown_ms;
                 self.record_cast_stats(player_id);
 
                 const slot = &self.players[player_id];
@@ -1152,27 +1105,40 @@ pub const Session = struct {
                     });
                 }
 
-                std.log.debug("player {} locked in '{s}' ({} left this turn, turn quoted at {})", .{
-                    player_id,
-                    self.cfg.balance.player_recipes[cast.move].label,
-                    self.casts_left[player_id],
-                    needed,
-                });
+                // The cast's own move lands first, then the group it
+                // completed stamps OVER it — the upgrade is the headline.
+                self.stats.player_recipe_hits[cast.move] +|= 1;
+                self.stats.players[player_id].recipe_casts +|= 1;
+                try self.broadcast_recipe_fired(.player, cast.move, 1);
+                try self.stamp_shape(logic.move_stamp(bal, cast.move, player_id), cast.square);
 
-                self.strand_budgets_if_broke();
-
-                // Spending the last budget in the room settles the turn.
-                try self.maybe_end_turn();
-            },
-            .cancel_cast => {
-                const player_id = seat orelse return;
-                if (self.restart_pending or self.prematch) return;
-                // Nothing of their own to take back: silent, because a player
-                // pressing undo on an empty plan has made no mistake.
-                if (!self.cancel_pending(player_id)) return;
-                std.log.debug("player {} cancelled a cast ({} left this turn)", .{
-                    player_id, self.casts_left[player_id],
-                });
+                if (fire) |f| {
+                    // Consumed contributors leave the window — a cast feeds
+                    // at most one group — and the completer's cast never
+                    // enters it: it has already done its coordinating.
+                    self.consume_recent(f);
+                    self.stats.team_recipe_hits[f.recipe_index] +|= 1;
+                    self.stats.players[player_id].recipe_casts +|= 1;
+                    try self.broadcast_recipe_fired(.team, f.recipe_index, 1);
+                    try self.stamp_shape(
+                        logic.group_stamp(bal, f.recipe_index, player_id),
+                        cast.square,
+                    );
+                    std.log.debug("player {} completed group '{s}' (cost {}, pool {})", .{
+                        player_id,
+                        bal.team_recipes[f.recipe_index].label,
+                        cost,
+                        self.charges,
+                    });
+                } else {
+                    self.push_recent(cast);
+                    std.log.debug("player {} cast '{s}' (cost {}, pool {})", .{
+                        player_id,
+                        bal.player_recipes[cast.move].label,
+                        cost,
+                        self.charges,
+                    });
+                }
             },
             else => {},
         }
@@ -1218,16 +1184,16 @@ pub const Session = struct {
         return @intCast(@min(v, std.math.maxInt(u16)));
     }
 
-    /// Decide whether the encounter is over.  Called ONLY from `end_turn`:
-    /// nothing between turns can FILL the hunger bar or move the slime
-    /// count.  A mid-game leave can shrink the bar's capacity down to
-    /// `current` (see uncount_hunger_share), but never below it, so the
-    /// verdict still cannot change until the next turn settles.
+    /// Decide whether the encounter is over.  Called ONLY from
+    /// `settle_bite`: nothing between bites can FILL the hunger bar or move
+    /// the slime count.  A mid-game leave can shrink the bar's capacity down
+    /// to `current` (see uncount_hunger_share), but never below it, so the
+    /// verdict still cannot change until the next bite settles.
     ///
     /// Running out of charges is deliberately NOT an ending: a broke team's
-    /// cast presses become passes (see the cast handler) and the bite's
-    /// nibbles keep softening the field, so the game always moves — the bar
-    /// is the clock that eventually calls it.
+    /// casts are refused (see the cast handler) while the bite's nibbles
+    /// keep softening the field, so the game always moves — the bar is the
+    /// clock that eventually calls it.
     fn check_end(self: *Session) !void {
         if (self.restart_pending) return;
         // Field-cleared wins ties: if the final feast fills the bar exactly,
@@ -1308,8 +1274,8 @@ pub const Session = struct {
 
     /// The game_start payload for one connection: encounter label, join code
     /// (the game id), the receiver's standing (their seat, or NO_PLAYER for
-    /// an observer), the per-turn cast budget, the charge pool and the grid
-    /// dimensions the client must render.
+    /// an observer), the realtime pacing (cast cooldown + group window), the
+    /// charge pool and the grid dimensions the client must render.
     fn game_start_msg(self: *const Session, label: []const u8, player_id: u8) proto.GameStart {
         var msg = proto.GameStart{
             .encounter_label = [_]u8{0} ** 32,
@@ -1317,7 +1283,8 @@ pub const Session = struct {
             .player_id = player_id,
             .join_code = self.join_code,
             .prematch = self.prematch,
-            .casts_per_turn = self.cfg.balance.casts_per_turn,
+            .cast_cooldown_ms = self.cfg.balance.cast_cooldown_ms,
+            .team_window_ms = self.cfg.balance.team_window_ms,
             .charges = self.charges,
             .grid_rows = self.field.grid.rows,
             .grid_cols = self.field.grid.cols,
@@ -1355,9 +1322,10 @@ pub const Session = struct {
     }
 
     fn broadcast_game_state(self: *Session) !void {
+        const now = self.now_ms();
         var snap = proto.GameState.blank;
         snap.tick = self.tick_count;
-        snap.turn = self.turn;
+        snap.bite = self.bite;
         snap.hunger = .{
             .current = self.hunger.current,
             .max = self.hunger.max,
@@ -1373,15 +1341,24 @@ pub const Session = struct {
         snap.reservoir = self.field.reservoir.total();
         snap.hatched = self.hatched;
 
-        // The turn as it stands.  Sent to everyone: a player deciding what to
-        // add needs to see what is already committed, and the client previews
-        // the turn from this list plus its own live aim.
-        snap.pending_count = @intCast(@min(self.pending_count, proto.MAX_PENDING_WIRE));
-        for (self.pending[0..snap.pending_count], 0..) |pc, i| {
-            snap.pending[i] = .{
-                .player_id = pc.player_id,
-                .move = pc.move,
-                .square = pc.square,
+        // The bite countdown clients draw.  0 while the timer is disarmed
+        // (nobody seated), which the client reads as "not coming".
+        snap.next_bite_ms = if (self.next_bite_at > now)
+            @intCast(@min(self.next_bite_at - now, std.math.maxInt(u32)))
+        else
+            0;
+
+        // The group window as it stands.  Sent to everyone: a player
+        // deciding where to aim needs to see which squares are ripe, and the
+        // client previews group potential from this list plus its own live
+        // aim.
+        snap.recent_count = @intCast(@min(self.recent_count, proto.MAX_RECENT_WIRE));
+        for (self.recent[0..snap.recent_count], 0..) |rc, i| {
+            snap.recent[i] = .{
+                .player_id = rc.player_id,
+                .move = rc.move,
+                .square = rc.square,
+                .age_ms = @intCast(@min(now -| rc.at_ms, std.math.maxInt(u32))),
             };
         }
 
@@ -1394,7 +1371,10 @@ pub const Session = struct {
                 .entity = e,
                 .kind = kd.tag,
                 .owner = own,
-                .casts_left = self.casts_left[own],
+                .cooldown_ms = @intCast(@min(
+                    self.cooldown_until[own] -| now,
+                    std.math.maxInt(u32),
+                )),
                 // The move this player would fire, so every client can preview
                 // its footprint under their cursor — theirs AND their
                 // teammates', which is how a group gets agreed on.

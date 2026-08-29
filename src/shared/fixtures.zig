@@ -166,9 +166,14 @@ pub const test_config = config.Config{
         // 6×10 = 60 on-grid cells; the fixture encounter's 112 units mean the
         // reservoir always starts non-empty (exercises refill paths).
         .slime_grid = .{ .rows = 6, .cols = 10 },
-        // 3 casts per player per turn: enough for a team recipe plus a solo
-        // follow-up, so tests can exercise budget exhaustion in one turn.
-        .casts_per_turn = 3,
+        // Realtime pacing, pinned small and round so tests advance time in
+        // tidy steps: a bite each simulated second, a 100ms cast cooldown,
+        // and a 500ms team-recipe window.
+        .bite_interval_ms = 1000,
+        .bite_speedup_per_guy_pct = 15,
+        .bite_speedup_per_baby_pct = 5,
+        .cast_cooldown_ms = 100,
+        .team_window_ms = 500,
         // Appetite → hunger formula, pinned: an appetite-0 player contributes
         // 100, so the usual two-player test session gets the historical 200
         // bar and hunger stays a non-binding 112-units-vs-200 affair.
@@ -191,7 +196,11 @@ pub const priced_config = config.Config{
     .balance = .{
         .hunger_cost_normal = test_config.balance.hunger_cost_normal,
         .slime_grid = test_config.balance.slime_grid,
-        .casts_per_turn = test_config.balance.casts_per_turn,
+        .bite_interval_ms = test_config.balance.bite_interval_ms,
+        .bite_speedup_per_guy_pct = test_config.balance.bite_speedup_per_guy_pct,
+        .bite_speedup_per_baby_pct = test_config.balance.bite_speedup_per_baby_pct,
+        .cast_cooldown_ms = test_config.balance.cast_cooldown_ms,
+        .team_window_ms = test_config.balance.team_window_ms,
         .hunger_base = test_config.balance.hunger_base,
         .appetite_scale = test_config.balance.appetite_scale,
         .hunger_player_cap = test_config.balance.hunger_player_cap,

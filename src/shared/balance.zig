@@ -228,16 +228,23 @@ pub const Balance = struct {
     /// Dimensions of the slime grid.  Slime beyond `rows * cols` waits in the
     /// off-grid reservoir and refills emptied cells at the start of each turn.
     slime_grid: SlimeGridDims,
-    /// Casts each player may commit per turn.  The turn ends once EVERY
-    /// connected player has spent their budget, so this is both the team's
-    /// per-turn power and the length of a turn.  Must be at least 1: a budget
-    /// of 0 could never be spent, so no turn could ever end.
-    ///
-    /// Selection cannot be wrong, so the only way a cast fails is price — and
-    /// a refused cast costs nothing, budget included.  A team too poor to add
-    /// anything has its remaining budgets stranded instead (see
-    /// session.strand_budgets_if_broke), so a turn always ends.
-    casts_per_turn: u8,
+    /// Base ms between BITE events — the realtime clock the Lil Guys chew
+    /// on.  The crowd speeds it up (see `bite_interval_effective`); the game
+    /// idles biteless while nobody is seated.
+    bite_interval_ms: u32 = DEFAULT_BITE_INTERVAL_MS,
+    /// Percent each seated Lil Guy PAST THE FIRST adds to the bite rate.
+    /// Additive: 2 extra guys at 15% = rate x1.30.
+    bite_speedup_per_guy_pct: u16 = DEFAULT_BITE_SPEEDUP_PER_GUY_PCT,
+    /// Percent each baby Lil Guy at the table (board-brought AND hatched)
+    /// adds to the bite rate.  Independent of the per-guy knob, and additive
+    /// with it.
+    bite_speedup_per_baby_pct: u16 = DEFAULT_BITE_SPEEDUP_PER_BABY_PCT,
+    /// Ms a player must wait between casts.  A press inside the cooldown is
+    /// ignored; 0 = no cooldown.
+    cast_cooldown_ms: u32 = DEFAULT_CAST_COOLDOWN_MS,
+    /// Ms window in which DISTINCT players' component casts on one square
+    /// spell a team recipe (see game_logic.complete_group).
+    team_window_ms: u32 = DEFAULT_TEAM_WINDOW_MS,
     /// Hunger capacity ONE player contributes with an appetite of 0.  The
     /// game's hunger bar capacity is the SUM of every player's contribution
     /// (see game_logic.player_hunger), so this replaces the old per-encounter
@@ -291,6 +298,22 @@ pub const Balance = struct {
         return @intCast(width);
     }
 
+    /// Ms between bites for a table of `seated` Lil Guys and `babies` baby
+    /// Lil Guys.  Additive rate multiplier in integer math:
+    /// `base * 100 / (100 + (seated-1)*guy_pct + babies*baby_pct)` — every
+    /// extra guy and every baby speeds the SAME base rate, no compounding.
+    /// A table of 0 or 1 guys and no babies bites at the base interval.
+    /// Never returns 0: the loader keeps bite_interval_ms >= 100, and the
+    /// result is floored at 1ms however large the crowd grows.
+    pub fn bite_interval_effective(self: *const Balance, seated: u32, babies: u32) u32 {
+        const extra_guys: u64 = if (seated > 1) seated - 1 else 0;
+        const pct: u64 = 100 +
+            extra_guys * self.bite_speedup_per_guy_pct +
+            @as(u64, babies) * self.bite_speedup_per_baby_pct;
+        const eff = @as(u64, self.bite_interval_ms) * 100 / pct;
+        return @intCast(@max(eff, 1));
+    }
+
     /// The cheapest cast in the whole move list.  A team too poor to afford
     /// this has no legal lock-in left: the session turns their cast presses
     /// into passes so turns keep ending (see session's cast handler).
@@ -302,5 +325,13 @@ pub const Balance = struct {
     }
 };
 
-/// Default per-player cast budget when `casts_per_turn` is absent.
-pub const DEFAULT_CASTS_PER_TURN: u8 = 3;
+/// Default ms between bite events when `bite_interval_ms` is absent.
+pub const DEFAULT_BITE_INTERVAL_MS: u32 = 4000;
+/// Default percent each seated Lil Guy past the first speeds the bite rate.
+pub const DEFAULT_BITE_SPEEDUP_PER_GUY_PCT: u16 = 15;
+/// Default percent each baby Lil Guy speeds the bite rate.
+pub const DEFAULT_BITE_SPEEDUP_PER_BABY_PCT: u16 = 5;
+/// Default ms a player waits between casts when `cast_cooldown_ms` is absent.
+pub const DEFAULT_CAST_COOLDOWN_MS: u32 = 750;
+/// Default ms window in which a team recipe's component casts must land.
+pub const DEFAULT_TEAM_WINDOW_MS: u32 = 3000;

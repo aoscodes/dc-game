@@ -32,8 +32,12 @@ const MAX_SHAPE_ROWS = MAX_GRID_ROWS;
 const MAX_SHAPE_COLS = MAX_GRID_COLS;
 /** Mirrors balance.DEFAULT_SLIME_GRID (used for pre-grid configs). */
 const DEFAULT_SLIME_GRID = { rows: 6, cols: 10 };
-/** Mirrors balance.DEFAULT_CASTS_PER_TURN. */
-const DEFAULT_CASTS_PER_TURN = 3;
+/** Mirrors the balance.DEFAULT_* realtime pacing knobs. */
+const DEFAULT_BITE_INTERVAL_MS = 4000;
+const DEFAULT_BITE_SPEEDUP_PER_GUY_PCT = 15;
+const DEFAULT_BITE_SPEEDUP_PER_BABY_PCT = 5;
+const DEFAULT_CAST_COOLDOWN_MS = 750;
+const DEFAULT_TEAM_WINDOW_MS = 3000;
 /** Mirrors balance.DEFAULT_RECIPE_COST — an unpriced recipe costs one charge. */
 const DEFAULT_RECIPE_COST = 1;
 /** Mirrors encounter.DEFAULT_CHARGES. */
@@ -63,7 +67,11 @@ const DEFAULT_FEAST_COLUMNS_PER_GUY = 0;
 /** Scalar balance fields: [key, label, min, max, step]. */
 const RATE_FIELDS = [
   ["hunger_cost_normal", "hunger per bite (eaten or nibbled)", 0, 1000, 1],
-  ["casts_per_turn", "casts per player per turn", 1, 255, 1],
+  ["bite_interval_ms", "ms between bites (base rate)", 100, 60000, 50],
+  ["bite_speedup_per_guy_pct", "% faster bites per extra lil guy", 0, 1000, 1],
+  ["bite_speedup_per_baby_pct", "% faster bites per baby", 0, 1000, 1],
+  ["cast_cooldown_ms", "ms between one player's casts", 0, 60000, 50],
+  ["team_window_ms", "ms window for team recipes", 1, 60000, 50],
   ["hunger_base", "hunger capacity per player (appetite 0)", 1, 65535, 1],
   ["appetite_scale", "extra capacity per appetite point", 0, 65535, 1],
   ["hunger_player_cap", "per-player capacity ceiling", 1, 65535, 1],
@@ -167,7 +175,11 @@ async function load() {
         cols: bal.slime_grid?.cols ?? DEFAULT_SLIME_GRID.cols,
       },
       // Default like the server does for older configs.
-      casts_per_turn: bal.casts_per_turn ?? DEFAULT_CASTS_PER_TURN,
+      bite_interval_ms: bal.bite_interval_ms ?? DEFAULT_BITE_INTERVAL_MS,
+      bite_speedup_per_guy_pct: bal.bite_speedup_per_guy_pct ?? DEFAULT_BITE_SPEEDUP_PER_GUY_PCT,
+      bite_speedup_per_baby_pct: bal.bite_speedup_per_baby_pct ?? DEFAULT_BITE_SPEEDUP_PER_BABY_PCT,
+      cast_cooldown_ms: bal.cast_cooldown_ms ?? DEFAULT_CAST_COOLDOWN_MS,
+      team_window_ms: bal.team_window_ms ?? DEFAULT_TEAM_WINDOW_MS,
       hunger_base: bal.hunger_base ?? DEFAULT_HUNGER_BASE,
       appetite_scale: bal.appetite_scale ?? DEFAULT_APPETITE_SCALE,
       hunger_player_cap: bal.hunger_player_cap ?? DEFAULT_HUNGER_PLAYER_CAP,

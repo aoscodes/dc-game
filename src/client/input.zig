@@ -75,13 +75,9 @@ pub const Drained = struct {
     steps: [MAX_CURSOR_STEPS]protocol.CursorDir = undefined,
     turn_count: usize = 0,
     turns: [MAX_CYCLE_TURNS]c.CycleDir = undefined,
-    /// Enter was pressed: lock in whatever the server has selected.  At most
+    /// Enter was pressed: fire whatever the server has selected.  At most
     /// one per drain, because `drain` returns as soon as it sees one.
     cast: bool = false,
-    /// Escape presses: each takes back one of this player's pending casts,
-    /// newest first.  Counted rather than flagged, so holding undo walks back
-    /// through a plan one step per press instead of collapsing to one.
-    cancels: u8 = 0,
     /// p was pressed: ask the server for a player seat (silently ignored when
     /// the game is full, or when this connection already holds one).
     take_seat: bool = false,
@@ -97,12 +93,11 @@ pub const Drained = struct {
     }
 };
 
-/// Drain the key queue into wheel turns, cursor steps, cancels, and at most
-/// one cast.
+/// Drain the key queue into wheel turns, cursor steps, and at most one cast.
 ///
 /// A cast stops the drain so the caller sees exactly one per call, but any
-/// turns, steps and cancels pressed BEFORE it are still returned — they are
-/// what chose and aimed the cast being fired.
+/// turns and steps pressed BEFORE it are still returned — they are what chose
+/// and aimed the cast being fired.
 pub fn drain(queue: *KeyQueue) Drained {
     var out = Drained{};
     while (queue.pop()) |key| {
@@ -111,10 +106,10 @@ pub fn drain(queue: *KeyQueue) Drained {
                 out.cast = true;
                 return out;
             },
-            // Undo: a cast is locked in, not fired, so it can be taken back
-            // right up until the last player commits.  Saturates rather than
-            // wrapping; nobody has more pending casts than a u8 can count.
-            .escape => out.cancels +|= 1,
+            // Inert: a realtime cast resolves the instant it fires, so there
+            // is nothing pending for undo to take back.  The key stays
+            // parsed so a board's D button is a clean no-op, not a typo.
+            .escape => {},
             // Seat control is a flag, not a count: taking a seat twice in one
             // frame is the same request twice, and the server ignores repeats
             // anyway.
@@ -188,8 +183,8 @@ test "drain: nothing is carried between calls" {
 }
 
 test "drain: escape is inert in game" {
-    // It used to cancel a half-typed combo.  There is no half-typed anything
-    // now, and the key is left to the lobby.
+    // It used to take back a pending lock-in.  A realtime cast resolves the
+    // instant it fires, so there is nothing left for the key to undo.
     var queue = KeyQueue{};
     queue.push(.one);
     queue.push(.escape);

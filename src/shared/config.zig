@@ -57,7 +57,9 @@ pub const Loaded = struct {
 pub const ConfigError = error{
     InvalidBalanceJson,
     InvalidEncountersJson,
-    InvalidCastsPerTurn,
+    InvalidBiteInterval,
+    InvalidBiteSpeedup,
+    InvalidTeamWindow,
     InvalidCharges,
     InvalidSlimeGrid,
     TooManyRecipes,
@@ -209,8 +211,13 @@ const BalanceJson = struct {
         .rows = balance.DEFAULT_SLIME_GRID.rows,
         .cols = balance.DEFAULT_SLIME_GRID.cols,
     },
-    /// Defaulted so a config written before turns keeps validating.
-    casts_per_turn: u8 = balance.DEFAULT_CASTS_PER_TURN,
+    /// Realtime pacing knobs (see balance.Balance); defaulted so configs
+    /// written before the realtime loop keep validating.
+    bite_interval_ms: u32 = balance.DEFAULT_BITE_INTERVAL_MS,
+    bite_speedup_per_guy_pct: u16 = balance.DEFAULT_BITE_SPEEDUP_PER_GUY_PCT,
+    bite_speedup_per_baby_pct: u16 = balance.DEFAULT_BITE_SPEEDUP_PER_BABY_PCT,
+    cast_cooldown_ms: u32 = balance.DEFAULT_CAST_COOLDOWN_MS,
+    team_window_ms: u32 = balance.DEFAULT_TEAM_WINDOW_MS,
     /// Appetite → hunger formula knobs (see game_logic.player_hunger).
     /// Defaulted so configs written before appetite keep validating.
     hunger_base: u16 = balance.DEFAULT_HUNGER_BASE,
@@ -274,11 +281,25 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         return ConfigError.InvalidBalanceJson;
     };
 
-    // A budget of 0 could never be spent, so the turn could never end and the
-    // encounter would hang.  Rejected at load rather than deadlocking at play.
-    if (raw.casts_per_turn < 1) {
-        fail("{s}: casts_per_turn must be >= 1", .{BALANCE_FILE});
-        return ConfigError.InvalidCastsPerTurn;
+    // A bite interval under 100ms would chew faster than the server's tick
+    // (and any human) can follow — always a units mistake (seconds vs ms).
+    if (raw.bite_interval_ms < 100) {
+        fail("{s}: bite_interval_ms {} must be >= 100", .{ BALANCE_FILE, raw.bite_interval_ms });
+        return ConfigError.InvalidBiteInterval;
+    }
+    // 1000% per head is already an 11x speedup from one extra guy; anything
+    // past that is a typo, not a tuning.
+    if (raw.bite_speedup_per_guy_pct > 1000 or raw.bite_speedup_per_baby_pct > 1000) {
+        fail("{s}: bite speedup pcts (guy={}, baby={}) must be 0..1000", .{
+            BALANCE_FILE, raw.bite_speedup_per_guy_pct, raw.bite_speedup_per_baby_pct,
+        });
+        return ConfigError.InvalidBiteSpeedup;
+    }
+    // A window of 0 could never be met — two casts can't land at the same
+    // instant — so every team recipe would be dead data.
+    if (raw.team_window_ms < 1) {
+        fail("{s}: team_window_ms must be >= 1", .{BALANCE_FILE});
+        return ConfigError.InvalidTeamWindow;
     }
     if (raw.slime_grid.rows < 1 or raw.slime_grid.rows > c.MAX_GRID_ROWS or
         raw.slime_grid.cols < 1 or raw.slime_grid.cols > c.MAX_GRID_COLS)
@@ -390,7 +411,11 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
     return .{
         .hunger_cost_normal = raw.hunger_cost_normal,
         .slime_grid = .{ .rows = raw.slime_grid.rows, .cols = raw.slime_grid.cols },
-        .casts_per_turn = raw.casts_per_turn,
+        .bite_interval_ms = raw.bite_interval_ms,
+        .bite_speedup_per_guy_pct = raw.bite_speedup_per_guy_pct,
+        .bite_speedup_per_baby_pct = raw.bite_speedup_per_baby_pct,
+        .cast_cooldown_ms = raw.cast_cooldown_ms,
+        .team_window_ms = raw.team_window_ms,
         .hunger_base = raw.hunger_base,
         .appetite_scale = raw.appetite_scale,
         .hunger_player_cap = raw.hunger_player_cap,
@@ -843,13 +868,15 @@ test "a group may name the same move twice" {
     try std.testing.expectEqualSlices(u8, &.{ 0, 0 }, loaded.config.balance.team_recipes[0].components);
 }
 
-test "casts_per_turn defaults when absent" {
+test "realtime pacing knobs default when absent" {
     var loaded = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
     defer loaded.deinit();
-    try std.testing.expectEqual(
-        balance.DEFAULT_CASTS_PER_TURN,
-        loaded.config.balance.casts_per_turn,
-    );
+    const bal = &loaded.config.balance;
+    try std.testing.expectEqual(balance.DEFAULT_BITE_INTERVAL_MS, bal.bite_interval_ms);
+    try std.testing.expectEqual(balance.DEFAULT_BITE_SPEEDUP_PER_GUY_PCT, bal.bite_speedup_per_guy_pct);
+    try std.testing.expectEqual(balance.DEFAULT_BITE_SPEEDUP_PER_BABY_PCT, bal.bite_speedup_per_baby_pct);
+    try std.testing.expectEqual(balance.DEFAULT_CAST_COOLDOWN_MS, bal.cast_cooldown_ms);
+    try std.testing.expectEqual(balance.DEFAULT_TEAM_WINDOW_MS, bal.team_window_ms);
 }
 
 test "slime_grid defaults when absent" {
@@ -893,28 +920,77 @@ test "out-of-range slime_grid dimensions are rejected" {
     );
 }
 
-test "zero casts_per_turn is rejected" {
-    // A budget that can never be spent is a turn that can never end.
-    const bad =
-        \\{"hunger_cost_normal":1,
-        \\ "casts_per_turn":0,
-        \\ "player_recipes":[],"team_recipes":[]}
-    ;
-    try std.testing.expectError(
-        ConfigError.InvalidCastsPerTurn,
-        parse(std.testing.allocator, bad, minimal_encounters),
-    );
-}
-
-test "casts_per_turn is read from the document" {
+test "realtime pacing knobs are read from the document" {
     const doc =
         \\{"hunger_cost_normal":1,
-        \\ "casts_per_turn":7,
+        \\ "bite_interval_ms":2500,"bite_speedup_per_guy_pct":20,
+        \\ "bite_speedup_per_baby_pct":10,"cast_cooldown_ms":300,
+        \\ "team_window_ms":1500,
         \\ "player_recipes":[],"team_recipes":[]}
     ;
     var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
     defer loaded.deinit();
-    try std.testing.expectEqual(@as(u8, 7), loaded.config.balance.casts_per_turn);
+    const bal = &loaded.config.balance;
+    try std.testing.expectEqual(@as(u32, 2500), bal.bite_interval_ms);
+    try std.testing.expectEqual(@as(u16, 20), bal.bite_speedup_per_guy_pct);
+    try std.testing.expectEqual(@as(u16, 10), bal.bite_speedup_per_baby_pct);
+    try std.testing.expectEqual(@as(u32, 300), bal.cast_cooldown_ms);
+    try std.testing.expectEqual(@as(u32, 1500), bal.team_window_ms);
+    // The additive interval formula: 1 guy = base; extra guys and babies
+    // speed the same base, no compounding.
+    try std.testing.expectEqual(@as(u32, 2500), bal.bite_interval_effective(1, 0));
+    // 3 guys, 2 babies: 100 + 2*20 + 2*10 = 160 -> 2500*100/160 = 1562.
+    try std.testing.expectEqual(@as(u32, 1562), bal.bite_interval_effective(3, 2));
+    // A zero-seat table still yields the base interval (never divides oddly).
+    try std.testing.expectEqual(@as(u32, 2500), bal.bite_interval_effective(0, 0));
+}
+
+test "a sub-100ms bite interval is rejected" {
+    // Faster than the server tick can pace — always a seconds-vs-ms mistake.
+    const bad =
+        \\{"hunger_cost_normal":1,
+        \\ "bite_interval_ms":99,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidBiteInterval,
+        parse(std.testing.allocator, bad, minimal_encounters),
+    );
+}
+
+test "an absurd bite speedup percent is rejected" {
+    const bad_guy =
+        \\{"hunger_cost_normal":1,
+        \\ "bite_speedup_per_guy_pct":1001,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidBiteSpeedup,
+        parse(std.testing.allocator, bad_guy, minimal_encounters),
+    );
+    const bad_baby =
+        \\{"hunger_cost_normal":1,
+        \\ "bite_speedup_per_baby_pct":1001,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidBiteSpeedup,
+        parse(std.testing.allocator, bad_baby, minimal_encounters),
+    );
+}
+
+test "a zero team window is rejected" {
+    // Two casts can never land at the same instant, so every group would be
+    // dead data.
+    const bad =
+        \\{"hunger_cost_normal":1,
+        \\ "team_window_ms":0,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidTeamWindow,
+        parse(std.testing.allocator, bad, minimal_encounters),
+    );
 }
 
 test "appetite formula knobs default when absent" {
@@ -976,11 +1052,18 @@ test "retired encounter hunger_max is rejected, not ignored" {
     );
 }
 
-test "retired realtime and medicine fields are rejected" {
-    // The turn loop has no buffers, locks or per-second eat rate, and medicine
-    // is gone entirely.  Leaving a stale tunable in a config would silently do
-    // nothing, so std.json's unknown-field strictness is the intended behaviour.
+test "retired turn, old-realtime and medicine fields are rejected" {
+    // The realtime loop has no cast budgets, buffers, locks or per-second eat
+    // rate, and medicine is gone entirely.  Leaving a stale tunable in a
+    // config would silently do nothing, so std.json's unknown-field
+    // strictness is the intended behaviour.
     for ([_][]const u8{
+        // The turn loop's per-player cast budget: casts pace themselves on
+        // cast_cooldown_ms now.
+        \\{"hunger_cost_normal":1,
+        \\ "casts_per_turn":3,
+        \\ "player_recipes":[],"team_recipes":[]}
+        ,
         \\{"hunger_cost_normal":1,
         \\ "eat_rate_units_per_s":2.0,
         \\ "player_recipes":[],"team_recipes":[]}

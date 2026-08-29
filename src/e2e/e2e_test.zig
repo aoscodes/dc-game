@@ -1,11 +1,17 @@
 //! End-to-end test: spawn a real server, connect two bot clients over
-//! WebSocket, play through the default Slime Feast encounter, assert the
+//! WebSocket, play through a Slime Feast encounter in real time, assert the
 //! game ends with a positive shared score.
 //!
-//! This exercises the whole turn-based stack: the server-authoritative slime
-//! grid and aim cursors, the per-player cast budget, the turn-end feast and the
-//! reservoir refill that follows it, shape stamping at each caster's captured
-//! anchor, and team-recipe pairing across two independent WebSocket clients.
+//! This exercises the whole realtime stack: the server-authoritative slime
+//! grid and aim cursors, the per-player cast cooldown, the bite clock (the
+//! feast settling on wall time, sped up by the two seats) and the reservoir
+//! refill that follows it, shape stamping at each caster's captured anchor,
+//! and the recent-cast window across two independent WebSocket clients.
+//!
+//! The server is launched on a TEST DATA DIR written by this binary: the
+//! shipped 4s bite interval would stretch the run past half a minute, so the
+//! e2e plays the same game at a 500ms bite and a 100ms cooldown — which also
+//! exercises --data-dir end to end.
 //!
 //! Run with:  zig build e2e
 //!
@@ -24,6 +30,51 @@ const proto = shared.protocol;
 const PORT: u16 = 19001;
 const SERVER_STARTUP_TIMEOUT_MS: u64 = 3000;
 const BOT_TIMEOUT_MS: u32 = 30_000;
+
+/// Where the fast-clock test data is written before the server spawns.
+const E2E_DATA_DIR = "zig-out/e2e-data";
+
+/// The shipped balance at e2e speed: a 500ms bite and a 100ms cooldown, so a
+/// whole encounter settles in seconds.  The tables are minimal — one cheap
+/// poke, one line, and a poke+poke group so team recipes are reachable.
+const E2E_BALANCE_JSON =
+    \\{
+    \\  "hunger_cost_normal": 1,
+    \\  "hunger_base": 30,
+    \\  "appetite_scale": 5,
+    \\  "hunger_player_cap": 500,
+    \\  "slime_grid": { "rows": 6, "cols": 10 },
+    \\  "bite_interval_ms": 500,
+    \\  "bite_speedup_per_guy_pct": 15,
+    \\  "bite_speedup_per_baby_pct": 5,
+    \\  "cast_cooldown_ms": 100,
+    \\  "team_window_ms": 1500,
+    \\  "baby_hunger": 10,
+    \\  "feast_columns": 1,
+    \\  "feast_columns_per_guy": 0,
+    \\  "specials_avoid_door_column": true,
+    \\  "player_recipes": [
+    \\    { "label": "poke", "shape": ["#"], "cost": 1 },
+    \\    { "label": "sweep", "shape": ["###"], "cost": 3 }
+    \\  ],
+    \\  "team_recipes": [
+    \\    { "label": "bloom", "moves": ["poke", "poke"],
+    \\      "shape": ["..#..", ".###.", "#####", ".###.", "..#.."], "cost": 4 }
+    \\  ]
+    \\}
+;
+
+/// 60 units against the two bots' 60-point bar: roughly ten bites of game,
+/// a couple of realtime seconds at the 500ms interval.
+const E2E_ENCOUNTERS_JSON =
+    \\{
+    \\  "default": "e2e_feast",
+    \\  "encounters": [
+    \\    { "label": "e2e_feast", "charges": 60,
+    \\      "zones": [ { "tiered": { "green": 30 }, "neutral": 30 } ] }
+    \\  ]
+    \\}
+;
 /// Cursor steps sent per cast cycle.  Walking before every cast sweeps the
 /// stamp across the field instead of grinding the same cells, and proves the
 /// server's cursor is authoritative and clamped (the bots deliberately walk
@@ -42,16 +93,16 @@ const BotResult = struct {
     /// Grid dimensions announced in game_start — proves the client is told how
     /// to lay the field out.
     grid_cells: u16 = 0,
-    /// Highest turn number seen in a game_state — proves the turn loop
-    /// advanced rather than the match resolving inside turn 1.
-    max_turn: u16 = 0,
-    /// `turn_ended` broadcasts seen: the wire proof that feasts happened.
-    turn_ends: u32 = 0,
-    /// Cast budget announced in game_start.
-    casts_per_turn: u8 = 0,
-    /// Lowest `casts_left` this bot ever saw for itself.  Starts above any
-    /// possible budget so the first snapshot always lowers it.
-    min_casts_left: u16 = std.math.maxInt(u16),
+    /// Highest bite number seen in a game_state — proves the bite clock
+    /// advanced rather than the match resolving inside the first meal.
+    max_bite: u16 = 0,
+    /// `bite_settled` broadcasts seen: the wire proof that feasts happened.
+    bite_settles: u32 = 0,
+    /// Cast cooldown announced in game_start.
+    cast_cooldown_ms: u32 = 0,
+    /// Highest `cooldown_ms` this bot ever saw on ITSELF — proof that casting
+    /// actually started the cooldown the server broadcasts.
+    max_cooldown_seen: u32 = 0,
     stats_neutralized: u32 = 0,
     casts_total: u16 = 0,
     /// Hazard cells the team's stamps downgraded, summed over all tiers.
@@ -95,6 +146,18 @@ pub fn main() !void {
 
     std.debug.print("[e2e] server binary: {s}\n", .{server_path});
 
+    // ---- Write the fast-clock data dir --------------------------------------
+    try std.fs.cwd().makePath(E2E_DATA_DIR);
+    try std.fs.cwd().writeFile(.{
+        .sub_path = E2E_DATA_DIR ++ "/balance.json",
+        .data = E2E_BALANCE_JSON,
+    });
+    try std.fs.cwd().writeFile(.{
+        .sub_path = E2E_DATA_DIR ++ "/encounters.json",
+        .data = E2E_ENCOUNTERS_JSON,
+    });
+    std.debug.print("[e2e] wrote fast-clock data to {s}\n", .{E2E_DATA_DIR});
+
     // ---- Kill any stale server on the test port ----------------------------
     if (std.process.Child.run(.{
         .allocator = allocator,
@@ -110,7 +173,7 @@ pub fn main() !void {
     defer allocator.free(port_str);
 
     var server_child = std.process.Child.init(
-        &.{ server_path, port_str },
+        &.{ server_path, port_str, "--data-dir", E2E_DATA_DIR },
         allocator,
     );
     server_child.stdout_behavior = .Ignore;
@@ -165,31 +228,29 @@ pub fn main() !void {
             failed = true;
             continue;
         }
-        if (ctx.result.max_turn < 2) {
-            std.debug.print("[e2e] FAIL {s}: reached turn {}, want the loop to advance\n", .{
-                ctx.name, ctx.result.max_turn,
+        if (ctx.result.max_bite < 2) {
+            std.debug.print("[e2e] FAIL {s}: reached bite {}, want the clock to advance\n", .{
+                ctx.name, ctx.result.max_bite,
             });
             failed = true;
             continue;
         }
-        if (ctx.result.turn_ends == 0) {
-            std.debug.print("[e2e] FAIL {s}: no turn_ended broadcasts seen\n", .{ctx.name});
+        if (ctx.result.bite_settles == 0) {
+            std.debug.print("[e2e] FAIL {s}: no bite_settled broadcasts seen\n", .{ctx.name});
             failed = true;
             continue;
         }
-        if (ctx.result.casts_per_turn == 0) {
-            std.debug.print("[e2e] FAIL {s}: game_start carried no cast budget\n", .{ctx.name});
+        if (ctx.result.cast_cooldown_ms == 0) {
+            std.debug.print("[e2e] FAIL {s}: game_start carried no cast cooldown\n", .{ctx.name});
             failed = true;
             continue;
         }
-        // A budget that never dips below its maximum would mean casts were
-        // free.  Zero itself is NOT required: the last spend in the room ends
-        // the turn and refills every budget inside the same drain, so an empty
-        // budget need never appear in a broadcast snapshot.
-        if (ctx.result.min_casts_left >= ctx.result.casts_per_turn) {
-            std.debug.print("[e2e] FAIL {s}: budget never spent down (min {} of {})\n", .{
-                ctx.name, ctx.result.min_casts_left, ctx.result.casts_per_turn,
-            });
+        // A cooldown that never appears on the wire would mean casts were
+        // throttle-free (or the snapshot lies).  The bots cast constantly and
+        // the state broadcasts every 50ms against a 100ms cooldown, so a
+        // running cooldown cannot stay invisible.
+        if (ctx.result.max_cooldown_seen == 0) {
+            std.debug.print("[e2e] FAIL {s}: own cooldown never seen running\n", .{ctx.name});
             failed = true;
             continue;
         }
@@ -219,10 +280,10 @@ pub fn main() !void {
             failed = true;
             continue;
         }
-        std.debug.print("[e2e] OK   {s}: score={}, {} hunger events, {}-cell grid, {} turns, {} feasts, {} casts, {} covered, {} defused, {} stamps, cursor col {}\n", .{
+        std.debug.print("[e2e] OK   {s}: score={}, {} hunger events, {}-cell grid, {} bites, {} feasts, {} casts, {} covered, {} defused, {} stamps, cursor col {}\n", .{
             ctx.name,                  ctx.result.score,
             ctx.result.hunger_events,  ctx.result.grid_cells,
-            ctx.result.max_turn,       ctx.result.turn_ends,
+            ctx.result.max_bite,       ctx.result.bite_settles,
             ctx.result.casts_total,    ctx.result.stats_covered,
             ctx.result.stats_neutralized, ctx.result.shape_casts,
             ctx.result.max_cursor_col,
@@ -313,10 +374,11 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                 my_player_id = start.player_id;
                 ctx.result.grid_cells =
                     @as(u16, start.grid_rows) * @as(u16, start.grid_cols);
-                ctx.result.casts_per_turn = start.casts_per_turn;
-                std.debug.print("[e2e] {s} game_start: {}x{} grid, player {}, {} casts/turn\n", .{
+                ctx.result.cast_cooldown_ms = start.cast_cooldown_ms;
+                std.debug.print("[e2e] {s} game_start: {}x{} grid, player {}, {}ms cooldown, {}ms window\n", .{
                     ctx.name,          start.grid_rows, start.grid_cols,
-                    start.player_id,   start.casts_per_turn,
+                    start.player_id,   start.cast_cooldown_ms,
+                    start.team_window_ms,
                 });
             },
 
@@ -325,30 +387,30 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                 const gs = proto.decode_game_state(fbs.reader()) catch continue;
                 if (!in_game) continue;
 
-                ctx.result.max_turn = @max(ctx.result.max_turn, gs.turn);
+                ctx.result.max_bite = @max(ctx.result.max_bite, gs.bite);
 
-                // Track our own cursor and budget as the server reports them.
+                // Track our own cursor and cooldown as the server reports them.
                 for (gs.entities[0..gs.entity_count]) |e| {
                     if (e.owner != my_player_id) continue;
                     ctx.result.max_cursor_col =
                         @max(ctx.result.max_cursor_col, e.cursor_col);
-                    ctx.result.min_casts_left =
-                        @min(ctx.result.min_casts_left, @as(u16, e.casts_left));
+                    ctx.result.max_cooldown_seen =
+                        @max(ctx.result.max_cooldown_seen, e.cooldown_ms);
                 }
 
-                // Cast every frame: casts resolve immediately, and casts past
-                // the budget are harmlessly ignored, so the bots simply spend
-                // their whole allowance as fast as the server will take it.
-                // Aim first, then cast: the server captures the cursor when the
-                // cast is accepted, so the walk must land before the trigger.
+                // Cast every frame: casts resolve immediately, and presses
+                // inside the cooldown are harmlessly dropped, so the bots
+                // simply cast as fast as the server will take it.  Aim first,
+                // then cast: the server captures the cursor when the cast is
+                // accepted, so the walk must land before the trigger.
                 // Clamping makes the sweep safe to run forever — a bot that
                 // reaches the edge simply stops advancing.
                 for (0..AIM_STEPS_PER_CAST) |_| {
                     try send_move_cursor(&client, ctx.sweep);
                 }
                 // Both bots leave the wheel on move 0 (`poke`), so wherever
-                // their sweeps cross they complete a group; everywhere else the
-                // poke lands on its own.
+                // their casts land on one square inside the window they
+                // complete the bloom; everywhere else the poke lands alone.
                 try send_cast(&client);
             },
 
@@ -360,10 +422,10 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                 }
             },
 
-            .turn_ended => {
+            .bite_settled => {
                 var fbs = std.io.fixedBufferStream(payload);
-                _ = proto.decode_turn_ended(fbs.reader()) catch continue;
-                ctx.result.turn_ends += 1;
+                _ = proto.decode_bite_settled(fbs.reader()) catch continue;
+                ctx.result.bite_settles += 1;
             },
 
             .shape_cast => {

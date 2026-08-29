@@ -13,10 +13,12 @@
 //! selection to the one the profile wants, which is both fewer messages and a
 //! genuine exercise of the cycling code.
 //!
-//! A "cycle" is one submit per bot, drained in a single tick.  Casts resolve as
-//! they are accepted, so a cycle is exactly one round of casting — NOT a turn.
-//! A turn only ends once every bot has spent its whole `casts_per_turn` budget,
-//! so `casts_per_turn` cycles retire one turn (and one feast).
+//! A "cycle" is one submit per bot plus 100ms of play time — the fixture's
+//! cast cooldown, walked in the driver's 50ms ticks — so every bot is off
+//! cooldown again by the next cycle.  Casts resolve the moment they drain,
+//! and the BITE fires on its own clock whenever a cycle's walk crosses it
+//! (the fixture base interval is 1000ms, sped up by the crowd), so a run of
+//! cycles interleaves casting and feasting exactly the way live play does.
 //!
 //! ## Usage
 //!
@@ -200,17 +202,20 @@ pub const BotHarness = struct {
     ///   1. inject_aim(), inject_select(), then inject_actions() for every bot
     ///      — aim and wheel first, so the cast fires this cycle's move at this
     ///      cycle's cursor
-    ///   2. tick() so the queue drains and every cast resolves
+    ///   2. two 50ms ticks — the first drains the queue (every cast resolves)
+    ///      and together they walk the clock past the 100ms fixture cooldown,
+    ///      so the next cycle's casts are never dropped as too eager.
     ///
-    /// If that drain exhausts every bot's budget, the session ends the turn
-    /// inside the same tick: the field is devoured and refilled.
+    /// Whenever the walk crosses the bite timer, the field is devoured and
+    /// refilled inside the same step — the realtime loop at bot speed.
     ///
     /// Increments self.cycle afterwards.
     pub fn step(self: *BotHarness) !void {
         try self.inject_aim();
         try self.inject_select();
         try self.inject_actions();
-        try self.session.tick(0.0);
+        try self.session.tick(0.05);
+        try self.session.tick(0.05);
         self.cycle += 1;
     }
 
@@ -311,17 +316,19 @@ test "sweeping bots eat their way into a field that starts completely walled" {
     );
 }
 
-test "an idle team is still fed: the bite nibbles the wall down turn by turn" {
+test "an idle team is still fed: the bite nibbles the wall down on the clock" {
     // The central change of the conveyor design: a live hazard is no longer
-    // a wall the feast cannot touch — the bite NIBBLES it one tier per turn.
+    // a wall the feast cannot touch — the bite NIBBLES it one tier per meal.
     // A team that never casts therefore still makes progress, it just pays
     // hunger-clock for nibbles that score nothing: every green costs a
     // nibble AND a consuming bite (2 hunger for 1 point), so the idle game
     // ends by the clock with slime left on the board.
     const allocator = std.testing.allocator;
 
-    // Idle side: a joined player who never casts would stall the turn forever,
-    // so its budget is retired directly.  Nothing is ever defused by a cast.
+    // Idle side: a seated player who never casts.  The bite runs on its own
+    // clock, so idleness stalls nothing; the settles are driven through the
+    // public seam so the test needs no wall time.  Nothing is ever defused
+    // by a cast.
     var idle_sess = try Session.init_seeded(allocator, "BOTK01".*, TEST_CFG, 0xB07_5EED);
     defer idle_sess.deinit();
     var idle_bot: BotState = undefined;
@@ -333,8 +340,7 @@ test "an idle team is still fed: the bite nibbles the wall down turn by turn" {
 
     var turns: u32 = 0;
     while (!idle_sess.restart_pending and turns < 200) : (turns += 1) {
-        idle_sess.casts_left = [_]u8{0} ** session_mod.MAX_PLAYERS;
-        try idle_sess.tick(0.0);
+        try idle_sess.settle_bite();
     }
     // 60 greens at 2 hunger each against a solo bar of 100: the clock fills
     // before the field clears.  The game ENDED — idle play cannot stall the
@@ -505,10 +511,8 @@ test "a cast lands where the bot aimed, not where it ends up" {
 
     try std.testing.expect(h.session.cursors[pid] != aimed);
 
-    // Land the lock-in without ending the turn: the feast would eat the very
-    // cell this test is about.
-    try h.session.resolve_pending();
-
+    // The cast resolved INSIDE the drain, before the moves queued behind it
+    // — and tick(0) walked no clock, so no bite has eaten the cell either.
     // `poke` is 1x1 and the field is all-green, so the stamp downgraded
     // exactly one green cell — at the anchor, not the moved-to cursor.
     try std.testing.expect(h.session.field.grid.get(aimed) == .neutralized);

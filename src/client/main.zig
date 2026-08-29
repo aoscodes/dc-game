@@ -227,20 +227,11 @@ fn send_cycle_shape(dir: c.CycleDir) void {
     emit_send(fbs.getWritten());
 }
 
-/// Lock in the server's current selection at the server's current cursor.
+/// Fire the server's current selection at the server's current cursor.
 /// There is nothing to send BUT the trigger: both are server state.
 fn send_cast() void {
     var fbs = std.io.fixedBufferStream(&g_state.send_buf);
     proto.encode(fbs.writer(), .cast, {}) catch return;
-    emit_send(fbs.getWritten());
-}
-
-/// Take back this player's most recent pending cast.  Carries no payload for
-/// the same reason `cast` does not: the server knows whose casts are whose and
-/// which of them is newest.
-fn send_cancel_cast() void {
-    var fbs = std.io.fixedBufferStream(&g_state.send_buf);
-    proto.encode(fbs.writer(), .cancel_cast, {}) catch return;
     emit_send(fbs.getWritten());
 }
 
@@ -270,7 +261,8 @@ fn process_recv() void {
                 g_state.player_id = p.player_id;
                 g_state.game.player_id = p.player_id;
                 g_state.game.join_code = p.join_code;
-                g_state.game.casts_per_turn = p.casts_per_turn;
+                g_state.game.cast_cooldown_ms = p.cast_cooldown_ms;
+                g_state.game.team_window_ms = p.team_window_ms;
                 g_state.game.encounter_label_len = p.encounter_label_len;
                 @memcpy(g_state.game.encounter_label[0..p.encounter_label_len], p.encounter_label[0..p.encounter_label_len]);
                 // A fresh outro must not survive into the next encounter.
@@ -335,12 +327,12 @@ fn process_recv() void {
                     gs.shape_cast_count += 1;
                 }
             },
-            .turn_ended => {
-                const p = proto.decode_turn_ended(r) catch continue;
+            .bite_settled => {
+                const p = proto.decode_bite_settled(r) catch continue;
                 // Transient, drained per frame: the renderer plays the devour
-                // animation off this.  A later turn end in the same frame wins
-                // — it describes the field the next snapshot will show.
-                g_state.game.turn_ended = p;
+                // animation off this.  A later bite in the same frame wins —
+                // it describes the field the next snapshot will show.
+                g_state.game.bite_settled = p;
             },
             .special_matched => {
                 const p = proto.decode_special_matched(r) catch continue;
@@ -383,10 +375,6 @@ fn update_game() void {
     // at the stale cursor — or is the stale shape.
     for (drained.cursor_steps()) |dir| send_move_cursor(dir);
     for (drained.cycle_turns()) |dir| send_cycle_shape(dir);
-    // Cancels before the cast: undoing a plan and then adding to it is the
-    // order the keys were pressed in, and the server prices each in turn.
-    var undone: u8 = 0;
-    while (undone < drained.cancels) : (undone += 1) send_cancel_cast();
     if (drained.cast) send_cast();
 }
 
