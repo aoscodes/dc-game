@@ -29,10 +29,10 @@
 //! server-authoritative and transmitted whole in `game_state`, so every client
 //! renders identical slime.
 //!
-//! A TURN is: everyone spends their cast budget, then the Lil Guys eat every
-//! unit they can REACH and the field settles.  Nothing is on a clock — `tick`
-//! only drains input and broadcasts, so a session advances solely by what
-//! players do.
+//! A TURN is: everyone spends their cast budget, then the Lil Guys BITE the
+//! front `feast_width` columns of the field and it settles.  Nothing is on a
+//! clock — `tick` only drains input and broadcasts, so a session advances
+//! solely by what players do.
 //!
 //! ## Two currencies
 //!
@@ -40,11 +40,13 @@
 //! pace of a turn and decide when it ends.
 //!
 //! CHARGES are ONE pool shared by the whole team for the WHOLE GAME
-//! (`encounter.charges`).  Nothing ever refills them.  Every recipe has a
-//! `cost`, so the pool is the real resource: the team is not asked "what can
-//! you do this turn?" but "what is this play worth out of everything you will
-//! ever have?".  Running the pool dry is a loss (`out_of_charges`) the moment
-//! the team can no longer afford its cheapest move — see check_end.
+//! (`encounter.charges`, plus what swallowed canisters give back).  Every
+//! recipe has a `cost`, so the pool is the real resource: the team is not
+//! asked "what can you do this turn?" but "what is this play worth out of
+//! everything you will ever have?".  Running the pool dry does NOT end the
+//! game — a broke team's cast presses become PASSES (budget spent, nothing
+//! stamped), so the turns keep coming and the bite keeps chewing; the
+//! hunger bar is the clock that eventually calls it.
 //!
 //! SELECTING.  Each player holds ONE selected move: an index into
 //! `balance.player_recipes` that they step around with `cycle_shape` and fire
@@ -86,21 +88,21 @@
 //!
 //! TURN END.  Resolution runs straight into the feast, and the field settles
 //! in three ordered steps (see slime.zig):
-//!   1. EAT — the Lil Guys enter from the LEFT edge and flood through empty
-//!      cells and edible slime.  Live hazards and specials are walls: what is
-//!      behind them is sheltered and survives.  Opening a path is the whole
-//!      point of a cast.
-//!   2. COLLAPSE — survivors fall straight down into the holes the feast left.
-//!   3. FILL — the reservoir tops the field up from the row the collapse
-//!      cleared.
+//!   1. BITE — the Lil Guys chew the front `feast_width` columns cell by
+//!      cell: edible units are consumed (scoring), live hazards are NIBBLED
+//!      one tier softer (hunger for nothing), rocks are skipped.  Defusing
+//!      the front before the bite lands is the whole point of a cast.
+//!   2. SHIFT — every row's survivors pack LEFT into the space the bite
+//!      opened: the conveyor advances.
+//!   3. FILL — the reservoir tops the field up from the RIGHT edge.
 //! The pending list is then cleared — groups form WITHIN a turn only, so a
 //! contribution nobody joined is simply a move that landed on its own — budgets
 //! reset, and `turn_ended` is broadcast.
 //!
-//! The encounter's end is checked ONLY at turn end: the hunger bar filling is a
-//! loss, a pool that can no longer afford the cheapest move is a loss (however
-//! well the feast just went), and a field holding nothing but specials is a
-//! win.  Either way the settled board is broadcast FIRST and the final shared
+//! The encounter's end is checked ONLY at turn end: the hunger bar is the
+//! game's CLOCK — every bite fills it, and a full bar simply calls time —
+//! while a field holding nothing but inconsumable specials is the win.
+//! Either way the settled board is broadcast FIRST and the final shared
 //! score follows via game_over, so the client can play the closing feast out
 //! before it shows the report.
 
@@ -198,7 +200,9 @@ pub const Session = struct {
     world: GameWorld,
     tick_count: u32 = 0,
     current_encounter: ?*const enc.Encounter = null,
-    /// Total Hunger bar.  Fills as slime is consumed; full = encounter over.
+    /// Total Hunger bar — the game's CLOCK.  Every bite fills it (consumed
+    /// food and nibbled hazards alike); full = time is up and the encounter
+    /// ends on whatever the score is.
     ///
     /// Its CAPACITY is the sum of every counted player's appetite-derived
     /// contribution (see `hunger_share` and game_logic.player_hunger) — group
@@ -513,8 +517,9 @@ pub const Session = struct {
 
     /// Give every seated player their avatar entity.
     ///
-    /// The Lil Guys have no server representation: they eat the whole field at
-    /// turn end regardless of how many there are, so they are purely a client
+    /// The Lil Guys have no server representation: their one mechanical
+    /// trace is the HEADCOUNT, which widens the bite via
+    /// `balance.feast_width` — everything else about them is client
     /// animation of `turn_ended`.
     fn spawn_players(self: *Session) !void {
         for (&self.players) |*p| {
@@ -654,9 +659,10 @@ pub const Session = struct {
     /// legal move to make.  Zeroing the remaining budgets settles the turn on
     /// what is already committed instead of hanging on what cannot be.
     ///
-    /// This is also how the game ends: the headroom that stranded the turn is
-    /// exactly the pool that will be left after it resolves, so `check_end`
-    /// calls `out_of_charges` on this turn rather than the next one.
+    /// This only ends the TURN, never the game: from the next turn on the
+    /// broke team's cast presses become passes (see the cast handler), so
+    /// play continues on the bite's nibbles alone until the hunger clock or
+    /// the cleared field calls it.
     ///
     /// A zero-cost move config never reaches this: `cheapest_cost` is 0, so
     /// there is always something the team can still add.
@@ -698,19 +704,20 @@ pub const Session = struct {
         try self.end_turn();
     }
 
-    /// Settle the turn: eat, collapse, refill, resolve special matches, then
+    /// Settle the turn: bite, shift, refill, resolve special matches, then
     /// refill budgets.
     ///
     /// The turn's stamps have already landed (see `resolve_pending`), so the
     /// board this reads is the one the team bought.
     ///
-    /// Order matters and is the whole mechanic.  `eat_all` is priced against
-    /// the field exactly as the casts left it, `collapse` drags the survivors
-    /// down into the holes it made, and only then does `fill` top the field up
-    /// — so refills always land ABOVE the survivors.  Matches resolve LAST,
-    /// on the refilled field, because the refill is what lines new specials
-    /// up.  The end condition is checked after all of it, because "field
-    /// cleared" means the reservoir had nothing left to send either.
+    /// Order matters and is the whole mechanic.  The bite is priced against
+    /// the field exactly as the casts left it, `shift_left` packs the
+    /// survivors into the space it opened, and only then does `fill` top the
+    /// field up — so refills always land BEHIND the survivors, at the right
+    /// edge.  Matches resolve LAST, on the refilled field, because the
+    /// refill is what lines new specials up.  The end condition is checked
+    /// after all of it, because "field cleared" means the reservoir had
+    /// nothing left to send either.
     /// Hard ceiling on settle passes, purely defensive.  Every pass past the
     /// first requires a match, every match pops at least two specials, and
     /// specials only ever leave play — so the real bound is half the
@@ -719,19 +726,20 @@ pub const Session = struct {
     const MAX_SETTLE_PASSES: u8 = 64;
 
     fn end_turn(self: *Session) !void {
-        // The turn settles as a CASCADE: eat, collapse, refill, resolve
-        // matches — and when a match fired, its pops and its 5x5 opened
-        // walls, so the Lil Guys eat AGAIN.  The loop runs until a pass ends
-        // with no match; the summary numbers total over every pass.
+        // The turn settles as a CASCADE: bite, shift, refill, resolve
+        // matches — and when a match fired, its pops and its 5x5 changed the
+        // front, so the Lil Guys bite AGAIN.  The loop runs until a pass
+        // ends with no match; the summary numbers total over every pass.
         var cells_total: u16 = 0;
         var hunger_total: u32 = 0;
         var score_total: u32 = 0;
-        // What survived: the LAST feast's view of the walls and what they
-        // saved — the numbers the next turn is planned around.
-        var last_sheltered: u16 = 0;
-        var last_walls: u16 = 0;
+        var bitten_total: u16 = 0;
         var hatch_msg = proto.EggsHatched{};
         var passes: u8 = 0;
+
+        // The bite's width is decided by the crowd at the table: the seats
+        // held at THIS settle, however the turn's casts were paced.
+        const width = self.cfg.balance.feast_width(self.seated_players());
 
         // Groups form within a turn only.  Resolution already emptied this;
         // clearing it again costs nothing and keeps the invariant local to
@@ -739,7 +747,7 @@ pub const Session = struct {
         self.pending_count = 0;
 
         while (passes < MAX_SETTLE_PASSES) {
-            const feast = self.field.eat_all(&self.cfg.balance);
+            const feast = self.field.feast(&self.cfg.balance, width);
 
             // Hatch BEFORE the hunger lands: the babies joined the feast
             // that freed them, so their capacity is on the bar when it
@@ -779,17 +787,14 @@ pub const Session = struct {
             cells_total +|= feast.cells;
             hunger_total +|= feast.hunger_total();
             score_total +|= feast.score;
-            last_sheltered = feast.sheltered;
-            last_walls = feast.walls;
+            bitten_total +|= feast.total_bitten();
 
-            // The feast already left the board settled (it ends with one
-            // collapse), so this is a safety no-op today — except after a
-            // (dormant) match pass popped holes, which is exactly what it
-            // exists to tidy.  Then
+            // The conveyor advances: every row's survivors pack left into
+            // the space the bite (or a match pass's pops) opened.  Then
             // the refill: the one part of a settle a client cannot derive
             // (it comes out of the session's PRNG), so which cells filled —
             // and with what — is captured and broadcast.
-            _ = self.field.collapse();
+            _ = self.field.shift_left();
             var was_empty = [_]bool{false} ** c.MAX_GRID_CELLS;
             for (0..self.field.grid.len()) |flat| {
                 was_empty[flat] = !self.field.grid.get(@intCast(flat)).is_slime();
@@ -810,7 +815,7 @@ pub const Session = struct {
 
             // Matches fire on the REFILLED field — the refill is what lines
             // new specials up.  Pops leave holes; whether the next turn's
-            // collapse tidies them or the next PASS eats through them is
+            // shift tidies them or the next PASS eats through them is
             // decided right here.
             const matched = self.field.resolve_matches(&self.cfg.balance);
             for (matched.matches[0..matched.count]) |m| {
@@ -866,20 +871,18 @@ pub const Session = struct {
             .turn = self.turn,
             .cells_eaten = cells_total,
             .hunger_added = stat_u16(hunger_total),
-            .sheltered = last_sheltered,
-            .walls = last_walls,
+            .hazards_bitten = bitten_total,
             .score_added = score_total,
             .charges_left = self.charges,
             .passes = passes,
         });
         try self.broadcast_raw(fbs.getWritten());
 
-        std.log.info("turn {} ended — ate {} over {} pass(es), sheltered {} behind {} walls, hunger+{} score+{} charges={} reservoir={}", .{
+        std.log.info("turn {} ended — ate {} and nibbled {} over {} pass(es), hunger+{} score+{} charges={} reservoir={}", .{
             self.turn,
             cells_total,
+            bitten_total,
             passes,
-            last_sheltered,
-            last_walls,
             hunger_total,
             score_total,
             self.charges,
@@ -965,7 +968,7 @@ pub const Session = struct {
     fn record_feast(self: *Session, feast: slime.FeastOutcome) void {
         const fs = &self.stats.feast;
         fs.hunger_normal +|= stat_u16(feast.hunger_total());
-        fs.sheltered +|= feast.sheltered;
+        fs.hazards_bitten +|= feast.total_bitten();
         fs.neutral_consumed +|= feast.neutral;
         fs.defused_consumed +|= feast.defused;
         fs.agents_consumed +|= feast.agents;
@@ -1092,6 +1095,20 @@ pub const Session = struct {
                 // Out of casts this turn: silent ignore.  The turn is waiting
                 // on someone else, and this player has nothing left to say.
                 if (self.casts_left[player_id] == 0) return;
+                // BROKE: the pool cannot afford even the cheapest move, so
+                // no lock-in could ever be accepted — the press becomes a
+                // PASS.  The budget is spent (which is what paces and ends
+                // the turn) but nothing is quoted, charged or stamped: the
+                // team keeps playing on the bite alone, chewing the field
+                // down until the hunger clock or the cleared field ends it.
+                if (self.charges < self.cfg.balance.cheapest_cost()) {
+                    self.casts_left[player_id] -= 1;
+                    std.log.debug("player {} passed — pool {} cannot afford the cheapest move", .{
+                        player_id, self.charges,
+                    });
+                    try self.maybe_end_turn();
+                    return;
+                }
                 // The list is capped well above any real turn, so a full one
                 // means a pathological config rather than a play worth
                 // reporting.
@@ -1202,10 +1219,15 @@ pub const Session = struct {
     }
 
     /// Decide whether the encounter is over.  Called ONLY from `end_turn`:
-    /// nothing between turns can FILL the hunger bar, move the slime count or
-    /// the charge pool.  A mid-game leave can shrink the bar's capacity down
-    /// to `current` (see uncount_hunger_share), but never below it, so the
+    /// nothing between turns can FILL the hunger bar or move the slime
+    /// count.  A mid-game leave can shrink the bar's capacity down to
+    /// `current` (see uncount_hunger_share), but never below it, so the
     /// verdict still cannot change until the next turn settles.
+    ///
+    /// Running out of charges is deliberately NOT an ending: a broke team's
+    /// cast presses become passes (see the cast handler) and the bite's
+    /// nibbles keep softening the field, so the game always moves — the bar
+    /// is the clock that eventually calls it.
     fn check_end(self: *Session) !void {
         if (self.restart_pending) return;
         // Field-cleared wins ties: if the final feast fills the bar exactly,
@@ -1215,27 +1237,13 @@ pub const Session = struct {
             try self.end_game(.field_cleared);
             return;
         }
+        // TIME IS UP.  The bar is not a loss, it is the clock that bounds
+        // the game: the Lil Guys are sated and the encounter ends on
+        // whatever the team scored.
         if (logic.hunger_full(self.hunger)) {
             std.log.info("hunger bar full — encounter over, score={}", .{self.score});
             try self.end_game(.hunger_full);
             return;
-        }
-        // OUT OF ENERGY.  Slime is left and the pool cannot afford even the
-        // cheapest move, so no future turn can differ from this one: every
-        // remaining cast would be refused and every remaining feast would eat
-        // whatever the Lil Guys can already reach.  Ending here beats letting
-        // the room spin turns that no input can change.
-        //
-        // Note this does NOT require the feast to have eaten nothing.  A team
-        // that is broke but still feeding the Lil Guys is not in a stalemate,
-        // but it has no decisions left either — the rest is bookkeeping, and
-        // playing it out turn by turn is not a game.
-        //
-        // A config with a zero-cost move can never trip this: there is always
-        // a move, so the game always has somewhere to go.  That is intentional.
-        if (self.charges < self.cfg.balance.cheapest_cost()) {
-            std.log.info("charges exhausted — encounter over, score={}", .{self.score});
-            try self.end_game(.out_of_charges);
         }
     }
 

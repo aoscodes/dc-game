@@ -161,8 +161,7 @@ fn write_render_inner(
         .turn = te.turn,
         .cells_eaten = te.cells_eaten,
         .hunger_added = te.hunger_added,
-        .sheltered = te.sheltered,
-        .walls = te.walls,
+        .hazards_bitten = te.hazards_bitten,
         .score_added = te.score_added,
         .charges_left = te.charges_left,
         .passes = te.passes,
@@ -243,7 +242,7 @@ fn write_render_inner(
                 .feast = .{
                     .covered = tiers(ms.feast.cells_covered),
                     .neutralized = tiers(ms.feast.neutralized),
-                    .sheltered = ms.feast.sheltered,
+                    .hazards_bitten = ms.feast.hazards_bitten,
                     .neutral = ms.feast.neutral_consumed,
                     .defused = ms.feast.defused_consumed,
                     .agents = ms.feast.agents_consumed,
@@ -419,9 +418,9 @@ const JsonBabies = struct {
 const JsonFeastStats = struct {
     covered: JsonTiers,
     neutralized: JsonTiers,
-    /// Edible units the flood never reached, summed over the match: the team's
-    /// running tally of food a wall kept from them.
-    sheltered: u32,
+    /// Live hazards the bites nibbled, summed over the match: the team's
+    /// running tally of hunger-clock spent on cells no cast defused in time.
+    hazards_bitten: u32,
     neutral: u16,
     defused: u16,
     /// Neutralizers swallowed — free equipment, never scored.
@@ -591,17 +590,16 @@ const JsonOverBudget = struct {
     have: u32,
 };
 
-/// The turn-end feast: everything the Lil Guys could REACH from the left edge
-/// was devoured at once.  `sheltered` is the food `walls` kept from them — the
-/// number the next turn's casts exist to shrink.  This drives the client's
-/// devour animation.
+/// The turn-end feast: the Lil Guys bit the front columns of the field.
+/// `hazards_bitten` counts the nibbles — hunger spent on hazards no cast
+/// defused in time, the number the next turn's casts exist to shrink.  This
+/// drives the client's devour animation.
 const JsonTurnEnded = struct {
     /// The turn that just ended (the frame after it carries turn + 1).
     turn: u16,
     cells_eaten: u16,
     hunger_added: u16,
-    sheltered: u16,
-    walls: u16,
+    hazards_bitten: u16,
     score_added: u32,
     /// The shared pool AFTER this turn: the client's running budget readout.
     charges_left: u32,

@@ -38,10 +38,11 @@ pub const DEFAULT_CHARGES: u32 = 30;
 pub const Encounter = struct {
     label: []const u8,
     /// Charges the team starts with, shared by everyone and spent across the
-    /// WHOLE encounter — never refilled between turns.  This is the encounter's
-    /// sharpest difficulty knob: it caps the total number of walls the team can
-    /// ever open, so it decides how much of the field is reachable at all.
-    /// Validated > 0: a team that cannot cast cannot play.
+    /// WHOLE encounter (swallowed canisters aside).  This is the encounter's
+    /// sharpest difficulty knob: it caps how many cells the team can defuse
+    /// BEFORE the bite reaches them — everything else is nibbles that burn
+    /// the hunger clock for nothing.  Validated > 0: a team that starts
+    /// unable to cast starts with nothing to decide.
     charges: u32 = DEFAULT_CHARGES,
     /// All the slime in this encounter, as the reservoir starts it.
     slime: c.SlimeReservoir,

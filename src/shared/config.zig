@@ -75,6 +75,7 @@ pub const ConfigError = error{
     NoSlime,
     InvalidHungerFormula,
     InvalidMatchLen,
+    InvalidFeastColumns,
     UnknownDefaultEncounter,
 };
 
@@ -218,6 +219,10 @@ const BalanceJson = struct {
     /// Hunger capacity per baby Lil Guy; defaulted so configs written before
     /// babies keep validating.
     baby_hunger: u16 = balance.DEFAULT_BABY_HUNGER,
+    /// Bite width knobs (see balance.Balance.feast_width); defaulted so
+    /// configs written before the column bite keep validating.
+    feast_columns: u8 = balance.DEFAULT_FEAST_COLUMNS,
+    feast_columns_per_guy: u8 = balance.DEFAULT_FEAST_COLUMNS_PER_GUY,
     /// When true (the default), no special kind ever spawns in column 0 —
     /// the feast's door.  Defaulted so older configs keep validating.
     specials_avoid_door_column: bool = true,
@@ -293,6 +298,17 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
             BALANCE_FILE, raw.hunger_base, raw.hunger_player_cap,
         });
         return ConfigError.InvalidHungerFormula;
+    }
+    // A bite of 0 columns would eat nothing every turn (the game could only
+    // end by running the hunger clock via downgrades that never happen), and
+    // one wider than the grid promises columns that do not exist.
+    // `feast_columns_per_guy` is unbounded above: `feast_width` clamps the
+    // total at the grid, so a huge per-guy bonus just means "whole board".
+    if (raw.feast_columns < 1 or raw.feast_columns > raw.slime_grid.cols) {
+        fail("{s}: feast_columns {} outside 1..{} (grid cols)", .{
+            BALANCE_FILE, raw.feast_columns, raw.slime_grid.cols,
+        });
+        return ConfigError.InvalidFeastColumns;
     }
     // A match_len of 0/1 would fire on every lone special, and one longer
     // than the grid's longest line could never fire at all — both are always
@@ -379,6 +395,8 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         .appetite_scale = raw.appetite_scale,
         .hunger_player_cap = raw.hunger_player_cap,
         .baby_hunger = raw.baby_hunger,
+        .feast_columns = raw.feast_columns,
+        .feast_columns_per_guy = raw.feast_columns_per_guy,
         .specials_avoid_door_column = raw.specials_avoid_door_column,
         .specials = specials,
         .player_recipes = players,
@@ -1263,6 +1281,55 @@ test "baby_hunger defaults and is read" {
     var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
     defer loaded.deinit();
     try std.testing.expectEqual(@as(u16, 25), loaded.config.balance.baby_hunger);
+}
+
+test "feast column knobs default and are read" {
+    var defaulted = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
+    defer defaulted.deinit();
+    try std.testing.expectEqual(balance.DEFAULT_FEAST_COLUMNS, defaulted.config.balance.feast_columns);
+    try std.testing.expectEqual(
+        balance.DEFAULT_FEAST_COLUMNS_PER_GUY,
+        defaulted.config.balance.feast_columns_per_guy,
+    );
+
+    const doc =
+        \\{"hunger_cost_normal":1,
+        \\ "feast_columns":2,"feast_columns_per_guy":1,
+        \\ "player_recipes":[{"label":"poke","shape":["#"]}],
+        \\ "team_recipes":[]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u8, 2), loaded.config.balance.feast_columns);
+    try std.testing.expectEqual(@as(u8, 1), loaded.config.balance.feast_columns_per_guy);
+    // The width formula: base + per-guy, clamped at the grid's columns.
+    try std.testing.expectEqual(@as(u8, 2), loaded.config.balance.feast_width(0));
+    try std.testing.expectEqual(@as(u8, 4), loaded.config.balance.feast_width(2));
+    try std.testing.expectEqual(@as(u8, 10), loaded.config.balance.feast_width(99));
+}
+
+test "a zero or over-wide feast_columns is rejected" {
+    // 0 columns would bite nothing forever; wider than the grid promises
+    // columns that do not exist.
+    const zero =
+        \\{"hunger_cost_normal":1,
+        \\ "feast_columns":0,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidFeastColumns,
+        parse(std.testing.allocator, zero, minimal_encounters),
+    );
+    const wide =
+        \\{"hunger_cost_normal":1,
+        \\ "slime_grid":{"rows":6,"cols":10},
+        \\ "feast_columns":11,
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidFeastColumns,
+        parse(std.testing.allocator, wide, minimal_encounters),
+    );
 }
 
 test "encounter charges default, are read, and 0 is rejected" {

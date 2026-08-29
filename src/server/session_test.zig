@@ -22,17 +22,21 @@
 //!   - shape stamping: a matched recipe's footprint downgrades every covered
 //!     hazard cell by exactly one tier (red→yellow→green→defused); cells off
 //!     the grid edge are clipped, non-hazard cells are inert
-//!   - turn end: pending casts resolving, then the PATHED feast (flood from
-//!     the left edge, live hazards and specials as walls), gravity collapse,
-//!     refill, the pending list clearing and budgets reset — in that order
-//!   - the shared charge pool: one per game, never refilled, per-move cost, a
-//!     group priced at the GROUP cost INSTEAD of its components' costs, and the
-//!     refusal of any lock-in that would take the turn's quote past the pool
-//!   - hunger accounting: a flat cost per unit EATEN, and nothing else
-//!   - score = units eaten (all of which are neutral or defused)
-//!   - end conditions: field cleared / hunger bar full / a pool too empty for
-//!     the cheapest move, all checked at turn end — plus the closing broadcast
-//!     order, which clients replay their outro from
+//!   - turn end: pending casts resolving, then the COLUMN BITE (the front
+//!     `feast_width` columns chewed cell by cell: edible units consumed, live
+//!     hazards nibbled one tier, rocks skipped), the leftward shift, the
+//!     refill from the right edge, the pending list clearing and budgets
+//!     reset — in that order
+//!   - the shared charge pool: one per game (canisters aside), per-move cost,
+//!     a group priced at the GROUP cost INSTEAD of its components' costs, the
+//!     refusal of any lock-in that would take the turn's quote past the pool,
+//!     and a BROKE team's cast presses becoming passes
+//!   - hunger accounting: a flat cost per BITE — consumed and nibbled alike
+//!   - score = units CONSUMED (all of which are neutral, defused, or
+//!     food-shaped specials); nibbles never score
+//!   - end conditions: field cleared / the hunger clock filling, checked at
+//!     turn end — plus the closing broadcast order, which clients replay
+//!     their outro from
 //!   - wire contents: grid, reservoir, turn, cursors, selections, cast budgets,
 //!     charges, and the turn's pending casts
 
@@ -124,8 +128,9 @@ const enc_mixed = enc.Encounter{
 };
 
 /// Exactly as many EDIBLE units as one `block` stamp covers (3x3 = 9).  Live,
-/// they are walls: no hunger, no score.  Under the default fixture config the
-/// duo bar is 200, so hunger never binds here — the pressure is the walls.
+/// they are nibbles: hunger for no score.  Under the default fixture config
+/// the duo bar is 200, so hunger never binds here — the pressure is the
+/// wasted bites.
 const enc_tight_budget = enc.Encounter{
     .label = "test_tight_budget",
     .slime = .{ .neutral = 9 },
@@ -139,8 +144,8 @@ const enc_paper_stomach = enc.Encounter{
     .slime = .{ .neutral = 9 },
 };
 
-/// Neutral-only: nothing walls the flood off, so the whole field is reachable
-/// from the first turn and every unit scores.
+/// Neutral-only: nothing needs defusing, so every bitten unit is consumed
+/// and every unit scores.
 const enc_neutral_only = enc.Encounter{
     .label = "test_neutral_only",
     .slime = .{ .neutral = 40 },
@@ -445,6 +450,24 @@ fn HungerBase(comptime base: u16) type {
     };
 }
 
+/// A config identical to the fixture except the bite spans the WHOLE grid,
+/// optionally with a custom `hunger_base` — for tests about "everything
+/// edible is eaten this turn" that are not themselves about the bite's
+/// width.  `WholeBite(0)` keeps the fixture bar.
+fn WholeBite(comptime base: u16) type {
+    return struct {
+        const cfg = shared.config.Config{
+            .balance = blk: {
+                var b = fixtures.test_config.balance;
+                b.feast_columns = b.slime_grid.cols;
+                if (base != 0) b.hunger_base = base;
+                break :blk b;
+            },
+            .encounters = fixtures.test_config.encounters,
+        };
+    };
+}
+
 /// Overwrite the whole grid with one cell value — the deterministic setup for
 /// tests that assert exact per-cell outcomes.  The reservoir is left alone.
 fn paint_grid(sess: *Session, cell: c.SlimeCell) void {
@@ -671,9 +694,16 @@ test "a small encounter fits entirely on the grid, leaving holes" {
 
     try std.testing.expectEqual(@as(u16, 20), s.sess.field.grid.occupied());
     try std.testing.expect(s.sess.field.reservoir.is_empty());
-    // Filled top-first, so the top rows hold the slime.
-    for (s.sess.field.grid.live(), 0..) |cell, i| {
-        try std.testing.expectEqual(i < 20, cell.is_slime());
+    // Filled from the right, so the back columns hold the slime: 20 units
+    // fill the rightmost 3 columns of the 6-row grid, plus 2 cells of the
+    // next one in.
+    const grid = &s.sess.field.grid;
+    for (grid.live(), 0..) |cell, i| {
+        const col = grid.col_of(@intCast(i));
+        const row = grid.row_of(@intCast(i));
+        const expected = col >= grid.cols - 3 or
+            (col == grid.cols - 4 and row < 2);
+        try std.testing.expectEqual(expected, cell.is_slime());
     }
 }
 
@@ -1606,13 +1636,15 @@ test "chasing a partner's stale cursor does not form a group" {
 }
 
 // ---------------------------------------------------------------------------
-// Turn end: the pathed feast, gravity, and the refill
+// Turn end: the column bite, the leftward shift, and the refill
 //
-// The Lil Guys enter from the LEFT edge (column 0) and flood 4-connected
-// through empty cells and edible slime (neutral / defused).  Live hazards and
-// specials are WALLS: the flood never enters one, so everything behind it is
-// sheltered.  Survivors then fall to the bottom of their column, and only then
-// does the reservoir refill the rows that opened up at the top.
+// The Lil Guys stand at the LEFT edge and bite the front `feast_width`
+// columns cell by cell: edible units (neutral / defused / consumable
+// specials) are consumed, live hazards are NIBBLED one tier softer (hunger,
+// no score), rocks are skipped.  Survivors then pack LEFT along their row,
+// and only then does the reservoir refill the columns that opened up on the
+// right.  The fixture width is 1 column; tests about "the whole field is
+// eaten" run on WholeBite, whose bite spans the grid.
 //
 // Nothing here depends on elapsed time — `end_turn_idly` settles the turn by
 // exhausting budgets.
@@ -1622,9 +1654,9 @@ test "an edible field is eaten whole and refilled from the reservoir" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
+    try init_two_player_session_cfg(&s, allocator, SEED, &WholeBite(0).cfg);
     defer s.deinit();
-    // 80 NEUTRAL units: nothing blocks, so the flood reaches the whole grid.
+    // 80 NEUTRAL units under a whole-board bite: everything on-grid goes.
     const enc_all_neutral = enc.Encounter{
         .label = "test_all_neutral",
         .slime = .{ .neutral = 80 },
@@ -1640,7 +1672,31 @@ test "an edible field is eaten whole and refilled from the reservoir" {
     try std.testing.expectEqual(@as(u16, 2), s.sess.turn);
 }
 
-test "refills enter from the top row" {
+test "the bite takes only the front columns; the rest of the field waits" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator); // fixture width: 1 column
+    defer s.deinit();
+    try start(&s, &enc_neutral_only);
+    paint_grid(&s.sess, .neutral);
+    s.sess.field.reservoir = .{};
+
+    try end_turn_idly(&s.sess);
+
+    // One 6-cell column eaten; the shift then walks every row one step left
+    // and nothing refills (the reservoir is dry), so the RIGHT column opens.
+    try std.testing.expectEqual(@as(u32, 6), s.sess.score);
+    try std.testing.expectEqual(@as(u16, 54), s.sess.field.grid.occupied());
+    const grid = &s.sess.field.grid;
+    var row: u8 = 0;
+    while (row < grid.rows) : (row += 1) {
+        try std.testing.expect(grid.at(row, 0).is_slime());
+        try std.testing.expect(!grid.at(row, grid.cols - 1).is_slime());
+    }
+}
+
+test "refills enter from the right edge" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -1648,63 +1704,72 @@ test "refills enter from the top row" {
     defer s.deinit();
     try start(&s, &enc_neutral_only); // 40 neutral, all edible
     // Clear the board so the refill has the whole grid to itself and the test
-    // is not reading survivors the collapse moved.
+    // is not reading survivors the shift moved.
     paint_grid(&s.sess, .empty);
     s.sess.field.reservoir = .{ .neutral = 20 };
 
     try end_turn_idly(&s.sess);
 
-    // 20 units into a 10-wide grid: the top two rows, and nothing below.
-    const cols = s.sess.field.grid.cols;
-    var col: u8 = 0;
-    while (col < cols) : (col += 1) {
-        try std.testing.expect(s.sess.field.grid.at(0, col).is_slime());
-        try std.testing.expect(s.sess.field.grid.at(1, col).is_slime());
-        try std.testing.expect(!s.sess.field.grid.at(2, col).is_slime());
+    // 20 units into a 6-row grid: the rightmost three columns fill whole,
+    // the fourth-from-right takes the remaining two, and the front stays
+    // open — new slime enters at the far end of the conveyor.
+    const grid = &s.sess.field.grid;
+    const last = grid.cols - 1;
+    var row: u8 = 0;
+    while (row < grid.rows) : (row += 1) {
+        try std.testing.expect(grid.at(row, last).is_slime());
+        try std.testing.expect(grid.at(row, last - 1).is_slime());
+        try std.testing.expect(grid.at(row, last - 2).is_slime());
+        try std.testing.expect(!grid.at(row, 0).is_slime());
     }
+    try std.testing.expect(grid.at(0, last - 3).is_slime());
+    try std.testing.expect(grid.at(1, last - 3).is_slime());
+    try std.testing.expect(!grid.at(2, last - 3).is_slime());
 }
 
-test "a live hazard is a wall, not a meal: the flood never touches it" {
+test "a live hazard is nibbled, never consumed: hunger for no score" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
+    try init_two_player_session_cfg(&s, allocator, SEED, &WholeBite(0).cfg);
     defer s.deinit();
     try start(&s, &enc_twenty_green);
 
-    // A field of live green: not one unit is edible, so the feast is empty.
+    // A field of live green under a whole-board bite: every unit is nibbled
+    // — 20 hunger, zero score — and every green steps to defused in place.
     set_field(&s.sess, tiered(.green), 20);
-    try end_turn_mid_game(&s.sess);
-
-    try std.testing.expectEqual(@as(u16, 0), s.sess.hunger.current);
-    try std.testing.expectEqual(@as(u32, 0), s.sess.score);
-    // All 20 are still there, and none of them counted as sheltered food:
-    // a wall is not something the team was denied, it is the obstacle itself.
-    try std.testing.expectEqual(@as(u16, 20), s.sess.field.grid.hazard_count());
-    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.feast.sheltered);
-
-    // Defuse the same field and it becomes 20 units of dinner.
-    set_field(&s.sess, .neutralized, 20);
     try end_turn_mid_game(&s.sess);
 
     try std.testing.expectEqual(
         @as(u16, @intCast(20 * BAL.hunger_cost_normal)),
         s.sess.hunger.current,
     );
+    try std.testing.expectEqual(@as(u32, 0), s.sess.score);
+    try std.testing.expectEqual(@as(u32, 20), s.sess.stats.feast.hazards_bitten);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.field.grid.hazard_count());
+
+    // Defused (by the nibbles or by casts), the same field is 20 units of
+    // dinner — consumed AND scored this time.
+    set_field(&s.sess, .neutralized, 20);
+    try end_turn_mid_game(&s.sess);
+
+    try std.testing.expectEqual(
+        @as(u16, @intCast(40 * BAL.hunger_cost_normal)),
+        s.sess.hunger.current,
+    );
     try std.testing.expectEqual(@as(u32, 20), s.sess.score);
     try std.testing.expectEqual(@as(u16, 20), s.sess.stats.feast.defused_consumed);
 }
 
-test "food behind a wall is sheltered, and one defusal opens the whole road" {
+test "a hot front is nibbled this turn and eaten the next" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
+    try init_two_player_session(&s, allocator); // fixture width: 1 column
     defer s.deinit();
     try start(&s, &enc_twenty_green);
 
-    // Column 0 is a solid green wall; columns 1..9 are neutral food.  The door
-    // is shut, so a whole grid of dinner goes untouched.
+    // Column 0 is a solid green wall; columns 1..9 are neutral food.
     //
     //   col:  0  1  2 ... 9
     //         G  n  n ... n     (every row)
@@ -1715,39 +1780,35 @@ test "food behind a wall is sheltered, and one defusal opens the whole road" {
     while (row < grid.rows) : (row += 1) grid.set(row, 0, tiered(.green));
 
     try end_turn_idly(&s.sess);
+    // Six nibbles: the greens step to defused in place, fill the hunger
+    // clock, and score nothing.  Nothing behind them is touched.
     try std.testing.expectEqual(@as(u32, 0), s.sess.score);
-    // 54 neutral units the team could see and not reach, behind 6 walls.
-    try std.testing.expectEqual(@as(u16, 54), s.sess.stats.feast.sheltered);
-    try std.testing.expectEqual(@as(u16, 6), s.sess.field.grid.hazard_count());
+    try std.testing.expectEqual(@as(u32, 6), s.sess.stats.feast.hazards_bitten);
+    try std.testing.expectEqual(@as(u16, 0), s.sess.field.grid.hazard_count());
+    try std.testing.expectEqual(
+        @as(u16, @intCast(6 * BAL.hunger_cost_normal)),
+        s.sess.hunger.current,
+    );
 
-    // Now knock ONE hole in the wall.  4-connectivity means a single doorway
-    // is enough: the flood goes in and takes everything.
-    paint_grid(&s.sess, .neutral);
-    row = 0;
-    while (row < grid.rows) : (row += 1) grid.set(row, 0, tiered(.green));
-    grid.set(3, 0, .neutralized);
-
+    // The next bite finds the front defused and CONSUMES it.
     try end_turn_idly(&s.sess);
-    // The doorway cell plus all 54 behind it: 55 units, from zero last turn.
-    try std.testing.expectEqual(@as(u32, 55), s.sess.score);
-    // And not one unit was shut out this time.
-    try std.testing.expectEqual(@as(u16, 54), s.sess.stats.feast.sheltered);
+    try std.testing.expectEqual(@as(u32, 6), s.sess.score);
+    try std.testing.expectEqual(@as(u16, 6), s.sess.stats.feast.defused_consumed);
 }
 
-test "one feast can mix every cell kind, pricing each on its own terms" {
+test "one bite can mix every cell kind, pricing each on its own terms" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
+    try init_two_player_session_cfg(&s, allocator, SEED, &WholeBite(0).cfg);
     defer s.deinit();
     try start(&s, &enc_twenty_red);
 
     // Row 0 of the 6x10 grid, left to right:
     //   n  n  .  .  .  x  x  .  .  .      (n neutral, x defused, . empty)
-    // and a neutral unit sealed into the bottom-right corner by two hazards:
-    //   (4,9) red above it, (5,8) green beside it, grid edges on the other two
-    //   sides.  A pocket needs a full seal — an open cell anywhere on its
-    //   border lets the flood in, since empty space conducts.
+    // plus a red at (4,9), a green at (5,8) and a neutral at (5,9).  The
+    // whole-board bite visits every cell: food is consumed, hazards are
+    // nibbled where they stand.
     paint_grid(&s.sess, .empty);
     s.sess.field.reservoir = .{};
     const grid = &s.sess.field.grid;
@@ -1761,22 +1822,23 @@ test "one feast can mix every cell kind, pricing each on its own terms" {
 
     try end_turn_idly(&s.sess);
 
-    // Eaten: 2 neutral + 2 defused.  The hazards are walls, and the corner
-    // neutral has no route to the left edge at all.
+    // Consumed: 3 neutral + 2 defused, one score each.  Nibbled: the red
+    // (to yellow) and the green (to defused) — hunger, no score.
     try std.testing.expectEqual(
-        @as(u16, @intCast(4 * BAL.hunger_cost_normal)),
+        @as(u16, @intCast(7 * BAL.hunger_cost_normal)),
         s.sess.hunger.current,
     );
-    try std.testing.expectEqual(@as(u32, 4), s.sess.score);
-    try std.testing.expectEqual(@as(u16, 2), s.sess.stats.feast.neutral_consumed);
+    try std.testing.expectEqual(@as(u32, 5), s.sess.score);
+    try std.testing.expectEqual(@as(u16, 3), s.sess.stats.feast.neutral_consumed);
     try std.testing.expectEqual(@as(u16, 2), s.sess.stats.feast.defused_consumed);
-    try std.testing.expectEqual(@as(u16, 1), s.sess.stats.feast.sheltered);
-    // Both hazards survive, so the field is not exhausted.
-    try std.testing.expectEqual(@as(u16, 2), s.sess.field.grid.hazard_count());
+    try std.testing.expectEqual(@as(u32, 2), s.sess.stats.feast.hazards_bitten);
+    // The red survives one tier softer; the green went all the way to
+    // defused, so it is no longer a hazard — but it IS still on the board.
+    try std.testing.expectEqual(@as(u16, 1), s.sess.field.grid.hazard_count());
     try std.testing.expect(!s.sess.field.is_exhausted());
 }
 
-test "survivors fall to the bottom of their column after the feast" {
+test "survivors pack left along their row after the bite" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
@@ -1784,29 +1846,31 @@ test "survivors fall to the bottom of their column after the feast" {
     defer s.deinit();
     try start(&s, &enc_twenty_green);
 
-    // Column 3, top to bottom: neutral, green, empty, empty, empty, empty.
-    // The neutral is edible but unreachable (column 0 is empty corridor, so the
-    // flood arrives along row 0 and eats it) — check the green's fall instead.
+    // Two hazards deep in row 1 and row 2; column 0 is empty, so the bite
+    // gets nothing and the shift is the whole story.
     paint_grid(&s.sess, .empty);
     s.sess.field.reservoir = .{};
     const grid = &s.sess.field.grid;
     grid.set(1, 3, tiered(.green));
-    grid.set(2, 3, tiered(.red));
+    grid.set(1, 5, tiered(.red));
+    grid.set(2, 7, tiered(.red));
 
     try end_turn_idly(&s.sess);
 
-    // Both hazards packed against the bottom, in the order they were stacked.
+    // Each row packed against the left edge, order preserved, no lane change.
+    try std.testing.expectEqual(c.SlimeCell{ .tiered = .green }, grid.at(1, 0));
+    try std.testing.expectEqual(c.SlimeCell{ .tiered = .red }, grid.at(1, 1));
+    try std.testing.expectEqual(c.SlimeCell{ .tiered = .red }, grid.at(2, 0));
     try std.testing.expectEqual(c.SlimeCell.empty, grid.at(1, 3));
-    try std.testing.expectEqual(c.SlimeCell.empty, grid.at(2, 3));
-    try std.testing.expectEqual(c.SlimeCell{ .tiered = .green }, grid.at(4, 3));
-    try std.testing.expectEqual(c.SlimeCell{ .tiered = .red }, grid.at(5, 3));
+    try std.testing.expectEqual(c.SlimeCell.empty, grid.at(1, 5));
+    try std.testing.expectEqual(c.SlimeCell.empty, grid.at(2, 7));
 }
 
 test "neutral slime is the only thing on the field that needs no work" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
+    try init_two_player_session_cfg(&s, allocator, SEED, &WholeBite(0).cfg);
     defer s.deinit();
     try start(&s, &enc_neutral_only);
     set_field(&s.sess, .neutral, 10);
@@ -1814,18 +1878,17 @@ test "neutral slime is the only thing on the field that needs no work" {
     try end_turn_idly(&s.sess);
     try std.testing.expectEqual(@as(u32, 10), s.sess.score);
     try std.testing.expectEqual(@as(u16, 10), s.sess.stats.feast.neutral_consumed);
-    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.feast.sheltered);
+    try std.testing.expectEqual(@as(u32, 0), s.sess.stats.feast.hazards_bitten);
 }
 
-test "a stamp destroys nothing: it converts a wall into a meal" {
+test "a stamp destroys nothing: it converts a nibble into a meal" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
+    try init_two_player_session_cfg(&s, allocator, SEED, &WholeBite(0).cfg);
     defer s.deinit();
     try start(&s, &enc_twenty_green);
-    // A 3x3 patch of green anchored on column 1, so the patch touches the left
-    // edge and the flood can reach it the moment it is defused.
+    // A 3x3 patch of green anchored on column 1.
     set_block_field(&s.sess, tiered(.green), 2, 1);
 
     aim_at(&s.sess, s.p[0].pid, 2, 1);
@@ -1837,9 +1900,10 @@ test "a stamp destroys nothing: it converts a wall into a meal" {
 
     try end_turn_idly(&s.sess);
 
-    // Defusal is what makes a unit food at all: 9 eaten, 9 scored.
+    // Defusal is what makes a unit SCORE at all: 9 eaten, 9 scored, and not
+    // one nibble wasted.
     try std.testing.expectEqual(@as(u32, 9), s.sess.score);
-    try std.testing.expectEqual(@as(u16, 0), s.sess.stats.feast.sheltered);
+    try std.testing.expectEqual(@as(u32, 0), s.sess.stats.feast.hazards_bitten);
     try std.testing.expectEqual(
         @as(u16, @intCast(9 * BAL.hunger_cost_normal)),
         s.sess.hunger.current,
@@ -1853,19 +1917,16 @@ test "turn_ended reports the feast the clients must animate" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
+    try init_two_player_session(&s, allocator); // fixture width: 1 column
     defer s.deinit();
     try start(&s, &enc_twenty_green);
-    // Row 0: 2 neutral at the door.  Bottom-right: 1 neutral sealed into the
-    // corner by 2 hazards.  Reserves keep the game alive past the turn.
+    // Column 0: one neutral and one green.  Reserves keep the game alive
+    // past the turn.
     paint_grid(&s.sess, .empty);
     s.sess.field.reservoir = .{ .neutral = 3 };
     const grid = &s.sess.field.grid;
     grid.set(0, 0, .neutral);
-    grid.set(0, 1, .neutral);
-    grid.set(4, 9, tiered(.green));
-    grid.set(5, 8, tiered(.green));
-    grid.set(5, 9, .neutral);
+    grid.set(1, 0, tiered(.green));
 
     const charges_before = s.sess.charges;
     s.p[1].clear();
@@ -1877,16 +1938,16 @@ test "turn_ended reports the feast the clients must animate" {
     const te = try proto.decode_turn_ended(fbs.reader());
 
     try std.testing.expectEqual(@as(u16, 1), te.turn);
-    try std.testing.expectEqual(@as(u16, 2), te.cells_eaten);
+    try std.testing.expectEqual(@as(u16, 1), te.cells_eaten);
+    // One consume plus one nibble: both fill the clock.
     try std.testing.expectEqual(
         @as(u16, @intCast(2 * BAL.hunger_cost_normal)),
         te.hunger_added,
     );
-    // The two numbers the next turn is planned around: what a wall cost them,
-    // and how many walls there were.
-    try std.testing.expectEqual(@as(u16, 1), te.sheltered);
-    try std.testing.expectEqual(@as(u16, 2), te.walls);
-    try std.testing.expectEqual(@as(u32, 2), te.score_added);
+    // The number the next turn is planned around: hunger spent on a cell no
+    // cast defused in time.
+    try std.testing.expectEqual(@as(u16, 1), te.hazards_bitten);
+    try std.testing.expectEqual(@as(u32, 1), te.score_added);
     // The broadcast agrees with the session it describes.
     try std.testing.expectEqual(te.hunger_added, s.sess.hunger.current);
     try std.testing.expectEqual(te.score_added, s.sess.score);
@@ -1901,13 +1962,13 @@ test "a swallowed canister refills the team's charge pool at turn end" {
     defer s.deinit();
     try start(&s, &enc_twenty_green);
 
-    // A canister on the feast's path, with reserves so the game outlives
+    // A canister in the bitten column, with reserves so the game outlives
     // the turn.
     paint_grid(&s.sess, .empty);
     s.sess.field.reservoir = .{ .neutral = 3 };
     const grid = &s.sess.field.grid;
     grid.set(0, 0, .neutral);
-    grid.set(0, 1, .{ .special = .canister });
+    grid.set(1, 0, .{ .special = .canister });
 
     const charges_before = s.sess.charges;
     try end_turn_idly(&s.sess);
@@ -1949,12 +2010,13 @@ test "eating an egg hatches a baby: capacity grows, the brood is tallied and ann
     try init_two_player_session(&s, allocator);
     defer s.deinit();
     try start(&s, &enc_twenty_green);
-    // One egg and one neutral at the door; reserves keep the game alive.
+    // One egg and one neutral in the bitten column; reserves keep the game
+    // alive.
     paint_grid(&s.sess, .empty);
     s.sess.field.reservoir = .{ .neutral = 3 };
     const grid = &s.sess.field.grid;
     grid.set(0, 0, .{ .special = .egg });
-    grid.set(0, 1, .neutral);
+    grid.set(1, 0, .neutral);
     const egg_cell = grid.index(0, 0);
     const max_before = s.sess.hunger.max;
 
@@ -2012,23 +2074,24 @@ test "eaten neutralizers fire 3x3 Agent blocks and are FREE food" {
     try init_two_player_session(&s, allocator);
     defer s.deinit();
     try start(&s, &enc_twenty_green);
-    // Bottom row: a red at col 2, then three reachable neutralizers.  The
-    // feast swallows all three for FREE; the first one's 3x3 (rows 4-5,
-    // cols 2-4) steps the red one tier.
+    // Column 0: three neutralizers spaced two rows apart, so their 3x3
+    // blocks never overlap on the red parked one column deep at (0,1).  The
+    // bite swallows all three for FREE; only the first one's block reaches
+    // the red, stepping it exactly one tier.
     paint_grid(&s.sess, .empty);
     s.sess.field.reservoir = .{};
     const grid = &s.sess.field.grid;
-    const bottom = grid.rows - 1;
-    grid.set(bottom, 2, tiered(.red));
-    grid.set(bottom, 3, .{ .special = .neutralizer });
-    grid.set(bottom, 4, .{ .special = .neutralizer });
-    grid.set(bottom, 5, .{ .special = .neutralizer });
+    grid.set(0, 0, .{ .special = .neutralizer });
+    grid.set(2, 0, .{ .special = .neutralizer });
+    grid.set(4, 0, .{ .special = .neutralizer });
+    grid.set(0, 1, tiered(.red));
 
     s.p[0].clear();
     try end_turn_idly(&s.sess);
 
-    // All three swallowed; the yellow (still a wall) is the only survivor.
-    try std.testing.expectEqual(tiered(.yellow), grid.at(bottom, 2));
+    // All three swallowed; the yellow (one column deep, out of the bite and
+    // shifted to the front by the settle) is the only survivor.
+    try std.testing.expectEqual(tiered(.yellow), grid.at(0, 0));
     try std.testing.expectEqual(@as(u16, 0), grid.special_count());
     try std.testing.expectEqual(@as(u32, 0), s.sess.score);
     try std.testing.expectEqual(@as(u16, 0), s.sess.hunger.current);
@@ -2046,7 +2109,7 @@ test "eaten neutralizers fire 3x3 Agent blocks and are FREE food" {
     try std.testing.expectEqual(@as(u8, 1), te.passes);
 }
 
-test "a swallowed neutralizer opens a sealed wall and the SAME feast eats through" {
+test "a swallowed neutralizer defuses a cell later in the SAME bite, which is consumed" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -2059,30 +2122,23 @@ test "a swallowed neutralizer opens a sealed wall and the SAME feast eats throug
     paint_grid(&s.sess, .empty);
     s.sess.field.reservoir = .{};
     const grid = &s.sess.field.grid;
-    const bottom = grid.rows - 1;
-    // A neutral sealed into the bottom of column 1 by three green walls; a
-    // reachable neutralizer sits above the seal.  Swallowing it fires the
-    // 3x3 (rows bottom-2..bottom, cols 0..2... anchored at (bottom-2,1):
-    // rows bottom-3..bottom-1) that defuses the green at (bottom-1,1) — and
-    // the same flood pours through the hole it just opened.
-    grid.set(bottom, 0, tiered(.green));
-    grid.set(bottom - 1, 1, tiered(.green));
-    grid.set(bottom, 1, .neutral);
-    grid.set(bottom, 2, tiered(.green));
-    grid.set(bottom - 2, 1, .{ .special = .neutralizer });
+    // Column 0, top-down: neutralizer, green, neutral.  The bite walks
+    // top-down, so the neutralizer's 3x3 defuses the green BEFORE the walk
+    // reaches it — the same bite then consumes it whole instead of nibbling.
+    grid.set(0, 0, .{ .special = .neutralizer });
+    grid.set(1, 0, tiered(.green));
+    grid.set(2, 0, .neutral);
 
     s.p[0].clear();
     try end_turn_idly(&s.sess);
 
-    // One pass, one continuous meal: the neutralizer (free), the defused
-    // wall, and the neutral it had sealed in.  The two uncovered greens
-    // stand; the settle then collapses them to the floor of their columns.
-    try std.testing.expectEqual(tiered(.green), grid.at(bottom, 0));
-    try std.testing.expectEqual(tiered(.green), grid.at(bottom, 2));
-    try std.testing.expectEqual(SC(.empty), grid.at(bottom, 1));
-    try std.testing.expectEqual(SC(.empty), grid.at(bottom - 1, 1));
-    try std.testing.expectEqual(SC(.empty), grid.at(bottom - 2, 1));
+    // One pass, one continuous bite: the neutralizer (free), the defused
+    // green, and the neutral — the column empties, nothing was nibbled.
+    try std.testing.expectEqual(SC(.empty), grid.at(0, 0));
+    try std.testing.expectEqual(SC(.empty), grid.at(1, 0));
+    try std.testing.expectEqual(SC(.empty), grid.at(2, 0));
     try std.testing.expectEqual(@as(u32, 2), s.sess.score); // defused + neutral
+    try std.testing.expectEqual(@as(u32, 0), s.sess.stats.feast.hazards_bitten);
 
     const msgs = try drain(s.p[0].buf.items, arena);
     const te_msg = find_tag(msgs, .turn_ended) orelse return error.NoTurnEnded;
@@ -2092,8 +2148,7 @@ test "a swallowed neutralizer opens a sealed wall and the SAME feast eats throug
     // not a cascade of settle passes.
     try std.testing.expectEqual(@as(u16, 3), te.cells_eaten);
     try std.testing.expectEqual(@as(u8, 1), te.passes);
-    try std.testing.expectEqual(@as(u16, 2), te.walls);
-    try std.testing.expectEqual(@as(u16, 0), te.sheltered);
+    try std.testing.expectEqual(@as(u16, 0), te.hazards_bitten);
 }
 
 test "a refilled line of neutralizers stays put: matches are dormant" {
@@ -2110,9 +2165,8 @@ test "a refilled line of neutralizers stays put: matches are dormant" {
     const grid = &s.sess.field.grid;
     const bottom = grid.rows - 1;
     // A red on the floor keeps the encounter alive; the reservoir holds
-    // EXACTLY three neutralizers, so the refill lands them on the top row's
-    // first three ELIGIBLE cells — the door column (col 0) never takes a
-    // special, so they seat at cols 1..3, a line the moment they arrive.
+    // EXACTLY three neutralizers, so the right-to-left refill lands them
+    // down the RIGHTMOST column — a vertical line the moment they arrive.
     // Nothing fires: match machinery is dormant, and refills are never
     // eaten same-turn.
     grid.set(bottom, 0, tiered(.red));
@@ -2122,10 +2176,10 @@ test "a refilled line of neutralizers stays put: matches are dormant" {
     s.p[0].clear();
     try end_turn_idly(&s.sess);
 
-    try std.testing.expectEqual(SC(.empty), grid.get(0));
-    try std.testing.expectEqual(SC(.{ .special = .neutralizer }), grid.get(1));
-    try std.testing.expectEqual(SC(.{ .special = .neutralizer }), grid.get(2));
-    try std.testing.expectEqual(SC(.{ .special = .neutralizer }), grid.get(3));
+    const last = grid.cols - 1;
+    try std.testing.expectEqual(SC(.{ .special = .neutralizer }), grid.at(0, last));
+    try std.testing.expectEqual(SC(.{ .special = .neutralizer }), grid.at(1, last));
+    try std.testing.expectEqual(SC(.{ .special = .neutralizer }), grid.at(2, last));
     try std.testing.expectEqual(@as(u16, 3), grid.special_count());
 
     const msgs = try drain(s.p[0].buf.items, arena);
@@ -2135,7 +2189,9 @@ test "a refilled line of neutralizers stays put: matches are dormant" {
     const fr = try proto.decode_field_refilled(fbs.reader());
     try std.testing.expectEqual(@as(u8, 0), fr.pass);
     try std.testing.expectEqual(@as(u16, 3), fr.count);
-    try std.testing.expectEqualSlices(u16, &[_]u16{ 1, 2, 3 }, fr.cells[0..3]);
+    try std.testing.expectEqualSlices(u16, &[_]u16{
+        grid.index(0, last), grid.index(1, last), grid.index(2, last),
+    }, fr.cells[0..3]);
     for (fr.contents[0..3]) |cell| {
         try std.testing.expectEqual(SC(.{ .special = .neutralizer }), cell);
     }
@@ -2787,12 +2843,13 @@ test "eating everything ends the game with reason field_cleared" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
+    try init_two_player_session_cfg(&s, allocator, SEED, &WholeBite(0).cfg);
     defer s.deinit();
     try start(&s, &enc_neutral_only); // 40 neutral, roomy budget
 
     s.p[0].clear();
-    // One feast eats all 40 and the reservoir has nothing to send back.
+    // One whole-board bite eats all 40 and the reservoir has nothing to
+    // send back.
     try end_turn_idly(&s.sess);
 
     try std.testing.expect(s.sess.restart_pending);
@@ -2813,14 +2870,13 @@ test "a full hunger bar ends the game with slime left over" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    // hunger_base 3 → the pair's bar is 6.
-    try init_two_player_session_cfg(&s, allocator, SEED, &HungerBase(3).cfg);
+    // hunger_base 3 → the pair's bar is 6; the bite spans the board.
+    try init_two_player_session_cfg(&s, allocator, SEED, &WholeBite(3).cfg);
     defer s.deinit();
-    // 8 edible units on the field against a bar of 6: the feast overfills it.
+    // 9 edible units on the field against a bar of 6: the feast overfills it.
     try start(&s, &enc_paper_stomach);
-    // Hold one unit back so the field is NOT cleared by the feast: the loss has
-    // to be unambiguous.
-    s.sess.field.grid.put(8, .empty);
+    // Keep a reserve so the field is NOT cleared by the feast: the clock has
+    // to be what unambiguously calls the game.
     s.sess.field.reservoir = .{ .neutral = 1 };
 
     s.p[0].clear();
@@ -2842,15 +2898,15 @@ test "defusing the tight budget survives what idle play loses" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
+    try init_two_player_session_cfg(&s, allocator, SEED, &WholeBite(0).cfg);
     defer s.deinit();
     try start(&s, &enc_tight_budget); // duo bar 200 — hunger never binds here
     set_block_field(&s.sess, tiered(.green), 2, 5);
 
-    // One `block` stamp defuses the whole field.  Left alone, those 9 cells are
-    // walls: no hunger, no score, and the encounter never ends.  Defused, they
-    // are 9 units of reachable food — the entire difference between playing and
-    // not playing.
+    // One `block` stamp defuses the whole field.  Left alone, those 9 cells
+    // would each cost a wasted nibble before scoring.  Defused, they are 9
+    // units of clean food — the difference between playing and not playing
+    // is the hunger-clock saved.
     aim_at(&s.sess, s.p[0].pid, 2, 5);
     try enqueue_cast_as(&s.sess, s.p[0].pid, BLOCK);
     try flush_and_resolve(&s.sess);
@@ -2871,8 +2927,8 @@ test "field_cleared wins the tie when the last bite fills the bar" {
 
     var s: TwoPlayerSession = undefined;
     // 2 neutral units against a bar of exactly 2 (hunger_base 1 × two
-    // players): the field empties as the bar fills.
-    try init_two_player_session_cfg(&s, allocator, SEED, &HungerBase(1).cfg);
+    // players), whole-board bite: the field empties as the bar fills.
+    try init_two_player_session_cfg(&s, allocator, SEED, &WholeBite(1).cfg);
     defer s.deinit();
     const encounter = enc.Encounter{
         .label = "test_exact",
@@ -2893,8 +2949,9 @@ test "field_cleared wins the tie when the last bite fills the bar" {
 //
 // These use `priced_config`, whose cheapest move costs 1.  The default fixture
 // has the free `trickle`, so its `cheapest_cost` is 0 and a team there can
-// never be unable to act — which is deliberate, and which makes these tests
-// impossible to write against it.
+// never be broke — which is deliberate, and which makes these tests
+// impossible to write against it.  Going broke no longer ENDS anything: a
+// broke team's cast presses become passes and the bite plays the game out.
 // ---------------------------------------------------------------------------
 
 /// A pair on the priced table, mid-encounter, with a pool the test sets itself.
@@ -2902,7 +2959,7 @@ fn init_priced_session(s: *TwoPlayerSession, allocator: std.mem.Allocator) !void
     try init_two_player_session_cfg(s, allocator, SEED, &fixtures.priced_config);
 }
 
-test "an empty pool ends the game even when the feast is still eating" {
+test "an empty pool does not end the game: cast presses become passes" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
@@ -2913,43 +2970,53 @@ test "an empty pool ends the game even when the feast is still eating" {
     defer s.deinit();
     try start(&s, &enc_neutral_only); // 40 neutral, roomy bar
 
-    // Plenty of food left and plenty of room to eat it — the ONLY thing wrong
-    // is that the team cannot cast.  A feast that eats is not a reprieve: with
-    // no charges there are no decisions left to make, so the encounter is over.
-    set_field(&s.sess, .{ .neutral = {} }, 10);
+    // Food on the field, room on the bar, and not one charge in the pool.
+    // The team cannot cast — but the bite still chews, so the game goes on.
+    paint_grid(&s.sess, .neutral);
     s.sess.field.reservoir = .{ .neutral = 5 }; // field cannot clear
     s.sess.charges = 0;
 
     s.p[0].clear();
-    try end_turn_idly(&s.sess);
+    // Every press is a PASS: it spends the budget slot (pacing the turn) and
+    // locks in nothing.  Two players x the full budget settles the turn.
+    for (0..BUDGET) |_| {
+        try enqueue_cast(&s.sess, s.p[0].pid);
+        try enqueue_cast(&s.sess, s.p[1].pid);
+    }
+    try flush(&s.sess);
 
-    try std.testing.expect(s.sess.restart_pending);
+    // The turn ended and the game CONTINUES: broke is not an ending.
+    try std.testing.expect(!s.sess.restart_pending);
+    try std.testing.expectEqual(@as(u16, 2), s.sess.turn);
     const msgs = try drain(s.p[0].buf.items, arena);
     const te_msg = find_tag(msgs, .turn_ended) orelse return error.NoTurnEnded;
     var te_fbs = std.io.fixedBufferStream(te_msg.payload);
     const te = try proto.decode_turn_ended(te_fbs.reader());
-    try std.testing.expect(te.cells_eaten > 0); // the closing feast DID eat
-
-    const go = try game_over_msg(msgs);
-    try std.testing.expectEqual(proto.EndReason.out_of_charges, go.stats.reason);
-    try std.testing.expect(go.stats.slime_left > 0);
+    try std.testing.expect(te.cells_eaten > 0); // the bite DID eat
+    // Passes are not refusals: nobody was told over_budget, and nothing
+    // landed on the board.
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .over_budget));
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .shape_cast));
 }
 
-test "a pool that can still afford the cheapest move keeps the game going" {
+test "a pool that can still afford the cheapest move takes lock-ins, not passes" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
     try init_priced_session(&s, allocator);
     defer s.deinit();
     try start(&s, &enc_neutral_only);
-    set_field(&s.sess, .{ .neutral = {} }, 10);
+    paint_grid(&s.sess, .neutral);
     s.sess.field.reservoir = .{ .neutral = 5 };
 
-    // One charge, and `poke` costs exactly one: the team has a move, so it has
-    // a game.  This is the boundary the end condition is written against.
-    s.sess.charges = fixtures.priced_config.balance.cheapest_cost();
-    try end_turn_idly(&s.sess);
-
+    // Two charges against a cheapest move of one: the team is NOT broke, so
+    // a press is a real lock-in — it joins the pending list rather than
+    // passing.  This is the boundary the pass rule is written against.
+    s.sess.charges = 2;
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try flush(&s.sess);
+    try std.testing.expectEqual(BUDGET - 1, s.sess.casts_left[s.p[0].pid]);
+    try std.testing.expectEqual(@as(usize, 1), s.sess.pending_count);
     try std.testing.expect(!s.sess.restart_pending);
 }
 
@@ -2963,7 +3030,7 @@ test "going broke mid-turn strands the casts still owed and settles the turn" {
     try init_priced_session(&s, allocator);
     defer s.deinit();
     try start(&s, &enc_neutral_only);
-    set_field(&s.sess, .{ .neutral = {} }, 10);
+    paint_grid(&s.sess, .neutral);
     s.sess.field.reservoir = .{ .neutral = 5 };
 
     // Exactly one poke's worth.  Alice commits it; Bob's three casts and
@@ -2980,7 +3047,6 @@ test "going broke mid-turn strands the casts still owed and settles the turn" {
     // Settled in the same drain as the cast: no second flush, and Bob was never
     // asked for input he had no way to spend.
     try std.testing.expectEqual(@as(u32, 0), s.sess.charges);
-    try std.testing.expect(s.sess.restart_pending);
 
     const msgs = try drain(s.p[0].buf.items, arena);
     try std.testing.expect(find_tag(msgs, .turn_ended) != null);
@@ -2988,8 +3054,11 @@ test "going broke mid-turn strands the casts still owed and settles the turn" {
     // they could not pay for one.
     try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .over_budget));
 
-    const go = try game_over_msg(msgs);
-    try std.testing.expectEqual(proto.EndReason.out_of_charges, go.stats.reason);
+    // And broke does NOT end the game: the next turn opens with fresh
+    // budgets, waiting on presses that will pass.
+    try std.testing.expect(!s.sess.restart_pending);
+    try std.testing.expectEqual(@as(u16, 2), s.sess.turn);
+    try std.testing.expectEqual(BUDGET, s.sess.casts_left[s.p[1].pid]);
 }
 
 test "a free move keeps a bankrupt team playing" {
@@ -3023,11 +3092,11 @@ test "the game-ending turn sends the post-feast board before game_over" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    // hunger_base 3 → a duo bar of 6, so one feast overfills it.
-    try init_two_player_session_cfg(&s, allocator, SEED, &HungerBase(3).cfg);
+    // hunger_base 3 → a duo bar of 6, and a whole-board bite: one feast
+    // overfills it.
+    try init_two_player_session_cfg(&s, allocator, SEED, &WholeBite(3).cfg);
     defer s.deinit();
     try start(&s, &enc_paper_stomach);
-    s.sess.field.grid.put(8, .empty);
     s.sess.field.reservoir = .{ .neutral = 1 };
 
     s.p[0].clear();
@@ -3057,7 +3126,7 @@ test "the game-ending turn sends the post-feast board before game_over" {
     try std.testing.expect(saw_game_over);
 
     // And it is the FINAL board, not a stale one: what the wire carried is what
-    // the field holds now that the feast, the collapse and the refill are done.
+    // the field holds now that the bite, the shift and the refill are done.
     const gs = try last_game_state(msgs);
     try std.testing.expectEqual(s.sess.field.grid.rows, gs.grid_rows);
     try std.testing.expectEqual(s.sess.field.grid.cols, gs.grid_cols);
@@ -3074,11 +3143,11 @@ test "the end screen holds — no new game, no broadcasts — until a restart ar
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
+    try init_two_player_session_cfg(&s, allocator, SEED, &WholeBite(0).cfg);
     defer s.deinit();
     try start(&s, &enc_neutral_only);
     s.sess.hunger.current = 7; // some progress, to prove the later reset
-    try end_turn_idly(&s.sess); // eats everything -> field_cleared
+    try end_turn_idly(&s.sess); // the whole-board bite eats everything -> field_cleared
     try std.testing.expect(s.sess.restart_pending);
 
     // Ticks pass; nothing moves and nothing is sent — the final board and the
@@ -3184,7 +3253,7 @@ test "an observer's restart works at the end screen" {
     const allocator = std.testing.allocator;
 
     var s: TwoPlayerSession = undefined;
-    try init_two_player_session(&s, allocator);
+    try init_two_player_session_cfg(&s, allocator, SEED, &WholeBite(0).cfg);
     defer s.deinit();
     try start(&s, &enc_neutral_only);
     try end_turn_idly(&s.sess);
@@ -3212,10 +3281,11 @@ test "match stats: feast tallies, players and recipes are reported" {
     const arena = arena_state.allocator();
 
     var s: TwoPlayerSession = undefined;
-    // Same 25-unit mix as `enc_mixed`, but with a hunger bar the single feast
-    // below OVERFILLS (hunger_base 2 × two players = 4, against 5 eaten) —
-    // that is what makes the game end and the report get sent in one turn.
-    try init_two_player_session_cfg(&s, allocator, SEED, &HungerBase(2).cfg);
+    // Same 25-unit mix as `enc_mixed`, on a whole-board bite with a hunger
+    // bar the single feast below OVERFILLS (hunger_base 2 × two players = 4,
+    // against 25 bites) — that is what makes the game end and the report get
+    // sent in one turn.
+    try init_two_player_session_cfg(&s, allocator, SEED, &WholeBite(2).cfg);
     defer s.deinit();
     const enc_stats_mixed = enc.Encounter{
         .label = "test_stats_mixed",
@@ -3230,9 +3300,6 @@ test "match stats: feast tallies, players and recipes are reported" {
     //   row 1:  R R R R R R R R n n
     //   row 2:  n n n n n . . . . .
     //   rows 3-5: empty
-    //
-    // Row 1's red run is a near-total wall, which is the point: it decides who
-    // gets eaten and who merely watches.
     paint_grid(&s.sess, .empty);
     var flat: u16 = 0;
     while (flat < 8) : (flat += 1) s.sess.field.grid.put(flat, tiered(.green));
@@ -3249,16 +3316,11 @@ test "match stats: feast tallies, players and recipes are reported" {
     try enqueue_cast_as(&s.sess, s.p[1].pid, SWEEP);
     try flush(&s.sess);
 
-    // The turn ends.  Gravity runs AFTER the meal (never mid-route, never
-    // feeding it), so the meal plays out:
-    //   eat:    (0,0), defused by Alice — the door's first edible — then the
-    //           five row-2 neutrals along the floor and, through the empty
-    //           rows beneath, the two neutrals at (1,8)/(1,9).  Eight cells,
-    //           with the board holding still throughout.
-    //   settle: every column packs onto rows 4-5 — greens and Bob's three
-    //           defused cells land on row 4, the red layer on row 5 — and
-    //           the meal is OVER: Bob's defused cells sit in reach, uneaten,
-    //           next turn's dinner.
+    // The turn ends and the whole-board bite visits every cell:
+    //   consumed: the 4 defused greens (Alice's poke + Bob's sweep) and the
+    //             7 neutrals — 11 cells, 11 points;
+    //   nibbled:  the 4 still-green cells and the 10 reds — 14 bites of
+    //             hunger for nothing.
     try end_turn_idly(&s.sess);
 
     const go = try game_over_msg(try drain(s.p[0].buf.items, arena));
@@ -3266,9 +3328,8 @@ test "match stats: feast tallies, players and recipes are reported" {
 
     try std.testing.expectEqual(proto.EndReason.hunger_full, st.reason);
     try std.testing.expectEqual(@as(u32, 25), st.slime_total);
-    // 8 of 25 eaten; the rest are walls (greens and reds) plus Bob's three
-    // defused cells, dropped into reach by the settle but no longer eaten.
-    try std.testing.expectEqual(@as(u32, 17), st.slime_left);
+    // 11 of 25 eaten; the nibbled hazards all survive in place.
+    try std.testing.expectEqual(@as(u32, 14), st.slime_left);
     try std.testing.expectEqual(@as(u16, 2), st.casts_total);
 
     // Coverage: 4 green cells covered (1 poke + 3 sweep), all defused since
@@ -3276,21 +3337,18 @@ test "match stats: feast tallies, players and recipes are reported" {
     try std.testing.expectEqual(@as(u16, 4), st.feast.cells_covered[GREEN]);
     try std.testing.expectEqual(@as(u16, 0), st.feast.cells_covered[RED]);
     try std.testing.expectEqual(@as(u16, 4), st.feast.neutralized[GREEN]);
-    // Eaten: all seven neutrals plus Alice's door defusal.  Bob's three
-    // defused cells were sealed while the meal ran and only fell into reach
-    // at the settle — after the eating was over.
+    // Consumed: all seven neutrals plus the four cells the casts defused.
     try std.testing.expectEqual(@as(u16, 7), st.feast.neutral_consumed);
-    try std.testing.expectEqual(@as(u16, 1), st.feast.defused_consumed);
-    // Nothing is SHELTERED though: after the settle, Bob's cells sit in the
-    // open — uneaten, but nothing walls them.
-    try std.testing.expectEqual(@as(u16, 0), st.feast.sheltered);
-    try std.testing.expectEqual(@as(u16, @intCast(8 * BAL.hunger_cost_normal)), st.feast.hunger_normal);
+    try std.testing.expectEqual(@as(u16, 4), st.feast.defused_consumed);
+    // Every hazard no cast reached was nibbled — the headline tuning number.
+    try std.testing.expectEqual(@as(u32, 14), st.feast.hazards_bitten);
+    try std.testing.expectEqual(@as(u16, @intCast(25 * BAL.hunger_cost_normal)), st.feast.hunger_normal);
     // Two casts at the fixture default of 1 charge each, out of a pool of
     // 100 (the encounter's 50, grown once for the second seat).
     try std.testing.expectEqual(@as(u16, 2), st.feast.charges_spent);
     try std.testing.expectEqual(@as(u32, 98), st.feast.charges_left);
-    // Score = every unit eaten, defused or neutral alike.
-    try std.testing.expectEqual(@as(u32, 8), go.score);
+    // Score = every unit CONSUMED, defused or neutral alike.
+    try std.testing.expectEqual(@as(u32, 11), go.score);
 
     // Players: dense, coverage attribution + recipe participation.
     try std.testing.expectEqual(@as(u8, 2), st.player_count);

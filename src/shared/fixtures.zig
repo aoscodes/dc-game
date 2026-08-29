@@ -152,9 +152,9 @@ pub const encounters = [_]enc.Encounter{
 /// without `deluge`, which follows it).
 ///
 /// `trickle` costs 0, so under `test_config` the cheapest move is free and the
-/// team can ALWAYS act — which is exactly why the fixture has it, and exactly
-/// why `out_of_charges` can never fire there.  Tests about running the pool dry
-/// need a table with a floor above zero, and this is it.
+/// team can NEVER be broke — which is exactly why the fixture has it.  Tests
+/// about running the pool dry (cast presses becoming passes) need a table
+/// with a floor above zero, and this is it.
 ///
 /// The indices POKE..WEDGE are unchanged, so the group table (which names
 /// components by index) is shared verbatim.

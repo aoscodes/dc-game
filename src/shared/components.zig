@@ -103,10 +103,11 @@ pub const Tier = enum(u8) {
 /// files tune their numbers (see balance.SpecialTuning) but cannot invent new
 /// kinds.  Three axes define a kind:
 ///
-///   consumable   — whether the feast can eat it.  A consumable special
-///                  conducts the flood and leaves the grid when consumed; an
-///                  inconsumable one is a permanent wall no cast can touch
-///                  (the rock is the one current example).
+///   consumable   — whether the bite can eat it.  A consumable special
+///                  leaves the grid when the bite reaches its column; an
+///                  inconsumable one is INERT — the bite skips it, no cast
+///                  can touch it, and only a bomb removes it (the rock is
+///                  the one current example).
 ///   eat_effect   — what CONSUMING one does, beyond emptying the cell.
 ///   match_effect — whether LINING UP `match_len` of the kind in a row or
 ///                  column (after the turn-end refill) fires an effect.
@@ -116,17 +117,18 @@ pub const Tier = enum(u8) {
 pub const SpecialKind = enum(u8) {
     /// Consumable.  Eating one is FREE — no score, no hunger — and releases
     /// a 3x3 block of Neutralizing Agent around its cell, downgrading every
-    /// covered hazard one tier exactly like a cast.  Fired INLINE, mid-flood,
-    /// so the same feast eats straight through whatever it defused.
+    /// covered hazard one tier exactly like a cast.  Fired INLINE, mid-bite,
+    /// so a cell later in the same bite that it defuses is consumed rather
+    /// than merely nibbled.
     neutralizer = 0,
     /// Consumable.  Eating one is ordinary food (scores, costs hunger) and
     /// HATCHES a baby Lil Guy (uniform-random BabyType) who joins the
     /// encounter and grows the hunger pool.
     egg = 1,
-    /// INCONSUMABLE: a permanent wall.  The feast cannot eat or pass it, no
-    /// cast can touch it, and it never matches — it leaves the grid only by
-    /// never having been there.  Not playable, so a field holding nothing
-    /// else is still won; it falls with its column like any unit.
+    /// INCONSUMABLE: an inert boulder.  The bite skips it (no hunger, no
+    /// score, no change), no cast can touch it, and it never matches — only
+    /// a bomb's blast removes one.  Not playable, so a field holding nothing
+    /// else is still won; it rides the conveyor left like any unit.
     rock = 2,
     /// Consumable.  A canister of Neutralizing Agent: free like the
     /// neutralizer — no score, no hunger — and REFILLS the team's charge
@@ -255,10 +257,12 @@ pub const MAX_GRID_CELLS: u16 = @as(u16, MAX_GRID_ROWS) * @as(u16, MAX_GRID_COLS
 /// A cell is:
 ///   empty       — eaten (or never filled); refilled from the reservoir
 ///   neutral     — naturally-neutral slime; edible
-///   tiered      — hazardous slime at difficulty `Tier`.  INEDIBLE: the feast
-///                 will not eat it and cannot pass through it.  A cast
-///                 downgrades it one tier (red -> yellow -> green -> defused),
-///                 which is the only way to open the path it blocks.
+///   tiered      — hazardous slime at difficulty `Tier`.  INEDIBLE: a bite
+///                 that reaches it DOWNGRADES it one tier instead of
+///                 consuming it (still filling hunger), exactly like a cast
+///                 (red -> yellow -> green -> defused).  Casts pre-chew: a
+///                 unit defused before the bite arrives is consumed whole
+///                 and scores.
 ///   neutralized — defused: a `tiered` cell downgraded past green.  Edible and
 ///                 scores like neutral, but kept distinct so the render can
 ///                 show the team earned it.
@@ -267,8 +271,8 @@ pub const MAX_GRID_CELLS: u16 = @as(u16, MAX_GRID_ROWS) * @as(u16, MAX_GRID_COLS
 ///                 whether it feeds the team at all — is the kind's own
 ///                 rulebook (see SpecialKind).
 ///
-/// The edible/blocking split is the heart of the game: see `is_edible` and
-/// `blocks_feast`, which `slime.eat_all` flood-fills over.
+/// `is_edible` is the bite's rulebook: `slime.feast` walks the front columns
+/// and consumes edible units, nibbles hazards, and skips the rest.
 ///
 /// Wire encoding (one byte, see protocol.zig):
 ///   0x00 = empty, 0x01 = neutral, 0x02 = neutralized, 0x10|t = tiered,
@@ -281,33 +285,21 @@ pub const SlimeCell = union(enum) {
     tiered: Tier,
 
     /// True if this cell holds a slime unit of any kind — anything that
-    /// occupies space and must fall when the column collapses.
+    /// occupies space and rides the conveyor when its row packs left.
     pub fn is_slime(self: SlimeCell) bool {
         return self != .empty;
     }
 
-    /// True if the turn-end feast will eat this unit once it can reach it.
-    /// Defused slime counts: taking a hazard to `neutralized` is precisely
-    /// what turns it into food.  So does a CONSUMABLE special — an egg is
-    /// food with a hatch attached, a neutralizer is free equipment the feast
-    /// picks up on its way through.
+    /// True if the turn-end bite will CONSUME this unit when its column is
+    /// bitten (as opposed to nibbling or skipping it).  Defused slime counts:
+    /// taking a hazard to `neutralized` is precisely what turns it into food.
+    /// So does a CONSUMABLE special — an egg is food with a hatch attached, a
+    /// neutralizer is free equipment the bite picks up on its way through.
     pub fn is_edible(self: SlimeCell) bool {
         return switch (self) {
             .neutral, .neutralized => true,
             .special => |kind| kind.consumable(),
             .empty, .tiered => false,
-        };
-    }
-
-    /// True if this cell stops the feast advancing through it — a live
-    /// hazard, or an inconsumable special (the rock).  Everything else
-    /// (empty, edible) conducts the path, since an edible cell is eaten
-    /// and therefore opens.
-    pub fn blocks_feast(self: SlimeCell) bool {
-        return switch (self) {
-            .tiered => true,
-            .special => |kind| !kind.consumable(),
-            .empty, .neutral, .neutralized => false,
         };
     }
 
@@ -320,10 +312,11 @@ pub const SlimeCell = union(enum) {
 
 /// The slime field: a fixed `rows` × `cols` grid of individual slime units.
 ///
-/// Row 0 is the TOP row (the side the reservoir refills from); Lil Guys
-/// approach from below.  `cells` is row-major with a compile-time capacity;
-/// only the first `rows * cols` entries are live — always go through the
-/// accessors, which assert the bounds.
+/// Row 0 is the TOP row; the Lil Guys stand at the LEFT edge (column 0) and
+/// the reservoir refills from the RIGHT, so the field is a conveyor drifting
+/// leftward into their mouths.  `cells` is row-major with a compile-time
+/// capacity; only the first `rows * cols` entries are live — always go
+/// through the accessors, which assert the bounds.
 ///
 /// The grid is server-authoritative: the session owns the only instance and
 /// transmits it, so every client renders identical slime.
@@ -457,7 +450,7 @@ pub const SlimeGrid = struct {
     }
 };
 
-/// Off-grid slime waiting to enter the grid from the top.
+/// Off-grid slime waiting to enter the grid from the right edge.
 ///
 /// The reservoir only ever holds slime in its ORIGINAL state — neutralizing
 /// happens on the grid, so no `neutralized` bucket exists here.  `tiered[t]`
@@ -604,36 +597,36 @@ test "SlimeCell.is_hazard is true only for a live tiered cell" {
     try testing.expect(!(SlimeCell{ .special = .egg }).is_hazard());
 }
 
-test "edible and blocking are exact opposites over the occupied cells" {
-    // The feast's whole rulebook: an occupied cell either feeds it or stops it,
-    // never both and never neither.  Empty conducts without feeding.
-    const cases = [_]SlimeCell{
-        .neutral,                        .neutralized,
-        .{ .special = .neutralizer },    .{ .special = .egg },
-        .{ .tiered = .red },             .{ .tiered = .yellow },
-        .{ .tiered = .green },
+test "the bite's rulebook: edible units are consumed, hazards and rocks are not" {
+    // Consumed whole when bitten: clean slime, defused slime, and every
+    // consumable special.
+    const consumed = [_]SlimeCell{
+        .neutral,                     .neutralized,
+        .{ .special = .neutralizer }, .{ .special = .egg },
+        .{ .special = .canister },    .{ .special = .bomb },
     };
-    for (cases) |cell| {
-        try testing.expect(cell.is_edible() != cell.blocks_feast());
-    }
-    const empty: SlimeCell = .empty;
-    try testing.expect(!empty.is_edible());
-    try testing.expect(!empty.blocks_feast());
+    for (consumed) |cell| try testing.expect(cell.is_edible());
+    // Not consumed: a live hazard (nibbled instead), the rock (inert), and
+    // an empty cell (nothing there).
+    const spared = [_]SlimeCell{
+        .{ .tiered = .red }, .{ .tiered = .yellow },
+        .{ .tiered = .green }, .{ .special = .rock },
+        .empty,
+    };
+    for (spared) |cell| try testing.expect(!cell.is_edible());
 }
 
 test "special kind rulebook: both kinds are food-shaped, neither matches" {
     const egg = SlimeCell{ .special = .egg };
     try testing.expect(egg.is_edible());
-    try testing.expect(!egg.blocks_feast());
     try testing.expect(SpecialKind.egg.consumable());
     try testing.expect(SpecialKind.egg.eat_is_food());
     try testing.expectEqual(SpecialEffect.hatch, SpecialKind.egg.eat_effect().?);
 
-    // The neutralizer conducts and is consumed like food, but it is
-    // equipment: eating it is free and fires the 3x3 Agent block.
+    // The neutralizer is consumed like food, but it is equipment: eating it
+    // is free and fires the 3x3 Agent block.
     const agent = SlimeCell{ .special = .neutralizer };
     try testing.expect(agent.is_edible());
-    try testing.expect(!agent.blocks_feast());
     try testing.expect(SpecialKind.neutralizer.consumable());
     try testing.expect(!SpecialKind.neutralizer.eat_is_food());
     try testing.expectEqual(
@@ -641,20 +634,18 @@ test "special kind rulebook: both kinds are food-shaped, neither matches" {
         SpecialKind.neutralizer.eat_effect().?,
     );
 
-    // The rock is the impassable one: inconsumable, so it walls the feast,
+    // The rock is the inert one: inconsumable, so the bite skips it; it
     // never feeds, never fires, and does not count as playable.
     const rock = SlimeCell{ .special = .rock };
     try testing.expect(!rock.is_edible());
-    try testing.expect(rock.blocks_feast());
     try testing.expect(!SpecialKind.rock.consumable());
     try testing.expect(!SpecialKind.rock.eat_is_food());
     try testing.expectEqual(@as(?SpecialEffect, null), SpecialKind.rock.eat_effect());
 
-    // The canister conducts like the neutralizer — free equipment — and
-    // refills the team's charge pool when swallowed.
+    // The canister is free equipment like the neutralizer — and refills the
+    // team's charge pool when swallowed.
     const canister = SlimeCell{ .special = .canister };
     try testing.expect(canister.is_edible());
-    try testing.expect(!canister.blocks_feast());
     try testing.expect(SpecialKind.canister.consumable());
     try testing.expect(!SpecialKind.canister.eat_is_food());
     try testing.expectEqual(

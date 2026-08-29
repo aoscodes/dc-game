@@ -41,7 +41,7 @@ pub const MsgTag = enum(u8) {
     /// One settle pass's reservoir refill: which cells filled and with what.
     /// The draw comes out of the session's PRNG, so this is the ONE part of
     /// a settle a client cannot derive — and with it, a client can replay a
-    /// whole cascading settle exactly (flood, collapse and match effects are
+    /// whole cascading settle exactly (bite, shift and match effects are
     /// all mirrored rules).  One message per pass, in pass order, before
     /// `turn_ended`.
     field_refilled = 0x20,
@@ -135,16 +135,18 @@ pub fn decode_over_budget(reader: anytype) !OverBudget {
     };
 }
 
-/// The turn's cast phase is over and the feast has eaten its way in from the
-/// left edge.
+/// The turn's cast phase is over and the Lil Guys have bitten the front
+/// columns of the field.
 ///
-/// Sent after the feast, the collapse and the refill, so a client can animate
+/// Sent after the bite, the shift and the refill, so a client can animate
 /// the devouring and float the resulting hunger/score without re-deriving any
 /// of it.  This is the only place hunger and score move in the turn loop:
-/// casting never feeds the Lil Guys, it only opens the path to what they eat.
+/// casting never feeds the Lil Guys, it only defuses what they are about to
+/// bite.
 ///
-/// `sheltered` is the message's most useful number for a player: it is the food
-/// that a wall kept out of reach, i.e. what the turn's casts failed to expose.
+/// `hazards_bitten` is the message's most useful number for a player: every
+/// one is a nibble that filled the hunger clock and scored nothing — the
+/// front the turn's casts failed to defuse in time.
 pub const TurnEnded = struct {
     /// The turn that just ended (1-based); the next turn is this + 1.
     turn: u16,
@@ -152,17 +154,16 @@ pub const TurnEnded = struct {
     cells_eaten: u16,
     /// Total hunger added by the feast.
     hunger_added: u16,
-    /// Edible units the feast could not reach behind a wall.
-    sheltered: u16,
-    /// Inedible cells (live hazards + specials) that held the feast back.
-    walls: u16,
+    /// Live hazards the bite NIBBLED — downgraded one tier in place, hunger
+    /// for no score.
+    hazards_bitten: u16,
     /// Score added by the feast.
     score_added: u32,
     /// Charges left in the shared pool after the turn.  Sent here as well as in
     /// GameState so the end-of-turn summary is self-contained.
     charges_left: u32,
     /// Settle passes this turn took (>= 1).  Every special match re-opens the
-    /// feast, so a turn is a CASCADE of eat/collapse/fill passes; the summary
+    /// feast, so a turn is a CASCADE of bite/shift/fill passes; the summary
     /// numbers above are totals over all of them, and the per-pass events
     /// (field_refilled, special_matched) preceded this message.
     passes: u8 = 1,
@@ -173,8 +174,7 @@ pub fn decode_turn_ended(reader: anytype) !TurnEnded {
         .turn = try reader.readInt(u16, .little),
         .cells_eaten = try reader.readInt(u16, .little),
         .hunger_added = try reader.readInt(u16, .little),
-        .sheltered = try reader.readInt(u16, .little),
-        .walls = try reader.readInt(u16, .little),
+        .hazards_bitten = try reader.readInt(u16, .little),
         .score_added = try reader.readInt(u32, .little),
         .charges_left = try reader.readInt(u32, .little),
         .passes = try reader.readByte(),
@@ -252,9 +252,10 @@ pub fn decode_eggs_hatched(reader: anytype) !EggsHatched {
 pub const MAX_REFILL_WIRE: u16 = components.MAX_GRID_CELLS;
 
 /// One settle pass's reservoir refill, resolved server-side.  `cells[i]` was
-/// filled with `contents[i]`.  Cells travel in fill order (row-major from the
-/// top), and contents use the same one-byte encoding as the grid, so a client
-/// can apply the refill to its replay board verbatim.
+/// filled with `contents[i]`.  Cells travel in ascending flat (row-major)
+/// order — NOT the fill's own right-to-left draw order — and contents use
+/// the same one-byte encoding as the grid, so a client can apply the refill
+/// to its replay board verbatim.
 pub const FieldRefilled = struct {
     /// Which settle pass this refill belongs to (0-based).  A turn settles in
     /// passes while special matches keep re-opening the feast; every pass
@@ -502,15 +503,15 @@ pub const ActionResult = struct {
 };
 
 pub const EndReason = enum(u8) {
+    /// The hunger bar — the game's clock — filled: the Lil Guys are sated
+    /// and the encounter ends on whatever the team scored.  Not a defeat.
     hunger_full = 0,
     /// Every playable unit was eaten — specials may remain, since no play can
     /// remove them.
     field_cleared = 1,
-    /// A dead position: the feast reached nothing, the shared charge pool can no
-    /// longer afford the cheapest recipe, and slime is still walled in.  No
-    /// sequence of moves can change the field again, so the encounter is called
-    /// rather than looping empty turns forever.
-    out_of_charges = 2,
+    // 2 was out_of_charges: retired — a broke team keeps playing on the
+    // bite's nibbles (cast presses become passes), so the pool running dry
+    // no longer ends anything.
 };
 
 /// Match-wide consumption/dispense tallies for the tuning report.  There are
@@ -520,10 +521,10 @@ pub const FeastStats = struct {
     cells_covered: [components.Tier.size]u16 = [_]u16{0} ** components.Tier.size,
     /// Cells taken all the way to defused, per tier they STARTED at.
     neutralized: [components.Tier.size]u16 = [_]u16{0} ** components.Tier.size,
-    /// Edible units the feast could never reach, summed over every turn — the
-    /// headline tuning number, since it measures how much of the encounter the
-    /// team's charges failed to open up.
-    sheltered: u32 = 0,
+    /// Live hazards the bites NIBBLED, summed over every turn — the headline
+    /// tuning number, since every nibble is hunger-clock spent on a cell the
+    /// team's charges failed to defuse in time.
+    hazards_bitten: u32 = 0,
     neutral_consumed: u16 = 0,
     defused_consumed: u16 = 0,
     /// Neutralizers the feasts swallowed — free equipment, not food, so they
@@ -621,8 +622,7 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
             try writer.writeInt(u16, p.turn, .little);
             try writer.writeInt(u16, p.cells_eaten, .little);
             try writer.writeInt(u16, p.hunger_added, .little);
-            try writer.writeInt(u16, p.sheltered, .little);
-            try writer.writeInt(u16, p.walls, .little);
+            try writer.writeInt(u16, p.hazards_bitten, .little);
             try writer.writeInt(u32, p.score_added, .little);
             try writer.writeInt(u32, p.charges_left, .little);
             try writer.writeByte(p.passes);
@@ -757,7 +757,7 @@ fn decode_u16_tiers(r: anytype) ![components.Tier.size]u16 {
 fn encode_feast_stats(w: anytype, rs: FeastStats) !void {
     try encode_u16_tiers(w, rs.cells_covered);
     try encode_u16_tiers(w, rs.neutralized);
-    try w.writeInt(u32, rs.sheltered, .little);
+    try w.writeInt(u32, rs.hazards_bitten, .little);
     try w.writeInt(u16, rs.neutral_consumed, .little);
     try w.writeInt(u16, rs.defused_consumed, .little);
     try w.writeInt(u16, rs.agents_consumed, .little);
@@ -770,7 +770,7 @@ fn decode_feast_stats(r: anytype) !FeastStats {
     return .{
         .cells_covered = try decode_u16_tiers(r),
         .neutralized = try decode_u16_tiers(r),
-        .sheltered = try r.readInt(u32, .little),
+        .hazards_bitten = try r.readInt(u32, .little),
         .neutral_consumed = try r.readInt(u16, .little),
         .defused_consumed = try r.readInt(u16, .little),
         .agents_consumed = try r.readInt(u16, .little),
@@ -997,7 +997,7 @@ test "round-trip: game_over carries score and match stats" {
     go.stats.feast = .{
         .cells_covered = .{ 30, 0, 5 },
         .neutralized = .{ 10, 0, 5 },
-        .sheltered = 21,
+        .hazards_bitten = 21,
         .neutral_consumed = 15,
         .defused_consumed = 9,
         .agents_consumed = 2,
@@ -1028,7 +1028,7 @@ test "round-trip: game_over carries score and match stats" {
     try std.testing.expectEqual(@as(u16, 199), d.stats.hunger_final);
     try std.testing.expectEqual(@as(u16, 30), d.stats.feast.cells_covered[0]);
     try std.testing.expectEqual(@as(u16, 5), d.stats.feast.neutralized[2]);
-    try std.testing.expectEqual(@as(u32, 21), d.stats.feast.sheltered);
+    try std.testing.expectEqual(@as(u32, 21), d.stats.feast.hazards_bitten);
     try std.testing.expectEqual(@as(u16, 15), d.stats.feast.neutral_consumed);
     try std.testing.expectEqual(@as(u16, 9), d.stats.feast.defused_consumed);
     try std.testing.expectEqual(@as(u16, 2), d.stats.feast.agents_consumed);
@@ -1404,15 +1404,14 @@ test "decode_eggs_hatched: an unknown baby type is rejected" {
     try std.testing.expectError(DecodeError.InvalidBabyType, decode_eggs_hatched(fbs.reader()));
 }
 
-test "round-trip: turn_ended carries the feast and what walled it off" {
+test "round-trip: turn_ended carries the feast and what it nibbled" {
     var buf: [32]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     try encode(fbs.writer(), .turn_ended, TurnEnded{
         .turn = 7,
         .cells_eaten = 41,
-        .hunger_added = 41,
-        .sheltered = 12,
-        .walls = 7,
+        .hunger_added = 53,
+        .hazards_bitten = 12,
         .score_added = 41,
         .charges_left = 18,
         .passes = 3,
@@ -1422,9 +1421,8 @@ test "round-trip: turn_ended carries the feast and what walled it off" {
     const decoded = try decode_turn_ended(fbs.reader());
     try std.testing.expectEqual(@as(u16, 7), decoded.turn);
     try std.testing.expectEqual(@as(u16, 41), decoded.cells_eaten);
-    try std.testing.expectEqual(@as(u16, 41), decoded.hunger_added);
-    try std.testing.expectEqual(@as(u16, 12), decoded.sheltered);
-    try std.testing.expectEqual(@as(u16, 7), decoded.walls);
+    try std.testing.expectEqual(@as(u16, 53), decoded.hunger_added);
+    try std.testing.expectEqual(@as(u16, 12), decoded.hazards_bitten);
     try std.testing.expectEqual(@as(u32, 41), decoded.score_added);
     try std.testing.expectEqual(@as(u32, 18), decoded.charges_left);
     // A cascade turn: three settle passes preceded this summary.

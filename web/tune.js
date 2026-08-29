@@ -54,13 +54,21 @@ const DEFAULT_CHARGE_REFILL = 3;
  *  special kind may spawn in — the far side from the feast's door. */
 const BACK_RANKS = 2;
 
+/** Mirrors balance.DEFAULT_FEAST_COLUMNS / _FEAST_COLUMNS_PER_GUY: the bite
+ *  chews the leftmost `feast_columns + seated * feast_columns_per_guy`
+ *  columns at turn end (clamped to the grid). */
+const DEFAULT_FEAST_COLUMNS = 1;
+const DEFAULT_FEAST_COLUMNS_PER_GUY = 0;
+
 /** Scalar balance fields: [key, label, min, max, step]. */
 const RATE_FIELDS = [
-  ["hunger_cost_normal", "hunger per unit eaten", 0, 1000, 1],
+  ["hunger_cost_normal", "hunger per bite (eaten or nibbled)", 0, 1000, 1],
   ["casts_per_turn", "casts per player per turn", 1, 255, 1],
   ["hunger_base", "hunger capacity per player (appetite 0)", 1, 65535, 1],
   ["appetite_scale", "extra capacity per appetite point", 0, 65535, 1],
   ["hunger_player_cap", "per-player capacity ceiling", 1, 65535, 1],
+  ["feast_columns", "bite width: columns eaten per turn", 1, 16, 1],
+  ["feast_columns_per_guy", "extra bite columns per seated player", 0, 16, 1],
 ];
 
 /**
@@ -163,6 +171,8 @@ async function load() {
       hunger_base: bal.hunger_base ?? DEFAULT_HUNGER_BASE,
       appetite_scale: bal.appetite_scale ?? DEFAULT_APPETITE_SCALE,
       hunger_player_cap: bal.hunger_player_cap ?? DEFAULT_HUNGER_PLAYER_CAP,
+      feast_columns: bal.feast_columns ?? DEFAULT_FEAST_COLUMNS,
+      feast_columns_per_guy: bal.feast_columns_per_guy ?? DEFAULT_FEAST_COLUMNS_PER_GUY,
       // Default like the server does: specials stay out of the door column.
       specials_avoid_door_column: bal.specials_avoid_door_column ?? true,
       // Per-kind special tuning, densified so inputs always bind (and so a

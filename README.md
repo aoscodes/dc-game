@@ -1,6 +1,6 @@
 # Slime Feast
 
-Co-op turn-based support game. Up to 6 players help a horde of Lil Guys devour a slime field: cast shapes to break down the hazards walling the field off, then watch the Lil Guys flood in from the left and eat everything they can reach. Every bite scores but also costs hunger, so the shared Hunger bar is the clock. Score = slime consumed.
+Co-op turn-based support game. Up to 6 players feed a crew of Lil Guys parked at the left edge of a slime conveyor: every turn the field drifts into their mouths and they bite the front columns whole. Cast shapes to defuse the hazards before they reach the front — a defused cell is consumed for a point, a live one is only nibbled, filling the shared Hunger bar (the game's clock) for nothing. Score = slime consumed; clear the field before the bar fills.
 
 Authoritative Zig server. Browser canvas renderer. Zig headless client ↔ Node bridge ↔ browser.
 
@@ -178,17 +178,20 @@ cell outright.
 Once every connected player's budget is spent the field settles in three
 ordered steps, and the order is the whole mechanic:
 
-1. **Eat** — the Lil Guys enter from the **left** edge and flood through empty
-   cells and edible slime.  Live hazards are walls: everything behind them is
-   **sheltered** and survives.  Opening a path is the point of a cast.
-2. **Collapse** — survivors fall straight down into the holes the feast left.
-3. **Fill** — the reservoir tops the field up from above.
+1. **Bite** — the Lil Guys stand at the **left** edge and chew the front
+   `feast_columns` columns (plus `feast_columns_per_guy` per seated player)
+   cell by cell.  Edible units (neutral, defused, consumable specials) are
+   **consumed**; a live hazard is **nibbled** — downgraded one tier in place,
+   filling hunger for no score; rocks are skipped.  Defusing the front before
+   the bite lands is the point of a cast.
+2. **Shift** — every row's survivors pack **left** into the space the bite
+   opened: the field is a conveyor drifting into the Lil Guys' mouths.
+3. **Fill** — the reservoir tops the field up from the **right** edge.
 
-Every unit eaten scores a point **and** costs hunger (`hunger_cost_normal`), so
-the Hunger bar is really a budget on how much this horde can eat before it has
-to stop.  Sheltered food is the loss that hurts: it scores nothing, and the
-reservoir keeps refilling the field above it.  Clearing the field outright
-before the bar fills is the win.
+Every bite fills hunger (`hunger_cost_normal`) whether it consumed or only
+nibbled, so the Hunger bar is the game's **clock**: a full bar simply calls
+time on the encounter.  Nibbles are the loss that hurts — clock spent on a
+cell that scored nothing.  Clearing the field before the bar fills is the win.
 
 Casting also composes: when 2+ **distinct** players cast a **group**'s
 component moves on the **same square** within one turn, the group fires at the
@@ -199,15 +202,17 @@ The encounter ends **at turn end**, on the first of:
 
 | Reason | Condition |
 | --- | --- |
-| `field_cleared` | the field and the reservoir are both empty — a win, and it beats the other two on a tie |
-| `hunger_full` | the Hunger bar filled |
-| `out_of_charges` | the shared pool can no longer afford the cheapest move |
+| `field_cleared` | the field and the reservoir hold nothing playable — a win, and it beats the clock on a tie |
+| `hunger_full` | the Hunger bar — the game's clock — filled |
 
-The final shared score and a match report are broadcast either way. Going
-broke mid-turn also strands the casts still owed: every one of them could only
-fizzle, so the turn settles immediately rather than asking for input that
-cannot matter. A config with a zero-cost move never runs out of charges — the
-economy has a floor, and the team always has something to do.
+Running the charge pool dry does **not** end the game: a broke team's cast
+presses become passes (budget spent, nothing stamped), and the bite's nibbles
+keep chewing the field down until the clock or the cleared field calls it.
+Going broke mid-turn also strands the casts still owed: every one of them
+could only fizzle, so the turn settles immediately rather than asking for
+input that cannot matter.
+
+The final shared score and a match report are broadcast either way.
 
 The board is **held** after the server calls it: the closing feast plays out in
 full, the verdict floats over it for three seconds, and only then does the

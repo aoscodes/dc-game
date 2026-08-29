@@ -159,6 +159,16 @@ pub const DEFAULT_MATCH_LEN: u8 = 3;
 /// (board/src/game/balance.c), so a change here should be made there too.
 pub const DEFAULT_BABY_HUNGER: u16 = 10;
 
+/// Default width of the turn-end bite, in grid columns from the left edge,
+/// used when `feast_columns` is absent from balance.json.  The first Lil Guy
+/// always eats at least one column.
+pub const DEFAULT_FEAST_COLUMNS: u8 = 1;
+
+/// Default EXTRA bite columns each seated Lil Guy adds, used when
+/// `feast_columns_per_guy` is absent from balance.json.  0 = the crowd's size
+/// is purely visual.
+pub const DEFAULT_FEAST_COLUMNS_PER_GUY: u8 = 0;
+
 /// The BACK RANKS: how many of the grid's rightmost columns a
 /// `back_ranks_only` special kind may spawn in — the columns farthest from
 /// the feast's door on the left edge.  Mirrored by the board firmware
@@ -182,13 +192,13 @@ pub const SpecialTuning = struct {
     /// physically possible.
     match_len: u8 = DEFAULT_MATCH_LEN,
     /// When true, the kind may only ENTER the field in the rightmost
-    /// `BACK_RANKS` columns — the far side from the feast's door.  Collapse
-    /// never moves a cell sideways, so a unit spawned there STAYS there for
-    /// its whole life: the kind becomes a deep prize the feast must tunnel
-    /// across the board to reach.  A fill whose reservoir holds only
-    /// restricted kinds leaves front cells empty rather than seating one
-    /// (see slime.fill).  On a grid of `BACK_RANKS` columns or fewer the
-    /// restriction covers every cell and is a no-op.
+    /// `BACK_RANKS` columns — the far side from the Lil Guys' mouths on the
+    /// left edge.  An ENTRY restriction only: the conveyor drifts every unit
+    /// leftward as the columns ahead of it are eaten, so the kind arrives at
+    /// the back and rides the whole board before it is bitten.  A fill whose
+    /// reservoir holds only restricted kinds leaves front cells empty rather
+    /// than seating one (see slime.fill).  On a grid of `BACK_RANKS` columns
+    /// or fewer the restriction covers every cell and is a no-op.
     back_ranks_only: bool = false,
     /// When true, at least one unit of the kind is seated on the grid at the
     /// START OF PLAY whenever the encounter's supply holds any: before the
@@ -211,9 +221,9 @@ pub const SpecialTuning = struct {
 /// All designer-tunable balance numbers.  Loaded from `data/balance.json`
 /// (see config.zig); tests use the frozen fixture in fixtures.zig.
 pub const Balance = struct {
-    /// Hunger cost per slime unit consumed.  Only EDIBLE units are ever eaten
-    /// (neutral and defused), so this is the single hunger rate: hazards are
-    /// never swallowed, they are walls.
+    /// Hunger cost per BITE — a consumed edible unit and a downgraded hazard
+    /// both fill the bar by this much.  The bar is the game's clock: every
+    /// bite runs it down toward the encounter's end.
     hunger_cost_normal: u32,
     /// Dimensions of the slime grid.  Slime beyond `rows * cols` waits in the
     /// off-grid reservoir and refills emptied cells at the start of each turn.
@@ -243,13 +253,21 @@ pub const Balance = struct {
     /// Hunger capacity each baby Lil Guy in the encounter adds to the pool —
     /// babies a board brought AND babies hatched mid-game alike.
     baby_hunger: u16 = DEFAULT_BABY_HUNGER,
+    /// Grid columns the turn-end bite covers, counted from the left edge.
+    /// The loader keeps it within 1..slime_grid.cols.  See `feast_width` for
+    /// how the seated crowd widens it.
+    feast_columns: u8 = DEFAULT_FEAST_COLUMNS,
+    /// EXTRA bite columns per seated Lil Guy: the bite's total width is
+    /// `feast_columns + seated * feast_columns_per_guy`, clamped to the grid.
+    /// Babies never count — their only number is `baby_hunger`.
+    feast_columns_per_guy: u8 = DEFAULT_FEAST_COLUMNS_PER_GUY,
     /// When true, NO special kind may ever ENTER the field in column 0 —
-    /// the feast's door on the left edge.  Collapse never moves a cell
-    /// sideways, so the door column stays special-free for the whole game.
-    /// A fill whose reservoir holds only specials leaves door cells empty
-    /// rather than seating one (see slime.fill).  Mirrored by the board
-    /// firmware (board/src/game/balance.c), so a change here should be made
-    /// there too.
+    /// the cells at the Lil Guys' mouths.  An ENTRY restriction only: the
+    /// conveyor drifts units leftward, so a special seated deeper does reach
+    /// column 0 eventually — it just never STARTS there.  A fill whose
+    /// reservoir holds only specials leaves door cells empty rather than
+    /// seating one (see slime.fill).  Mirrored by the board firmware
+    /// (board/src/game/balance.c), so a change here should be made there too.
     specials_avoid_door_column: bool = true,
     /// Per-SpecialKind tuning, indexed by SpecialKind ordinal.
     specials: [c.SpecialKind.size]SpecialTuning =
@@ -262,9 +280,20 @@ pub const Balance = struct {
         return self.specials[@intFromEnum(kind)];
     }
 
-    /// The cheapest cast in the whole move list.  A team holding fewer charges
-    /// than this can never affect the grid again, which is how the session
-    /// recognises a dead position (see session.check_end).
+    /// Width of the turn-end bite for a crowd of `seated` Lil Guys, in grid
+    /// columns from the left edge: `feast_columns` plus
+    /// `feast_columns_per_guy` per guy, clamped to the grid — the bite can
+    /// never be wider than the board.  Mirrored by the browser's replay
+    /// (web/game.js feastWidth), so a change here must be made there too.
+    pub fn feast_width(self: *const Balance, seated: u32) u8 {
+        const extra = @as(u32, self.feast_columns_per_guy) * seated;
+        const width = @min(@as(u32, self.feast_columns) + extra, self.slime_grid.cols);
+        return @intCast(width);
+    }
+
+    /// The cheapest cast in the whole move list.  A team too poor to afford
+    /// this has no legal lock-in left: the session turns their cast presses
+    /// into passes so turns keep ending (see session's cast handler).
     pub fn cheapest_cost(self: *const Balance) u16 {
         var min: u16 = std.math.maxInt(u16);
         for (self.player_recipes) |r| min = @min(min, r.cost);

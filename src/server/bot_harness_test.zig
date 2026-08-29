@@ -33,6 +33,7 @@ const c = shared.components;
 const enc = shared.encounter;
 const bots = shared.bots;
 const fixtures = shared.fixtures;
+const logic = shared.game_logic;
 
 const session_mod = @import("session.zig");
 const Session = session_mod.Session;
@@ -299,7 +300,7 @@ test "sweeping bots eat their way into a field that starts completely walled" {
         @as(u32, 60),
         h.session.score + h.session.field.remaining(),
     );
-    // The board opened: stamps defused cells and the flood got in behind them.
+    // The board opened: stamps defused cells for the bite to consume.
     try std.testing.expect(tier_total(h.session.stats.feast.cells_covered) > 0);
     try std.testing.expect(h.session.score > 0);
     // Charges are spent, never conjured.
@@ -310,15 +311,17 @@ test "sweeping bots eat their way into a field that starts completely walled" {
     );
 }
 
-test "a live wall feeds nobody: only casting turns slime into score" {
-    // The central change from the old design: a hazard is no longer eaten at a
-    // premium, it is not eaten AT ALL.  A team that never casts therefore makes
-    // literally zero progress, however many turns pass.  Same field, same seed,
-    // one team stamping and one not.
+test "an idle team is still fed: the bite nibbles the wall down turn by turn" {
+    // The central change of the conveyor design: a live hazard is no longer
+    // a wall the feast cannot touch — the bite NIBBLES it one tier per turn.
+    // A team that never casts therefore still makes progress, it just pays
+    // hunger-clock for nibbles that score nothing: every green costs a
+    // nibble AND a consuming bite (2 hunger for 1 point), so the idle game
+    // ends by the clock with slime left on the board.
     const allocator = std.testing.allocator;
 
     // Idle side: a joined player who never casts would stall the turn forever,
-    // so its budget is retired directly.  Nothing is ever defused.
+    // so its budget is retired directly.  Nothing is ever defused by a cast.
     var idle_sess = try Session.init_seeded(allocator, "BOTK01".*, TEST_CFG, 0xB07_5EED);
     defer idle_sess.deinit();
     var idle_bot: BotState = undefined;
@@ -333,18 +336,21 @@ test "a live wall feeds nobody: only casting turns slime into score" {
         idle_sess.casts_left = [_]u8{0} ** session_mod.MAX_PLAYERS;
         try idle_sess.tick(0.0);
     }
-    // 200 turns of nothing.  The wall never opens, so the encounter cannot end:
-    // no hunger to fill the bar, no slime eaten to clear the field, and a full
-    // charge pool so it is not a dead position either.  A stalemate is the
-    // honest outcome of refusing to play.
-    try std.testing.expect(!idle_sess.restart_pending);
-    try std.testing.expectEqual(@as(u32, 0), idle_sess.score);
-    try std.testing.expectEqual(@as(u16, 0), idle_sess.hunger.current);
-    // A solo seat holds the bare seed: nothing grew it, nothing spent it.
+    // 60 greens at 2 hunger each against a solo bar of 100: the clock fills
+    // before the field clears.  The game ENDED — idle play cannot stall the
+    // conveyor — but it ended by time, having scored less than it swallowed.
+    try std.testing.expect(idle_sess.restart_pending);
+    try std.testing.expect(idle_sess.score > 0);
+    try std.testing.expect(logic.hunger_full(idle_sess.hunger));
+    try std.testing.expect(idle_sess.field.remaining() > 0);
+    // Every nibble filled the bar without scoring, so hunger strictly
+    // outran the score.
+    try std.testing.expect(@as(u32, idle_sess.hunger.current) > idle_sess.score);
+    // Not one charge was spent doing it.
     try std.testing.expectEqual(enc_survival.charges, idle_sess.charges);
-    try std.testing.expectEqual(@as(u32, 60), idle_sess.field.remaining());
 
-    // Active side: the same field, but cast at.
+    // Active side: the same field, but cast at — the casts pre-chew the
+    // front, converting would-be nibbles into points.
     var h = try BotHarness.init(allocator, &bots.team_mixed, &enc_survival, "BOTK02".*, .{});
     defer h.deinit();
     const pool_start = h.session.charges;
@@ -354,11 +360,10 @@ test "a live wall feeds nobody: only casting turns slime into score" {
     try std.testing.expect(h.session.hunger.current > 0);
     try std.testing.expect(h.session.charges < pool_start);
     try std.testing.expect(tier_total(h.session.stats.feast.cells_covered) > 0);
-    // Hunger is now exactly one point per unit eaten — no hazard surcharge, and
-    // score counts the same units, so the two readings must agree.
-    try std.testing.expectEqual(
-        @as(u32, h.session.hunger.current) * BAL.hunger_cost_normal,
-        h.session.score,
+    // A consumed unit is 1 hunger for 1 score; a nibble is 1 hunger for
+    // nothing — so score can never outrun the bar.
+    try std.testing.expect(
+        h.session.score <= @as(u32, h.session.hunger.current) * BAL.hunger_cost_normal,
     );
 }
 
@@ -370,7 +375,7 @@ test "mixed team makes real progress on the default encounter" {
     _ = try h.run_to_completion(400);
 
     try std.testing.expectEqual(DEFAULT_ENC.total_units(), h.session.slime_total);
-    // The encounter's 30 neutral units are edible from the start, so the flood
+    // The encounter's 30 neutral units are edible from the start, so the bite
     // always finds something even before a single cast lands.
     try std.testing.expect(h.session.score > 0);
     // Casts landed: the tuning report saw them.

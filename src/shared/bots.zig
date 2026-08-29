@@ -67,10 +67,10 @@ pub const profile_poker = Profile{
 };
 
 /// Walks LEFT one cell per cast, stamping 3x3 blocks — the field-clearing
-/// workhorse.  It heads left because the Lil Guys enter from the left edge, so
-/// a hazard in column 0 walls off the entire board no matter what has been
-/// defused behind it.  Clamping means it eventually parks on that edge, which
-/// is precisely where a cast is worth the most.
+/// workhorse.  It heads left because the Lil Guys bite the LEFT columns at
+/// turn end: a hazard reaching column 0 still live is a nibble that fills
+/// the hunger clock for nothing.  Clamping means it eventually parks on that
+/// edge, which is precisely where a cast is worth the most.
 pub const profile_sweeper = Profile{
     .label = "sweeper",
     .moves = &.{"block"},
