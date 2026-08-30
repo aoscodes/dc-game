@@ -158,6 +158,7 @@ fn write_render_inner(
             .neutralized = sc.neutralized,
             .off_grid = sc.off_grid,
             .inert = sc.inert,
+            .rocks_broken = sc.rocks_broken,
         };
     }
 
@@ -185,6 +186,7 @@ fn write_render_inner(
             .cells = match_cells_bufs[i][0..sm.cell_count],
             .downgraded = tiers(sm.downgraded),
             .neutralized = sm.neutralized,
+            .rocks_broken = sm.rocks_broken,
         };
     }
 
@@ -254,6 +256,7 @@ fn write_render_inner(
                     .hunger_normal = ms.feast.hunger_normal,
                     .charges_spent = ms.feast.charges_spent,
                     .charges_left = ms.feast.charges_left,
+                    .rocks_broken = ms.feast.rocks_broken,
                 },
                 .eggs_hatched = babies_u16(ms.eggs_hatched),
                 .players = pstats_buf[0..ms.player_count],
@@ -435,6 +438,8 @@ const JsonFeastStats = struct {
     hunger_normal: u16,
     charges_spent: u32,
     charges_left: u32,
+    /// Rocks broken into red slime over the match — Agent spent on boulders.
+    rocks_broken: u32,
 };
 
 const JsonPlayerStats = struct {
@@ -558,6 +563,7 @@ const JsonSpecialMatched = struct {
     cells: []const u16,
     downgraded: JsonTiers,
     neutralized: u16,
+    rocks_broken: u16,
 };
 
 /// One turn's hatches: `cells[i]` (flat grid index of the eaten egg) hatched
@@ -580,6 +586,8 @@ const JsonShapeCast = struct {
     off_grid: u16,
     /// In-bounds cells that held nothing downgradable (empty/neutral/defused).
     inert: u16,
+    /// Rocks the Agent BROKE into red slime — accomplishment, not waste.
+    rocks_broken: u16,
 };
 
 const JsonRecipeFired = struct {

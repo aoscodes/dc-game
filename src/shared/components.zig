@@ -105,9 +105,11 @@ pub const Tier = enum(u8) {
 ///
 ///   consumable   — whether the bite can eat it.  A consumable special
 ///                  leaves the grid when the bite reaches its column; an
-///                  inconsumable one is INERT — the bite skips it, no cast
-///                  can touch it, and only a bomb removes it (the rock is
-///                  the one current example).
+///                  inconsumable one is skipped by the bite (the rock is
+///                  the one current example).  Inconsumable does NOT mean
+///                  untouchable: Neutralizing Agent BREAKS a rock into red
+///                  slime — the hardest tier — after which it is ordinary
+///                  hazard, and a bomb removes one instantly.
 ///   eat_effect   — what CONSUMING one does, beyond emptying the cell.
 ///   match_effect — whether LINING UP `match_len` of the kind in a row or
 ///                  column (after the turn-end refill) fires an effect.
@@ -125,10 +127,12 @@ pub const SpecialKind = enum(u8) {
     /// HATCHES a baby Lil Guy (uniform-random BabyType) who joins the
     /// encounter and grows the hunger pool.
     egg = 1,
-    /// INCONSUMABLE: an inert boulder.  The bite skips it (no hunger, no
-    /// score, no change), no cast can touch it, and it never matches — only
-    /// a bomb's blast removes one.  Not playable, so a field holding nothing
-    /// else is still won; it rides the conveyor left like any unit.
+    /// INCONSUMABLE: a boulder.  The bite skips it (no hunger, no score, no
+    /// change) and it never matches, but it is NOT permanent: Neutralizing
+    /// Agent — a cast or an inline block — BREAKS it into red slime, the
+    /// hardest tier, four applications from edible; a bomb's blast removes
+    /// one instantly.  Clearable, so it counts toward the win like any unit;
+    /// it rides the conveyor left like any unit too.
     rock = 2,
     /// Consumable.  A canister of Neutralizing Agent: free like the
     /// neutralizer — no score, no hunger — and REFILLS the team's charge
@@ -143,9 +147,9 @@ pub const SpecialKind = enum(u8) {
 
     pub const size = @typeInfo(SpecialKind).@"enum".fields.len;
 
-    /// True if the feast can eat this kind.  Consumable specials count as
-    /// PLAYABLE slime: they can be cleared, so they do not exempt a field
-    /// from the win check the way an inconsumable one (the rock) does.
+    /// True if the feast can eat this kind — the bite's rulebook, nothing
+    /// more.  An inconsumable kind (the rock) is still clearable: the Agent
+    /// breaks it into slime first, and the bite eats the result.
     pub fn consumable(self: SpecialKind) bool {
         return switch (self) {
             .neutralizer => true,
@@ -266,10 +270,11 @@ pub const MAX_GRID_CELLS: u16 = @as(u16, MAX_GRID_ROWS) * @as(u16, MAX_GRID_COLS
 ///   neutralized — defused: a `tiered` cell downgraded past green.  Edible and
 ///                 scores like neutral, but kept distinct so the render can
 ///                 show the team earned it.
-///   special     — a special slime unit of a hard-coded `SpecialKind`.  No
-///                 cast affects any special.  What eating one does — and
-///                 whether it feeds the team at all — is the kind's own
-///                 rulebook (see SpecialKind).
+///   special     — a special slime unit of a hard-coded `SpecialKind`.  The
+///                 one a cast affects is the rock, which the Agent BREAKS
+///                 into `tiered` red; every other special ignores casts.
+///                 What eating one does — and whether it feeds the team at
+///                 all — is the kind's own rulebook (see SpecialKind).
 ///
 /// `is_edible` is the bite's rulebook: `slime.feast` walks the front columns
 /// and consumes edible units, nibbles hazards, and skips the rest.
@@ -303,8 +308,10 @@ pub const SlimeCell = union(enum) {
         };
     }
 
-    /// True if this cell still needs neutralizing — the only kind a cast
-    /// affects.  Specials are NOT hazards: nothing can change them.
+    /// True if this cell still needs neutralizing — tiered slime on the
+    /// red -> yellow -> green ladder.  A rock is NOT a hazard: a cast that
+    /// covers one BREAKS it into red (see slime.apply_shape), at which point
+    /// the resulting cell is one; no other special is changed by anything.
     pub fn is_hazard(self: SlimeCell) bool {
         return self == .tiered;
     }
@@ -434,20 +441,6 @@ pub const SlimeGrid = struct {
         }
         return n;
     }
-
-    /// Occupied cells the team can still clear: everything except
-    /// INCONSUMABLE specials, which no play can remove.  Consumable specials
-    /// (eggs) are food, so they count.  Zero here (with an equally
-    /// playable-free reservoir) is the win.
-    pub fn playable_count(self: *const SlimeGrid) u16 {
-        var n: u16 = 0;
-        for (self.live()) |cell| {
-            if (!cell.is_slime()) continue;
-            if (cell == .special and !cell.special.consumable()) continue;
-            n += 1;
-        }
-        return n;
-    }
 };
 
 /// Off-grid slime waiting to enter the grid from the right edge.
@@ -472,19 +465,6 @@ pub const SlimeReservoir = struct {
 
     pub fn is_empty(self: SlimeReservoir) bool {
         return self.total() == 0;
-    }
-
-    /// Units here the team can still clear once they arrive — everything
-    /// except INCONSUMABLE specials.  The win condition asks whether anything
-    /// clearable is left in play, and the reservoir half of that question is
-    /// this.
-    pub fn playable(self: SlimeReservoir) u32 {
-        var n: u32 = self.total();
-        for (self.special, 0..) |m, k| {
-            const kind: SpecialKind = @enumFromInt(k);
-            if (!kind.consumable()) n -= m;
-        }
-        return n;
     }
 };
 
@@ -634,8 +614,9 @@ test "special kind rulebook: both kinds are food-shaped, neither matches" {
         SpecialKind.neutralizer.eat_effect().?,
     );
 
-    // The rock is the inert one: inconsumable, so the bite skips it; it
-    // never feeds, never fires, and does not count as playable.
+    // The rock is the holdout: inconsumable, so the bite skips it; it never
+    // feeds and never fires on eat — the Agent must break it into red slime
+    // before it can be cleared.
     const rock = SlimeCell{ .special = .rock };
     try testing.expect(!rock.is_edible());
     try testing.expect(!SpecialKind.rock.consumable());
@@ -670,35 +651,18 @@ test "SlimeReservoir totals across tiers, neutral and specials" {
     res.tiered[@intFromEnum(Tier.green)] = 3;
     try testing.expect(!res.is_empty());
     try testing.expectEqual(@as(u32, 10), res.total());
-    try testing.expectEqual(@as(u32, 10), res.playable());
 
-    // Every special kind counts toward the total (they still have to enter
-    // the grid), but INCONSUMABLE ones (the rock) are excluded from
-    // `playable`, which is what the win check reads: no play can ever
-    // clear a rock, so it must not hold the win hostage.
+    // Every special kind counts toward the total — the win is literally
+    // "nothing left anywhere", and even a rock is clearable now (the Agent
+    // breaks it into red slime), so no kind is exempt from the count.
     res.special[@intFromEnum(SpecialKind.neutralizer)] = 4;
     res.special[@intFromEnum(SpecialKind.egg)] = 2;
     try testing.expectEqual(@as(u32, 16), res.total());
-    try testing.expectEqual(@as(u32, 16), res.playable());
     res.special[@intFromEnum(SpecialKind.rock)] = 5;
     try testing.expectEqual(@as(u32, 21), res.total());
-    try testing.expectEqual(@as(u32, 16), res.playable());
 }
 
-test "a reservoir of nothing but specials is still clearable slime" {
-    // Both kinds are consumable, so a specials-only reservoir is all still
-    // in play: the encounter is not won until the feast eats them too.
-    var res = SlimeReservoir{};
-    res.special[@intFromEnum(SpecialKind.neutralizer)] = 3;
-    try testing.expect(!res.is_empty());
-    try testing.expectEqual(@as(u32, 3), res.playable());
-
-    var eggs = SlimeReservoir{};
-    eggs.special[@intFromEnum(SpecialKind.egg)] = 3;
-    try testing.expectEqual(@as(u32, 3), eggs.playable());
-}
-
-test "grid playable_count counts every consumable special" {
+test "grid special counters see every kind" {
     var grid = SlimeGrid.init(2, 3);
     grid.set(0, 0, .neutral);
     grid.set(0, 1, .{ .tiered = .red });
@@ -710,8 +674,6 @@ test "grid playable_count counts every consumable special" {
     try testing.expectEqual(@as(u16, 2), grid.special_count());
     try testing.expectEqual(@as(u16, 1), grid.special_kind_count(.neutralizer));
     try testing.expectEqual(@as(u16, 1), grid.special_kind_count(.egg));
-    // Every kind is consumable, so every occupied cell is still in play.
-    try testing.expectEqual(@as(u16, 5), grid.playable_count());
 }
 
 test "baby_total sums the per-type tallies, saturating" {

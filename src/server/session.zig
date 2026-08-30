@@ -787,6 +787,7 @@ pub const Session = struct {
                     .cell_count = m.len,
                     .downgraded = m.downgraded,
                     .neutralized = m.neutralized,
+                    .rocks_broken = m.rocks_broken,
                 };
                 @memcpy(msg.cells[0..m.len], m.cells[0..m.len]);
                 var mbuf: [80]u8 = undefined;
@@ -893,6 +894,7 @@ pub const Session = struct {
             .neutralized = outcome.neutralized,
             .off_grid = outcome.off_grid,
             .inert = outcome.inert,
+            .rocks_broken = outcome.rocks_broken,
         };
         // Send the RESOLVED cells so clients never re-derive placement and
         // cannot disagree with the server about what was hit.
@@ -910,6 +912,7 @@ pub const Session = struct {
         // Only a green cell can step all the way to defused, so every
         // neutralization is attributable to the green bucket.
         fs.neutralized[@intFromEnum(c.Tier.green)] +|= outcome.neutralized;
+        fs.rocks_broken +|= outcome.rocks_broken;
         const ps = &self.stats.players[stamp.anchor_player];
         ps.cells_covered +|= stat_u16(outcome.total_downgraded());
         ps.cells_neutralized +|= outcome.neutralized;
@@ -932,6 +935,7 @@ pub const Session = struct {
         fs.neutral_consumed +|= feast.neutral;
         fs.defused_consumed +|= feast.defused;
         fs.agents_consumed +|= feast.agents;
+        fs.rocks_broken +|= feast.agent_rocks_broken;
         fs.charges_left = self.charges;
     }
 

@@ -4,8 +4,9 @@
 //! eat.  That slime starts in the off-grid reservoir; the grid (dimensions
 //! come from balance.slime_grid, a global knob) is filled from it and
 //! refilled from the top as cells are emptied.  The encounter ends when
-//! every playable unit is eaten, the hunger bar fills, or the charges run out
-//! with the field still walled off.  One encounter per game (no chaining).
+//! every unit is eaten (rocks included — the Agent breaks them into slime),
+//! the hunger bar fills, or the charges run out with the field still walled
+//! off.  One encounter per game (no chaining).
 //!
 //! The hunger bar's CAPACITY is not an encounter knob any more: it is the sum
 //! of every player's appetite-derived contribution (balance.hunger_base /

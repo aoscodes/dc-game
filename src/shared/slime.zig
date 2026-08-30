@@ -26,9 +26,10 @@
 //!                 in the rightmost BACK_RANKS columns; a cell whose eligible
 //!                 pool is empty is SKIPPED, not filled.
 //!   apply_shape — stamp a cast's footprint at an aimed anchor, DOWNGRADING
-//!                 every covered hazard one tier.  Deterministic: the player
-//!                 chose the cells, so nothing is random and nothing is
-//!                 destroyed — only made safer.
+//!                 every covered hazard one tier and BREAKING every covered
+//!                 rock into red slime.  Deterministic: the player chose the
+//!                 cells, so nothing is random and nothing is destroyed —
+//!                 only made safer (or, for a rock, made breakable-down).
 //!   feast       — the turn-end bite: the Lil Guys chew through the leftmost
 //!                 `n_cols` columns.  An EDIBLE unit is consumed whole; a
 //!                 live hazard is NIBBLED — downgraded one tier in place,
@@ -137,21 +138,14 @@ pub const SlimeField = struct {
         return @as(u32, self.grid.occupied()) + self.reservoir.total();
     }
 
-    /// Slime still in play the team can actually clear — everything except
-    /// INCONSUMABLE specials.  Consumable specials (eggs) count: the feast
-    /// eats them like any other food.
-    pub fn remaining_playable(self: *const SlimeField) u32 {
-        return @as(u32, self.grid.playable_count()) + self.reservoir.playable();
-    }
-
-    /// True when nothing but inconsumable `special` units is left anywhere.
+    /// True when nothing is left anywhere — grid and reservoir both empty.
     ///
-    /// This is the WIN, not "the grid is empty": an inconsumable special can
-    /// only leave the grid by matching, which the team cannot force, so
-    /// demanding an empty grid would make encounters unwinnable.  Clearing
-    /// all the clearable slime is the achievement.
+    /// This is the WIN, and it is literally "eat everything": every unit can
+    /// be cleared.  Food is eaten, hazards downgrade into food, and even a
+    /// rock is broken into red slime by Neutralizing Agent — no unit is
+    /// permanent, so nothing needs exempting from the count.
     pub fn is_exhausted(self: *const SlimeField) bool {
-        return self.remaining_playable() == 0;
+        return self.remaining() == 0;
     }
 
     /// Move reservoir slime into every empty cell, walking the RIGHTMOST
@@ -247,16 +241,19 @@ pub const SlimeField = struct {
     /// Stamp one cast's shape on the grid, anchored at (`row`, `col`).
     ///
     /// Every covered cell holding a hazard is DOWNGRADED one tier
-    /// (red -> yellow -> green -> neutralized).  Nothing is destroyed: a
+    /// (red -> yellow -> green -> neutralized).  A covered ROCK is BROKEN:
+    /// the Agent cracks it into red slime — the hardest tier — putting it at
+    /// the top of the same ladder (rock -> red -> ... -> neutralized), so a
+    /// rock is four applications from edible.  Nothing is destroyed: a
     /// neutralized unit stays on the grid, edible, scoring, and costing only
     /// normal hunger — clearing the field is the Lil Guys' job, not the cast's.
     ///
-    /// Cells the shape covers that cannot be downgraded are WASTED, and the
+    /// Cells the shape covers that cannot be changed are WASTED, and the
     /// distinction is the player's aiming feedback:
     ///   - `off_grid`  — the offset fell outside the playfield (clipped)
     ///   - `inert`     — a real cell with nothing to neutralize (empty,
-    ///                   neutral, already neutralized, or a `special`, which no
-    ///                   cast can ever change)
+    ///                   neutral, already neutralized, or a special OTHER
+    ///                   than the rock — no cast can change those)
     ///
     /// Deterministic: no randomness, because the player chose the cells.
     pub fn apply_shape(
@@ -277,6 +274,14 @@ pub const SlimeField = struct {
             }
             const flat = self.grid.index(@intCast(r), @intCast(cl));
             const cell = self.grid.get(flat);
+            if (cell == .special and cell.special == .rock) {
+                // The BREAK: the Agent cracks the boulder into the hardest
+                // slime.  Accomplishment, not waste — it goes on its own
+                // tally, never into `inert` or the per-tier `downgraded`.
+                self.grid.put(flat, .{ .tiered = .red });
+                out.rocks_broken += 1;
+                continue;
+            }
             if (cell != .tiered) {
                 out.inert += 1;
                 continue;
@@ -314,8 +319,10 @@ pub const SlimeField = struct {
     ///     (red -> yellow -> green -> defused), never removed.  A nibble
     ///     fills hunger like a meal but scores NOTHING: hazards the casts
     ///     failed to defuse in time run the clock down for free.
-    ///   - A ROCK (inconsumable special) — inert: skipped outright, no
-    ///     hunger, no score, no change.  Only a bomb removes one.
+    ///   - A ROCK (inconsumable special) — skipped outright: no hunger, no
+    ///     score, no change.  The bite cannot break one; only Neutralizing
+    ///     Agent (a cast or an inline block, cracking it to red) starts it
+    ///     down the ladder, and only a bomb removes one instantly.
     ///   - EMPTY — nothing there.
     ///
     /// Nothing shelters anything: every cell in the bitten columns is
@@ -348,7 +355,7 @@ pub const SlimeField = struct {
                     }
                     continue;
                 }
-                if (!cell.is_edible()) continue; // empty, or an inert rock
+                if (!cell.is_edible()) continue; // empty, or an unbroken rock
                 const effect = self.consume(flat, bal, &out) orelse continue;
                 switch (effect) {
                     // Recorded in `consume`; nothing on the board changes.
@@ -367,6 +374,7 @@ pub const SlimeField = struct {
                             out.agent_downgraded[t] += n;
                         }
                         out.agent_defused += fired.neutralized;
+                        out.agent_rocks_broken += fired.rocks_broken;
                     },
                     .explode => {
                         // The blast levels the 3x3 where the bomb was eaten,
@@ -547,6 +555,7 @@ pub const SlimeField = struct {
                     );
                     m.downgraded = shape_out.downgraded;
                     m.neutralized = shape_out.neutralized;
+                    m.rocks_broken = shape_out.rocks_broken;
                 },
                 // On-eat effects; no matchable kind carries them.
                 .hatch, .refill_charges, .explode => unreachable,
@@ -661,6 +670,8 @@ pub const Match = struct {
     downgraded: [c.Tier.size]u16 = [_]u16{0} ** c.Tier.size,
     /// Of those, cells taken all the way to defused.
     neutralized: u16 = 0,
+    /// Rocks the effect BROKE into red slime (neutralize_block only).
+    rocks_broken: u16 = 0,
 };
 
 /// Everything one `resolve_matches` pass found and did.
@@ -709,6 +720,8 @@ pub const FeastOutcome = struct {
     /// went all the way to defused (most of which this same feast then ate).
     agent_downgraded: [c.Tier.size]u16 = [_]u16{0} ** c.Tier.size,
     agent_defused: u16 = 0,
+    /// Rocks those blocks BROKE into red slime (see ShapeOutcome).
+    agent_rocks_broken: u16 = 0,
     /// Canisters consumed.  Free like the neutralizer — counted in `cells`,
     /// never in score or hunger.
     canisters: u16 = 0,
@@ -742,7 +755,7 @@ pub const FeastOutcome = struct {
     }
 };
 
-/// What stamping one shape did.  The three wasted-cell kinds are kept apart
+/// What stamping one shape did.  The two wasted-cell kinds are kept apart
 /// because they mean different things to the player: `off_grid` says "you
 /// aimed off the edge", `inert` says "you hit clean slime".
 pub const ShapeOutcome = struct {
@@ -750,12 +763,16 @@ pub const ShapeOutcome = struct {
     downgraded: [c.Tier.size]u16 = [_]u16{0} ** c.Tier.size,
     /// Of those, how many were fully defused (green -> neutralized).
     neutralized: u16 = 0,
+    /// Rocks BROKEN into red slime.  Kept out of `downgraded` — a rock had
+    /// no tier to step down FROM — and out of the waste tallies: cracking a
+    /// boulder is what the Agent was for.
+    rocks_broken: u16 = 0,
     /// Covered offsets that fell outside the grid.
     off_grid: u16 = 0,
     /// Covered cells with nothing to neutralize.
     inert: u16 = 0,
 
-    /// Total cells the cast changed.
+    /// Total cells the cast stepped down a tier (breaks not included).
     pub fn total_downgraded(self: ShapeOutcome) u16 {
         var n: u16 = 0;
         for (self.downgraded) |d| n += d;
@@ -1383,18 +1400,64 @@ test "a consumable special is food: eaten, scored, and hatched" {
     try testing.expect(field.is_exhausted());
 }
 
-test "no cast can ever change a special of any kind" {
-    for ([_]c.SpecialKind{ .neutralizer, .egg, .rock, .canister }) |kind| {
+test "no cast can ever change a special — except the rock, which BREAKS" {
+    for ([_]c.SpecialKind{ .neutralizer, .egg, .canister, .bomb }) |kind| {
         var field = empty_field(1, 1);
         field.grid.put(0, .{ .special = kind });
         var i: usize = 0;
         while (i < 8) : (i += 1) {
             const out = field.apply_shape(DOT, 0, 0);
             try testing.expectEqual(@as(u16, 0), out.total_downgraded());
+            try testing.expectEqual(@as(u16, 0), out.rocks_broken);
             try testing.expectEqual(@as(u16, 1), out.inert);
         }
         try testing.expectEqual(c.SlimeCell{ .special = kind }, field.grid.get(0));
     }
+}
+
+test "the Agent breaks a rock into red: four applications from edible" {
+    var field = empty_field(1, 1);
+    field.grid.put(0, .{ .special = .rock });
+
+    // Application 1: the BREAK.  Its own tally — not a downgrade (the rock
+    // had no tier to step down from), and not waste.
+    const broke = field.apply_shape(DOT, 0, 0);
+    try testing.expectEqual(@as(u16, 1), broke.rocks_broken);
+    try testing.expectEqual(@as(u16, 0), broke.total_downgraded());
+    try testing.expectEqual(@as(u16, 0), broke.wasted());
+    try testing.expectEqual(c.SlimeCell{ .tiered = .red }, field.grid.get(0));
+
+    // Applications 2-4: ordinary hazard from here — red -> yellow -> green
+    // -> neutralized — and then the bite eats the result.
+    _ = field.apply_shape(DOT, 0, 0);
+    _ = field.apply_shape(DOT, 0, 0);
+    const defused = field.apply_shape(DOT, 0, 0);
+    try testing.expectEqual(@as(u16, 1), defused.neutralized);
+    try testing.expectEqual(c.SlimeCell.neutralized, field.grid.get(0));
+
+    const out = field.feast(test_bal, 1);
+    try testing.expectEqual(@as(u16, 1), out.cells);
+    try testing.expectEqual(@as(u32, 1), out.score);
+    try testing.expect(field.is_exhausted());
+}
+
+test "a swallowed neutralizer breaks a rock later in the same bite" {
+    // Column of neutralizer / rock.  The 3x3 fires INLINE where the
+    // neutralizer is eaten, cracking the rock to red BEFORE the walk gets
+    // there — so the walk NIBBLES the fresh red instead of skipping a rock.
+    // Part of the ordering contract the browser replay mirrors.
+    var field = empty_field(2, 1);
+    field.grid.set(0, 0, .{ .special = .neutralizer });
+    field.grid.set(1, 0, .{ .special = .rock });
+
+    const out = field.feast(test_bal, 1);
+    try testing.expectEqual(@as(u16, 1), out.agents);
+    try testing.expectEqual(@as(u16, 1), out.agent_rocks_broken);
+    try testing.expectEqual(
+        @as(u16, 1),
+        out.bitten_downgraded[@intFromEnum(c.Tier.red)],
+    );
+    try testing.expectEqual(c.SlimeCell{ .tiered = .yellow }, field.grid.at(1, 0));
 }
 
 test "a defused front is consumed instead of nibbled: casts pre-chew the bite" {
@@ -1539,7 +1602,7 @@ test "a rock is INERT: the bite skips it — no hunger, no score, no change" {
     try testing.expectEqual(c.SlimeCell{ .special = .rock }, field.grid.at(1, 0));
 }
 
-test "a field holding nothing but rocks is WON: rocks are not playable" {
+test "a field holding only rocks is NOT won: rocks are clearable and owed" {
     var field = empty_field(1, 2);
     field.grid.put(0, .neutral);
     field.grid.put(1, .{ .special = .rock });
@@ -1547,10 +1610,50 @@ test "a field holding nothing but rocks is WON: rocks are not playable" {
 
     const out = field.feast(test_bal, 2);
     try testing.expectEqual(@as(u16, 1), out.cells);
-    // The rock remains — permanently — and the field is still exhausted:
-    // demanding it gone would make the encounter unwinnable.
+    // The rock remains, and it HOLDS the win: the Agent can break it into
+    // slime, so the team is expected to — the win is eating everything.
     try testing.expectEqual(@as(u16, 1), field.grid.occupied());
+    try testing.expect(!field.is_exhausted());
+
+    // Break it, chew it down, eat it: now the field is won.
+    _ = field.apply_shape(DOT, 0, 1); // rock -> red
+    _ = field.apply_shape(DOT, 0, 1); // red -> yellow
+    _ = field.apply_shape(DOT, 0, 1); // yellow -> green
+    _ = field.apply_shape(DOT, 0, 1); // green -> neutralized
+    _ = field.shift_left();
+    const meal = field.feast(test_bal, 1);
+    try testing.expectEqual(@as(u16, 1), meal.cells);
     try testing.expect(field.is_exhausted());
+}
+
+test "a rocks-only field is a STALL: the bite cannot move it on its own" {
+    // The counterpart to the win above, and the reason session.check_end's
+    // "the game always moves" invariant now needs the Agent to hold.
+    //
+    // A rock is skipped by the bite: no hunger, no score, no change.  So a
+    // field of nothing but rocks is inert under biting alone — it is neither
+    // exhausted (rocks are owed) nor advancing toward the hunger bar.  Only a
+    // cast breaks the stall, which is why a team that can still afford one
+    // always has a move, and why a team that cannot has none.
+    var field = empty_field(1, 2);
+    field.grid.put(0, .{ .special = .rock });
+    field.grid.put(1, .{ .special = .rock });
+
+    // Bite it as often as you like: nothing is eaten, nothing is nibbled and
+    // — the part that matters — no hunger accrues, so the clock never runs.
+    for (0..8) |_| {
+        const out = field.feast(test_bal, 2);
+        try testing.expectEqual(@as(u16, 0), out.cells);
+        try testing.expectEqual([_]u16{ 0, 0, 0 }, out.bitten_downgraded);
+        try testing.expectEqual(@as(u32, 0), out.hunger);
+        _ = field.shift_left();
+    }
+    try testing.expectEqual(@as(u16, 2), field.grid.occupied());
+    try testing.expect(!field.is_exhausted());
+
+    // The Agent is the only thing that moves it — and it costs charges.
+    _ = field.apply_shape(DOT, 0, 0);
+    try testing.expectEqual(c.SlimeCell{ .tiered = .red }, field.grid.at(0, 0));
 }
 
 test "a rock rides the conveyor like any unit" {
@@ -1673,10 +1776,10 @@ test "an uneaten egg keeps the field unwon: eggs are playable slime" {
 
     // The bite only nibbles the red; the egg behind it is out of this
     // turn's bite and still on the grid — food the team has not eaten, so
-    // no win.  Both count as playable: each can still be cleared.
+    // no win.  Both still count: each can be cleared.
     const out = field.feast(test_bal, 1);
     try testing.expectEqual(@as(u16, 0), out.cells);
-    try testing.expectEqual(@as(u32, 2), field.remaining_playable());
+    try testing.expectEqual(@as(u32, 2), field.remaining());
     try testing.expect(!field.is_exhausted());
 }
 

@@ -997,11 +997,18 @@ function floatStampOutcome(ev, slot, rows, cols) {
     : fieldCenter();
   const y = at.y + slot * STACK;
 
+  // A broken rock is accomplishment on par with a downgrade: it joins the
+  // head line (never the waste line) and keeps "no effect" honest.
   const hits = sumTiers(ev.downgraded);
-  const head = hits > 0
-    ? `${hits} downgraded${ev.neutralized > 0 ? `, ${ev.neutralized} defused` : ""}`
-    : "no effect";
-  spawnFloater(head, at.x, y, hits > 0 ? C_SLIME_HDR : C_BAD,
+  const cracked = ev.rocks_broken ?? 0;
+  const parts = [];
+  if (hits > 0) {
+    parts.push(`${hits} downgraded`);
+    if (ev.neutralized > 0) parts.push(`${ev.neutralized} defused`);
+  }
+  if (cracked > 0) parts.push(`${cracked} cracked`);
+  const head = parts.length > 0 ? parts.join(", ") : "no effect";
+  spawnFloater(head, at.x, y, parts.length > 0 ? C_SLIME_HDR : C_BAD,
     LAYOUT.floater.lifetime, LAYOUT.floater.font);
 
   // Nothing is destroyed by a stamp, so the only waste is coverage thrown
@@ -1571,8 +1578,9 @@ const SPECIAL_COLOR = "rgba(140,70,210,1)";
  *  as a prize rather than a threat. */
 const EGG_COLOR = "rgba(235,200,120,1)";
 
-/** Rock special: the permanent wall — inedible, impassable, cast-proof.
- *  Cold slate, deliberately duller than any hazard: nothing to do here. */
+/** Rock special: the boulder — inedible until the Agent BREAKS it into red
+ *  slime (a cast or an inline block: rock → red, then down the usual ladder).
+ *  Cold slate, deliberately duller than any hazard: work before food. */
 const ROCK_COLOR = "rgba(96,94,108,1)";
 
 /** Canister special: free pickup that refills the team's charge pool
@@ -1645,13 +1653,17 @@ function sumTiers(obj) {
 
 /**
  * One stamp applied to a cell: the name it becomes, or null when there is
- * nothing to downgrade (empty / neutral / already defused).
+ * nothing to downgrade (empty / neutral / already defused, or a special
+ * other than the rock).
  *
- * MIRRORS components.Tier.downgrade + slime.apply_shape: red → yellow → green
- * → defused.  Nothing is ever destroyed, so a stamp only ever changes what a
- * cell COSTS to eat, never whether it is eaten.
+ * MIRRORS components.Tier.downgrade + slime.apply_shape: rock → red → yellow
+ * → green → defused — the Agent BREAKS a rock into the hardest slime, then
+ * chews it down the same ladder as any hazard.  Nothing is ever destroyed,
+ * so a stamp only ever changes what a cell COSTS to eat, never whether it
+ * is eaten.
  */
 function downgradeName(name) {
+  if (name === "special_rock") return "red";
   if (name === "red") return "yellow";
   if (name === "yellow") return "green";
   if (name === "green") return "defused";
@@ -1850,7 +1862,7 @@ function biteFeast(board, rows, cols, width, overrides) {
         nibbled.add(flat);
         continue;
       }
-      if (!cellIsEdible(name)) continue; // empty, or an inert rock
+      if (!cellIsEdible(name)) continue; // empty, or an unbroken rock
       work[flat] = "empty";
       order.push(flat);
       eaten.add(flat);
@@ -1993,8 +2005,8 @@ const TILE_RGB = {
  *   "special_neutralizer" → violet body + ★ glyph (free pickup: eaten for no
  *                            score, fires a 3x3 Agent block)
  *   "special_egg"         → cream body + ○ glyph  (food with a baby inside)
- *   "special_rock"        → slate body + ■ glyph  (permanent wall: inedible,
- *                            impassable, cast-proof)
+ *   "special_rock"        → slate body + ■ glyph  (boulder: the bite skips
+ *                            it; the Agent breaks it into red slime)
  *   "special_canister"    → teal body + ⚡ glyph  (free pickup: refills the
  *                            team's charge pool)
  *   "special_bomb"        → orange body + ✱ glyph (free pickup: destroys its
@@ -2022,8 +2034,9 @@ function cellIsSlime(name) {
 }
 
 /** True when the bite CONSUMES this cell (as opposed to nibbling or skipping
- *  it).  Live hazards are nibbled instead; the rock is inert; empty is
- *  nothing.  Consumable specials are eaten whole: an egg is food with a baby
+ *  it).  Live hazards are nibbled instead; the rock is skipped (edible only
+ *  after the Agent breaks it down); empty is nothing.  Consumable specials
+ *  are eaten whole: an egg is food with a baby
  *  inside, a neutralizer is free equipment that fires a 3x3 Agent block as
  *  it is swallowed, a canister is free equipment that refills the team's
  *  charge pool, a bomb levels its 3x3 as it goes down. */

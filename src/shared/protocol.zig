@@ -206,6 +206,8 @@ pub const SpecialMatched = struct {
     downgraded: [components.Tier.size]u16 = [_]u16{0} ** components.Tier.size,
     /// Of those, cells taken all the way to defused.
     neutralized: u16 = 0,
+    /// Rocks the effect BROKE into red slime (see slime.ShapeOutcome).
+    rocks_broken: u16 = 0,
 };
 
 pub fn decode_special_matched(reader: anytype) !SpecialMatched {
@@ -221,6 +223,7 @@ pub fn decode_special_matched(reader: anytype) !SpecialMatched {
     for (p.cells[0..p.cell_count]) |*cell| cell.* = try reader.readInt(u16, .little);
     p.downgraded = try decode_u16_tiers(reader);
     p.neutralized = try reader.readInt(u16, .little);
+    p.rocks_broken = try reader.readInt(u16, .little);
     return p;
 }
 
@@ -309,7 +312,9 @@ pub const MAX_SHAPE_CELLS_WIRE: u16 = balance.MAX_SHAPE_CELLS;
 /// cannot disagree with the server about what was hit.
 ///
 /// `downgraded[t]` counts cells that stepped DOWN from tier `t`; `neutralized`
-/// counts how many of those landed on defused.  `off_grid` (clipped by the
+/// counts how many of those landed on defused; `rocks_broken` counts rocks
+/// the Agent cracked into red (accomplishment, not waste — a rock has no
+/// tier, so it travels apart from `downgraded`).  `off_grid` (clipped by the
 /// edge) and `inert` (hit empty/neutral/neutralized cells) are the two ways
 /// coverage is wasted — the headline aiming signal, which is why they travel
 /// alongside rather than being inferred.
@@ -329,6 +334,7 @@ pub const ShapeCast = struct {
     neutralized: u16 = 0,
     off_grid: u16 = 0,
     inert: u16 = 0,
+    rocks_broken: u16 = 0,
 };
 
 pub fn decode_shape_cast(reader: anytype) !ShapeCast {
@@ -342,6 +348,7 @@ pub fn decode_shape_cast(reader: anytype) !ShapeCast {
     p.neutralized = try reader.readInt(u16, .little);
     p.off_grid = try reader.readInt(u16, .little);
     p.inert = try reader.readInt(u16, .little);
+    p.rocks_broken = try reader.readInt(u16, .little);
     return p;
 }
 
@@ -518,8 +525,8 @@ pub const EndReason = enum(u8) {
     /// The hunger bar — the game's clock — filled: the Lil Guys are sated
     /// and the encounter ends on whatever the team scored.  Not a defeat.
     hunger_full = 0,
-    /// Every playable unit was eaten — specials may remain, since no play can
-    /// remove them.
+    /// Everything was eaten — grid and reservoir empty.  Nothing is exempt:
+    /// even a rock is clearable (the Agent breaks it into red slime).
     field_cleared = 1,
     // 2 was out_of_charges: retired — a broke team keeps playing on the
     // bite's nibbles (cast presses become passes), so the pool running dry
@@ -537,6 +544,10 @@ pub const FeastStats = struct {
     /// tuning number, since every nibble is hunger-clock spent on a cell the
     /// team's charges failed to defuse in time.
     hazards_bitten: u32 = 0,
+    /// Rocks BROKEN into red slime over the encounter — Agent spent on
+    /// boulders, by cast and by swallowed neutralizer alike.  The rock
+    /// tuning number: high here means the field was more quarry than meal.
+    rocks_broken: u32 = 0,
     neutral_consumed: u16 = 0,
     defused_consumed: u16 = 0,
     /// Neutralizers the feasts swallowed — free equipment, not food, so they
@@ -623,6 +634,7 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
             try writer.writeInt(u16, p.neutralized, .little);
             try writer.writeInt(u16, p.off_grid, .little);
             try writer.writeInt(u16, p.inert, .little);
+            try writer.writeInt(u16, p.rocks_broken, .little);
         },
         .recipe_fired => {
             try writer.writeByte(@intFromEnum(payload.kind));
@@ -647,6 +659,7 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
             for (p.cells[0..p.cell_count]) |cell| try writer.writeInt(u16, cell, .little);
             try encode_u16_tiers(writer, p.downgraded);
             try writer.writeInt(u16, p.neutralized, .little);
+            try writer.writeInt(u16, p.rocks_broken, .little);
         },
         .eggs_hatched => {
             const p: EggsHatched = payload;
@@ -778,6 +791,7 @@ fn encode_feast_stats(w: anytype, rs: FeastStats) !void {
     try w.writeInt(u16, rs.hunger_normal, .little);
     try w.writeInt(u32, rs.charges_spent, .little);
     try w.writeInt(u32, rs.charges_left, .little);
+    try w.writeInt(u32, rs.rocks_broken, .little);
 }
 
 fn decode_feast_stats(r: anytype) !FeastStats {
@@ -791,6 +805,7 @@ fn decode_feast_stats(r: anytype) !FeastStats {
         .hunger_normal = try r.readInt(u16, .little),
         .charges_spent = try r.readInt(u32, .little),
         .charges_left = try r.readInt(u32, .little),
+        .rocks_broken = try r.readInt(u32, .little),
     };
 }
 
@@ -1034,6 +1049,7 @@ test "round-trip: game_over carries score and match stats" {
         .hunger_normal = 38,
         .charges_spent = 27,
         .charges_left = 13,
+        .rocks_broken = 6,
     };
     go.stats.player_count = 2;
     go.stats.players[0] = .{ .casts = 3, .cells_covered = 27, .cells_neutralized = 6, .recipe_casts = 2 };
@@ -1064,6 +1080,7 @@ test "round-trip: game_over carries score and match stats" {
     try std.testing.expectEqual(@as(u16, 2), d.stats.feast.agents_consumed);
     try std.testing.expectEqual(@as(u32, 27), d.stats.feast.charges_spent);
     try std.testing.expectEqual(@as(u32, 13), d.stats.feast.charges_left);
+    try std.testing.expectEqual(@as(u32, 6), d.stats.feast.rocks_broken);
     try std.testing.expectEqual(@as(u8, 2), d.stats.player_count);
     try std.testing.expectEqual(@as(u16, 3), d.stats.players[0].casts);
     try std.testing.expectEqual(@as(u16, 27), d.stats.players[0].cells_covered);
@@ -1353,6 +1370,7 @@ test "round-trip: special_matched carries the run, its centre and its effect" {
     sm.cells[2] = 23;
     sm.downgraded[@intFromEnum(components.Tier.red)] = 12;
     sm.neutralized = 4;
+    sm.rocks_broken = 1;
     try encode(fbs.writer(), .special_matched, sm);
     fbs.reset();
     try std.testing.expectEqual(MsgTag.special_matched, try read_tag(fbs.reader()));
@@ -1364,6 +1382,7 @@ test "round-trip: special_matched carries the run, its centre and its effect" {
     try std.testing.expectEqualSlices(u16, sm.cells[0..3], got.cells[0..3]);
     try std.testing.expectEqual(@as(u16, 12), got.downgraded[@intFromEnum(components.Tier.red)]);
     try std.testing.expectEqual(@as(u16, 4), got.neutralized);
+    try std.testing.expectEqual(@as(u16, 1), got.rocks_broken);
 }
 
 test "round-trip: eggs_hatched carries each hatch's cell and rolled type" {
@@ -1581,6 +1600,7 @@ test "shape_cast round-trips its footprint and outcome" {
     sc.neutralized = 1;
     sc.off_grid = 5;
     sc.inert = 3;
+    sc.rocks_broken = 2;
     try encode(fbs.writer(), .shape_cast, sc);
 
     var rfbs = std.io.fixedBufferStream(fbs.getWritten());
@@ -1595,9 +1615,11 @@ test "shape_cast round-trips its footprint and outcome" {
     try std.testing.expectEqual(@as(u16, 0), got.downgraded[@intFromEnum(components.Tier.yellow)]);
     try std.testing.expectEqual(@as(u16, 1), got.downgraded[@intFromEnum(components.Tier.green)]);
     try std.testing.expectEqual(@as(u16, 1), got.neutralized);
-    // Wasted coverage travels explicitly, never inferred.
+    // Wasted coverage travels explicitly, never inferred — and a broken
+    // rock travels apart from both waste and the per-tier downgrades.
     try std.testing.expectEqual(@as(u16, 5), got.off_grid);
     try std.testing.expectEqual(@as(u16, 3), got.inert);
+    try std.testing.expectEqual(@as(u16, 2), got.rocks_broken);
 }
 
 test "shape_cast: a fully-clipped cast carries no cells" {

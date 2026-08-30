@@ -1222,10 +1222,10 @@ test "specials are summed per kind from the zones and default to none" {
     try std.testing.expectEqual(@as(u16, 3), e.slime.special[@intFromEnum(c.SpecialKind.neutralizer)]);
     try std.testing.expectEqual(@as(u16, 1), e.slime.special[@intFromEnum(c.SpecialKind.egg)]);
     // Every special counts as supply — they occupy grid cells — and every
-    // current kind is CONSUMABLE, so all of them stay in the playable count
-    // the win condition measures.
+    // unit is clearable (even a rock breaks under the Agent), so the total
+    // is exactly what the win condition measures down to zero.
     try std.testing.expectEqual(@as(u32, 10), e.total_units());
-    try std.testing.expectEqual(@as(u32, 10), e.slime.playable());
+    try std.testing.expectEqual(@as(u32, 10), e.slime.total());
 }
 
 test "an encounter of nothing but specials is still 'slime' for validation" {
