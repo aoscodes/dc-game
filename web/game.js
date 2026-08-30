@@ -1623,21 +1623,51 @@ function projectBatch(game) {
  *   hits: number, defused: number}} `cells` maps flat index → the tier name it
  *   will become ("defused" when it bottoms out).
  */
+/**
+ * Where every projected cast would LAND — the footprint alone, with no claim
+ * about what any of it would turn into.
+ *
+ * flat → { owner, pending } for EVERY on-grid covered cell, inert ones
+ * included (already-defused slime, empty ground).  This is the map the
+ * renderer draws a stamp's SHAPE from, so it must be the whole footprint: a
+ * coverage map that skipped the do-nothing cells would show a stamp with
+ * holes in it.  The outline wears the owner's color; pending (locked-in)
+ * draws dotted, live aim solid.  Where stamps overlap the VIEWER's own wins:
+ * your own aim is what your cast resolves against — same precedence as the
+ * badge's overlay map.
+ *
+ * Split out of `shapePreview` because it is BOARD-INDEPENDENT: a footprint is
+ * a pure function of (shape offsets, anchor cursor, grid dimensions) and
+ * never reads a cell.  That is what makes it safe to draw over a feast
+ * replay, where the coordinates still mean what they say but the contents are
+ * a column out of date (see the preview gate in drawGrid).
+ *
+ * @returns {Map<number, {owner: number, pending: boolean}>}
+ */
+function castFootprint(game) {
+  const { rows, cols } = gridDims(game);
+  const owners = new Map();
+  for (const stamp of projectBatch(game).stamps) {
+    for (const { dRow, dCol } of stamp.offsets) {
+      const r = stamp.anchor.row + dRow;
+      const cl = stamp.anchor.col + dCol;
+      if (r < 0 || r >= rows || cl < 0 || cl >= cols) continue;
+      const flat = r * cols + cl;
+      if (!owners.has(flat) || stamp.owner === game.player_id) {
+        owners.set(flat, { owner: stamp.owner, pending: stamp.pending });
+      }
+    }
+  }
+  return owners;
+}
+
 function shapePreview(game) {
   const { rows, cols } = gridDims(game);
   const grid = game.grid ?? [];
   const projected = projectBatch(game);
 
   const cells = new Map();
-  // flat → { owner, pending } for EVERY on-grid covered cell — inert ones
-  // included (already-defused slime, empty ground).  This is the map the
-  // renderer draws the stamp's SHAPE from, so it must be the whole
-  // footprint: a coverage map that skipped the do-nothing cells would show
-  // a stamp with holes in it.  The outline wears the owner's color; pending
-  // (locked-in) draws dotted, live aim solid.  Where stamps overlap the
-  // VIEWER's own wins: your own aim is what your cast resolves against —
-  // same precedence as the badge's overlay map.
-  const owners = new Map();
+  const owners = castFootprint(game);
   const out = shapeOutcome();
 
   // Projected against a real WORKING BOARD rather than cell-by-cell, because
@@ -1649,17 +1679,10 @@ function shapePreview(game) {
   const work = grid.slice(0, rows * cols);
 
   for (const stamp of projected.stamps) {
-    // Ownership is the SHAPE's, so it is collected over the raw footprint —
-    // a crater the stamp blew open elsewhere belongs to nobody's outline.
-    for (const { dRow, dCol } of stamp.offsets) {
-      const r = stamp.anchor.row + dRow;
-      const cl = stamp.anchor.col + dCol;
-      if (r < 0 || r >= rows || cl < 0 || cl >= cols) continue;
-      const flat = r * cols + cl;
-      if (!owners.has(flat) || stamp.owner === game.player_id) {
-        owners.set(flat, { owner: stamp.owner, pending: stamp.pending });
-      }
-    }
+    // Ownership was collected above over the raw footprint — a crater the
+    // stamp blew open elsewhere belongs to nobody's outline — so all that is
+    // left here is resolving what the board becomes.
+    //
     // Chain multiple stamps over the same board: each one resolves against
     // what the last left behind, exactly as the server applies them in
     // sequence.  Depth 0 — every cast begins its own chain.
@@ -2707,11 +2730,13 @@ function animProgress(anim) {
  * each one is a statement ABOUT:
  *
  *   COORDINATES survive the replay — the cursor, the pips of a locked-in cast,
- *   the bite strip.  A cursor is a (row, col) the server owns and clamps; a
- *   bite strip is the front `feastWidth` columns.  Neither reads a cell, so
- *   neither can be stale, and play is REALTIME: the player is still aiming and
- *   still casting while the meal plays, so taking their crosshair away for the
- *   better part of every bite interval is the one thing the replay must not do.
+ *   the bite strip, and the cast's FOOTPRINT.  A cursor is a (row, col) the
+ *   server owns and clamps; a bite strip is the front `feastWidth` columns; a
+ *   footprint is (offsets + anchor), which `castFootprint` computes without
+ *   reading a single cell.  None of them can be stale, and play is REALTIME:
+ *   the player is still aiming while the meal plays, so taking their crosshair
+ *   or their shape away for the better part of every bite interval is the one
+ *   thing the replay must not do.
  *
  *   CONTENTS do not — the cast preview's outcome tints and the nibble
  *   hatching.  Those are computed against `game.grid`, the server's real board,
@@ -2720,6 +2745,13 @@ function animProgress(anim) {
  *   eats, so for most of the replay the two disagree by a column.  Drawn
  *   together they would contradict each other on screen, which is worse than
  *   showing nothing: they come back the moment the board lands.
+ *
+ * The footprint used to be hidden with the tints, because it was half of one
+ * value.  It is not the same KIND of statement: a tint promises what a cast
+ * would DO, while a footprint only says where the player is POINTING — which
+ * is true over any board.  With the settle window on it is also the only one
+ * of the two that stays meaningful, since mid-chew there is no cast to
+ * promise anything about (see balance settle_lockout_ms).
  */
 function drawSlimeField(game) {
   const { rows, cols } = gridDims(game);
@@ -2740,9 +2772,15 @@ function drawSlimeField(game) {
   // — so the stamp's shape renders unbroken; `cells` holds only the
   // outcomes, for the tint.  Exact, not a guess: placement is a pure
   // function of (shape, cursor).  Computed once per frame.
-  const pv = replay || playSuspended()
+  //
+  // Mid-replay only the footprint survives — see this function's header for
+  // why the two halves part company.  At the outro nothing is drawn at all:
+  // the game is over, so there is no aim left to describe.
+  const pv = playSuspended()
     ? { cells: new Map(), owners: new Map() }
-    : shapePreview(game);
+    : replay
+      ? { cells: new Map(), owners: castFootprint(game) }
+      : shapePreview(game);
   const preview = pv.cells;
   const previewOwners = pv.owners;
   // Only LIVE aim pulses ("not yet resolved"); locked-in outlines hold

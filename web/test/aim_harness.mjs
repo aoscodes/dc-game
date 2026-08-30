@@ -87,8 +87,15 @@ for (const [re, what] of [
   [/if \(!playSuspended\(\)\) \{\s*\n\s*drawPendingMarks/, "cursor+pip gate"],
 ]) ok(re.test(field), `${what} must be gated on playSuspended, not replay`);
 
-// ...and the content-derived overlays still are gated on `replay`.
-ok(/const pv = replay \|\| playSuspended\(\)/.test(field), "preview tints stay replay-gated");
+// ...and the content-derived overlays still are gated on `replay`, while the
+// FOOTPRINT is not: mid-replay the gate must ask castFootprint for owners and
+// hand back empty cells.  Both halves are asserted, because a gate that
+// blanked everything (the old behaviour) satisfies the tint half alone.
+ok(/const pv = playSuspended\(\)/.test(field), "outro still blanks the whole preview");
+const midReplay = field.match(/: replay\s*\n\s*\? \{ cells: new Map\(\), owners: ([^}]*)\}/);
+ok(midReplay !== null, "mid-replay branch must build owners from a footprint");
+ok(/castFootprint\(game\)/.test(midReplay[1]),
+  "mid-replay owners must come from castFootprint", midReplay[1]);
 // Every set the hatch reads must be EMPTY during the replay -- if a new
 // reachability set is added and left out of this stub, the draw either
 // throws or starts telling the truth about a board that is not on screen.
@@ -97,5 +104,75 @@ ok(stub !== null, "nibble hatching stays replay-gated");
 for (const set of ["eaten", "nibbled", "gnawed"])
   ok(new RegExp(`${set}: new Set\\(\\)`).test(stub[1]),
     `replay stub must blank reach.${set}`);
+
+// ---------------------------------------------------------------------------
+// castFootprint: the half of shapePreview that survives a feast replay.
+// ---------------------------------------------------------------------------
+
+// Structural: a footprint is (offsets + anchor + dimensions) and nothing else.
+// If it ever learns to read a cell it stops being safe to draw over a replay
+// board, and the gate above becomes a lie.
+const fp = extract("castFootprint");
+ok(!/\bgrid\b|cinematicBoard|\.board\b|work\[/.test(fp),
+  "castFootprint must not read any board", fp.match(/\bgrid\b|cinematicBoard|\.board\b/));
+
+// Behavioural: same aim, two utterly different boards, identical footprint.
+// The structural check alone would pass a function that read the board
+// through a helper.
+function footprint(frame) {
+  return new Function("game", "PLAYER_RECIPES", "TEAM_RECIPES", `
+    ${extract("gridDims")}
+    ${extract("addOutput")}
+    ${extract("projectedCasts")}
+    ${extract("projectBatch")}
+    ${extract("castFootprint")}
+    return castFootprint(game);
+  `)(frame,
+    [{ label: "poke", offsets: [{ dRow: 0, dCol: 0 }, { dRow: 1, dCol: 0 }], cost: 1 }],
+    []);
+}
+
+const aim = {
+  player_id: 1,
+  grid_rows: 4, grid_cols: 4,
+  entities: [
+    { owner: 1, cursor_row: 1, cursor_col: 2, selected_shape: 0 },
+    { owner: 2, cursor_row: 1, cursor_col: 2, selected_shape: 0 },
+  ],
+  recent: [],
+};
+const emptyBoard = { ...aim, grid: Array(16).fill("empty") };
+const fullBoard = { ...aim, grid: Array(16).fill("tiered_red") };
+
+const fpEmpty = footprint(emptyBoard);
+const fpFull = footprint(fullBoard);
+const asList = (m) => [...m.entries()].sort((a, b) => a[0] - b[0])
+  .map(([k, v]) => `${k}:${v.owner}:${v.pending}`).join("|");
+
+ok(fpEmpty.size > 0, "footprint drew nothing");
+ok(asList(fpEmpty) === asList(fpFull),
+  "footprint must not vary with the board", [asList(fpEmpty), asList(fpFull)]);
+
+// The shape lands where it is aimed: anchor (1,2) on a 4-wide grid is flat 6,
+// and the poke's second offset is the cell below it, flat 10.
+ok(fpEmpty.has(6) && fpEmpty.has(10),
+  "footprint must cover the anchor and its offset", [...fpEmpty.keys()]);
+ok(fpEmpty.size === 2, "footprint must cover ONLY the shape", [...fpEmpty.keys()]);
+
+// The viewer's own aim wins an overlap -- both players aim at the same square
+// here, and player 1 is the viewer.
+ok(fpEmpty.get(6).owner === 1, "viewer's own stamp must win an overlap", fpEmpty.get(6));
+
+// Negative control for the board-independence check: a footprint that DID
+// consult the board would differ between these two frames, so prove the two
+// frames are actually distinguishable.
+ok(JSON.stringify(emptyBoard.grid) !== JSON.stringify(fullBoard.grid),
+  "the two control boards must actually differ");
+
+// Negative control for the coverage check: an aim somewhere else must produce
+// a different footprint, or `has(6) && has(10)` would pass on anything.
+const moved = footprint({ ...emptyBoard,
+  entities: [{ owner: 1, cursor_row: 0, cursor_col: 0, selected_shape: 0 }] });
+ok(!moved.has(6), "moving the aim must move the footprint", [...moved.keys()]);
 
 console.log("AIM OVERLAY OK");
