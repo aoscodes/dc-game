@@ -1,8 +1,8 @@
 {
-  "default": "slime_feast_01",
+  "default": "custom",
   "encounters": [
     {
-      "label": "slime_feast_01",
+      "label": "custom",
       "charges": 30,
       "zones": [
         {
@@ -13,8 +13,11 @@
           },
           "neutral": 0,
           "special": {
-            "neutralizer": 4,
-            "egg": 3
+            "neutralizer": 50,
+            "egg": 3,
+            "rock": 100,
+            "canister": 50,
+            "bomb": 20
           }
         }
       ]
