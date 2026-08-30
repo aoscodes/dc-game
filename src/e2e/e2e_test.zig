@@ -37,6 +37,12 @@ const E2E_DATA_DIR = "zig-out/e2e-data";
 /// The shipped balance at e2e speed: a 500ms bite and a 100ms cooldown, so a
 /// whole encounter settles in seconds.  The tables are minimal — one cheap
 /// poke, one line, and a poke+poke group so team recipes are reachable.
+///
+/// The settle window is scaled to match: 60ms against a 434ms two-bot bite
+/// interval leaves most of each meal playable, so the bots still land the
+/// hundreds of casts the assertions below count — while a bot casting every
+/// frame is guaranteed to walk into the window and be refused, which is the
+/// only way this path gets exercised end to end.
 const E2E_BALANCE_JSON =
     \\{
     \\  "hunger_cost_normal": 1,
@@ -49,6 +55,7 @@ const E2E_BALANCE_JSON =
     \\  "bite_speedup_per_baby_pct": 5,
     \\  "cast_cooldown_ms": 100,
     \\  "team_window_ms": 1500,
+    \\  "settle_lockout_ms": 60,
     \\  "baby_hunger": 10,
     \\  "feast_columns": 1,
     \\  "feast_columns_per_guy": 0,
@@ -112,6 +119,12 @@ const BotResult = struct {
     max_cursor_col: u8 = 0,
     /// shape_cast broadcasts seen — the wire proof that stamps landed.
     shape_casts: u32 = 0,
+    /// `cast_refused` messages this bot earned — the wire proof that the
+    /// post-bite settle window actually turned casts away.
+    casts_refused: u32 = 0,
+    /// Highest `cast_locked_ms` seen in a snapshot, proving the window both
+    /// appeared on the wire and was drawable.
+    max_cast_locked_ms: u32 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -254,6 +267,20 @@ pub fn main() !void {
             failed = true;
             continue;
         }
+        // The settle window, both halves of it: the countdown clients draw
+        // and the refusal a cast inside it earns.  A bot casting every frame
+        // against a 60ms window on a 434ms bite cannot avoid walking into it,
+        // so silence here means the rule is not reaching the wire at all.
+        if (ctx.result.max_cast_locked_ms == 0) {
+            std.debug.print("[e2e] FAIL {s}: settle window never seen on the wire\n", .{ctx.name});
+            failed = true;
+            continue;
+        }
+        if (ctx.result.casts_refused == 0) {
+            std.debug.print("[e2e] FAIL {s}: no cast was ever refused mid-settle\n", .{ctx.name});
+            failed = true;
+            continue;
+        }
         if (ctx.result.casts_total == 0 or ctx.result.stats_neutralized == 0) {
             std.debug.print("[e2e] FAIL {s}: empty match stats (casts={}, neutralized={})\n", .{
                 ctx.name, ctx.result.casts_total, ctx.result.stats_neutralized,
@@ -388,6 +415,8 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                 if (!in_game) continue;
 
                 ctx.result.max_bite = @max(ctx.result.max_bite, gs.bite);
+                ctx.result.max_cast_locked_ms =
+                    @max(ctx.result.max_cast_locked_ms, gs.cast_locked_ms);
 
                 // Track our own cursor and cooldown as the server reports them.
                 for (gs.entities[0..gs.entity_count]) |e| {
@@ -432,6 +461,12 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                 var fbs = std.io.fixedBufferStream(payload);
                 _ = proto.decode_shape_cast(fbs.reader()) catch continue;
                 ctx.result.shape_casts += 1;
+            },
+
+            .cast_refused => {
+                var fbs = std.io.fixedBufferStream(payload);
+                _ = proto.decode_cast_refused(fbs.reader()) catch continue;
+                ctx.result.casts_refused += 1;
             },
 
             .game_over => {

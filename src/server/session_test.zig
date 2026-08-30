@@ -233,6 +233,7 @@ fn consume_payload(tag: proto.MsgTag, r: anytype) bool {
         .action_result => if (proto.decode_action_result(r)) |_| true else |_| false,
         .game_over => if (proto.decode_game_over(r)) |_| true else |_| false,
         .over_budget => if (proto.decode_over_budget(r)) |_| true else |_| false,
+        .cast_refused => if (proto.decode_cast_refused(r)) |_| true else |_| false,
         .recipe_fired => if (proto.decode_recipe_fired(r)) |_| true else |_| false,
         .shape_cast => if (proto.decode_shape_cast(r)) |_| true else |_| false,
         .move_cursor => if (proto.decode_move_cursor(r)) |_| true else |_| false,
@@ -4059,4 +4060,231 @@ test "a freed seat can be taken by a NEW connection, which counts in fresh" {
     try std.testing.expectEqual(@as(u8, 2), s.sess.seated_players());
     try std.testing.expectEqual(@as(u16, 200), s.sess.hunger.max);
     try std.testing.expectEqual(@as(u32, 40), s.sess.charges);
+}
+
+// ---------------------------------------------------------------------------
+// The post-bite settle window (balance.settle_lockout_ms).
+//
+// While the Lil Guys chew, the board is theirs: every cast is refused, table
+// wide, and the caster is TOLD so — unlike the per-player cast cooldown,
+// which drops a press in silence because the seat panel already counts it
+// down.  A refused cast is a cast that never happened: nothing lands, no
+// cooldown starts, the pool is untouched and the team window does not age.
+//
+// These use `settling_config` (window ON at 200ms).  The default fixture
+// leaves it at 0 — the shipped default — so every test above casts straight
+// through a settle exactly as it always did.
+// ---------------------------------------------------------------------------
+
+/// A pair with the settle window switched on, mid-encounter.
+fn init_settling_session(s: *TwoPlayerSession, allocator: std.mem.Allocator) !void {
+    try init_two_player_session_cfg(s, allocator, SEED, &fixtures.settling_config);
+}
+
+test "a cast while the Lil Guys chew is refused, and the caster is told" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_settling_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_neutral_only);
+    paint_grid(&s.sess, .neutral);
+    s.sess.field.reservoir = .{ .neutral = 5 }; // field cannot clear
+    s.sess.charges = 50;
+
+    try settle_idly(&s.sess);
+    const charges_after_bite = s.sess.charges;
+
+    s.p[0].clear();
+    s.p[1].clear();
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try flush(&s.sess);
+
+    // Refused, out loud, and nothing reached the board.
+    const msgs = try drain(s.p[0].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_refused));
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .shape_cast));
+    const refusal = find_tag(msgs, .cast_refused) orelse return error.NoRefusal;
+    var rfbs = std.io.fixedBufferStream(refusal.payload);
+    const decoded = try proto.decode_cast_refused(rfbs.reader());
+    try std.testing.expectEqual(proto.CastRefusal.settling, decoded.reason);
+
+    // A refused cast is a cast that never happened: the pool is untouched,
+    // no cooldown started (so the player may try again the instant the
+    // window lifts), and the team window took no entry.
+    try std.testing.expectEqual(charges_after_bite, s.sess.charges);
+    try std.testing.expectEqual(@as(u64, 0), s.sess.cooldown_until[s.p[0].pid]);
+    try std.testing.expectEqual(@as(u8, 0), s.sess.recent_count);
+
+    // The OTHER player hears nothing about it: nothing landed, so there is
+    // nothing for anyone else to redraw.
+    const other = try drain(s.p[1].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 0), count_tag(other, .cast_refused));
+}
+
+test "once the chewing stops, the same cast lands" {
+    // The negative control for the refusal above.  A lockout that never
+    // lifted would pass every assertion there while making the game
+    // unplayable, so the window must be shown to EXPIRE.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_settling_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_neutral_only);
+    paint_grid(&s.sess, .neutral);
+    s.sess.field.reservoir = .{ .neutral = 5 };
+    s.sess.charges = 50;
+
+    try settle_idly(&s.sess);
+    // Past the window.  Well under the 869ms two-player bite interval, so no
+    // second meal muddies the result.
+    try advance(&s.sess, fixtures.SETTLE_LOCKOUT_MS + 50);
+
+    s.p[0].clear();
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try flush(&s.sess);
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_refused));
+    try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .shape_cast));
+}
+
+test "the settle window outlasts the cast cooldown it is not" {
+    // The two refusals are different rules with different answers, and the
+    // fixture pins the window (200ms) at double the cooldown (100ms) so they
+    // can be told apart.  Here the cooldown has expired and the window has
+    // not: a press must still be refused, and refused OUT LOUD.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_settling_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_neutral_only);
+    paint_grid(&s.sess, .neutral);
+    s.sess.field.reservoir = .{ .neutral = 5 };
+    s.sess.charges = 50;
+
+    try settle_idly(&s.sess);
+    try advance(&s.sess, COOLDOWN_MS + 50); // past the cooldown, inside the window
+    try std.testing.expect(s.sess.now_ms() < s.sess.cast_locked_until);
+
+    s.p[0].clear();
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try flush(&s.sess);
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .cast_refused));
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .shape_cast));
+}
+
+test "with the window off, a cast lands the instant the bite settles" {
+    // The negative control for the FIXTURE: everything above is driven by one
+    // balance knob, and `test_config` leaves it at the shipped default of 0.
+    // Without this, a bug that locked the board unconditionally would look
+    // exactly like the feature working.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator); // default config: window OFF
+    defer s.deinit();
+    try start(&s, &enc_neutral_only);
+    paint_grid(&s.sess, .neutral);
+    s.sess.field.reservoir = .{ .neutral = 5 };
+    s.sess.charges = 50;
+
+    try std.testing.expectEqual(@as(u32, 0), TEST_CFG.balance.settle_lockout_ms);
+    try settle_idly(&s.sess);
+    try std.testing.expectEqual(@as(u64, 0), s.sess.cast_locked_until);
+
+    s.p[0].clear();
+    try enqueue_cast_as(&s.sess, s.p[0].pid, POKE);
+    try flush(&s.sess);
+
+    const msgs = try drain(s.p[0].buf.items, arena);
+    try std.testing.expectEqual(@as(usize, 0), count_tag(msgs, .cast_refused));
+    try std.testing.expectEqual(@as(usize, 1), count_tag(msgs, .shape_cast));
+}
+
+test "the settle window counts down on the wire, and reaches zero" {
+    // Clients draw this number, so it must both APPEAR and DRAIN.  A field
+    // pinned at its full value would have every seat panel stuck mid-chew.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_settling_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_neutral_only);
+    paint_grid(&s.sess, .neutral);
+    s.sess.field.reservoir = .{ .neutral = 5 };
+
+    s.p[0].clear();
+    try settle_idly(&s.sess);
+    const at_settle = try latest_cast_locked_ms(s.p[0].buf.items, arena);
+    try std.testing.expectEqual(@as(u32, fixtures.SETTLE_LOCKOUT_MS), at_settle);
+
+    // Halfway: still running, but strictly less than it was.
+    s.p[0].clear();
+    try advance(&s.sess, fixtures.SETTLE_LOCKOUT_MS / 2);
+    const midway = try latest_cast_locked_ms(s.p[0].buf.items, arena);
+    try std.testing.expect(midway > 0);
+    try std.testing.expect(midway < at_settle);
+
+    // Past the end: zero, on the same "0 means not happening" convention the
+    // bite countdown uses.
+    s.p[0].clear();
+    try advance(&s.sess, fixtures.SETTLE_LOCKOUT_MS);
+    try std.testing.expectEqual(@as(u32, 0), try latest_cast_locked_ms(s.p[0].buf.items, arena));
+}
+
+/// The `cast_locked_ms` on the last game_state in `raw`.  The window drains
+/// every tick, so a test that read the FIRST snapshot of a multi-tick advance
+/// would be reading the clock before the walk it just took.
+fn latest_cast_locked_ms(raw: []const u8, arena: std.mem.Allocator) !u32 {
+    const msgs = try drain(raw, arena);
+    var last: ?u32 = null;
+    for (msgs) |m| {
+        if (m.tag != .game_state) continue;
+        var fbs = std.io.fixedBufferStream(m.payload);
+        const gs = try proto.decode_game_state(fbs.reader());
+        last = gs.cast_locked_ms;
+    }
+    return last orelse error.NoGameState;
+}
+
+test "a restart does not resume into chewing that a previous game left behind" {
+    // The hold FREEZES the session clock, so a window standing when the game
+    // ended could never retire on its own: without the explicit clear, the
+    // next encounter would open with the board locked by a meal nobody at the
+    // table ever saw.
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_settling_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_neutral_only);
+    paint_grid(&s.sess, .neutral);
+    s.sess.field.reservoir = .{ .neutral = 5 };
+
+    try settle_idly(&s.sess);
+    try std.testing.expect(s.sess.cast_locked_until > 0); // mid-chew
+
+    s.sess.restart_pending = true;
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u64, 0), s.sess.cast_locked_until);
 }

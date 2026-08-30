@@ -189,6 +189,28 @@ pub const test_config = config.Config{
     },
 };
 
+/// `test_config` with the post-bite settle window switched ON, and identical
+/// in every other respect — so a test can change exactly one thing about the
+/// world: whether casting is refused while the Lil Guys chew.
+///
+/// 200ms is deliberately DOUBLE the fixture's 100ms cast cooldown, so a test
+/// can tell the two refusals apart by walking the clock between them: past
+/// the cooldown but still inside the window.  It also sits well under the
+/// 869ms two-player bite interval, leaving playable time between meals.
+///
+/// `test_config` itself leaves the window at 0 (the shipped default), so
+/// every test that is not about this feature casts through a settle exactly
+/// as it always did.
+pub const settling_config = blk: {
+    var cfg = test_config;
+    cfg.balance.settle_lockout_ms = SETTLE_LOCKOUT_MS;
+    break :blk cfg;
+};
+
+/// The settle window `settling_config` pins, named so tests can walk the
+/// clock relative to it instead of against a magic number.
+pub const SETTLE_LOCKOUT_MS: u32 = 200;
+
 /// `test_config` with a floor under the move table: identical in every other
 /// respect, so a test can swap it in and change exactly one thing about the
 /// world — whether the team can act on an empty pool.

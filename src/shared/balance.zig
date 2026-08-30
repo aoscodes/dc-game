@@ -329,6 +329,15 @@ pub const Balance = struct {
     /// Ms window in which DISTINCT players' component casts on one square
     /// spell a team recipe (see game_logic.complete_group).
     team_window_ms: u32 = DEFAULT_TEAM_WINDOW_MS,
+    /// Ms after a bite settles in which NO player may cast: the Lil Guys are
+    /// chewing and the board is not yours to write on.  Unlike
+    /// `cast_cooldown_ms` this is one table-wide window, not per-player, and
+    /// a press inside it is REFUSED out loud (`cast_refused`) rather than
+    /// silently dropped — the client shakes the seat panel so the answer is
+    /// visible.  0 = no window, and casting stays legal through the whole
+    /// meal.  The loader keeps it below `bite_interval_ms`: a window that
+    /// outlasts the gap between bites is a table that never accepts a cast.
+    settle_lockout_ms: u32 = DEFAULT_SETTLE_LOCKOUT_MS,
     /// Hunger capacity ONE player contributes with an appetite of 0.  The
     /// game's hunger bar capacity is the SUM of every player's contribution
     /// (see game_logic.player_hunger), so this replaces the old per-encounter
@@ -419,3 +428,8 @@ pub const DEFAULT_BITE_SPEEDUP_PER_BABY_PCT: u16 = 5;
 pub const DEFAULT_CAST_COOLDOWN_MS: u32 = 750;
 /// Default ms window in which a team recipe's component casts must land.
 pub const DEFAULT_TEAM_WINDOW_MS: u32 = 3000;
+/// Default settle window when `settle_lockout_ms` is absent: OFF.  The window
+/// is scaled to the shipped bite interval, so a config that shortens the
+/// interval without saying otherwise should keep casting open rather than
+/// inherit a lockout that swallows its whole meal.
+pub const DEFAULT_SETTLE_LOCKOUT_MS: u32 = 0;

@@ -12,6 +12,7 @@
   "bite_speedup_per_baby_pct": 5,
   "cast_cooldown_ms": 750,
   "team_window_ms": 3000,
+  "settle_lockout_ms": 900,
   "baby_hunger": 10,
   "feast_columns": 1,
   "feast_columns_per_guy": 0,

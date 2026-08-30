@@ -60,6 +60,7 @@ pub const ConfigError = error{
     InvalidBiteInterval,
     InvalidBiteSpeedup,
     InvalidTeamWindow,
+    SettleLockoutTooLong,
     InvalidCharges,
     InvalidSlimeGrid,
     TooManyRecipes,
@@ -233,6 +234,7 @@ const BalanceJson = struct {
     bite_speedup_per_baby_pct: u16 = balance.DEFAULT_BITE_SPEEDUP_PER_BABY_PCT,
     cast_cooldown_ms: u32 = balance.DEFAULT_CAST_COOLDOWN_MS,
     team_window_ms: u32 = balance.DEFAULT_TEAM_WINDOW_MS,
+    settle_lockout_ms: u32 = balance.DEFAULT_SETTLE_LOCKOUT_MS,
     /// Appetite → hunger formula knobs (see game_logic.player_hunger).
     /// Defaulted so configs written before appetite keep validating.
     hunger_base: u16 = balance.DEFAULT_HUNGER_BASE,
@@ -316,6 +318,7 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         fail("{s}: team_window_ms must be >= 1", .{BALANCE_FILE});
         return ConfigError.InvalidTeamWindow;
     }
+
     if (raw.slime_grid.rows < 1 or raw.slime_grid.rows > c.MAX_GRID_ROWS or
         raw.slime_grid.cols < 1 or raw.slime_grid.cols > c.MAX_GRID_COLS)
     {
@@ -448,7 +451,7 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         };
     }
 
-    return .{
+    const out: balance.Balance = .{
         .hunger_cost_normal = raw.hunger_cost_normal,
         .max_chain_depth = raw.max_chain_depth,
         .blast_chains = raw.blast_chains,
@@ -458,6 +461,7 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         .bite_speedup_per_baby_pct = raw.bite_speedup_per_baby_pct,
         .cast_cooldown_ms = raw.cast_cooldown_ms,
         .team_window_ms = raw.team_window_ms,
+        .settle_lockout_ms = raw.settle_lockout_ms,
         .hunger_base = raw.hunger_base,
         .appetite_scale = raw.appetite_scale,
         .hunger_player_cap = raw.hunger_player_cap,
@@ -469,6 +473,23 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         .player_recipes = players,
         .team_recipes = teams,
     };
+
+    // The settle window must leave playable time between bites, or the table
+    // locks up.  Checked against the interval at a FULL table, not the base
+    // one: the crowd speeds the bite up (bite_interval_effective), so a
+    // window that fits at one seat can still swallow the whole gap at four.
+    // Babies speed it further and are encounter data, so this is a floor on
+    // the mistake rather than a proof — but it catches the realistic case.
+    if (out.settle_lockout_ms > 0) {
+        const crowded = out.bite_interval_effective(protocol.MAX_PLAYERS, 0);
+        if (out.settle_lockout_ms >= crowded) {
+            fail("{s}: settle_lockout_ms {} must be < the {}ms bite interval at a full table", .{
+                BALANCE_FILE, out.settle_lockout_ms, crowded,
+            });
+            return ConfigError.SettleLockoutTooLong;
+        }
+    }
+    return out;
 }
 
 fn parse_encounters(a: std.mem.Allocator, bytes: []const u8) !enc.EncounterSet {

@@ -160,6 +160,10 @@ const LAYOUT = {
     // so the flourish never scales with the meal: a wide bite hurries and a
     // one-column nibble lingers instead of finishing before the eye catches
     // it.
+    // eatMinS is the FALLBACK target meal length, used only when the settle
+    // window is off (balance settle_lockout_ms = 0); with it on, the window
+    // sets the length and this is unread.  eatCapS caps the per-column pause
+    // either way, so a one-column nibble cannot linger forever.
     eatMinS: 0.8,
     eatCapS: 2,
     chompPauseS: 0.1,   // beat held on each bitten column, so a bite is legible
@@ -427,6 +431,7 @@ async function loadBalanceData(hash = PAGE_CONFIG_HASH) {
   const bal = await res.json();
   CAST_COOLDOWN_MS = bal.cast_cooldown_ms ?? 750;
   TEAM_WINDOW_MS = bal.team_window_ms ?? 3000;
+  SETTLE_LOCKOUT_MS = bal.settle_lockout_ms ?? 0;
   BOMB_ROCKS_ONLY = bal.specials?.bomb?.explode_rocks_only ?? false;
   ROCK_BITE_COSTS_HUNGER = bal.specials?.rock?.bite_costs_hunger ?? false;
   // Keyed by CELL NAME so the board walks can look a cell up directly.
@@ -1453,6 +1458,15 @@ function chainRevealsPending() {
 let CAST_COOLDOWN_MS = 750;
 /** Ms a landed cast stays able to complete a team recipe, from balance.json. */
 let TEAM_WINDOW_MS = 3000;
+/** Ms after a bite settles in which the SERVER refuses every cast — the Lil
+ *  Guys are chewing (balance settle_lockout_ms).  0 = no window.
+ *
+ *  Read here only to size the chew animation (see `armEatPass`), never to
+ *  decide whether a press is legal: the server owns that, and answers a
+ *  press inside the window with `cast_refused`.  The two can disagree at the
+ *  edges — the animation has a legibility floor the window does not — and
+ *  when they do, the server is right. */
+let SETTLE_LOCKOUT_MS = 0;
 /** @typedef {{dRow: number, dCol: number}} ShapeOffset */
 /** @type {Array<{label: string, rows: string[],
  *   offsets: ShapeOffset[], cost: number}>} */
@@ -3304,7 +3318,7 @@ function drawLilGuys(game, dt) {
  * @property {number} groupIdx - the next groups entry to take
  * @property {number} holdT   - chomp pause remaining after the last column
  * @property {number} chompS   - per-column pause, fitted so the whole meal
- *   lands between eatMinS and eatCapS
+ *   lasts about as long as the server's settle window (see armEatPass)
  * @property {number} t        - seconds left in a timed stage (collapse, fill)
  * @property {{score: number, hunger: number, stamps: object[]}} deferred - things
  *   the server already applied, held back until the screen catches up: the feast's
@@ -3463,8 +3477,8 @@ function startFeastCinematic(game) {
 /**
  * Arm the current pass's eat stage: bite the replay board with the mirrored
  * rules, group the scripted cells by COLUMN — each column lands in one step
- * — and fit the per-column hold so the whole meal lands between eatMinS and
- * eatCapS.
+ * — and fit the per-column hold to the SETTLE WINDOW, so the chewing on
+ * screen lasts about as long as the server refuses casts for.
  *
  * The grouping lives here rather than in biteFeast, which stays a pure
  * mirror of slime.feast: how the replay PACES the walk is a presentation
@@ -3509,10 +3523,23 @@ function armEatPass(game) {
     beginShift();
     return false;
   }
+  // How long the whole meal should take.  With the settle window on, that is
+  // the window: the player watches the Lil Guys chew for exactly as long as
+  // the server is turning their casts away, so the animation EXPLAINS the
+  // rule instead of merely coinciding with it.  With the window off (the
+  // shipped default is 0) this falls back to the old floor and the pacing is
+  // unchanged.
+  const targetS = SETTLE_LOCKOUT_MS > 0 ? SETTLE_LOCKOUT_MS / 1000 : C.eatMinS;
   // Every column is one hold, so the meal's wall clock is columns × chompS:
   // stretched on a narrow meal (the chomps ARE the animation) and shortened
   // on a wide one so the pause never scales past the cap.
-  c.chompS = Math.min(Math.max(C.chompPauseS, C.eatMinS / steps), C.eatCapS / steps);
+  //
+  // chompPauseS is a LEGIBILITY floor, and it wins: a meal wide enough to
+  // need columns faster than that chews on past the window's end.  Erring
+  // this way is deliberate — casting reopens slightly before the chewing
+  // finishes, which costs a player nothing, where the reverse would refuse
+  // presses over a board that had visibly settled.
+  c.chompS = Math.min(Math.max(C.chompPauseS, targetS / steps), C.eatCapS / steps);
   c.stage = "eat";
   return true;
 }
@@ -4070,9 +4097,10 @@ function spawnFeastTallyFloaters(tally) {
 //   pulse — the box swells once when its player LANDS a cast (their casts
 //           tally on the wire grows)
 //   shake — the box rattles when its player's attempt is REFUSED: the pool
-//           cannot afford it (`over_budget`), or they pressed ENTER inside
-//           their cooldown (detected locally, since the server silently
-//           drops a press that does nothing)
+//           cannot afford it (`over_budget`), the Lil Guys are still chewing
+//           (`cast_refused`), or they pressed ENTER inside their cooldown
+//           (the only one detected locally, since the server silently drops
+//           a press that does nothing)
 
 /** @typedef {{kind: "pulse"|"shake", t: number, dur: number}} MenuFx */
 
@@ -4109,8 +4137,14 @@ function tickMenuFx(dt) {
  * just landed: the server sets cooldown_ms back to its full value the
  * instant a cast is accepted, so a cooldown that ROSE since last frame is a
  * landed cast — the pulse, for whichever player's menu it was.  A cooldown
- * merely draining is the baseline moving.  `over_budget` is sent only to
- * the player who tried, so it always shakes the viewer's own menu.
+ * merely draining is the baseline moving.  Refusals — `over_budget` and
+ * `cast_refused` alike — are sent only to the player who tried, so they
+ * always shake the viewer's own menu.
+ *
+ * The shake is never predicted locally: it fires if and only if the SERVER
+ * turned a press away.  A client that guessed would shake on presses the
+ * server accepted and stay silent on ones it refused, which is worse than
+ * no feedback — the panel would be confidently wrong.
  *
  * Call once per FRESH frame (transient events must be consumed exactly once).
  */
@@ -4127,7 +4161,7 @@ function updateMenuFx(game) {
   }
   prevMenuPending = cds;
 
-  if (game.over_budget) triggerMenuFx(game.player_id, "shake");
+  if (game.over_budget || game.cast_refused) triggerMenuFx(game.player_id, "shake");
 }
 
 /** Draw the whole seat row: one menu per player, placeholders for the rest. */
@@ -4168,7 +4202,15 @@ function drawPlayerMenu(game, e, x, y) {
   const own = e.owner === game.player_id;
   // Cooling down: the spell is held but cannot fire yet — the same visual
   // slot the old lock-in used, now a short breath instead of a turn.
-  const locked = (e.cooldown_ms ?? 0) > 0;
+  //
+  // Two different waits share this one bar, whichever has longer to run: the
+  // player's own cast cooldown, and the table-wide settle window while the
+  // Lil Guys chew.  The settle window is the same number for every seat, so
+  // during a meal the whole row counts down together — which reads correctly,
+  // because the whole table is waiting on the same thing.
+  const cooldownMs = e.cooldown_ms ?? 0;
+  const settleMs = game.cast_locked_ms ?? 0;
+  const locked = cooldownMs > 0 || settleMs > 0;
   const fx = menuFx.get(e.owner);
 
   ctx.save();
@@ -4224,7 +4266,12 @@ function drawPlayerMenu(game, e, x, y) {
   // the instant the next press is legal.  READY replaces it at rest.
   const statusY = y + P.h - P.statusDy;
   if (locked) {
-    const frac = Math.min(1, (e.cooldown_ms ?? 0) / Math.max(1, CAST_COOLDOWN_MS));
+    // Each wait is drawn against its OWN full length, so the bar always
+    // starts full and drains to nothing whichever one is running.
+    const frac = Math.min(1, Math.max(
+      cooldownMs / Math.max(1, CAST_COOLDOWN_MS),
+      settleMs / Math.max(1, SETTLE_LOCKOUT_MS),
+    ));
     const barW = (P.w - 20) * frac;
     ctx.fillStyle = withAlpha(CAST_EVENT_COLOR, 0.9);
     ctx.fillRect(x + 10, statusY - P.statusFont + 3, barW, P.statusFont - 2);
@@ -5021,7 +5068,10 @@ function connect() {
 
 const FORWARDED_KEYS = new Set([
   // Enter = lock in a cast (game) / dismiss (game over).
-  // Escape = take back your newest lock-in, one per press.
+  // Escape = INERT during play.  It was the turn loop's take-back; a realtime
+  // cast resolves the instant it fires, so there is nothing pending to
+  // withdraw and the Zig client answers it with nothing (see input.zig).
+  // Still forwarded so a board's D button stays a clean no-op, not a typo.
   "Enter", "Escape",
   // Shape wheel: 1 turns forward, 2 turns back.  Selection lives on the
   // server, so these are the whole of the client's part in it.
@@ -5055,6 +5105,13 @@ document.addEventListener("keydown", (e) => {
   // Play is REALTIME: keys stay live even while a feast replay flourishes
   // over the board — the server keeps chewing and keeps taking input, so
   // dropping keys here would be the desync, not the courtesy.
+  //
+  // That holds even for ENTER during the settle window, when the server is
+  // refusing casts outright.  The press is still forwarded and still
+  // refused, on purpose: the shake belongs to the server's answer, not to a
+  // guess made here.  The client's chew animation only approximates the
+  // window, so a local gate would swallow presses the server would have
+  // taken — and stay silent on ones it would have turned away.
   //
   // The outro is the one true pause: the match is already decided, and the
   // only key the Zig client still answers to is the one that dismisses the

@@ -235,6 +235,16 @@ pub const Session = struct {
     /// Session clock time (ms) each player may cast again at.  A press
     /// before this is silently dropped.
     cooldown_until: [MAX_PLAYERS]u64 = [_]u64{0} ** MAX_PLAYERS,
+    /// Session clock time (ms) casting reopens after a bite settles, or 0
+    /// while the board is free.  TABLE-WIDE, not per-player: the Lil Guys are
+    /// chewing and nobody's spell reaches the board through it.
+    ///
+    /// Distinct from `cooldown_until` in what a refusal costs the player: a
+    /// cooldown press is dropped in silence because the seat panel is already
+    /// counting it down, while a press in here is answered with
+    /// `cast_refused` so the client can say so.  See
+    /// `balance.settle_lockout_ms`; 0 there leaves this permanently clear.
+    cast_locked_until: u64 = 0,
     /// Each player's selected move, as an index into
     /// `balance.player_recipes`.  SERVER-OWNED: clients send a cycle DIRECTION,
     /// so this is always a valid index and no client can name a move outside
@@ -437,6 +447,7 @@ pub const Session = struct {
         // bite arms itself on the first live tick with someone seated.
         self.cooldown_until = [_]u64{0} ** MAX_PLAYERS;
         self.next_bite_at = 0;
+        self.cast_locked_until = 0;
 
         // The bar's capacity is the SUM of every seated player's
         // appetite-derived contribution — there is no per-encounter budget
@@ -628,6 +639,10 @@ pub const Session = struct {
         // billed to the next meal.
         if (self.restart_pending or self.prematch) {
             self.next_bite_at = 0;
+            // A frozen clock can never retire a settle window, so a lock left
+            // over from before the hold would still be standing on resume —
+            // chewing that finished a whole game ago.
+            self.cast_locked_until = 0;
             return;
         }
 
@@ -804,6 +819,16 @@ pub const Session = struct {
             if (matched.count == 0) break;
         }
 
+        // The meal is over, so the settle window opens: for the next
+        // `settle_lockout_ms` the board is the Lil Guys', and every cast is
+        // refused.  Set AFTER the whole cascade, not per pass — one window
+        // covers the entire meal however many times it re-opened, so a long
+        // chain does not stack lockouts on top of each other.
+        //
+        // Clients animate the chewing over roughly this window, but the
+        // animation only approximates it; this is the number that decides.
+        self.cast_locked_until = self.now_ms() + self.cfg.balance.settle_lockout_ms;
+
         // The feast is the ONLY thing that adds hunger, so it is the only
         // damage event in the game — announced pool-level (no actor).  Sent
         // even at zero so the client's damage cue is not silently conditional
@@ -871,6 +896,20 @@ pub const Session = struct {
             .needed = needed,
             .have = self.charges,
         });
+        t.send(fbs.getWritten()) catch {};
+    }
+
+    /// Tell one player their cast was refused for a reason with no numbers.
+    ///
+    /// Sent to the caster alone, for the same reason as `send_over_budget`:
+    /// nothing landed, so there is nothing for anyone else to redraw.
+    fn send_cast_refused(self: *Session, player_id: u8, reason: proto.CastRefusal) !void {
+        const slot = &self.players[player_id];
+        if (!slot.occupied) return;
+        const t = self.connections[slot.conn].transport orelse return;
+        var buf: [8]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&buf);
+        try proto.encode(fbs.writer(), .cast_refused, proto.CastRefused{ .reason = reason });
         t.send(fbs.getWritten()) catch {};
     }
 
@@ -1062,6 +1101,21 @@ pub const Session = struct {
                 // timer, so an early press is impatience, not a mistake —
                 // and it must not restart the cooldown.
                 if (now < self.cooldown_until[player_id]) return;
+
+                // The Lil Guys are still chewing.  Refused OUT LOUD, unlike
+                // the cooldown above: this window has no countdown of its own
+                // on the panel, so a silent drop would read as the game
+                // dropping inputs.  Checked before the group window is pruned
+                // and before anything is priced — a refused cast is a cast
+                // that never happened, so it must not age the team window or
+                // touch the pool.
+                if (now < self.cast_locked_until) {
+                    std.log.debug("player {} cast refused — settling for {}ms more", .{
+                        player_id, self.cast_locked_until - now,
+                    });
+                    try self.send_cast_refused(player_id, .settling);
+                    return;
+                }
 
                 // Every selection names a real move, so there is no "this
                 // spells nothing" case: a cast always fires something.
@@ -1349,6 +1403,14 @@ pub const Session = struct {
         // (nobody seated), which the client reads as "not coming".
         snap.next_bite_ms = if (self.next_bite_at > now)
             @intCast(@min(self.next_bite_at - now, std.math.maxInt(u32)))
+        else
+            0;
+
+        // What is left of the settle window, on the same "0 means not
+        // happening" convention as the bite countdown above.  Table-wide, so
+        // every seat panel counts down the same number.
+        snap.cast_locked_ms = if (self.cast_locked_until > now)
+            @intCast(@min(self.cast_locked_until - now, std.math.maxInt(u32)))
         else
             0;
 

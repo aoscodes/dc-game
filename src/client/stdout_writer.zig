@@ -22,6 +22,7 @@ pub const Writer = struct {
         out.writeAll(w.buffered()) catch return;
         game.last_action_count = 0;
         game.over_budget = null;
+        game.cast_refused = null;
         game.recipe_count = 0;
         game.bite_settled = null;
         game.shape_cast_count = 0;
@@ -72,6 +73,10 @@ pub const GameState = struct {
     /// At most one per frame: a refused cast changes nothing, so a second in
     /// the same frame would say the same thing about the same turn.
     over_budget: ?proto.OverBudget = null,
+    /// A numberless refusal this player's last cast earned, if any, since the
+    /// last render write (transient, drained per frame like `over_budget`).
+    /// At most one per frame, for the same reason.
+    cast_refused: ?proto.CastRefused = null,
     /// Recipes fired since the last render write (transient).
     recipes_fired: [16]proto.RecipeFired = undefined,
     recipe_count: u8 = 0,
@@ -289,6 +294,7 @@ fn write_render_inner(
             .team_window_ms = game.team_window_ms,
             .bite = game.snapshot.bite,
             .next_bite_ms = game.snapshot.next_bite_ms,
+            .cast_locked_ms = game.snapshot.cast_locked_ms,
             .tick = game.snapshot.tick,
             .entities = entities_buf[0..game.snapshot.entity_count],
             .hunger = .{
@@ -305,6 +311,10 @@ fn write_render_inner(
             .recent = recent_buf[0..game.snapshot.recent_count],
             .over_budget = if (game.over_budget) |ob|
                 JsonOverBudget{ .needed = ob.needed, .have = ob.have }
+            else
+                null,
+            .cast_refused = if (game.cast_refused) |cr|
+                JsonCastRefused{ .reason = @tagName(cr.reason) }
             else
                 null,
             .recipes_fired = recipes_buf[0..game.recipe_count],
@@ -496,6 +506,10 @@ const JsonGame = struct {
     /// Ms until the Lil Guys bite again; 0 while the timer is disarmed
     /// (nobody seated, or the session is holding).
     next_bite_ms: u32,
+    /// Ms left in the post-bite settle window, during which no player may
+    /// cast; 0 while casting is open.  Table-wide, so every seat panel counts
+    /// the same window down.
+    cast_locked_ms: u32,
     tick: u32,
     entities: []const JsonEntity,
     hunger: JsonHunger,
@@ -521,6 +535,10 @@ const JsonGame = struct {
     /// on every other frame, and never sent to anyone else — it is about a
     /// cast that never happened.
     over_budget: ?JsonOverBudget,
+    /// A numberless refusal the viewer's last cast earned, if any
+    /// (transient).  Separate from `over_budget` because it carries no
+    /// quote: the `reason` tag is the whole explanation.
+    cast_refused: ?JsonCastRefused,
     /// Recipes fired since the previous frame (transient).  `index` refers
     /// to the balance recipe table for `kind` (JS resolves labels from the
     /// fetched data/balance.json, same order).
@@ -617,6 +635,13 @@ const JsonRecent = struct {
 const JsonOverBudget = struct {
     needed: u32,
     have: u32,
+};
+
+/// A cast turned away for a reason with no numbers attached.  `reason` is the
+/// `proto.CastRefusal` tag name, so a new reason reaches the renderer as a
+/// new string rather than a number it would have to know a table for.
+const JsonCastRefused = struct {
+    reason: []const u8,
 };
 
 /// A settled bite: the Lil Guys bit the front columns of the field.
@@ -777,4 +802,58 @@ test "the anchor survives even when clipping drops it from the cell list" {
     const cells = cast.get("cells").?.array;
     try testing.expectEqual(@as(usize, 1), cells.items.len);
     try testing.expectEqual(@as(i64, 4), cells.items[0].integer);
+}
+
+test "the settle window and a settling refusal both reach the renderer" {
+    // The renderer cannot derive either of these.  `cast_locked_ms` is the
+    // server's own countdown — the client's chew animation only approximates
+    // it — and the refusal is about a cast that left no trace on the board.
+    var game = GameState{};
+    game.snapshot.grid_rows = 1;
+    game.snapshot.grid_cols = 1;
+    game.snapshot.cast_locked_ms = 640;
+    game.cast_refused = .{ .reason = .settling };
+
+    var buf: [32768]u8 = undefined;
+    const json = try render_to_json(&buf, &game);
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        json,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const g = parsed.value.object.get("game").?.object;
+    try testing.expectEqual(@as(i64, 640), g.get("cast_locked_ms").?.integer);
+    // The reason travels as its tag NAME: a new refusal reaches the renderer
+    // as a new string, not as a number it would need a table to read.
+    const refused = g.get("cast_refused").?.object;
+    try testing.expectEqualStrings("settling", refused.get("reason").?.string);
+}
+
+test "an open board reports no settle window and no refusal" {
+    // The negative control for the test above: both fields are transient or
+    // conditional, so a frame that always claimed a lock (or always carried a
+    // refusal) would pass the assertions above while telling the renderer the
+    // table is permanently frozen.
+    var game = GameState{};
+    game.snapshot.grid_rows = 1;
+    game.snapshot.grid_cols = 1;
+
+    var buf: [32768]u8 = undefined;
+    const json = try render_to_json(&buf, &game);
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        json,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const g = parsed.value.object.get("game").?.object;
+    try testing.expectEqual(@as(i64, 0), g.get("cast_locked_ms").?.integer);
+    // Absent, not null: transient fields are omitted from the frame entirely,
+    // which is what lets `game.cast_refused` read as falsy in the renderer.
+    try testing.expect(g.get("cast_refused") == null);
 }

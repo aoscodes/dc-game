@@ -310,6 +310,11 @@ fn process_recv() void {
                 // Record for the renderer (transient, drained per frame).
                 g_state.game.over_budget = p;
             },
+            .cast_refused => {
+                const p = proto.decode_cast_refused(r) catch continue;
+                // Record for the renderer (transient, drained per frame).
+                g_state.game.cast_refused = p;
+            },
             .recipe_fired => {
                 const p = proto.decode_recipe_fired(r) catch continue;
                 // Record for the renderer (transient, drained per frame).

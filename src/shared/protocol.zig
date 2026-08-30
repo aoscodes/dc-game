@@ -25,6 +25,7 @@ pub const MsgTag = enum(u8) {
     action_result = 0x13,
     game_over = 0x15,
     over_budget = 0x19,
+    cast_refused = 0x1a,
     recipe_fired = 0x18,
     shape_cast = 0x1c,
     // 0x1d was turn_ended: retired with the turn loop — the same settle now
@@ -136,6 +137,35 @@ pub fn decode_over_budget(reader: anytype) !OverBudget {
         .needed = try reader.readInt(u32, .little),
         .have = try reader.readInt(u32, .little),
     };
+}
+
+/// Why a cast was turned away.  An enum rather than a bare message so the
+/// next reason to refuse extends this instead of burning another opcode —
+/// and so a client must handle the reasons exhaustively.
+///
+/// `over_budget` stays its own message: it carries the two numbers that
+/// explain it, and a refusal with no numbers has nothing to say.
+pub const CastRefusal = enum(u8) {
+    /// The Lil Guys are still chewing (see balance.settle_lockout_ms).  The
+    /// board is mid-settle and not the player's to write on yet.
+    settling = 0,
+};
+
+/// A cast was refused for a reason with no numbers attached.
+///
+/// Sent only to the player who tried it, and deliberately NOT silent: unlike
+/// the per-player cast cooldown — which drops a press without comment because
+/// the seat panel is already counting it down — a refusal here has no visible
+/// countdown of its own, so the client is told and shakes the panel.
+pub const CastRefused = struct {
+    reason: CastRefusal,
+};
+
+pub fn decode_cast_refused(reader: anytype) !CastRefused {
+    const byte = try reader.readByte();
+    const reason = std.meta.intToEnum(CastRefusal, byte) catch
+        return DecodeError.InvalidCastRefusal;
+    return .{ .reason = reason };
 }
 
 /// The bite clock fired and the Lil Guys have bitten the front columns of
@@ -476,6 +506,15 @@ pub const GameState = struct {
     hatched: [components.BabyType.size]u16,
     /// Ms until the Lil Guys bite again — the countdown clients draw.
     next_bite_ms: u32,
+    /// Ms left in the post-bite settle window, during which NO player may
+    /// cast (see balance.settle_lockout_ms).  0 when casting is open.
+    ///
+    /// Table-wide, not per-player: unlike the per-seat `cooldown_ms` on an
+    /// EntitySnapshot, one number covers everyone, so every seat panel counts
+    /// the same window down together.  Sent rather than derived because the
+    /// client's chew animation only APPROXIMATES the window — the server owns
+    /// when casting reopens.
+    cast_locked_ms: u32,
     /// Casts still inside the team-recipe window, in landing order.
     recent_count: u8,
     recent: [MAX_RECENT_WIRE]RecentCastWire,
@@ -494,6 +533,7 @@ pub const GameState = struct {
         .reservoir = 0,
         .hatched = [_]u16{0} ** components.BabyType.size,
         .next_bite_ms = 0,
+        .cast_locked_ms = 0,
         .recent_count = 0,
         .recent = [_]RecentCastWire{
             .{ .player_id = 0, .move = 0, .square = 0, .age_ms = 0 },
@@ -623,6 +663,7 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
             try writer.writeInt(u32, payload.needed, .little);
             try writer.writeInt(u32, payload.have, .little);
         },
+        .cast_refused => try writer.writeByte(@intFromEnum(payload.reason)),
         .move_cursor => try writer.writeByte(@intFromEnum(payload.dir)),
         .shape_cast => {
             const p: ShapeCast = payload;
@@ -762,6 +803,7 @@ fn encode_game_state(w: anytype, p: GameState) !void {
     try w.writeInt(u32, p.reservoir, .little);
     for (p.hatched) |h| try w.writeInt(u16, h, .little);
     try w.writeInt(u32, p.next_bite_ms, .little);
+    try w.writeInt(u32, p.cast_locked_ms, .little);
     try w.writeByte(p.recent_count);
     for (p.recent[0..p.recent_count]) |rc| {
         try w.writeByte(rc.player_id);
@@ -899,6 +941,7 @@ pub const DecodeError = error{
     TooManyMatchCells,
     TooManyHatches,
     TooManyRefills,
+    InvalidCastRefusal,
 };
 
 pub fn read_tag(reader: anytype) !MsgTag {
@@ -976,6 +1019,7 @@ pub fn decode_game_state(reader: anytype) !GameState {
     p.reservoir = try reader.readInt(u32, .little);
     for (&p.hatched) |*h| h.* = try reader.readInt(u16, .little);
     p.next_bite_ms = try reader.readInt(u32, .little);
+    p.cast_locked_ms = try reader.readInt(u32, .little);
     p.recent_count = try reader.readByte();
     if (p.recent_count > MAX_RECENT_WIRE) return DecodeError.TooManyRecent;
     p.recent = [_]RecentCastWire{
@@ -1154,6 +1198,7 @@ test "round-trip: game_state — bite, hunger, score, grid, and selection surviv
     gs.reservoir = 44;
     gs.hatched = .{ 2, 0, 1, 0, 0 };
     gs.next_bite_ms = 1234;
+    gs.cast_locked_ms = 777;
     gs.recent_count = 1;
     gs.recent[0] = .{ .player_id = 1, .move = 2, .square = 5, .age_ms = 250 };
     gs.entities[0] = EntitySnapshot{
@@ -1177,8 +1222,10 @@ test "round-trip: game_state — bite, hunger, score, grid, and selection surviv
     try std.testing.expectEqual(@as(u16, 3), decoded.bite);
     try std.testing.expectEqual(@as(u8, 1), decoded.entity_count);
     try std.testing.expectEqual(@as(u32, 450), decoded.entities[0].cooldown_ms);
-    // The bite countdown and the group window travel with every snapshot.
+    // The bite countdown, the settle window and the group window all travel
+    // with every snapshot.
     try std.testing.expectEqual(@as(u32, 1234), decoded.next_bite_ms);
+    try std.testing.expectEqual(@as(u32, 777), decoded.cast_locked_ms);
     try std.testing.expectEqual(@as(u8, 1), decoded.recent_count);
     try std.testing.expectEqual(@as(u8, 1), decoded.recent[0].player_id);
     try std.testing.expectEqual(@as(u8, 2), decoded.recent[0].move);
@@ -1328,6 +1375,16 @@ test "round-trip: a full MAX grid of every cell kind survives" {
     );
 }
 
+/// Bytes a `game_state` frame writes AFTER the grid, for a snapshot with no
+/// recent casts: the u32 reservoir, the per-type hatched u16s, the u32 bite
+/// countdown, the u32 settle window, and the recent-cast count itself.
+///
+/// The corruption tests below reach backwards past this to land on the last
+/// grid cell, so a new tail field must be added here or they poke the wrong
+/// byte and stop testing what they claim to.
+const GAME_STATE_TAIL_BYTES = @sizeOf(u32) + 2 * components.BabyType.size +
+    @sizeOf(u32) + @sizeOf(u32) + 1;
+
 test "decode_game_state: an unknown slime cell byte is rejected" {
     var buf: [512]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -1336,11 +1393,7 @@ test "decode_game_state: an unknown slime cell byte is rejected" {
     gs.grid_cols = 1;
     try encode(fbs.writer(), .game_state, gs);
     const written = fbs.getWritten();
-    // The single grid cell sits just before the tail: the u32 reservoir, the
-    // per-type hatched u16s, the u32 bite countdown, and the recent-cast
-    // count (0 here, so no entries follow it).
-    const tail = @sizeOf(u32) + 2 * components.BabyType.size + @sizeOf(u32) + 1;
-    written[written.len - tail - 1] = 0x7F;
+    written[written.len - GAME_STATE_TAIL_BYTES - 1] = 0x7F;
     fbs.reset();
     _ = try read_tag(fbs.reader());
     try std.testing.expectError(DecodeError.InvalidSlimeCell, decode_game_state(fbs.reader()));
@@ -1354,8 +1407,7 @@ test "decode_game_state: the retired kindless special byte 0x03 is rejected" {
     gs.grid_cols = 1;
     try encode(fbs.writer(), .game_state, gs);
     const written = fbs.getWritten();
-    const tail = @sizeOf(u32) + 2 * components.BabyType.size + @sizeOf(u32) + 1;
-    written[written.len - tail - 1] = 0x03;
+    written[written.len - GAME_STATE_TAIL_BYTES - 1] = 0x03;
     fbs.reset();
     _ = try read_tag(fbs.reader());
     try std.testing.expectError(DecodeError.InvalidSlimeCell, decode_game_state(fbs.reader()));
@@ -1533,6 +1585,25 @@ test "round-trip: over_budget carries the quote and the pool" {
     const decoded = try decode_over_budget(fbs.reader());
     try std.testing.expectEqual(@as(u32, 11), decoded.needed);
     try std.testing.expectEqual(@as(u32, 4), decoded.have);
+}
+
+test "round-trip: cast_refused carries the reason" {
+    var buf: [4]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    try encode(fbs.writer(), .cast_refused, CastRefused{ .reason = .settling });
+    fbs.reset();
+    const tag = try read_tag(fbs.reader());
+    try std.testing.expectEqual(MsgTag.cast_refused, tag);
+    const decoded = try decode_cast_refused(fbs.reader());
+    try std.testing.expectEqual(CastRefusal.settling, decoded.reason);
+}
+
+test "decode_cast_refused: an unknown reason is rejected, not guessed" {
+    // A newer server refusing for a reason this build has no name for must
+    // fail loudly.  Silently coercing to `settling` would have the client
+    // blame the Lil Guys for a refusal they had nothing to do with.
+    var fbs = std.io.fixedBufferStream(&[_]u8{0xEE});
+    try std.testing.expectError(DecodeError.InvalidCastRefusal, decode_cast_refused(fbs.reader()));
 }
 
 test "round-trip: recipe_fired carries kind and table index" {
