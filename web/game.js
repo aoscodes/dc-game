@@ -2277,9 +2277,23 @@ function animProgress(anim) {
  *
  * While the feast cinematic runs, the BOARD DRAWN IS THE CINEMATIC'S, not the
  * frame's: the replay is mid-way between two server boards, so the frame's grid
- * is the future.  Every aiming overlay (cast preview, nibble hatching,
- * cursors) is suppressed for the same reason — they answer
- * questions about a board that is not on screen, and input is dead anyway.
+ * is the future.  That splits the overlays in two, and the split is by what
+ * each one is a statement ABOUT:
+ *
+ *   COORDINATES survive the replay — the cursor, the pips of a locked-in cast,
+ *   the bite strip.  A cursor is a (row, col) the server owns and clamps; a
+ *   bite strip is the front `feastWidth` columns.  Neither reads a cell, so
+ *   neither can be stale, and play is REALTIME: the player is still aiming and
+ *   still casting while the meal plays, so taking their crosshair away for the
+ *   better part of every bite interval is the one thing the replay must not do.
+ *
+ *   CONTENTS do not — the cast preview's outcome tints and the nibble
+ *   hatching.  Those are computed against `game.grid`, the server's real board,
+ *   so they are truthful about what a cast would do; but the tiles they would
+ *   be drawn over are the replay's, and the feast packs each row LEFT as it
+ *   eats, so for most of the replay the two disagree by a column.  Drawn
+ *   together they would contradict each other on screen, which is worse than
+ *   showing nothing: they come back the moment the board lands.
  */
 function drawSlimeField(game) {
   const { rows, cols } = gridDims(game);
@@ -2317,10 +2331,11 @@ function drawSlimeField(game) {
     : 0;
 
   // Cells drawn with the INVERTED tile art: covered by the cast preview, or
-  // under any player's cursor (the crosshair still says whose).  Suppressed
-  // with the rest of the aiming overlays during the replay.
+  // under any player's cursor (the crosshair still says whose).  A cursor is
+  // a coordinate, so this survives the replay (see the note on drawSlimeField)
+  // — only the outro takes it away, where nothing can be aimed at all.
   const cursorCells = new Set();
-  if (!replay && !playSuspended()) {
+  if (!playSuspended()) {
     for (const e of game.entities ?? []) {
       cursorCells.add((e.cursor_row ?? 0) * cols + (e.cursor_col ?? 0));
     }
@@ -2340,9 +2355,12 @@ function drawSlimeField(game) {
   for (const flat of reach.nibbled) {
     if (after.eaten.has(flat)) opened.add(flat);
   }
-  // The bite strip: the columns the turn-end feast will chew, marked so the
-  // team always knows what front they are defending.
-  const biteCols = replay ? 0 : feastWidth(game, cols);
+  // The bite strip: the columns the next feast will chew, marked so the team
+  // always knows what front they are defending.  Held through the replay: the
+  // strip is the front `feastWidth` COLUMNS, not the units standing in them,
+  // and on a realtime clock the next bite is already counting down while this
+  // one is still being played out.
+  const biteCols = feastWidth(game, cols);
 
   // Walk the grid off `g` directly: cellRect would recompute the same
   // placement (and allocate a rect) for every one of up to 256 cells.
@@ -2465,9 +2483,12 @@ function drawSlimeField(game) {
   }
 
   // Ripe window casts, then cursors, so aim is never buried under a tile.
-  // Both hidden during the replay so the feast reads clean; play stays LIVE
-  // underneath (input is never blocked in realtime).
-  if (!replay) {
+  // Both are drawn from COORDINATES — a pip sits on its cast's square, a
+  // crosshair on the cursor the server owns — so both hold through the
+  // replay, when the player is still aiming and still casting.  The outro is
+  // the one place they come off: there, nothing can be aimed at all, and an
+  // affordance that promises otherwise is a lie (see playSuspended).
+  if (!playSuspended()) {
     drawPendingMarks(game, g, cols);
     drawCursors(game, g, cols);
   }
@@ -2834,11 +2855,15 @@ function drawLilGuys(game, dt) {
 // ends on a server board, and every intermediate step is derived from the same
 // rules the server used.  A survivor that does not match the server's board at
 // the end means a rule drifted, and the replay snaps to the server instead of
-// arguing (see finishFill).
+// arguing (see finishSettle).
 //
-// It is also a deliberate pause in play: input is dead for its duration
-// (see the keydown handler), because the board on screen is mid-replay and
-// aiming at it would mean nothing.
+// It is NOT a pause in play.  Play is realtime: the server keeps taking casts
+// and keeps its own bite clock running for the whole of the replay, so input
+// stays live (see the keydown handler) and the aiming overlays that can stay
+// honest stay up (see drawSlimeField).  The replay decides what the BOARD
+// draws and nothing else — it is a flourish over live play, and on a busy
+// table it can occupy most of the interval between bites, which is exactly
+// why it must not take the game away from the player while it runs.
 
 /**
  * @typedef {object} Cinematic
@@ -2886,16 +2911,23 @@ function cinematicActive() {
 
 /**
  * True while the board is on screen but not playable: the end-of-match outro
- * (see `outroActive`).  A mid-game feast replay does NOT suspend play any
- * more — realtime input stays live under it — so the aiming overlays merely
- * hide while the board itself is mid-replay (the `replay` flag in drawField)
- * and return the moment it lands.
+ * (see `outroActive`), and nothing else.  A mid-game feast replay does NOT
+ * suspend play — realtime input stays live under it — so this is the ONLY
+ * predicate that may take an aiming affordance off the board.
  *
- * Every affordance the board offers — the cast preview, the cells it would
- * cover — is a promise that pressing a key will do something.  In the outro
- * nothing will, so the promise has to come off the screen rather than be
- * quietly broken.  The keydown handler drops the same case, and that is not
- * a coincidence: this predicate is the visible half of that one.
+ * Every affordance the board offers — the crosshair, the cast preview, the
+ * cells it would cover — is a promise that pressing a key will do something.
+ * In the outro nothing will, so the promise has to come off the screen rather
+ * than be quietly broken.  The keydown handler drops the same case, and that
+ * is not a coincidence: this predicate is the visible half of that one.
+ *
+ * The converse binds just as hard.  During a replay a key DOES still do
+ * something, so the crosshair and the pips have to stay: hiding them would
+ * break the promise in the other direction, telling the player they cannot
+ * act at the exact moment they can.  Overlays that hide mid-replay do so for
+ * a different reason entirely — they would contradict the board drawn under
+ * them (see drawSlimeField) — and `replay`, not this predicate, is what gates
+ * those.
  */
 function playSuspended() {
   return outroActive();
