@@ -164,17 +164,56 @@ const LAYOUT = {
     eatCapS: 2,
     chompPauseS: 0.1,   // beat held on each bitten column, so a bite is legible
     collapseS: 0.4,     // one advance: survivors sliding left, refills sliding in
-    // Stagger of the COSMETIC ring sweep over a swallowed neutralizer's
-    // cells (the downgrades land instantly with the bite): short enough that
-    // a full 3x3 finishes inside even the minimum eat stage.
-    effectStepS: 0.05,
-    ringS: 0.4,         // one affected cell's border flash, fading out
     // Longest frame the replay will honour.  requestAnimationFrame stops firing
     // in a hidden tab, so returning to one delivers a single frame worth however
     // long it was away — and spending it would eat the whole meal in one step,
     // which is the jump cut the replay exists to avoid.  Time the player was not
     // watching is not time the feast ran.
     maxStepS: 1 / 15,
+  },
+
+  // A reaction, played out link by link.  A cast can set off a special, whose
+  // effect can set off the next, and the server resolves that whole cascade
+  // inside ONE tick — so without this the board would simply be different,
+  // with nothing on screen saying a chain had happened at all.
+  //
+  // The staging is COSMETIC and owns no rules.  The board is already the
+  // server's; each cell is merely held at its pre-chain look until its own
+  // link is due, then revealed with a burst of sparks over it.  A cell at
+  // depth 0 — every ordinary cast — is due immediately and so is not held at
+  // all, which is what keeps a plain cast feeling exactly as instant as it
+  // did before any of this existed.
+  chainFx: {
+    // Gap between one link and the next.  This is the whole effect: it is
+    // what turns a simultaneous cascade into something with a direction.
+    // Long enough to read as separate events, short enough to stay close to
+    // the eat stage's own length.
+    waveS: 0.3,
+    // Ceiling on how many waves a reaction is staged over, independent of
+    // how deep it actually ran.
+    //
+    // `max_chain_depth` is a BALANCE knob the server owns, and the deepest
+    // link reported is one PAST it (a unit is reported at its own depth, its
+    // effect one further out).  Left unbounded, raising that knob would
+    // silently stretch the eat stage — which the collapse waits on — past
+    // the bite interval, and every meal would end by being cut short.  Four
+    // waves covers the default cap exactly; beyond it the last links arrive
+    // together, which is a far smaller lie than a meal that never lands.
+    maxWaves: 4,
+    // How long one cell's sparks live once its link fires.  Free to outlast
+    // the wave: sparks are loose in screen space, so unlike a held tile they
+    // are not tied to a cell the collapse is about to move.
+    lifeS: 0.45,
+    count: 7,           // sparks per affected cell
+    speed: 90,          // initial outward speed, design px/s
+    speedJitter: 55,
+    gravity: 210,       // px/s^2 down, so sparks arc rather than float
+    size: 2.6,          // spark radius at birth, design px
+    sizeJitter: 1.4,
+    // Sparks still alive above this are the oldest ones dropped.  A deep
+    // chain over a full board can touch a couple of hundred cells at once,
+    // and a burst each would cost more than the effect is worth.
+    max: 700,
   },
 
   // Per-player action menus: one box per SEAT (max `seats`), bottom row,
@@ -501,8 +540,7 @@ function clearEntityState() {
   cinematic = null;
   prevGrid = [];
   cellAnim.clear();
-  ringQueue.length = 0;
-  ringT = 0;
+  chainParticles.length = 0;
   stampedThisFrame.clear();
   lastTransientGame = null;
   chargesSeenMax = 0;
@@ -975,7 +1013,11 @@ function spawnStampFloaters(game) {
   if (events.length === 0) return;
 
   for (const ev of events) {
-    for (const flat of ev.cells ?? []) stampedThisFrame.add(flat);
+    // Unstaged: this path has no board to work the links out from (that is
+    // recordCastChain's job), so every cell is reported as the first link.
+    for (const flat of ev.cells ?? []) {
+      stampedThisFrame.set(flat, { depth: 0, source: "cast" });
+    }
   }
 
   // A cast that lands while the feast is replaying is held until the replay
@@ -1276,6 +1318,121 @@ function drawScoreHud(game) {
   ctx.textAlign = "right";
   ctx.fillText(`${scoreHud.displayed}`, S.x - S.triSize - S.gap, S.y + S.font * 0.35);
   ctx.restore();
+}
+
+// ---------------------------------------------------------------------------
+// Chain sparks
+// ---------------------------------------------------------------------------
+//
+// The visible half of a reaction.  A cast lands, something it covered goes
+// off, that sets off the next thing, and the server resolves the entire
+// cascade inside a single tick — so the board simply arrives different, with
+// no trace of the order it happened in.  These sparks are that trace.
+//
+// Loose in SCREEN space, not attached to a cell.  That is deliberate: the
+// collapse packs survivors left partway through a long chain, and anything
+// anchored to a cell would have to be dropped or dragged at that moment.
+// Sparks just keep flying.
+//
+// Violet for an Agent's work (a cast's own stamp, and any block a
+// neutralizer fires) and the bomb's orange for a blast, so the two reactions
+// stay as distinguishable in motion as the units themselves are at rest.
+
+/** @typedef {{x:number, y:number, vx:number, vy:number,
+ *             delay:number, age:number, life:number,
+ *             r:number, rgb:string}} Spark */
+
+/** @type {Spark[]} */
+const chainParticles = [];
+
+/**
+ * Burst `count` sparks over one cell, `delay` seconds from now.
+ *
+ * The delay is the cell's place in the chain — depth x waveS — and it is the
+ * only thing sequencing the effect.  Sparks are inert until it drains, so a
+ * burst can be scheduled the instant the rules resolve and still land in
+ * turn.
+ */
+function spawnChainBurst(flat, rows, cols, color, delay) {
+  const F = LAYOUT.chainFx;
+  const at = cellCenter(flat, rows, cols);
+  const rgb = parseRgb(color);
+  // Overflow drops from the front.  That is push order, which is NOT depth
+  // order — the walk recurses mid-offset — so this makes no claim about
+  // which link is sacrificed.  It is a buffer bound, nothing more: at the
+  // cap the effect is already denser than anyone can read.
+  if (chainParticles.length + F.count > F.max) {
+    chainParticles.splice(0, chainParticles.length + F.count - F.max);
+  }
+  for (let i = 0; i < F.count; i++) {
+    // Spread evenly around the cell with a jittered start, so a burst reads
+    // as a ring rather than a spray with a direction it does not mean.
+    const a = (i / F.count) * Math.PI * 2 + Math.random() * 0.9;
+    const speed = F.speed + Math.random() * F.speedJitter;
+    chainParticles.push({
+      x: at.x, y: at.y,
+      vx: Math.cos(a) * speed,
+      vy: Math.sin(a) * speed,
+      delay,
+      age: 0,
+      life: F.lifeS,
+      r: F.size + Math.random() * F.sizeJitter,
+      rgb: `${rgb[0]},${rgb[1]},${rgb[2]}`,
+    });
+  }
+}
+
+/** Advance every spark, dropping the spent ones. */
+function tickChainParticles(dt) {
+  const F = LAYOUT.chainFx;
+  let w = 0;
+  for (const p of chainParticles) {
+    if (p.delay > 0) {
+      // Waiting its turn: held at the cell it belongs to, invisible.
+      p.delay -= dt;
+      chainParticles[w++] = p;
+      continue;
+    }
+    p.age += dt;
+    if (p.age >= p.life) continue;
+    p.vy += F.gravity * dt;
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    chainParticles[w++] = p;
+  }
+  chainParticles.length = w;
+}
+
+/** Draw the sparks that have started: shrinking and fading as they arc. */
+function drawChainParticles() {
+  for (const p of chainParticles) {
+    if (p.delay > 0) continue;
+    const frac = p.age / p.life;
+    const r = p.r * (1 - frac * 0.7);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, Math.max(0.4, r), 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${p.rgb},${(1 - frac).toFixed(3)})`;
+    ctx.fill();
+  }
+}
+
+/**
+ * True while any cell is still waiting to be allowed to look changed — see
+ * the collapse hold in tickEat.
+ *
+ * Reads the HOLDS, not the sparks.  A hold is pinned to a cell and is the
+ * only thing the collapse can strand; sparks are loose in screen space with
+ * no cell to be wrong about, and the board is free to move under them.  The
+ * two are scheduled together but they are not interchangeable — sparks are
+ * ticked a step ahead of holds, and the buffer cap can drop one — so asking
+ * the sparks would be asking a proxy that is occasionally wrong about the
+ * only thing that matters here.
+ */
+function chainRevealsPending() {
+  for (const a of cellAnim.values()) {
+    if (a.kind === "hold") return true;
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1998,8 +2155,9 @@ function agentBlockCells(center, rows, cols) {
 /**
  * The bomb's blast — MIRRORS slime.detonate: destroy every occupied cell in
  * the 3x3 around `center` (or, with BOMB_ROCKS_ONLY, just the rocks in it).
- * Walked in the server's row-major order; `onDestroy(flat, name)` is called
- * per destroyed cell so the replay can burst them where they stood.
+ * Walked in the server's row-major order; `onChange(ev)` is called per
+ * destroyed cell so the replay can burst them where they stood.  See stampOn
+ * for the event's shape; a blast reports `source: "blast"` throughout.
  *
  * With BLAST_CHAINS a bomb caught in the blast goes off in turn — deferred
  * until this blast has finished its own 3x3, exactly as slime.detonate
@@ -2007,7 +2165,7 @@ function agentBlockCells(center, rows, cols) {
  * link number: a swallowed or cast-activated bomb blasts at 1.  Returns the
  * number of cells destroyed, the whole cascade included.
  */
-function detonateOn(board, center, rows, cols, onDestroy, depth = 1) {
+function detonateOn(board, center, rows, cols, onChange, depth = 1) {
   const mayChain = BLAST_CHAINS && depth <= MAX_CHAIN_DEPTH;
   let destroyed = 0;
   // Bombs the blast uncovered, fired only after this one has finished
@@ -2019,12 +2177,14 @@ function detonateOn(board, center, rows, cols, onDestroy, depth = 1) {
     if (!cellIsSlime(name)) continue;
     if (BOMB_ROCKS_ONLY && name !== "special_rock") continue;
     board[cell] = "empty";
-    if (onDestroy) onDestroy(cell, name);
+    if (onChange) {
+      onChange({ flat: cell, from: name, to: "empty", depth, source: "blast" });
+    }
     destroyed++;
     if (mayChain && name === "special_bomb") chained.push(cell);
   }
   for (const bomb of chained) {
-    destroyed += detonateOn(board, bomb, rows, cols, onDestroy, depth + 1);
+    destroyed += detonateOn(board, bomb, rows, cols, onChange, depth + 1);
   }
   return destroyed;
 }
@@ -2039,10 +2199,19 @@ function detonateOn(board, center, rows, cols, onDestroy, depth = 1) {
  *
  * Offsets resolve IN ORDER against the board as it stands, so a cell an
  * earlier activation emptied is simply gone when a later offset reaches it.
- * Tallies into `out` (a ShapeOutcome mirror); `onChange(flat, before, after)`
- * fires per mutated cell so a replay can animate it.
+ * Tallies into `out` (a ShapeOutcome mirror).
+ *
+ * `onChange({flat, from, to, depth, source})` fires per mutated cell so a
+ * replay can animate it.  `source` is what DID it — "cast" (a player's
+ * stamp), "block" (an Agent block a neutralizer fired) or "blast" (a bomb) —
+ * and `depth` is the reporting link, NOT the callback's ordinal: this walk
+ * recurses depth-first mid-offset, so the calls arrive interleaved and only
+ * `depth` groups a chain into the waves it actually ran in.
  */
-function stampOn(board, offsets, row, col, rows, cols, out, depth = 0, onChange) {
+function stampOn(
+  board, offsets, row, col, rows, cols, out, depth = 0, onChange,
+  source = "cast",
+) {
   const mayActivate = depth <= MAX_CHAIN_DEPTH;
   for (const { dRow, dCol } of offsets) {
     const r = row + dRow, cl = col + dCol;
@@ -2052,7 +2221,7 @@ function stampOn(board, offsets, row, col, rows, cols, out, depth = 0, onChange)
     if (name === "special_rock") {
       board[flat] = "red";
       out.rocksBroken++;
-      if (onChange) onChange(flat, name, "red");
+      if (onChange) onChange({ flat, from: name, to: "red", depth, source });
       continue;
     }
     if (activatesOnCast(name)) {
@@ -2067,7 +2236,7 @@ function stampOn(board, offsets, row, col, rows, cols, out, depth = 0, onChange)
     board[flat] = next;
     out.downgraded++;
     if (next === "defused") out.neutralized++;
-    if (onChange) onChange(flat, name, next);
+    if (onChange) onChange({ flat, from: name, to: next, depth, source });
   }
 }
 
@@ -2082,18 +2251,25 @@ function stampOn(board, offsets, row, col, rows, cols, out, depth = 0, onChange)
  */
 function activateOn(board, flat, rows, cols, out, depth, onChange) {
   const name = board[flat];
+  // The unit SPENDING itself is the link that fired, so it is reported at
+  // this depth and coloured by what it is about to do — the spark that
+  // starts a blast is already the blast's.
+  const source = name === "special_bomb" ? "blast" : "block";
   board[flat] = "empty"; // BEFORE the effect — see above.
   out.activated++;
-  if (onChange) onChange(flat, name, "empty");
+  if (onChange) onChange({ flat, from: name, to: "empty", depth, source });
 
   // Only the two kinds the loader will arm reach here; config.zig refuses
   // the rest, whose effects need the session rather than the board.
+  //
+  // The effect is one link FURTHER out than the unit that fired it, and
+  // that distance is what a replay paces its waves by: everything reported
+  // at depth N landed because something at depth N-1 went off.
   if (name === "special_neutralizer") {
     stampOn(board, AGENT_BLOCK_OFFSETS, Math.floor(flat / cols), flat % cols,
-      rows, cols, out, depth + 1, onChange);
+      rows, cols, out, depth + 1, onChange, "block");
   } else if (name === "special_bomb") {
-    out.destroyed += detonateOn(board, flat, rows, cols,
-      onChange && ((cell, was) => onChange(cell, was, "empty")), depth + 1);
+    out.destroyed += detonateOn(board, flat, rows, cols, onChange, depth + 1);
   }
 }
 
@@ -2104,6 +2280,27 @@ const AGENT_BLOCK_OFFSETS = [
   { dRow: 0, dCol: -1 }, { dRow: 0, dCol: 0 }, { dRow: 0, dCol: 1 },
   { dRow: 1, dCol: -1 }, { dRow: 1, dCol: 0 }, { dRow: 1, dCol: 1 },
 ];
+
+/**
+ * Rebuild a landed cast's OFFSETS from the wire event.
+ *
+ * `cells` are absolute and pre-clipped, so subtracting the anchor recovers
+ * the shape the player actually threw — every offset that survived, anyway,
+ * which is all a replay needs.  The anchor has to travel for this: clipping
+ * can drop the anchor cell itself, so it is not derivable from the list (see
+ * JsonShapeCast in stdout_writer.zig).
+ *
+ * Offsets, not the cell list, are what `stampOn` walks — and running the
+ * stamp again locally is the only way to see the cells a reaction took
+ * OUTSIDE the footprint, which the footprint by definition cannot name.
+ */
+function castOffsets(ev, cols) {
+  const ar = Math.floor(ev.anchor / cols), ac = ev.anchor % cols;
+  return (ev.cells ?? []).map((flat) => ({
+    dRow: Math.floor(flat / cols) - ar,
+    dCol: (flat % cols) - ac,
+  }));
+}
 
 /** A fresh ShapeOutcome mirror (see slime.ShapeOutcome). */
 function shapeOutcome() {
@@ -2385,19 +2582,35 @@ let prevGrid = [];
  *   { kind: "pop",   dur, t, from, cells? }  a bitten tile bursting outward,
  *     with any replacement arriving behind it
  *   { kind: "flash", dur, t }                a downgraded tile blooming
+ *   { kind: "hold",  dur, t, from }          a cell MASKED at its pre-chain
+ *     look until its link in a reaction is due (see scheduleChainFx)
  * `cells` is the travel distance in cells, defaulting to one: the feast
  * cinematic sets a real distance, since its survivors and refills travel
  * arbitrarily far.
+ *
+ * Every kind here decorates a board that has ALREADY changed — none of them
+ * gates a rule.  `hold` is the one that can be mistaken for a rule, because
+ * it withholds a change from the eye; the change itself landed the moment
+ * the server sent it.
  */
 const cellAnim = new Map();
 
-/** Cells a stamp covered this frame, from `game.shape_casts`.  A covered cell
- *  that stepped DOWN a tier flashes in place rather than dropping in as new
- *  slime: a downgrade rewrites the cell, and arriving slime is a different
- *  event that must not look the same.  A covered cell the cast EMPTIED —
- *  a spent special, or a victim of a blast it set off — is neither: it
- *  bursts, because it was destroyed. */
-const stampedThisFrame = new Set();
+/**
+ * flat -> `{depth, source}`, what a cast did to each cell it reached this
+ * frame (see recordCastChain).
+ *
+ * Two jobs.  A covered cell that stepped DOWN a tier flashes in place rather
+ * than dropping in as new slime: a downgrade rewrites the cell, and arriving
+ * slime is a different event that must not look the same.  A covered cell the
+ * cast EMPTIED — a spent special, or a victim of a blast it set off — is
+ * neither: it bursts, because it was destroyed.
+ *
+ * And `depth` says which link of the reaction reached it, which is the only
+ * thing that can pace a cascade the server resolved in a single tick.
+ *
+ * Consumed and cleared by updateGridAnims on the same frame.
+ */
+const stampedThisFrame = new Map();
 
 /** flat → idle wobble phase.  Derived from the flat index so a cell always
  *  breathes on the same beat, and memoised because the draw loop would
@@ -2419,21 +2632,28 @@ function bobPhase(flat) {
  * Turn-end frames never reach here: drawGame hands those to the cinematic,
  * which owns the eat/fall/refill animations and adopts the grid when it is done.
  */
-function updateGridAnims(grid) {
+function updateGridAnims(grid, rows, cols) {
   for (let flat = 0; flat < grid.length; flat++) {
     const now = grid[flat];
     const was = prevGrid[flat];
     if (was === undefined) continue; // first frame: no animation, just adopt
     if (now === was) continue;
 
-    if (stampedThisFrame.has(flat) && now === downgradeName(was)) {
-      // A stamp stepped this unit down a tier in place: it survived, so it
-      // stays put and blooms.
-      cellAnim.set(flat, { kind: "flash", dur: FIELD.flashS, t: FIELD.flashS });
-    } else if (stampedThisFrame.has(flat) && now === "empty") {
-      // The cast ERASED it — a special it set off, or something the blast
-      // that followed took.  Nothing drops into a crater, so it bursts.
-      cellAnim.set(flat, { kind: "pop", dur: FIELD.popS, t: FIELD.popS, from: was });
+    // The cast's own account of this cell, if it touched it.  The DIFF stays
+    // the authority on what changed — it compares two boards the server sent,
+    // where the record is only a local replay of the rules — so the record is
+    // read for its link and its cause, never for the outcome.
+    const rec = stampedThisFrame.get(flat);
+
+    if (rec && (now === downgradeName(was) || now === "empty")) {
+      // A cell the cast reached: it either stepped down a tier in place, or
+      // was erased outright (a special it set off, or something the blast
+      // that followed took).  Either way it is staged by its link, so a
+      // reaction arrives in waves instead of all at once.
+      scheduleChainFx(
+        { flat, from: was, to: now, depth: rec.depth, source: rec.source },
+        rows, cols,
+      );
     } else {
       // A refilled hole, or any other replacement, sliding in from above.
       cellAnim.set(flat, { kind: "drop", dur: FIELD.dropS, t: FIELD.dropS });
@@ -2443,11 +2663,17 @@ function updateGridAnims(grid) {
   stampedThisFrame.clear();
 }
 
-/** Advance queued cell animations, dropping the finished ones. */
+/** Advance queued cell animations, dropping the finished ones.
+ *
+ *  A `hold` is the one kind that does not simply end: when its wait runs out
+ *  the cell is finally allowed to look changed, so the hold HANDS OVER to the
+ *  reveal it was carrying rather than expiring into nothing. */
 function tickGridAnims(dt) {
   for (const [flat, a] of cellAnim) {
     a.t -= dt;
-    if (a.t <= 0) cellAnim.delete(flat);
+    if (a.t > 0) continue;
+    if (a.then) cellAnim.set(flat, a.then);
+    else cellAnim.delete(flat);
   }
 }
 
@@ -2599,7 +2825,21 @@ function drawSlimeField(game) {
         withAlpha(becomesColor(becomes), FIELD.previewFillAlpha));
     }
 
-    const name = grid[flat];
+    // A cell waiting its turn in a chain is drawn as it stood BEFORE the
+    // reaction reached it.  The board underneath is already the server's —
+    // the hold is a mask over it, not a delay in it — so the TILE below
+    // reads this name rather than the grid's, right down to whether the cell
+    // counts as occupied at all: a unit a blast has already taken must keep
+    // its socket until the blast is visibly its turn to fire.
+    //
+    // The mask stops at the tile.  The overlays above (nibble hatching, the
+    // cast preview) were computed from the frame's grid and still describe
+    // the settled board, so for the fraction of a second a cell is held they
+    // can disagree with the tile drawn under them.  Left alone deliberately:
+    // those overlays answer "what would a bite/cast do NOW", which is a
+    // question about the real board, and re-deriving them per held cell
+    // would make them lie about the game instead.
+    const name = anim?.kind === "hold" ? anim.from : grid[flat];
     if (!cellIsSlime(name)) {
       // Empty cell: the footprint outline is all there is to draw — and
       // covering empty ground still shows, which is exactly the aiming
@@ -2655,19 +2895,6 @@ function drawSlimeField(game) {
       ctx.restore();
     }
 
-    // Agent-block ring: a violet border flashed on a cell a swallowed
-    // neutralizer's 3x3 downgraded.  The downgrade itself landed with the
-    // bite; the rings sweep the footprint afterwards, one square at a time
-    // (see tickRingQueue), purely as a receipt.
-    if (anim?.kind === "ring") {
-      const p = animProgress(anim);
-      ctx.save();
-      ctx.globalAlpha = 1 - p;
-      ctx.strokeStyle = SPECIAL_COLOR;
-      ctx.lineWidth = 3;
-      ctx.strokeRect(x0 + inset, y0 + inset, body, body);
-      ctx.restore();
-    }
   }
 
   // Ripe window casts, then cursors, so aim is never buried under a tile.
@@ -3174,21 +3401,18 @@ function startFeastCinematic(game) {
     // took OUTSIDE the footprint, which `ev.cells` (the footprint) cannot
     // name.  The anchor travels for exactly this kind of re-derivation.
     // `cells` arrives pre-clipped, so no offset here is ever off-grid.
+    const offsets = castOffsets(ev, cols);
     const ar = Math.floor(ev.anchor / cols), ac = ev.anchor % cols;
-    const offsets = (ev.cells ?? []).map((flat) => ({
-      dRow: Math.floor(flat / cols) - ar,
-      dCol: (flat % cols) - ac,
-    }));
+    // UNSTAGED, for the same reason a cast landing mid-replay is (see
+    // recordCastChain): the meal is about to be eaten off this board and the
+    // survivors packed left, and a hold outliving that would sit over a
+    // socket that is no longer its own.  Worse, a bite strip with nothing to
+    // chew collapses immediately (armEatPass), so there is not even a stage
+    // for the waves to run in.  The cast still blooms and sparks — it simply
+    // arrives all at once.
     stampOn(board, offsets, ar, ac, rows, cols, shapeOutcome(), 0,
-      (flat, from, to) => {
-        // Bloom a downgrade, as any downgrade does: the last cast of a turn is
-        // the one most worth seeing land, and the replay starts on the board
-        // it made.  A cell the cast ERASED bursts instead — it is gone, and a
-        // flash would promise it was merely improved.
-        cellAnim.set(flat, to === "empty"
-          ? { kind: "pop", dur: FIELD.popS, t: FIELD.popS, from }
-          : { kind: "flash", dur: FIELD.flashS, t: FIELD.flashS });
-      });
+      ({ flat, from, to, source }) =>
+        scheduleChainFx({ flat, from, to, depth: 0, source }, rows, cols));
   }
 
   // The turn settled in PASSES: matches re-open the feast, so the server ran
@@ -3316,9 +3540,6 @@ function tickCinematic(game, dt) {
   if (!cinematic) return;
   // The freshest frame, for the entity roster the next pass's queues need.
   cinematic.frame = game;
-  // The cosmetic ring sweep runs in every stage: it gates nothing (see
-  // tickRingQueue), so the meal never waits on it.
-  tickRingQueue(dt);
   switch (cinematic.stage) {
     case "eat": tickEat(game, dt); break;
     case "collapse":
@@ -3375,7 +3596,17 @@ function tickEat(game, dt) {
     c.holdT = Math.max(0, c.holdT - dt);
   }
 
-  if (c.groupIdx >= c.groups.length && c.holdT <= 0) {
+  // A reaction a late bite set off may still be working its way outward.  The
+  // collapse would pack the survivors left underneath it — moving the very
+  // cells the remaining links are holding, and stranding each held tile over
+  // a socket that is no longer its own.  So the meal waits for the waves to
+  // finish arriving.
+  //
+  // Only cells still WAITING count.  Sparks already flying are loose in
+  // screen space with no cell to be wrong about, and the board is free to
+  // move under them — which is what keeps a long chain from stalling the
+  // clock for as long as its sparks happen to burn.
+  if (c.groupIdx >= c.groups.length && c.holdT <= 0 && !chainRevealsPending()) {
     finishEat();
   }
 }
@@ -3497,21 +3728,15 @@ function bite(flat) {
   // STANDING board, so a hazard later in the same walk can be defused in
   // time to be consumed.  Routed through the shared `stampOn` so a block
   // that lands on a cast-armed special sets it off here exactly as it does
-  // on the server.  The board changes NOW; the ring flashes are purely
-  // cosmetic and sweep the footprint afterwards (see tickRingQueue), never
-  // gating the meal.
+  // on the server.  The board changes NOW; the sparks are purely cosmetic and
+  // sweep outward behind it (see scheduleChainFx), holding each cell's old
+  // look only until its own link is due.
   if (was === "special_neutralizer") {
     const r = Math.floor(flat / c.cols), cl = flat % c.cols;
     // Depth 1: the swallow was what started this, so the block is already
     // the chain's first link.
     stampOn(c.board, AGENT_BLOCK_OFFSETS, r, cl, c.rows, c.cols,
-      shapeOutcome(), 1, (cell, from, to) => {
-        if (to === "empty") {
-          cellAnim.set(cell, { kind: "pop", dur: FIELD.popS, t: FIELD.popS, from });
-        } else {
-          ringQueue.push(cell);
-        }
-      });
+      shapeOutcome(), 1, (ev) => scheduleChainFx(ev, c.rows, c.cols), "block");
     const fx = cellCenter(flat, c.rows, c.cols);
     spawnFloater("neutralized!", fx.x, fx.y - LAYOUT.floater.stack,
       SPECIAL_COLOR, 0.9);
@@ -3521,32 +3746,68 @@ function bite(flat) {
   // server's inline blast, so the replay board opens exactly where the
   // walk continues.  Destroyed tiles burst where they stood.
   if (was === "special_bomb") {
-    detonateOn(c.board, flat, c.rows, c.cols, (cell, name) => {
-      cellAnim.set(cell, { kind: "pop", dur: FIELD.popS, t: FIELD.popS, from: name });
-    }, 1);
+    detonateOn(c.board, flat, c.rows, c.cols,
+      (ev) => scheduleChainFx(ev, c.rows, c.cols), 1);
     const fx = cellCenter(flat, c.rows, c.cols);
     spawnFloater("BOOM!", fx.x, fx.y - LAYOUT.floater.stack, BOMB_COLOR, 0.9);
   }
 }
 
-/** Cells owed a cosmetic neutralizer ring, flashed one per `effectStepS` so
- *  the block reads as sweeping its footprint.  The downgrades themselves
- *  already landed (see bite): this queue gates NOTHING — the meal, the slide
- *  and the refill all run over it, and a ring landing on a cell a later bite
- *  consumed is simply replaced by that cell's pop, the truer state. */
-let ringQueue = [];
-let ringT = 0;
+/**
+ * Stage one cell's place in a reaction — the single handler behind every
+ * `onChange` the replay passes down.
+ *
+ * The rules have ALREADY run: `board` holds the server's outcome before this
+ * is ever called, and nothing here can change it.  All this does is decide
+ * WHEN the cell is allowed to look changed, and throw sparks when it does.
+ *
+ * A cell's link (`ev.depth`) is the whole schedule: depth 0 — a player's own
+ * cast, and by far the common case — is due at once and is not held, so an
+ * ordinary cast is exactly as immediate as it has always been.  Deeper links
+ * wait their turn, which is what makes a cascade read as one thing setting
+ * off the next instead of the board simply being different.
+ */
+function scheduleChainFx(ev, rows, cols) {
+  // What the cell does when its turn comes.  A survivor blooms; a cell the
+  // reaction ERASED bursts, because a flash would promise it was merely
+  // stepped down when it is gone.
+  const reveal = ev.to === "empty"
+    ? { kind: "pop", dur: FIELD.popS, t: FIELD.popS, from: ev.from }
+    : { kind: "flash", dur: FIELD.flashS, t: FIELD.flashS };
 
-/** Flash the next owed ring every `effectStepS`.  Ticked in every cinematic
- *  stage; cleared with the meal it decorates (see endCinematic). */
-function tickRingQueue(dt) {
-  ringT -= dt;
-  if (ringT > 0 || ringQueue.length === 0) return;
-  const cell = ringQueue.shift();
-  cellAnim.set(cell, {
-    kind: "ring", dur: LAYOUT.cinematic.ringS, t: LAYOUT.cinematic.ringS,
-  });
-  ringT = LAYOUT.cinematic.effectStepS;
+  // Waves are capped independently of the chain cap.  `max_chain_depth` is a
+  // BALANCE knob the server owns and can raise; letting it set animation
+  // length would let a tuning change stretch the eat stage past the bite
+  // interval, so a deep chain's last links arrive together rather than
+  // holding the meal open indefinitely.
+  const F = LAYOUT.chainFx;
+  const delay = Math.min(ev.depth, F.maxWaves) * F.waveS;
+
+  const held = cellAnim.get(ev.flat);
+  if (delay <= 0) {
+    // The common case, and the one worth protecting: a player's own cast is
+    // its own first link and waits for nothing.
+    //
+    // But it can still land on a cell a DEEPER link already holds — the walk
+    // recurses mid-offset, so a block fired by the first cell a cast covers
+    // reports before the cast reaches its own later cells (see stampOn).
+    // The cell is already waiting; all this link does is change what it
+    // wakes up as.  Revealing here would let it jump its own queue.
+    if (held?.kind === "hold") held.then = reveal;
+    else cellAnim.set(ev.flat, reveal);
+  } else {
+    // Two links can touch one cell — downgraded by a block, then taken by a
+    // blast behind it.  Keep the FIRST look and the LAST moment: the cell
+    // holds what it was before the reaction started and changes once, when
+    // the reaction is finally done with it.  Showing the intermediate would
+    // claim a step the player never had time to see.
+    const from = held?.kind === "hold" ? held.from : ev.from;
+    const t = held?.kind === "hold" ? Math.max(held.t, delay) : delay;
+    cellAnim.set(ev.flat, { kind: "hold", dur: t, t, from, then: reveal });
+  }
+
+  spawnChainBurst(ev.flat, rows, cols,
+    ev.source === "blast" ? BOMB_COLOR : SPECIAL_COLOR, delay);
 }
 
 /** The strip is picked clean: pay out the deltas the meal earned, then slide. */
@@ -3764,10 +4025,9 @@ function snapFinishCinematic() {
 function endCinematic() {
   const c = cinematic;
   cinematic = null;
-  // Rings still owed belong to the meal that just ended: dropped with it,
-  // never carried into the next one.
-  ringQueue.length = 0;
-  ringT = 0;
+  // Sparks still in flight belong to the meal that just ended: dropped with
+  // it, never carried into the next one.
+  chainParticles.length = 0;
   // The baseline is the board the replay reproduced, NOT whatever the latest
   // frame holds: teammates can cast while the replay runs, and those changes
   // must still be diffed and animated on the next frame rather than adopted
@@ -4033,6 +4293,63 @@ let lastTransientGame = null;
 // shot: a floater at the run's centre, and marking the effect's footprint so
 // the downgraded cells bloom in place instead of reading as refills.
 
+/**
+ * Work out which link of a reaction reached each cell a cast touched, and
+ * record it for updateGridAnims.
+ *
+ * The server sends a cast as its FOOTPRINT — the cells the shape covered —
+ * and nothing else.  That is not enough on its own: the whole point of a
+ * chain is that it reaches cells outside the footprint, and it says nothing
+ * about ORDER, because the server resolved every link inside one tick.  So
+ * the stamp is run again here, over a scratch copy of the board as it stood
+ * before, purely to watch the rules unfold and note when each cell's turn
+ * came.
+ *
+ * Nothing here can be seen or believed.  The scratch board is thrown away,
+ * and the diff in updateGridAnims — two boards the server actually sent — is
+ * what decides what changed.  Should this mirror ever drift from the server,
+ * the worst it can do is mistime a spark.
+ */
+function recordCastChain(game) {
+  const events = game.shape_casts ?? [];
+  if (events.length === 0) return;
+  const { rows, cols } = gridDims(game);
+  // Needs the board the cast landed ON.  On the first frame of a match, or
+  // across a resize, there is no such board and the cast is simply not staged
+  // — updateGridAnims falls back to treating its cells as replacements.
+  if (prevGrid.length !== rows * cols) return;
+
+  // Mid-replay, the pacing is dropped and every cell reported as the cast's
+  // own first link.
+  //
+  // `prevGrid` is frozen at the pre-feast board while a replay runs, so the
+  // links worked out here would be read off a board that is no longer the
+  // one the cast landed on.  Worse, the collapse the replay is about to run
+  // MOVES cells: a hold surviving past it would sit over a socket that is no
+  // longer its own, showing a tile that belongs somewhere else entirely.
+  //
+  // So the cast still classifies — a downgrade blooms, an erasure bursts,
+  // which is what the diff after the replay needs — it simply arrives all at
+  // once.  A reaction we could not honestly sequence is better shown
+  // unsequenced than shown wrong.
+  const staged = !cinematicActive();
+
+  const board = prevGrid.slice();
+  for (const ev of events) {
+    stampOn(board, castOffsets(ev, cols), Math.floor(ev.anchor / cols),
+      ev.anchor % cols, rows, cols, shapeOutcome(), 0,
+      // Deepest link wins when several casts in one frame reach the same
+      // cell: the cell settles when the LAST thing that touched it is done,
+      // and holding it that long is what keeps it from changing twice.
+      ({ flat, depth, source }) => {
+        const link = staged ? depth : 0;
+        const prev = stampedThisFrame.get(flat);
+        if (prev && prev.depth >= link) return;
+        stampedThisFrame.set(flat, { depth: link, source });
+      });
+  }
+}
+
 /** The neutralize_block footprint around `center` — MIRRORS the hard-coded
  *  5x5 in slime.NEUTRALIZE_BLOCK, clipped at the grid edge. */
 function matchBlockCells(center, rows, cols) {
@@ -4055,7 +4372,9 @@ function spawnMatchFloaters(game) {
   const { rows, cols } = gridDims(game);
   events.forEach((ev, i) => {
     for (const flat of matchBlockCells(ev.center, rows, cols)) {
-      stampedThisFrame.add(flat);
+      // A resolved match is one event with no reaction behind it: every cell
+      // is the first and only link, so none of them is held.
+      stampedThisFrame.set(flat, { depth: 0, source: "block" });
     }
     const at = cellCenter(ev.center, rows, cols);
     const hits = sumTiers(ev.downgraded);
@@ -4264,6 +4583,7 @@ function drawGame(game, dt) {
   // covered (a downgrade blooms in place; a replacement drops in), and the feast
   // replay below starts from the board those same stamps produced.
   //if (fresh) spawnStampFloaters(game);
+  if (fresh) recordCastChain(game);
 
   // A settled bite starts the feast replay, which then owns the board and the
   // Lil Guys until it lands.  It must start BEFORE anything reads the board,
@@ -4292,7 +4612,10 @@ function drawGame(game, dt) {
   // stamped meanwhile are kept, not dropped: the team keeps casting while the
   // replay plays, and the first diff after it lands is what has to tell those
   // downgrades from refills.
-  if (fresh && !cinematicActive() && !startedReplay) updateGridAnims(game.grid ?? []);
+  if (fresh && !cinematicActive() && !startedReplay) {
+    const d = gridDims(game);
+    updateGridAnims(game.grid ?? [], d.rows, d.cols);
+  }
   if (fresh) {
     spawnRefusalFloater(game);
     //spawnRecipeFloaters(game);
@@ -4307,6 +4630,10 @@ function drawGame(game, dt) {
   // Fliers wear the same hidden-tab clamp as the replay that spawns them:
   // a single huge frame must not teleport every streak onto the HUD at once.
   tickFlyTris(Math.min(dt, LAYOUT.cinematic.maxStepS));
+  // Sparks run on the BOARD's clamped step, not real time: they are paced by
+  // the same waves that hold the cells they cover, and the two must not drift
+  // apart across a hidden tab.
+  tickChainParticles(step);
 
   clear();
 
@@ -4340,6 +4667,10 @@ function drawGame(game, dt) {
   drawHungerBar(game);
   drawChargeBar(game);
   drawSlimeField(game);
+  // Sparks sit over the board but under the creatures on it: a reaction is
+  // something that happened TO the field, and a Lil Guy standing in one
+  // should not be dimmed by it.
+  drawChainParticles();
   drawLilGuys(game, dt);
   drawBabies(game);
   drawPlayerMenus(game);
