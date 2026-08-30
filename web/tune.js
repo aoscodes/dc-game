@@ -54,6 +54,9 @@ const DEFAULT_MATCH_LEN = 3;
 /** Mirrors balance.DEFAULT_CHARGE_REFILL: charges a swallowed canister
  *  pours back into the team pool. */
 const DEFAULT_CHARGE_REFILL = 3;
+/** Mirrors balance.DEFAULT_MAX_CHAIN_DEPTH: links a reaction may run past
+ *  whatever started it. */
+const DEFAULT_MAX_CHAIN_DEPTH = 3;
 /** Mirrors balance.BACK_RANKS: the rightmost columns a back_ranks_only
  *  special kind may spawn in — the far side from the feast's door. */
 const BACK_RANKS = 2;
@@ -187,6 +190,8 @@ async function load() {
       feast_columns_per_guy: bal.feast_columns_per_guy ?? DEFAULT_FEAST_COLUMNS_PER_GUY,
       // Default like the server does: specials stay out of the door column.
       specials_avoid_door_column: bal.specials_avoid_door_column ?? true,
+      max_chain_depth: bal.max_chain_depth ?? DEFAULT_MAX_CHAIN_DEPTH,
+      blast_chains: bal.blast_chains ?? false,
       // Per-kind special tuning, densified so inputs always bind (and so a
       // round-trip PRESERVES it — older editors silently dropped the table).
       specials: Object.fromEntries(SPECIAL_KINDS.map((k) => [k, {
@@ -196,6 +201,7 @@ async function load() {
         charge_refill: bal.specials?.[k]?.charge_refill ?? DEFAULT_CHARGE_REFILL,
         explode_rocks_only: bal.specials?.[k]?.explode_rocks_only ?? false,
         bite_costs_hunger: bal.specials?.[k]?.bite_costs_hunger ?? false,
+        activate_on: bal.specials?.[k]?.activate_on ?? "eat",
       }])),
       player_recipes: bal.player_recipes.map((r) => ({
         label: r.label,
@@ -248,6 +254,26 @@ function boolInput(obj, key, onChange = null) {
   input.checked = !!obj[key];
   input.addEventListener("change", () => {
     obj[key] = input.checked;
+    if (onChange) onChange();
+  });
+  return input;
+}
+
+/**
+ * A dropdown bound to obj[key], one option per entry of `choices`
+ * ([value, label] pairs).  For knobs whose domain is a small closed set —
+ * a checkbox cannot express three states and a number would let a designer
+ * write one the loader will refuse.
+ */
+function enumInput(obj, key, choices, onChange = null) {
+  const input = el("select");
+  for (const [value, label] of choices) {
+    const opt = el("option", { value }, label);
+    if (obj[key] === value) opt.selected = true;
+    input.append(opt);
+  }
+  input.addEventListener("change", () => {
+    obj[key] = input.value;
     if (onChange) onChange();
   });
   return input;
@@ -459,6 +485,17 @@ function specialsRows() {
       el("span", {}, "specials never spawn in the door column (column 0)"),
       boolInput(state.balance, "specials_avoid_door_column")),
     el("br"),
+    // Chain knobs are GLOBAL, not per-kind: how far any reaction carries,
+    // and whether a blast sets off the bombs it destroys.  Both only bite
+    // once some kind below is armed for the cast.
+    el("label", {},
+      el("span", {}, "reaction chain depth (links past whatever started it; 0 = no chains)"),
+      numInput(state.balance, "max_chain_depth", 0, 255)),
+    el("br"),
+    el("label", {},
+      el("span", {}, "a bomb caught in a blast DETONATES instead of just dying"),
+      boolInput(state.balance, "blast_chains")),
+    el("br"),
   ];
   for (const k of SPECIAL_KINDS) {
     const tuning = state.balance.specials[k];
@@ -497,6 +534,23 @@ function specialsRows() {
         el("label", {},
           el("span", {}, "the bite GNAWS a rock: hunger for no score, rock unmoved"),
           boolInput(tuning, "bite_costs_hunger")),
+        el("br"),
+      );
+    }
+    // Only the neutralizer and the bomb resolve entirely on the board, so
+    // they are the only kinds the loader will arm — the rest would need the
+    // session (an egg's PRNG, a canister's charge pool) and are REFUSED
+    // outright, so offering the choice here would only build a file that
+    // will not load.
+    if (k === "neutralizer" || k === "bomb") {
+      rows.push(
+        el("label", {},
+          el("span", {}, "fires when"),
+          enumInput(tuning, "activate_on", [
+            ["eat", "eaten (the effect is the bite's)"],
+            ["cast", "cast on (eating it WASTES the effect)"],
+            ["eatcast", "either — whichever reaches it first"],
+          ])),
         el("br"),
       );
     }

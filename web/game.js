@@ -390,6 +390,13 @@ async function loadBalanceData(hash = PAGE_CONFIG_HASH) {
   TEAM_WINDOW_MS = bal.team_window_ms ?? 3000;
   BOMB_ROCKS_ONLY = bal.specials?.bomb?.explode_rocks_only ?? false;
   ROCK_BITE_COSTS_HUNGER = bal.specials?.rock?.bite_costs_hunger ?? false;
+  // Keyed by CELL NAME so the board walks can look a cell up directly.
+  SPECIAL_ACTIVATE_ON = {};
+  for (const [kind, tuning] of Object.entries(bal.specials ?? {})) {
+    if (tuning?.activate_on) SPECIAL_ACTIVATE_ON[`special_${kind}`] = tuning.activate_on;
+  }
+  MAX_CHAIN_DEPTH = bal.max_chain_depth ?? 3;
+  BLAST_CHAINS = bal.blast_chains ?? false;
   FEAST_COLUMNS = bal.feast_columns ?? 1;
   FEAST_COLUMNS_PER_GUY = bal.feast_columns_per_guy ?? 0;
   PLAYER_RECIPES = bal.player_recipes.map((r) => ({
@@ -1460,30 +1467,41 @@ function shapePreview(game) {
   // VIEWER's own wins: your own aim is what your cast resolves against —
   // same precedence as the badge's overlay map.
   const owners = new Map();
-  let offGrid = 0;
-  let inert = 0;
-  let hits = 0;
-  let defused = 0;
+  const out = shapeOutcome();
+
+  // Projected against a real WORKING BOARD rather than cell-by-cell, because
+  // a stamp is no longer a pure per-offset downgrade: an armed special it
+  // covers is set off, and the block or blast that follows changes cells the
+  // shape never touched.  `cells` is therefore taken as the DIFF at the end —
+  // every square that would end up different, footprint or not — which is
+  // exactly what the renderer draws and what reachability needs as overrides.
+  const work = grid.slice(0, rows * cols);
 
   for (const stamp of projected.stamps) {
+    // Ownership is the SHAPE's, so it is collected over the raw footprint —
+    // a crater the stamp blew open elsewhere belongs to nobody's outline.
     for (const { dRow, dCol } of stamp.offsets) {
       const r = stamp.anchor.row + dRow;
       const cl = stamp.anchor.col + dCol;
-      if (r < 0 || r >= rows || cl < 0 || cl >= cols) { offGrid++; continue; }
+      if (r < 0 || r >= rows || cl < 0 || cl >= cols) continue;
       const flat = r * cols + cl;
       if (!owners.has(flat) || stamp.owner === game.player_id) {
         owners.set(flat, { owner: stamp.owner, pending: stamp.pending });
       }
-      // Chain multiple stamps over the same cell: each one steps it down
-      // again, exactly as the server applies them in sequence.
-      const current = cells.get(flat) ?? grid[flat];
-      const next = downgradeName(current);
-      if (next === null) { inert++; continue; }
-      cells.set(flat, next);
-      hits++;
-      if (next === "defused") defused++;
     }
+    // Chain multiple stamps over the same board: each one resolves against
+    // what the last left behind, exactly as the server applies them in
+    // sequence.  Depth 0 — every cast begins its own chain.
+    stampOn(work, stamp.offsets, stamp.anchor.row, stamp.anchor.col,
+      rows, cols, out, 0);
   }
+  for (let flat = 0; flat < work.length; flat++) {
+    if (work[flat] !== grid[flat]) cells.set(flat, work[flat]);
+  }
+  const { offGrid, inert, neutralized: defused } = out;
+  // Rock BREAKS count as hits: the old per-offset walk went through
+  // downgradeName, which turns a rock into red, so they always did.
+  const hits = out.downgraded + out.rocksBroken;
   // Nibbles this batch would turn into MEALS.  A cast's real value is what
   // it defuses before the bite lands on it — hunger-clock that would have
   // been spent for nothing becomes a point instead — so the preview has to
@@ -1570,9 +1588,10 @@ const SHAPE_COLOR = "rgba(40,120,200,1)";
  *  bar's fill. */
 const NEUTRAL_COLOR = "rgba(150,150,162,1)";
 
-/** Neutralizer special: inert to casts, swallowed for free by the feast,
- *  firing a 3x3 Agent block as it goes down.  Violet, shared with nothing,
- *  because it is neither ordinary food nor hazard. */
+/** Neutralizer special: swallowed for free by the feast, firing a 3x3 Agent
+ *  block as it goes down — or, where balance arms it for the cast, fired by
+ *  the Agent instead (see SPECIAL_ACTIVATE_ON).  Violet, shared with
+ *  nothing, because it is neither ordinary food nor hazard. */
 const SPECIAL_COLOR = "rgba(140,70,210,1)";
 
 /** Egg special: edible, hatches a baby when eaten.  Warm cream so it reads
@@ -1606,6 +1625,34 @@ let BOMB_ROCKS_ONLY = false;
  *
  *  Off, a rock is inert and the bite steps over it. */
 let ROCK_BITE_COSTS_HUNGER = false;
+
+/** WHEN each special fires, by cell name (balance specials.<kind>.activate_on
+ *  — "eat" | "cast" | "eatcast").  Missing means "eat", the default and the
+ *  original game.  Read with the balance tables like BOMB_ROCKS_ONLY: it
+ *  decides which cells a stamp empties and which the bite sets off, so the
+ *  replay and the reachability preview must agree with the server or the two
+ *  boards drift. */
+let SPECIAL_ACTIVATE_ON = {};
+
+/** How many links a reaction chain may run past the thing that started it,
+ *  and whether a bomb caught in a blast goes off in turn (balance
+ *  max_chain_depth / blast_chains). */
+let MAX_CHAIN_DEPTH = 3;
+let BLAST_CHAINS = false;
+
+/** MIRRORS balance.Activation.on_cast — does an Agent block covering this
+ *  cell set it off? */
+function activatesOnCast(name) {
+  const mode = SPECIAL_ACTIVATE_ON[name];
+  return mode === "cast" || mode === "eatcast";
+}
+
+/** MIRRORS balance.Activation.on_eat — does swallowing this cell set it off?
+ *  Absent tuning means yes: `eat` is the default. */
+function activatesOnEat(name) {
+  const mode = SPECIAL_ACTIVATE_ON[name];
+  return mode === undefined || mode === "eat" || mode === "eatcast";
+}
 
 /** Bite width knobs (balance feast_columns / feast_columns_per_guy) — read
  *  with the balance tables so the replay bites exactly the columns the
@@ -1668,9 +1715,10 @@ function sumTiers(obj) {
  *
  * MIRRORS components.Tier.downgrade + slime.apply_shape: rock → red → yellow
  * → green → defused — the Agent BREAKS a rock into the hardest slime, then
- * chews it down the same ladder as any hazard.  Nothing is ever destroyed,
- * so a stamp only ever changes what a cell COSTS to eat, never whether it
- * is eaten.
+ * chews it down the same ladder as any hazard.  This LADDER destroys
+ * nothing: it only changes what a cell costs to eat.  (A stamp as a whole
+ * can now destroy, but never through here — see stampOn/activateOn, where a
+ * cast-armed special is spent and a bomb it sets off levels its 3x3.)
  */
 function downgradeName(name) {
   if (name === "special_rock") return "red";
@@ -1889,16 +1937,19 @@ function biteFeast(board, rows, cols, width, overrides) {
       work[flat] = "empty";
       order.push(flat);
       eaten.add(flat);
+      // A special armed for the CAST is still swallowed — it is in `eaten`
+      // above and the mouths still pay for it — but its effect is FORFEIT.
+      // MIRRORS the on_eat gate in slime.consume.
+      if (!activatesOnEat(name)) continue;
       if (name === "special_neutralizer") {
         // The block fires where it was eaten, on the board AS IT STANDS.
-        for (const cell of agentBlockCells(flat, rows, cols)) {
-          const next = downgradeName(work[cell]);
-          if (next !== null) work[cell] = next;
-        }
+        // Depth 1: the swallow was what started this, so the block it fires
+        // is already the chain's first link.
+        stampOn(work, AGENT_BLOCK_OFFSETS, r, col, rows, cols, shapeOutcome(), 1);
       } else if (name === "special_bomb") {
         // The blast levels its 3x3 where it was eaten, on the board AS IT
         // STANDS — a cell it empties ahead of the walk is skipped there.
-        detonateOn(work, flat, rows, cols, null);
+        detonateOn(work, flat, rows, cols, null, 1);
       }
     }
   }
@@ -1949,15 +2000,117 @@ function agentBlockCells(center, rows, cols) {
  * the 3x3 around `center` (or, with BOMB_ROCKS_ONLY, just the rocks in it).
  * Walked in the server's row-major order; `onDestroy(flat, name)` is called
  * per destroyed cell so the replay can burst them where they stood.
+ *
+ * With BLAST_CHAINS a bomb caught in the blast goes off in turn — deferred
+ * until this blast has finished its own 3x3, exactly as slime.detonate
+ * defers it — while `depth <= MAX_CHAIN_DEPTH`.  `depth` is the blast's own
+ * link number: a swallowed or cast-activated bomb blasts at 1.  Returns the
+ * number of cells destroyed, the whole cascade included.
  */
-function detonateOn(board, center, rows, cols, onDestroy) {
+function detonateOn(board, center, rows, cols, onDestroy, depth = 1) {
+  const mayChain = BLAST_CHAINS && depth <= MAX_CHAIN_DEPTH;
+  let destroyed = 0;
+  // Bombs the blast uncovered, fired only after this one has finished
+  // levelling its own 3x3 — deferred exactly as slime.detonate defers them,
+  // so both walks stay simple row-major over one blast's board.
+  const chained = [];
   for (const cell of agentBlockCells(center, rows, cols)) {
     const name = board[cell];
     if (!cellIsSlime(name)) continue;
     if (BOMB_ROCKS_ONLY && name !== "special_rock") continue;
     board[cell] = "empty";
     if (onDestroy) onDestroy(cell, name);
+    destroyed++;
+    if (mayChain && name === "special_bomb") chained.push(cell);
   }
+  for (const bomb of chained) {
+    destroyed += detonateOn(board, bomb, rows, cols, onDestroy, depth + 1);
+  }
+  return destroyed;
+}
+
+/**
+ * One application of `offsets` at (`row`, `col`) — MIRRORS slime.stamp.
+ *
+ * Downgrades hazards, BREAKS rocks into red, and ACTIVATES any special the
+ * balance armed for the cast.  `depth` is the reaction's distance from
+ * whatever began the chain (a player's cast and a swallowed special both
+ * start at 0); a stamp may only activate while `depth <= MAX_CHAIN_DEPTH`.
+ *
+ * Offsets resolve IN ORDER against the board as it stands, so a cell an
+ * earlier activation emptied is simply gone when a later offset reaches it.
+ * Tallies into `out` (a ShapeOutcome mirror); `onChange(flat, before, after)`
+ * fires per mutated cell so a replay can animate it.
+ */
+function stampOn(board, offsets, row, col, rows, cols, out, depth = 0, onChange) {
+  const mayActivate = depth <= MAX_CHAIN_DEPTH;
+  for (const { dRow, dCol } of offsets) {
+    const r = row + dRow, cl = col + dCol;
+    if (r < 0 || r >= rows || cl < 0 || cl >= cols) { out.offGrid++; continue; }
+    const flat = r * cols + cl;
+    const name = board[flat];
+    if (name === "special_rock") {
+      board[flat] = "red";
+      out.rocksBroken++;
+      if (onChange) onChange(flat, name, "red");
+      continue;
+    }
+    if (activatesOnCast(name)) {
+      // Armed but out of reach of the cap: left standing, and waste like any
+      // other cell the stamp could not change.
+      if (mayActivate) activateOn(board, flat, rows, cols, out, depth, onChange);
+      else out.inert++;
+      continue;
+    }
+    const next = downgradeName(name);
+    if (next === null) { out.inert++; continue; }
+    board[flat] = next;
+    out.downgraded++;
+    if (next === "defused") out.neutralized++;
+    if (onChange) onChange(flat, name, next);
+  }
+}
+
+/**
+ * Set off the special at `flat` — MIRRORS slime.activate.
+ *
+ * ORDER IS LOAD-BEARING: the cell is cleared BEFORE its effect runs.  An
+ * Agent block is a 3x3 centred on the cell that fired it, so it covers that
+ * cell; firing first would find the neutralizer still standing and set it off
+ * forever.  Clearing first is also what bounds every chain — each link empties
+ * a cell, so the board runs out even with the cap wound up.
+ */
+function activateOn(board, flat, rows, cols, out, depth, onChange) {
+  const name = board[flat];
+  board[flat] = "empty"; // BEFORE the effect — see above.
+  out.activated++;
+  if (onChange) onChange(flat, name, "empty");
+
+  // Only the two kinds the loader will arm reach here; config.zig refuses
+  // the rest, whose effects need the session rather than the board.
+  if (name === "special_neutralizer") {
+    stampOn(board, AGENT_BLOCK_OFFSETS, Math.floor(flat / cols), flat % cols,
+      rows, cols, out, depth + 1, onChange);
+  } else if (name === "special_bomb") {
+    out.destroyed += detonateOn(board, flat, rows, cols,
+      onChange && ((cell, was) => onChange(cell, was, "empty")), depth + 1);
+  }
+}
+
+/** The 3x3 Agent block as stamp offsets — MIRRORS slime.AGENT_BLOCK, so a
+ *  block fired by an activation walks the server's order. */
+const AGENT_BLOCK_OFFSETS = [
+  { dRow: -1, dCol: -1 }, { dRow: -1, dCol: 0 }, { dRow: -1, dCol: 1 },
+  { dRow: 0, dCol: -1 }, { dRow: 0, dCol: 0 }, { dRow: 0, dCol: 1 },
+  { dRow: 1, dCol: -1 }, { dRow: 1, dCol: 0 }, { dRow: 1, dCol: 1 },
+];
+
+/** A fresh ShapeOutcome mirror (see slime.ShapeOutcome). */
+function shapeOutcome() {
+  return {
+    downgraded: 0, neutralized: 0, rocksBroken: 0,
+    offGrid: 0, inert: 0, activated: 0, destroyed: 0,
+  };
 }
 
 /**
@@ -2062,7 +2215,11 @@ function cellIsSlime(name) {
  *  are eaten whole: an egg is food with a baby
  *  inside, a neutralizer is free equipment that fires a 3x3 Agent block as
  *  it is swallowed, a canister is free equipment that refills the team's
- *  charge pool, a bomb levels its 3x3 as it goes down. */
+ *  charge pool, a bomb levels its 3x3 as it goes down.
+ *
+ *  Edibility is about the MOUTH only, so it does not move with
+ *  `activate_on`: a special armed for the cast is still consumed here, it
+ *  just goes down silently (see activatesOnEat, the gate that follows). */
 function cellIsEdible(name) {
   return name === "neutral" || name === "defused" ||
     name === "special_egg" || name === "special_neutralizer" ||
@@ -2235,9 +2392,11 @@ let prevGrid = [];
 const cellAnim = new Map();
 
 /** Cells a stamp covered this frame, from `game.shape_casts`.  A covered cell
- *  that changed was DOWNGRADED by a cast, so it flashes in place rather than
- *  dropping in as new slime — a downgrade rewrites the cell, it never destroys
- *  it, and the two must not look the same. */
+ *  that stepped DOWN a tier flashes in place rather than dropping in as new
+ *  slime: a downgrade rewrites the cell, and arriving slime is a different
+ *  event that must not look the same.  A covered cell the cast EMPTIED —
+ *  a spent special, or a victim of a blast it set off — is neither: it
+ *  bursts, because it was destroyed. */
 const stampedThisFrame = new Set();
 
 /** flat → idle wobble phase.  Derived from the flat index so a cell always
@@ -2271,6 +2430,10 @@ function updateGridAnims(grid) {
       // A stamp stepped this unit down a tier in place: it survived, so it
       // stays put and blooms.
       cellAnim.set(flat, { kind: "flash", dur: FIELD.flashS, t: FIELD.flashS });
+    } else if (stampedThisFrame.has(flat) && now === "empty") {
+      // The cast ERASED it — a special it set off, or something the blast
+      // that followed took.  Nothing drops into a crater, so it bursts.
+      cellAnim.set(flat, { kind: "pop", dur: FIELD.popS, t: FIELD.popS, from: was });
     } else {
       // A refilled hole, or any other replacement, sliding in from above.
       cellAnim.set(flat, { kind: "drop", dur: FIELD.dropS, t: FIELD.dropS });
@@ -2525,6 +2688,11 @@ function drawSlimeField(game) {
 
 /** The color standing for a projected outcome tier ("defused" has no tier). */
 function becomesColor(becomes) {
+  // ERASED, not improved: a cast that sets off an armed special spends it,
+  // and a bomb it touches off levels the cells around it.  Those squares end
+  // up with nothing on them, which is a different promise from "defused" and
+  // must not wear the same encouraging colour.
+  if (becomes === "empty") return C_BAD;
   return becomes === "defused" ? SHAPE_COLOR : (TIER_COLOR[becomes] ?? SHAPE_COLOR);
 }
 
@@ -3000,14 +3168,27 @@ function startFeastCinematic(game) {
   // the server applied them — in event order, each stamp stepping a cell down
   // again — and clipped identically, since the cell lists arrive pre-clipped.
   for (const ev of game.shape_casts ?? []) {
-    for (const flat of ev.cells ?? []) {
-      const next = downgradeName(board[flat]);
-      if (next === null) continue;
-      board[flat] = next;
-      // Bloom it, as any downgrade does: the last cast of a turn is the one most
-      // worth seeing land, and the replay starts on the board it made.
-      cellAnim.set(flat, { kind: "flash", dur: FIELD.flashS, t: FIELD.flashS });
-    }
+    // Rebuilt as OFFSETS around the wire's anchor and pushed through the
+    // shared `stampOn`, so a cast that set off an armed special empties the
+    // same cells here as it did on the server — including the ones its blast
+    // took OUTSIDE the footprint, which `ev.cells` (the footprint) cannot
+    // name.  The anchor travels for exactly this kind of re-derivation.
+    // `cells` arrives pre-clipped, so no offset here is ever off-grid.
+    const ar = Math.floor(ev.anchor / cols), ac = ev.anchor % cols;
+    const offsets = (ev.cells ?? []).map((flat) => ({
+      dRow: Math.floor(flat / cols) - ar,
+      dCol: (flat % cols) - ac,
+    }));
+    stampOn(board, offsets, ar, ac, rows, cols, shapeOutcome(), 0,
+      (flat, from, to) => {
+        // Bloom a downgrade, as any downgrade does: the last cast of a turn is
+        // the one most worth seeing land, and the replay starts on the board
+        // it made.  A cell the cast ERASED bursts instead — it is gone, and a
+        // flash would promise it was merely improved.
+        cellAnim.set(flat, to === "empty"
+          ? { kind: "pop", dur: FIELD.popS, t: FIELD.popS, from }
+          : { kind: "flash", dur: FIELD.flashS, t: FIELD.flashS });
+      });
   }
 
   // The turn settled in PASSES: matches re-open the feast, so the server ran
@@ -3304,19 +3485,33 @@ function bite(flat) {
       CANISTER_COLOR, 0.9);
   }
 
+  // A special armed for the CAST is swallowed silently: the server's mouth
+  // takes it and forfeits the effect, so the replay must forfeit it too or
+  // the player watches an explosion that never happened and the board snaps
+  // at the end of the meal.  MIRRORS the on_eat gate in slime.consume and in
+  // biteFeast — the three walks have to agree cell for cell.
+  if (!activatesOnEat(was)) return;
+
   // A swallowed neutralizer's block fires the moment it goes down — MIRRORS
   // the server's (and biteFeast's) inline application, row-major over the
   // STANDING board, so a hazard later in the same walk can be defused in
-  // time to be consumed.  The board changes NOW; the ring flashes are purely
+  // time to be consumed.  Routed through the shared `stampOn` so a block
+  // that lands on a cast-armed special sets it off here exactly as it does
+  // on the server.  The board changes NOW; the ring flashes are purely
   // cosmetic and sweep the footprint afterwards (see tickRingQueue), never
   // gating the meal.
   if (was === "special_neutralizer") {
-    for (const cell of agentBlockCells(flat, c.rows, c.cols)) {
-      const next = downgradeName(c.board[cell]);
-      if (next === null) continue;
-      c.board[cell] = next;
-      ringQueue.push(cell);
-    }
+    const r = Math.floor(flat / c.cols), cl = flat % c.cols;
+    // Depth 1: the swallow was what started this, so the block is already
+    // the chain's first link.
+    stampOn(c.board, AGENT_BLOCK_OFFSETS, r, cl, c.rows, c.cols,
+      shapeOutcome(), 1, (cell, from, to) => {
+        if (to === "empty") {
+          cellAnim.set(cell, { kind: "pop", dur: FIELD.popS, t: FIELD.popS, from });
+        } else {
+          ringQueue.push(cell);
+        }
+      });
     const fx = cellCenter(flat, c.rows, c.cols);
     spawnFloater("neutralized!", fx.x, fx.y - LAYOUT.floater.stack,
       SPECIAL_COLOR, 0.9);
@@ -3328,7 +3523,7 @@ function bite(flat) {
   if (was === "special_bomb") {
     detonateOn(c.board, flat, c.rows, c.cols, (cell, name) => {
       cellAnim.set(cell, { kind: "pop", dur: FIELD.popS, t: FIELD.popS, from: name });
-    });
+    }, 1);
     const fx = cellCenter(flat, c.rows, c.cols);
     spawnFloater("BOOM!", fx.x, fx.y - LAYOUT.floater.stack, BOMB_COLOR, 0.9);
   }

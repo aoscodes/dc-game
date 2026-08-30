@@ -27,9 +27,15 @@
 //!                 pool is empty is SKIPPED, not filled.
 //!   apply_shape — stamp a cast's footprint at an aimed anchor, DOWNGRADING
 //!                 every covered hazard one tier and BREAKING every covered
-//!                 rock into red slime.  Deterministic: the player chose the
-//!                 cells, so nothing is random and nothing is destroyed —
-//!                 only made safer (or, for a rock, made breakable-down).
+//!                 rock into red slime.  A covered special that balance armed
+//!                 for the cast (SpecialTuning.activate_on) is ACTIVATED
+//!                 instead: spent, and its effect fired on the spot — which
+//!                 may CHAIN into further specials, bounded by
+//!                 Balance.max_chain_depth.  Deterministic either way: the
+//!                 player chose the cells, so nothing is random.  Absent an
+//!                 armed kind nothing is destroyed, only made safer (or, for
+//!                 a rock, made breakable-down); an armed bomb is the one
+//!                 way a cast removes units from the board.
 //!   feast       — the turn-end bite: the Lil Guys chew through the leftmost
 //!                 `n_cols` columns.  An EDIBLE unit is consumed whole; a
 //!                 live hazard is NIBBLED — downgraded one tier in place,
@@ -38,7 +44,9 @@
 //!                 Specials are consumed with their effects: an egg HATCHES a
 //!                 baby (reported, not resolved here), a neutralizer fires a
 //!                 3x3 Agent block INLINE mid-bite, a canister refills
-//!                 charges, a bomb detonates.
+//!                 charges, a bomb detonates.  A special armed for the CAST
+//!                 is still swallowed and still paid for, but its effect is
+//!                 FORFEIT — the bite and the Agent race for it.
 //!   shift_left  — pack every row's survivors against the left edge, so the
 //!                 holes the bite (and any match pops) made drift to the
 //!                 right for `fill` to refill: the conveyor's advance.
@@ -245,26 +253,63 @@ pub const SlimeField = struct {
     /// (red -> yellow -> green -> neutralized).  A covered ROCK is BROKEN:
     /// the Agent cracks it into red slime — the hardest tier — putting it at
     /// the top of the same ladder (rock -> red -> ... -> neutralized), so a
-    /// rock is four applications from edible.  Nothing is destroyed: a
-    /// neutralized unit stays on the grid, edible, scoring, and costing only
-    /// normal hunger — clearing the field is the Lil Guys' job, not the cast's.
+    /// rock is four applications from edible.  Nothing on this LADDER is
+    /// destroyed: a neutralized unit stays on the grid, edible, scoring, and
+    /// costing only normal hunger — clearing the field is the Lil Guys' job,
+    /// not the cast's.  (One exception follows.)
+    ///
+    /// A covered special whose tuning arms it for the cast (balance
+    /// Activation.on_cast) is ACTIVATED instead: removed, and its effect
+    /// fired on the spot.  That is the one case where a cast destroys —
+    /// a bomb it sets off levels its 3x3 — so the "nothing is destroyed"
+    /// rule above holds only for kinds left on the default `.eat`.
     ///
     /// Cells the shape covers that cannot be changed are WASTED, and the
     /// distinction is the player's aiming feedback:
     ///   - `off_grid`  — the offset fell outside the playfield (clipped)
     ///   - `inert`     — a real cell with nothing to neutralize (empty,
-    ///                   neutral, already neutralized, or a special OTHER
-    ///                   than the rock — no cast can change those)
+    ///                   neutral, already neutralized, or a special that is
+    ///                   neither a rock nor armed for the cast)
     ///
     /// Deterministic: no randomness, because the player chose the cells.
     pub fn apply_shape(
         self: *SlimeField,
+        bal: *const balance.Balance,
         shape: balance.Shape,
         row: u8,
         col: u8,
     ) ShapeOutcome {
-        std.debug.assert(row < self.grid.rows and col < self.grid.cols);
         var out = ShapeOutcome{};
+        self.stamp(bal, shape, row, col, 0, &out);
+        return out;
+    }
+
+    /// One application of `shape` at (`row`, `col`), accumulating into `out`.
+    ///
+    /// `depth` is the reaction's distance from whatever started the chain: a
+    /// player's cast and a swallowed special both begin at 0, and an effect
+    /// fired by an activation runs one deeper.  The counter is WIDER than
+    /// `max_chain_depth`'s u8 on purpose: a full board can supply one more
+    /// link than that type can hold (MAX_GRID_CELLS is 256), so a u8 here
+    /// would overflow one step past the largest cap a designer can write.  A stamp may only ACTIVATE
+    /// what it covers while `depth <= bal.max_chain_depth`; past that it
+    /// still downgrades and breaks normally, it just sets nothing off.  So
+    /// raising the cap lengthens chains and never changes a lone cast.
+    ///
+    /// Offsets resolve IN ORDER against the STANDING board — an activation
+    /// partway through is visible to the offsets after it, exactly as a
+    /// neutralizer swallowed mid-bite is (see feast).
+    fn stamp(
+        self: *SlimeField,
+        bal: *const balance.Balance,
+        shape: balance.Shape,
+        row: u8,
+        col: u8,
+        depth: u16,
+        out: *ShapeOutcome,
+    ) void {
+        std.debug.assert(row < self.grid.rows and col < self.grid.cols);
+        const may_activate = depth <= bal.max_chain_depth;
 
         for (shape.offsets) |off| {
             const r = @as(i32, row) + off.d_row;
@@ -283,6 +328,19 @@ pub const SlimeField = struct {
                 out.rocks_broken += 1;
                 continue;
             }
+            if (cell == .special and
+                bal.special_tuning(cell.special).activate_on.on_cast())
+            {
+                if (may_activate) {
+                    self.activate(bal, flat, depth, out);
+                } else {
+                    // Armed, but too deep to set off: the chain ends here
+                    // and the unit is left standing, which is waste like any
+                    // other cell the stamp could not change.
+                    out.inert += 1;
+                }
+                continue;
+            }
             if (cell != .tiered) {
                 out.inert += 1;
                 continue;
@@ -297,7 +355,63 @@ pub const SlimeField = struct {
                 out.neutralized += 1;
             }
         }
-        return out;
+    }
+
+    /// Set off the special at `flat`, which an Agent block just covered.
+    ///
+    /// ORDER IS LOAD-BEARING: the unit is cleared from the grid BEFORE its
+    /// effect runs.  A neutralizer's own 3x3 covers its own cell, so firing
+    /// first would activate it again, and again, forever.  Clearing first
+    /// also makes "spent" free — under `.eatcast` whichever trigger arrives
+    /// first consumes the unit and the other can never find it — and it is
+    /// what bounds every chain: each link strictly empties one cell, so the
+    /// board runs out even with the depth cap wound up.
+    ///
+    /// The effect fires one level deeper than the stamp that reached it.
+    /// Activation scores nothing and costs no hunger: a cast does not feed
+    /// the Lil Guys.
+    fn activate(
+        self: *SlimeField,
+        bal: *const balance.Balance,
+        flat: u16,
+        depth: u16,
+        out: *ShapeOutcome,
+    ) void {
+        const kind = self.grid.get(flat).special;
+        // The loader is what makes the `unreachable` below sound, and it is
+        // not the only way a Balance can be built (tests construct them
+        // directly).  Assert the precondition HERE, where the offending kind
+        // is still in hand, rather than letting it fall five lines into an
+        // unreachable that says nothing about which knob was wrong.
+        std.debug.assert(switch (kind) {
+            .neutralizer, .bomb => true,
+            .egg, .canister, .rock => false,
+        });
+        self.grid.put(flat, .empty); // BEFORE the effect — see above.
+        out.activated += 1;
+
+        const effect = kind.eat_effect() orelse return;
+        switch (effect) {
+            .neutralize_block => self.stamp(
+                bal,
+                AGENT_BLOCK,
+                self.grid.row_of(flat),
+                self.grid.col_of(flat),
+                depth + 1,
+                out,
+            ),
+            .explode => out.destroyed += self.detonate(
+                bal,
+                flat,
+                bal.special_tuning(kind).explode_rocks_only,
+                depth + 1,
+            ),
+            // Unreachable by construction: config.zig refuses to arm the egg
+            // or the canister, whose effects need the session (a baby's type
+            // comes from its PRNG, a refill from the team's pool) and so
+            // cannot be resolved inside the field.
+            .hatch, .refill_charges => unreachable,
+        }
     }
 
     /// The turn-end bite: the Lil Guys chew through the leftmost `n_cols`
@@ -381,17 +495,27 @@ pub const SlimeField = struct {
                         // The 3x3 fires where the neutralizer was eaten, on
                         // the board AS IT STANDS — a cell it defuses later
                         // in this same bite is consumed when reached.
+                        // Depth 1: the SWALLOW is what started this, so the
+                        // block it fires is already the chain's first link
+                        // — the same rung a cast-activated neutralizer's
+                        // block sits on, so both paths chain alike.
                         out.agents += 1;
-                        const fired = self.apply_shape(
+                        var fired = ShapeOutcome{};
+                        self.stamp(
+                            bal,
                             AGENT_BLOCK,
                             self.grid.row_of(flat),
                             self.grid.col_of(flat),
+                            1,
+                            &fired,
                         );
                         for (fired.downgraded, 0..) |n, t| {
                             out.agent_downgraded[t] += n;
                         }
                         out.agent_defused += fired.neutralized;
                         out.agent_rocks_broken += fired.rocks_broken;
+                        out.agent_activated += fired.activated;
+                        out.destroyed += fired.destroyed;
                     },
                     .explode => {
                         // The blast levels the 3x3 where the bomb was eaten,
@@ -399,8 +523,10 @@ pub const SlimeField = struct {
                         // ahead of the walk is skipped when reached.
                         out.bombs += 1;
                         out.destroyed += self.detonate(
+                            bal,
                             flat,
                             bal.special_tuning(.bomb).explode_rocks_only,
+                            1, // the swallow was 0; the blast is link one
                         );
                     },
                 }
@@ -436,6 +562,15 @@ pub const SlimeField = struct {
                     out.hunger += bal.hunger_cost_normal;
                 }
                 const effect = kind.eat_effect() orelse return null;
+                // A unit armed for the CAST is still swallowed — scored and
+                // paid for above, because the mouth cannot tell — but its
+                // effect is FORFEIT.  That loss is the point of the mode:
+                // the bite races the Agent for every armed special, and
+                // reaching one first wastes it.  Returning HERE also skips
+                // the hatch and refill tallies below, which is safe only
+                // because config.zig refuses to arm the egg or the canister
+                // — the two kinds those tallies belong to.
+                if (!bal.special_tuning(kind).activate_on.on_eat()) return null;
                 switch (effect) {
                     .hatch => {
                         // Recorded by CELL so the caller can roll each baby's
@@ -469,8 +604,29 @@ pub const SlimeField = struct {
     /// nothing returns to the reservoir.  Walked in row-major offset order,
     /// the same order every implementation mirrors.  Returns the number of
     /// units destroyed.
-    fn detonate(self: *SlimeField, flat: u16, rocks_only: bool) u16 {
+    ///
+    /// With `bal.blast_chains`, a BOMB caught in the blast goes off itself
+    /// rather than merely dying — the chain reaction — one level deeper, and
+    /// only while `depth <= bal.max_chain_depth`.  The chained bomb is
+    /// cleared by the blast before it fires, so it cannot re-detonate itself
+    /// and every link empties a cell: the board bounds the cascade even
+    /// before the cap does.  A property of the BLAST, so it reads the same
+    /// whether the first bomb was cast at or swallowed.
+    fn detonate(
+        self: *SlimeField,
+        bal: *const balance.Balance,
+        flat: u16,
+        rocks_only: bool,
+        depth: u16,
+    ) u16 {
         var destroyed: u16 = 0;
+        const may_chain = bal.blast_chains and depth <= bal.max_chain_depth;
+        // Bombs the blast uncovered, fired only AFTER this one has finished
+        // levelling its own 3x3.  Deferring them keeps the walk row-major
+        // over a board this blast alone is changing, so the order every
+        // implementation mirrors stays the simple one.
+        var chained: [9]u16 = undefined;
+        var n_chained: usize = 0;
         const r = self.grid.row_of(flat);
         const cl = self.grid.col_of(flat);
         var dr: i32 = -1;
@@ -490,9 +646,17 @@ pub const SlimeField = struct {
                     };
                     if (!is_rock) continue;
                 }
+                const is_bomb = cell == .special and cell.special == .bomb;
                 self.grid.set(@intCast(nr), @intCast(nc), .empty);
                 destroyed += 1;
+                if (may_chain and is_bomb) {
+                    chained[n_chained] = self.grid.index(@intCast(nr), @intCast(nc));
+                    n_chained += 1;
+                }
             }
+        }
+        for (chained[0..n_chained]) |bomb| {
+            destroyed += self.detonate(bal, bomb, rocks_only, depth + 1);
         }
         return destroyed;
     }
@@ -566,6 +730,7 @@ pub const SlimeField = struct {
             switch (m.kind.match_effect() orelse unreachable) { // only matchable kinds are detected
                 .neutralize_block => {
                     const shape_out = self.apply_shape(
+                        bal,
                         NEUTRALIZE_BLOCK,
                         self.grid.row_of(m.center),
                         self.grid.col_of(m.center),
@@ -737,7 +902,9 @@ pub const FeastOutcome = struct {
     hatched: u16 = 0,
     hatched_cells: [c.MAX_GRID_CELLS]u16 = [_]u16{0} ** c.MAX_GRID_CELLS,
     /// Neutralizers consumed.  Free — counted in `cells` but never in score
-    /// or hunger — each firing a 3x3 Agent block as it was swallowed.
+    /// or hunger — each firing a 3x3 Agent block as it was swallowed.  Like
+    /// `bombs`, this counts the ones that FIRED: a neutralizer armed for the
+    /// cast is eaten silently and is absent here.
     agents: u16 = 0,
     /// What those blocks downgraded, per tier the cell was AT, and how many
     /// went all the way to defused (most of which this same feast then ate).
@@ -745,14 +912,24 @@ pub const FeastOutcome = struct {
     agent_defused: u16 = 0,
     /// Rocks those blocks BROKE into red slime (see ShapeOutcome).
     agent_rocks_broken: u16 = 0,
+    /// Specials those blocks SET OFF, cast-armed ones and the whole chain
+    /// below them.  Scoreless and hungerless like the block itself: the
+    /// bite paid for the neutralizer, not for what it touched off.
+    agent_activated: u16 = 0,
     /// Canisters consumed.  Free like the neutralizer — counted in `cells`,
     /// never in score or hunger.
     canisters: u16 = 0,
     /// Charges the swallowed canisters refill into the team pool
     /// (`charge_refill` per canister); the caller credits the pool.
     charges_refilled: u32 = 0,
-    /// Bombs consumed.  Free — counted in `cells`, never in score or hunger
-    /// — each destroying its 3x3 surroundings as it was swallowed.
+    /// Bombs that DETONATED on being SWALLOWED.  Free — counted in `cells`,
+    /// never in score or hunger — each destroying its 3x3 surroundings.
+    ///
+    /// Neither "bombs eaten" nor "blasts": a bomb armed for the cast is
+    /// still eaten and still counted in `cells`, but goes off silently and
+    /// is absent here; a bomb set off further down a chain blasted without
+    /// being eaten and lands in `agent_activated` and `destroyed` instead.
+    /// `agents` is scoped the same way — neutralizers that FIRED.
     bombs: u16 = 0,
     /// Units the bombs DESTROYED: removed from play outright, not eaten —
     /// no score, no hunger, and nothing returns to the reservoir.
@@ -794,6 +971,14 @@ pub const ShapeOutcome = struct {
     off_grid: u16 = 0,
     /// Covered cells with nothing to neutralize.
     inert: u16 = 0,
+    /// Specials SET OFF by the stamp and every reaction below it (see
+    /// SlimeField.activate).  Kept out of the waste tallies and out of
+    /// `downgraded`: an activated unit was neither stepped down nor missed,
+    /// it was spent.  Counts the whole chain, not just the first link.
+    activated: u16 = 0,
+    /// Units removed outright by blasts the chain set off.  Zero unless a
+    /// bomb was armed for the cast: absent that, a stamp never destroys.
+    destroyed: u16 = 0,
 
     /// Total cells the cast stepped down a tier (breaks not included).
     pub fn total_downgraded(self: ShapeOutcome) u16 {
@@ -1122,7 +1307,7 @@ test "reservoir slime always arrives at full difficulty" {
     field.grid.put(0, .{ .tiered = .green });
     field.reservoir.tiered[ti(.red)] = 1;
 
-    _ = field.apply_shape(DOT, 0, 0);
+    _ = field.apply_shape(test_bal, DOT, 0, 0);
     try testing.expectEqual(c.SlimeCell.neutralized, field.grid.get(0));
 
     _ = field.fill(test_bal, rng.random());
@@ -1133,7 +1318,7 @@ test "apply_shape downgrades every covered hazard one tier" {
     var field = empty_field(3, 3);
     paint(&field, .{ .tiered = .red });
 
-    const out = field.apply_shape(SQUARE_3X3, 1, 1);
+    const out = field.apply_shape(test_bal, SQUARE_3X3, 1, 1);
     try testing.expectEqual(@as(u16, 9), out.total_downgraded());
     try testing.expectEqual(@as(u16, 9), out.downgraded[ti(.red)]);
     try testing.expectEqual(@as(u16, 0), out.neutralized);
@@ -1147,20 +1332,20 @@ test "a red cell takes three casts to defuse" {
     var field = empty_field(1, 1);
     field.grid.put(0, .{ .tiered = .red });
 
-    const first = field.apply_shape(DOT, 0, 0);
+    const first = field.apply_shape(test_bal, DOT, 0, 0);
     try testing.expectEqual(c.SlimeCell{ .tiered = .yellow }, field.grid.get(0));
     try testing.expectEqual(@as(u16, 0), first.neutralized);
 
-    _ = field.apply_shape(DOT, 0, 0);
+    _ = field.apply_shape(test_bal, DOT, 0, 0);
     try testing.expectEqual(c.SlimeCell{ .tiered = .green }, field.grid.get(0));
 
-    const third = field.apply_shape(DOT, 0, 0);
+    const third = field.apply_shape(test_bal, DOT, 0, 0);
     try testing.expectEqual(c.SlimeCell.neutralized, field.grid.get(0));
     try testing.expectEqual(@as(u16, 1), third.neutralized);
     try testing.expectEqual(@as(u16, 1), third.downgraded[ti(.green)]);
 
     // A fourth cast finds nothing left to neutralize.
-    const fourth = field.apply_shape(DOT, 0, 0);
+    const fourth = field.apply_shape(test_bal, DOT, 0, 0);
     try testing.expectEqual(@as(u16, 0), fourth.total_downgraded());
     try testing.expectEqual(@as(u16, 1), fourth.inert);
 }
@@ -1171,7 +1356,7 @@ test "apply_shape clips at the grid edge and reports the loss" {
 
     // Anchored at the top-left corner, a 3x3 lands only its bottom-right
     // quadrant: 4 cells on, 5 offsets clipped away.
-    const out = field.apply_shape(SQUARE_3X3, 0, 0);
+    const out = field.apply_shape(test_bal, SQUARE_3X3, 0, 0);
     try testing.expectEqual(@as(u16, 4), out.total_downgraded());
     try testing.expectEqual(@as(u16, 5), out.off_grid);
     try testing.expectEqual(@as(u16, 0), out.inert);
@@ -1194,7 +1379,7 @@ test "apply_shape counts inert cells but leaves them untouched" {
     field.grid.put(1, .neutralized);
     field.grid.put(2, .empty);
 
-    const out = field.apply_shape(test_shape(&.{"###"}), 0, 1);
+    const out = field.apply_shape(test_bal, test_shape(&.{"###"}), 0, 1);
     try testing.expectEqual(@as(u16, 0), out.total_downgraded());
     try testing.expectEqual(@as(u16, 3), out.inert);
     try testing.expectEqual(@as(u16, 0), out.off_grid);
@@ -1208,7 +1393,7 @@ test "apply_shape hits exactly the shape's footprint" {
     var field = empty_field(3, 3);
     paint(&field, .{ .tiered = .green });
 
-    const out = field.apply_shape(PLUS, 1, 1);
+    const out = field.apply_shape(test_bal, PLUS, 1, 1);
     try testing.expectEqual(@as(u16, 5), out.total_downgraded());
     // The four diagonals are untouched; the plus arms are defused.
     try testing.expectEqual(c.SlimeCell{ .tiered = .green }, field.grid.at(0, 0));
@@ -1227,9 +1412,9 @@ test "apply_shape destroys nothing: the unit count is unchanged" {
     paint(&field, .{ .tiered = .red });
     const before = field.remaining();
 
-    _ = field.apply_shape(SQUARE_3X3, 1, 1);
-    _ = field.apply_shape(SQUARE_3X3, 1, 1);
-    _ = field.apply_shape(SQUARE_3X3, 1, 1);
+    _ = field.apply_shape(test_bal, SQUARE_3X3, 1, 1);
+    _ = field.apply_shape(test_bal, SQUARE_3X3, 1, 1);
+    _ = field.apply_shape(test_bal, SQUARE_3X3, 1, 1);
 
     // Every cell is defused, and every unit is still there to be eaten.
     try testing.expectEqual(before, field.remaining());
@@ -1242,7 +1427,7 @@ test "apply_shape is deterministic — the same aim gives the same field" {
         fn go() SlimeField {
             var field = empty_field(4, 4);
             paint(&field, .{ .tiered = .red });
-            _ = field.apply_shape(PLUS, 2, 2);
+            _ = field.apply_shape(test_bal, PLUS, 2, 2);
             return field;
         }
     }.go;
@@ -1429,7 +1614,7 @@ test "no cast can ever change a special — except the rock, which BREAKS" {
         field.grid.put(0, .{ .special = kind });
         var i: usize = 0;
         while (i < 8) : (i += 1) {
-            const out = field.apply_shape(DOT, 0, 0);
+            const out = field.apply_shape(test_bal, DOT, 0, 0);
             try testing.expectEqual(@as(u16, 0), out.total_downgraded());
             try testing.expectEqual(@as(u16, 0), out.rocks_broken);
             try testing.expectEqual(@as(u16, 1), out.inert);
@@ -1444,7 +1629,7 @@ test "the Agent breaks a rock into red: four applications from edible" {
 
     // Application 1: the BREAK.  Its own tally — not a downgrade (the rock
     // had no tier to step down from), and not waste.
-    const broke = field.apply_shape(DOT, 0, 0);
+    const broke = field.apply_shape(test_bal, DOT, 0, 0);
     try testing.expectEqual(@as(u16, 1), broke.rocks_broken);
     try testing.expectEqual(@as(u16, 0), broke.total_downgraded());
     try testing.expectEqual(@as(u16, 0), broke.wasted());
@@ -1452,9 +1637,9 @@ test "the Agent breaks a rock into red: four applications from edible" {
 
     // Applications 2-4: ordinary hazard from here — red -> yellow -> green
     // -> neutralized — and then the bite eats the result.
-    _ = field.apply_shape(DOT, 0, 0);
-    _ = field.apply_shape(DOT, 0, 0);
-    const defused = field.apply_shape(DOT, 0, 0);
+    _ = field.apply_shape(test_bal, DOT, 0, 0);
+    _ = field.apply_shape(test_bal, DOT, 0, 0);
+    const defused = field.apply_shape(test_bal, DOT, 0, 0);
     try testing.expectEqual(@as(u16, 1), defused.neutralized);
     try testing.expectEqual(c.SlimeCell.neutralized, field.grid.get(0));
 
@@ -1490,7 +1675,7 @@ test "a defused front is consumed instead of nibbled: casts pre-chew the bite" {
     field.grid.put(0, .{ .tiered = .green });
     field.grid.put(1, .neutral);
 
-    _ = field.apply_shape(DOT, 0, 0);
+    _ = field.apply_shape(test_bal, DOT, 0, 0);
     const out = field.feast(test_bal, 1);
     try testing.expectEqual(@as(u16, 1), out.cells);
     try testing.expectEqual(@as(u16, 1), out.defused);
@@ -1705,10 +1890,10 @@ test "a field holding only rocks is NOT won: rocks are clearable and owed" {
     try testing.expect(!field.is_exhausted());
 
     // Break it, chew it down, eat it: now the field is won.
-    _ = field.apply_shape(DOT, 0, 1); // rock -> red
-    _ = field.apply_shape(DOT, 0, 1); // red -> yellow
-    _ = field.apply_shape(DOT, 0, 1); // yellow -> green
-    _ = field.apply_shape(DOT, 0, 1); // green -> neutralized
+    _ = field.apply_shape(test_bal, DOT, 0, 1); // rock -> red
+    _ = field.apply_shape(test_bal, DOT, 0, 1); // red -> yellow
+    _ = field.apply_shape(test_bal, DOT, 0, 1); // yellow -> green
+    _ = field.apply_shape(test_bal, DOT, 0, 1); // green -> neutralized
     _ = field.shift_left();
     const meal = field.feast(test_bal, 1);
     try testing.expectEqual(@as(u16, 1), meal.cells);
@@ -1741,7 +1926,7 @@ test "a rocks-only field STALLS by default, and bite_costs_hunger ends it" {
     try testing.expect(!field.is_exhausted());
 
     // The Agent is the only thing that moves it — and it costs charges.
-    _ = field.apply_shape(DOT, 0, 0);
+    _ = field.apply_shape(test_bal, DOT, 0, 0);
     try testing.expectEqual(c.SlimeCell{ .tiered = .red }, field.grid.at(0, 0));
 
     // With `bite_costs_hunger` on, the same board is no longer a stall.  The
@@ -1962,7 +2147,7 @@ test "defusing before the bite turns nibbles into points" {
 
     // One cast over the whole 3x3 defuses all nine, so a whole-board bite
     // consumes all nine.
-    _ = field.apply_shape(SQUARE_3X3, 1, 1);
+    _ = field.apply_shape(test_bal, SQUARE_3X3, 1, 1);
 
     const out = field.feast(test_bal, 3);
     try testing.expectEqual(@as(u16, 9), out.cells);
@@ -1978,7 +2163,7 @@ test "field ops are reproducible for a given seed" {
             var res = c.SlimeReservoir{ .neutral = 10 };
             res.tiered[ti(.red)] = 10;
             var field = SlimeField.init(.{ .rows = 3, .cols = 4 }, res, test_bal, rng.random());
-            _ = field.apply_shape(PLUS, 1, 1);
+            _ = field.apply_shape(test_bal, PLUS, 1, 1);
             _ = field.feast(test_bal, 2);
             _ = field.shift_left();
             _ = field.fill(test_bal, rng.random());
@@ -2065,3 +2250,272 @@ test "mixed-kind runs do not match: the line must be one kind" {
     try testing.expectEqual(@as(u16, 0), out.count);
 }
 
+
+// --- cast activation -------------------------------------------------------
+//
+// `activate_on` moves a special's trigger from the mouth to the Agent.  These
+// pin the three things that make it a mechanic rather than a switch: what a
+// cast does to an armed unit, what the BITE does to one (nothing — the effect
+// is lost), and how far a reaction is allowed to run.
+
+/// A balance with `kind` armed for the cast.  Copies the frozen fixture so
+/// each test tunes one knob against a known board.
+fn armed(kind: c.SpecialKind, mode: balance.Activation) balance.Balance {
+    var bal = fixtures.test_config.balance;
+    bal.specials[@intFromEnum(kind)].activate_on = mode;
+    return bal;
+}
+
+test "a cast is INERT on a special by default — arming it is what fires it" {
+    // The negative control the rest of this block leans on: nothing here
+    // changes unless `activate_on` does.  A bomb under a cast is waste,
+    // exactly as it was before the knob existed.
+    var field = empty_field(3, 3);
+    field.grid.put(field.grid.index(1, 1), .{ .special = .bomb });
+    field.grid.put(field.grid.index(0, 0), .{ .tiered = .red });
+
+    const idle = field.apply_shape(test_bal, DOT, 1, 1);
+    try testing.expectEqual(@as(u16, 1), idle.inert);
+    try testing.expectEqual(@as(u16, 0), idle.activated);
+    try testing.expectEqual(@as(u16, 0), idle.destroyed);
+    try testing.expectEqual(c.SlimeCell{ .special = .bomb }, field.grid.at(1, 1));
+
+    // Same board, same cast, `.cast` armed: now it goes off and levels the
+    // 3x3 it sits in.  The bomb itself is gone either way it is counted —
+    // cleared before the blast, so it is never destroyed by its own blast.
+    const bal = armed(.bomb, .cast);
+    const out = field.apply_shape(&bal, DOT, 1, 1);
+    try testing.expectEqual(@as(u16, 1), out.activated);
+    try testing.expectEqual(@as(u16, 0), out.inert);
+    try testing.expectEqual(@as(u16, 1), out.destroyed); // the red at (0,0)
+    try testing.expectEqual(@as(u16, 0), field.grid.occupied());
+}
+
+test "an armed special is still EATEN — but its effect is LOST" {
+    // The tension the mode is for.  Arming a bomb for the cast does not make
+    // it safe to swallow and does not make it dangerous to swallow: the bite
+    // takes the unit and nothing happens.  The Lil Guys still pay for it in
+    // hunger and still score it, because the mouth cannot tell the
+    // difference — only the effect is forfeit.
+    const bal = armed(.bomb, .cast);
+    var armed_field = empty_field(1, 3);
+    armed_field.grid.put(0, .{ .special = .bomb });
+    armed_field.grid.put(1, .{ .tiered = .red });
+    armed_field.grid.put(2, .{ .tiered = .red });
+    const lost = armed_field.feast(&bal, 1);
+
+    // Differential against the unarmed board: the bite is identical apart
+    // from the blast that does not happen.
+    var eat_field = empty_field(1, 3);
+    eat_field.grid.put(0, .{ .special = .bomb });
+    eat_field.grid.put(1, .{ .tiered = .red });
+    eat_field.grid.put(2, .{ .tiered = .red });
+    const fired = eat_field.feast(test_bal, 1);
+
+    // Swallowed either way, at the same price: the mouth cannot tell.
+    try testing.expectEqual(fired.cells, lost.cells);
+    try testing.expectEqual(fired.hunger, lost.hunger);
+    try testing.expectEqual(fired.score, lost.score);
+    // `bombs` counts BLASTS, not mouthfuls, so the armed one is absent from
+    // it — which is exactly what keeps a client's explosion FX honest.
+    try testing.expectEqual(@as(u16, 1), fired.bombs);
+    try testing.expectEqual(@as(u16, 0), lost.bombs);
+    // ...and there they part: one board was blasted, one was not.
+    try testing.expect(fired.destroyed > 0);
+    try testing.expectEqual(@as(u16, 0), lost.destroyed);
+    try testing.expectEqual(c.SlimeCell{ .tiered = .red }, armed_field.grid.at(0, 1));
+
+    // `.eatcast` restores the swallow WITHOUT giving up the cast: the same
+    // bite fires the blast again.
+    const both = armed(.bomb, .eatcast);
+    var both_field = empty_field(1, 3);
+    both_field.grid.put(0, .{ .special = .bomb });
+    both_field.grid.put(1, .{ .tiered = .red });
+    both_field.grid.put(2, .{ .tiered = .red });
+    const meal = both_field.feast(&both, 1);
+    try testing.expectEqual(fired.destroyed, meal.destroyed);
+}
+
+test "activation CLEARS the unit before firing — a neutralizer cannot re-trigger itself" {
+    // The invariant the whole recursion rests on (see SlimeField.activate).
+    // AGENT_BLOCK is a 3x3 centred on the cell that fired it, so it covers
+    // that cell.  Were the effect to run before the removal, the block would
+    // find the neutralizer still standing and set it off again forever.
+    // Reaching the end of this test at all is the assertion.
+    const bal = armed(.neutralizer, .cast);
+    var field = empty_field(3, 3);
+    field.grid.put(field.grid.index(1, 1), .{ .special = .neutralizer });
+    for ([_][2]u8{ .{ 0, 0 }, .{ 0, 1 }, .{ 2, 2 } }) |rc| {
+        field.grid.set(rc[0], rc[1], .{ .tiered = .green });
+    }
+
+    const out = field.apply_shape(&bal, DOT, 1, 1);
+    try testing.expectEqual(@as(u16, 1), out.activated);
+    try testing.expectEqual(c.SlimeCell.empty, field.grid.at(1, 1));
+    // The block did fire: three greens went to neutralized around it.
+    try testing.expectEqual(@as(u16, 3), out.neutralized);
+}
+
+test "a chain runs from special to special, bounded by max_chain_depth" {
+    // Armed neutralizers in a row, each one's 3x3 reaching the next.  The
+    // cast touches only the first; the rest go off because a block is just
+    // another stamp.  `max_chain_depth` decides how far that carries.
+    //
+    // Depth ladder: the cast stamps at 0 and always activates, so the first
+    // unit fires whatever the cap.  Its block is link 1, the next block is
+    // link 2, and a stamp activates only while its depth is within the cap.
+    // So a cap of N sets off N+1 units.
+    const Case = struct { cap: u8, fired: u16 };
+    for ([_]Case{
+        .{ .cap = 0, .fired = 1 }, // the cast's own unit, and no further
+        .{ .cap = 1, .fired = 2 },
+        .{ .cap = 3, .fired = 4 },
+        .{ .cap = 9, .fired = 5 }, // the board runs out before the cap does
+    }) |case| {
+        var bal = armed(.neutralizer, .cast);
+        bal.max_chain_depth = case.cap;
+
+        var field = empty_field(1, 5);
+        for (0..5) |i| field.grid.put(@intCast(i), .{ .special = .neutralizer });
+
+        const out = field.apply_shape(&bal, DOT, 0, 0);
+        try testing.expectEqual(case.fired, out.activated);
+        // Every unit that fired left the board, and every one that did not
+        // is still standing — the chain stops, it does not half-consume.
+        try testing.expectEqual(@as(u16, 5) - case.fired, field.grid.occupied());
+    }
+}
+
+test "blast_chains makes one bomb set off the next" {
+    // The cascade, and its off switch.  Two bombs a cell apart: the first
+    // blast destroys the second either way, but only `blast_chains` makes
+    // that second bomb GO OFF instead of merely dying.
+    var field = empty_field(3, 4);
+    field.grid.put(field.grid.index(1, 0), .{ .special = .bomb });
+    field.grid.put(field.grid.index(1, 1), .{ .special = .bomb });
+    // Just outside the FIRST blast (cols 0..1) and just inside the second's
+    // (cols 0..2): the witness for whether the chain happened.
+    field.grid.put(field.grid.index(1, 2), .{ .tiered = .red });
+
+    var quiet = field;
+    const bal_quiet = armed(.bomb, .cast);
+    _ = quiet.apply_shape(&bal_quiet, DOT, 1, 0);
+    // The second bomb died in the blast without firing, so the far red lives.
+    try testing.expectEqual(c.SlimeCell{ .tiered = .red }, quiet.grid.at(1, 2));
+
+    var loud = field;
+    var bal_loud = armed(.bomb, .cast);
+    bal_loud.blast_chains = true;
+    const out = loud.apply_shape(&bal_loud, DOT, 1, 0);
+    // The second bomb went off in turn and its blast reached one cell further.
+    try testing.expectEqual(c.SlimeCell.empty, loud.grid.at(1, 2));
+    try testing.expectEqual(@as(u16, 1), out.activated); // the cast armed ONE
+    try testing.expect(out.destroyed > 1);
+    try testing.expectEqual(@as(u16, 0), loud.grid.occupied());
+}
+
+test "blast_chains belongs to the BLAST, so a SWALLOWED bomb chains too" {
+    // Not a property of how the first bomb was set off.  The bite is the
+    // oldest trigger there is and it cascades just the same, which is why
+    // the knob sits on Balance and not under `specials.bomb`.
+    var bal = fixtures.test_config.balance; // bomb still on plain `.eat`
+    bal.blast_chains = true;
+
+    var field = empty_field(3, 4);
+    field.grid.put(field.grid.index(1, 0), .{ .special = .bomb });
+    field.grid.put(field.grid.index(1, 1), .{ .special = .bomb });
+    field.grid.put(field.grid.index(1, 2), .{ .tiered = .red }); // second blast only
+
+    const meal = field.feast(&bal, 1);
+    try testing.expectEqual(@as(u16, 1), meal.bombs); // one was EATEN
+    try testing.expectEqual(c.SlimeCell.empty, field.grid.at(1, 2));
+}
+
+test "a cast-fired chain scores nothing and costs no hunger" {
+    // Casts do not feed the Lil Guys.  Setting off a board's worth of
+    // specials is spectacle, not a meal: it moves no hunger and no score,
+    // both of which live on FeastOutcome and are never touched here.
+    // ShapeOutcome has no score or hunger field to touch — that IS the
+    // guarantee, so what this pins is that the board changed anyway.
+    var bal = armed(.neutralizer, .cast);
+    bal.max_chain_depth = 4;
+
+    var field = empty_field(1, 4);
+    for (0..4) |i| field.grid.put(@intCast(i), .{ .special = .neutralizer });
+    const out = field.apply_shape(&bal, DOT, 0, 0);
+
+    try testing.expectEqual(@as(u16, 4), out.activated);
+    try testing.expectEqual(@as(u16, 0), field.grid.occupied());
+    // The units were spent, not eaten: nothing was counted as consumed.
+    try testing.expectEqual(@as(u16, 0), out.total_downgraded());
+}
+
+test "an eaten neutralizer's block can set off an armed special" {
+    // The two paths meet: a swallowed neutralizer fires an Agent block, and
+    // a block is a stamp, so it activates whatever it covers just as a
+    // player's cast would.  Chaining is not the player's privilege.
+    var bal = armed(.bomb, .cast);
+    bal.blast_chains = false;
+
+    var field = empty_field(3, 3);
+    field.grid.put(field.grid.index(1, 0), .{ .special = .neutralizer });
+    field.grid.put(field.grid.index(1, 1), .{ .special = .bomb });
+    field.grid.put(field.grid.index(2, 2), .{ .tiered = .red });
+
+    const meal = field.feast(&bal, 1);
+    try testing.expectEqual(@as(u16, 1), meal.agents);
+    try testing.expectEqual(@as(u16, 1), meal.agent_activated);
+    // The bomb the block set off levelled its 3x3, taking the far red with it.
+    try testing.expect(meal.destroyed > 0);
+    try testing.expectEqual(c.SlimeCell.empty, field.grid.at(2, 2));
+}
+
+test "a stamp activates IN OFFSET ORDER against the standing board" {
+    // Same doctrine `feast` already documents for the inline block: offsets
+    // resolve one at a time against the board as it is, so a cell an earlier
+    // activation emptied is simply gone when a later offset reaches it.  The
+    // client mirrors this walk, so the order is a wire contract, not an
+    // implementation detail.
+    var bal = armed(.bomb, .cast);
+    var field = empty_field(3, 3);
+    // Two bombs inside one 3x3 cast.  The first blast clears the second
+    // before the shape's later offset arrives at it.
+    field.grid.put(field.grid.index(0, 0), .{ .special = .bomb });
+    field.grid.put(field.grid.index(0, 1), .{ .special = .bomb });
+
+    const out = field.apply_shape(&bal, SQUARE_3X3, 1, 1);
+    // Only ONE activated: the earlier offset's blast destroyed the other
+    // where it stood, and a destroyed unit is not there to be activated.
+    try testing.expectEqual(@as(u16, 1), out.activated);
+    // The later offset found the crater and counted it as waste, not as a
+    // second activation.
+    try testing.expect(out.inert > 0);
+    try testing.expectEqual(@as(u16, 0), field.grid.occupied());
+}
+
+test "the deepest chain a full board can supply does not overflow the counter" {
+    // Regression: `max_chain_depth` is a u8, so a designer can write 255,
+    // but the LARGEST grid holds MAX_GRID_CELLS (256) cells and therefore
+    // can supply 256 links — one more than a u8 counter can hold.  With the
+    // depth counter narrowed to u8 this panics with integer overflow, and
+    // only from certain anchors: the chain has to be long enough to reach
+    // 256, which depends on where it starts.  So every start cell is tried.
+    var bal = armed(.neutralizer, .cast);
+    bal.max_chain_depth = std.math.maxInt(u8);
+
+    const rows = c.MAX_GRID_ROWS;
+    const cols = c.MAX_GRID_COLS;
+    for (0..rows) |r| {
+        for (0..cols) |cl| {
+            var field = empty_field(rows, cols);
+            for (0..@as(usize, rows) * cols) |i| {
+                field.grid.put(@intCast(i), .{ .special = .neutralizer });
+            }
+            const out = field.apply_shape(&bal, DOT, @intCast(r), @intCast(cl));
+            // Whatever the anchor, the board is the real bound: the chain
+            // eats the grid and stops because there is nothing left.
+            try testing.expectEqual(@as(u16, 0), field.grid.occupied());
+            try testing.expectEqual(c.MAX_GRID_CELLS, out.activated);
+        }
+    }
+}

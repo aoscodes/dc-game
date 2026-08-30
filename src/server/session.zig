@@ -885,7 +885,7 @@ pub const Session = struct {
         const row = grid.row_of(anchor);
         const col = grid.col_of(anchor);
 
-        const outcome = self.field.apply_shape(stamp.shape, row, col);
+        const outcome = self.field.apply_shape(&self.cfg.balance, stamp.shape, row, col);
 
         var msg = proto.ShapeCast{
             .caster = stamp.anchor_player,

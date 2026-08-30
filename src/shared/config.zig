@@ -78,6 +78,7 @@ pub const ConfigError = error{
     InvalidHungerFormula,
     InvalidMatchLen,
     InvalidFeastColumns,
+    UnsupportedActivation,
     UnknownDefaultEncounter,
 };
 
@@ -155,6 +156,10 @@ const SpecialTuningJson = struct {
     charge_refill: u16 = balance.DEFAULT_CHARGE_REFILL,
     explode_rocks_only: bool = false,
     bite_costs_hunger: bool = false,
+    /// Parsed straight into the enum: std.json matches the JSON string to a
+    /// tag name, so `"eat"` / `"cast"` / `"eatcast"` validate themselves and
+    /// anything else fails the parse with the file named.
+    activate_on: balance.Activation = .eat,
 };
 
 /// Per-kind tuning table.  Every kind defaults, so `"specials"` and any kind
@@ -207,6 +212,15 @@ const SlimeGridJson = struct {
 
 const BalanceJson = struct {
     hunger_cost_normal: u32,
+    // Deliberately unvalidated beyond its type.  A chain cannot outrun the
+    // grid — every link empties a cell — and the largest grid (256 cells)
+    // can supply more links than a u8 can count, so every value that fits
+    // here is one the board may or may not reach: none of them is out of
+    // range, and a bounds check would be one that never fires.  The cap
+    // being narrower than the board is exactly why slime.stamp counts depth
+    // in a wider integer; see the note on Balance.max_chain_depth.
+    max_chain_depth: u8 = balance.DEFAULT_MAX_CHAIN_DEPTH,
+    blast_chains: bool = false,
     /// Slime grid dimensions; defaulted so pre-grid configs keep validating.
     slime_grid: SlimeGridJson = .{
         .rows = balance.DEFAULT_SLIME_GRID.rows,
@@ -348,6 +362,7 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
             .charge_refill = t.charge_refill,
             .explode_rocks_only = t.explode_rocks_only,
             .bite_costs_hunger = t.bite_costs_hunger,
+            .activate_on = t.activate_on,
         };
     }
     const longest_line = @max(raw.slime_grid.rows, raw.slime_grid.cols);
@@ -360,6 +375,29 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
                 longest_line,
             });
             return ConfigError.InvalidMatchLen;
+        }
+        // Cast activation is wired for the two kinds whose effects need
+        // nothing from the session: the neutralizer's block and the bomb's
+        // blast both resolve entirely inside the field.  The others are
+        // refused rather than half-supported -- a cast-hatched egg would
+        // need the session PRNG to roll the baby's type and a cast-drunk
+        // canister would need the team's charge pool, neither of which the
+        // stamp path can reach.  The rock has no effect to fire at all: a
+        // cast BREAKS it (see slime.apply_shape).
+        if (tuning.activate_on != .eat) {
+            const kind: c.SpecialKind = @enumFromInt(k);
+            const wired = switch (kind) {
+                .neutralizer, .bomb => true,
+                .egg, .canister, .rock => false,
+            };
+            if (!wired) {
+                fail("{s}: specials.{s} activate_on \"{s}\" unsupported (only neutralizer and bomb)", .{
+                    BALANCE_FILE,
+                    @tagName(kind),
+                    @tagName(tuning.activate_on),
+                });
+                return ConfigError.UnsupportedActivation;
+            }
         }
     }
     if (raw.player_recipes.len > balance.MAX_PLAYER_RECIPES) {
@@ -412,6 +450,8 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
 
     return .{
         .hunger_cost_normal = raw.hunger_cost_normal,
+        .max_chain_depth = raw.max_chain_depth,
+        .blast_chains = raw.blast_chains,
         .slime_grid = .{ .rows = raw.slime_grid.rows, .cols = raw.slime_grid.cols },
         .bite_interval_ms = raw.bite_interval_ms,
         .bite_speedup_per_guy_pct = raw.bite_speedup_per_guy_pct,
@@ -1473,4 +1513,100 @@ test "too many zones is rejected" {
         ConfigError.TooManyZones,
         parse(std.testing.allocator, minimal_balance, bad),
     );
+}
+
+test "activate_on defaults to eat, reads per kind, and refuses unwired kinds" {
+    var defaulted = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
+    defer defaulted.deinit();
+    for (defaulted.config.balance.specials) |tuning| {
+        try std.testing.expectEqual(balance.Activation.eat, tuning.activate_on);
+    }
+
+    const doc =
+        \\{"hunger_cost_normal":1,
+        \\ "specials":{"bomb":{"activate_on":"cast"},
+        \\             "neutralizer":{"activate_on":"eatcast"}},
+        \\ "player_recipes":[{"label":"poke","shape":["#"]}],
+        \\ "team_recipes":[]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    const bal = loaded.config.balance;
+    try std.testing.expectEqual(balance.Activation.cast, bal.special_tuning(.bomb).activate_on);
+    try std.testing.expectEqual(balance.Activation.eatcast, bal.special_tuning(.neutralizer).activate_on);
+    try std.testing.expectEqual(balance.Activation.eat, bal.special_tuning(.egg).activate_on);
+
+    // The three kinds whose cast path is not wired are refused OUTRIGHT
+    // rather than silently ignored — a knob that reads as set but does
+    // nothing is worse than one that will not load.
+    for ([_][]const u8{ "egg", "canister", "rock" }) |kind| {
+        var buf: [256]u8 = undefined;
+        const bad = try std.fmt.bufPrint(&buf,
+            \\{{"hunger_cost_normal":1,
+            \\ "specials":{{"{s}":{{"activate_on":"cast"}}}},
+            \\ "player_recipes":[{{"label":"poke","shape":["#"]}}],
+            \\ "team_recipes":[]}}
+        , .{kind});
+        try std.testing.expectError(
+            ConfigError.UnsupportedActivation,
+            parse(std.testing.allocator, bad, minimal_encounters),
+        );
+    }
+
+    // ...but leaving one of them explicitly on `eat` is fine: the check is
+    // on the VALUE, not on mentioning the kind.
+    const explicit_eat =
+        \\{"hunger_cost_normal":1,
+        \\ "specials":{"rock":{"activate_on":"eat"}},
+        \\ "player_recipes":[{"label":"poke","shape":["#"]}],
+        \\ "team_recipes":[]}
+    ;
+    var ok = try parse(std.testing.allocator, explicit_eat, minimal_encounters);
+    defer ok.deinit();
+
+    // A tag that is not one of the three fails the PARSE, naming the file.
+    const nonsense =
+        \\{"hunger_cost_normal":1,
+        \\ "specials":{"bomb":{"activate_on":"whenever"}},
+        \\ "player_recipes":[{"label":"poke","shape":["#"]}],
+        \\ "team_recipes":[]}
+    ;
+    try std.testing.expectError(
+        ConfigError.InvalidBalanceJson,
+        parse(std.testing.allocator, nonsense, minimal_encounters),
+    );
+}
+
+test "chain knobs default and are read" {
+    var defaulted = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
+    defer defaulted.deinit();
+    try std.testing.expectEqual(
+        balance.DEFAULT_MAX_CHAIN_DEPTH,
+        defaulted.config.balance.max_chain_depth,
+    );
+    try std.testing.expect(!defaulted.config.balance.blast_chains);
+
+    const doc =
+        \\{"hunger_cost_normal":1,
+        \\ "max_chain_depth":7, "blast_chains":true,
+        \\ "player_recipes":[{"label":"poke","shape":["#"]}],
+        \\ "team_recipes":[]}
+    ;
+    var loaded = try parse(std.testing.allocator, doc, minimal_encounters);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(u8, 7), loaded.config.balance.max_chain_depth);
+    try std.testing.expect(loaded.config.balance.blast_chains);
+
+    // The cap needs no range check: see the note on BalanceJson.  The
+    // largest value the type can hold loads fine — slime.zig pins that a
+    // full board chained at this cap counts without overflowing.
+    const maxed =
+        \\{"hunger_cost_normal":1,
+        \\ "max_chain_depth":255,
+        \\ "player_recipes":[{"label":"poke","shape":["#"]}],
+        \\ "team_recipes":[]}
+    ;
+    var wide = try parse(std.testing.allocator, maxed, minimal_encounters);
+    defer wide.deinit();
+    try std.testing.expectEqual(@as(u8, 255), wide.config.balance.max_chain_depth);
 }

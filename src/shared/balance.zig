@@ -181,6 +181,40 @@ pub const BACK_RANKS: u8 = 2;
 /// there too.
 pub const DEFAULT_CHARGE_REFILL: u16 = 3;
 
+/// Default cap on how many links a reaction CHAIN may run past the thing
+/// that started it (see Balance.max_chain_depth).
+pub const DEFAULT_MAX_CHAIN_DEPTH: u8 = 3;
+
+/// Which trigger fires a special's effect (components.SpecialKind.eat_effect).
+///
+/// The effect itself is hard-coded per kind; this only chooses WHEN it goes
+/// off.  Whichever trigger fires it CONSUMES the unit — activation removes it
+/// from the grid before the effect runs — so under `eatcast` the first
+/// trigger to reach it wins and the other never sees it.
+pub const Activation = enum {
+    /// Fires when the bite SWALLOWS it.  The original behaviour, and the
+    /// default: a cast covering the unit does nothing (it counts `inert`).
+    eat,
+    /// Fires when an Agent block COVERS it — a player's cast, or another
+    /// block in the same chain.  The bite can still eat the unit, but eating
+    /// it fires nothing: the effect is lost, which is the whole tension.
+    /// Cast activation scores nothing and costs no hunger; a cast does not
+    /// feed the Lil Guys.
+    cast,
+    /// Fires on EITHER trigger, whichever arrives first.
+    eatcast,
+
+    /// True if an Agent block covering a unit of this kind sets it off.
+    pub fn on_cast(self: Activation) bool {
+        return self == .cast or self == .eatcast;
+    }
+
+    /// True if swallowing a unit of this kind sets it off.
+    pub fn on_eat(self: Activation) bool {
+        return self == .eat or self == .eatcast;
+    }
+};
+
 /// Designer knobs for one SpecialKind.  What a kind DOES is hard-coded
 /// (components.SpecialKind); this tunes only its numbers.
 pub const SpecialTuning = struct {
@@ -229,6 +263,16 @@ pub const SpecialTuning = struct {
     /// nothing — the clock always advances, at the price of making a rock a
     /// live drain on hunger rather than dead weight.
     bite_costs_hunger: bool = false,
+    /// WHEN this kind's effect fires (see Activation).  `.eat` — the
+    /// default — is the original game: only the bite sets a special off, and
+    /// a cast that covers one achieves nothing.
+    ///
+    /// The loader rejects anything but `.eat` for kinds whose cast path is
+    /// not wired: the egg (a cast-hatched baby would need the session's PRNG
+    /// to roll its type), the canister (a cast-credited refill), and the
+    /// rock (inconsumable, so it has no effect to fire — a cast BREAKS it
+    /// instead, see slime.apply_shape).
+    activate_on: Activation = .eat,
 };
 
 /// All designer-tunable balance numbers.  Loaded from `data/balance.json`
@@ -238,6 +282,33 @@ pub const Balance = struct {
     /// both fill the bar by this much.  The bar is the game's clock: every
     /// bite runs it down toward the encounter's end.
     hunger_cost_normal: u32,
+    /// How many links a reaction CHAIN may run past the thing that started
+    /// it.  The stamp that begins a chain is depth 0; a special it activates
+    /// fires its own effect at depth 1, whatever that effect activates goes
+    /// at depth 2, and so on while `depth <= max_chain_depth`.  At 0 a cast
+    /// still activates the specials it covers, but their blocks and blasts
+    /// set nothing further off.
+    ///
+    /// This is a LEGIBILITY limit, not a safety rail.  A chain cannot run
+    /// away regardless: every link removes a unit from the grid before it
+    /// fires, so the BOARD is the real bound and the cap only exists so a
+    /// cascade stays something a player can follow.  (The invariant that
+    /// actually matters is the ordering — see slime.SlimeField.activate.)
+    ///
+    /// Note the type: a u8 tops out at 255 while the largest grid holds 256
+    /// cells, so the deepest chain a board can supply is one longer than the
+    /// biggest cap that can be written here.  slime.stamp therefore counts
+    /// depth in a WIDER integer than this.
+    max_chain_depth: u8 = DEFAULT_MAX_CHAIN_DEPTH,
+    /// When true, a bomb DESTROYED by another bomb's blast detonates itself
+    /// instead of merely dying — the chain reaction.  A property of the
+    /// BLAST, not of what set the first bomb off, so it applies just the
+    /// same to a bomb the Lil Guys swallowed.
+    ///
+    /// Dead in combination with the bomb's `explode_rocks_only`: a blast
+    /// that spares everything but rocks never destroys a bomb, so there is
+    /// nothing to chain to.
+    blast_chains: bool = false,
     /// Dimensions of the slime grid.  Slime beyond `rows * cols` waits in the
     /// off-grid reservoir and refills emptied cells at the start of each turn.
     slime_grid: SlimeGridDims,
