@@ -153,6 +153,7 @@ fn write_render_inner(
         @memcpy(cells_bufs[i][0..sc.cell_count], sc.cells[0..sc.cell_count]);
         shape_cast_buf[i] = .{
             .caster = sc.caster,
+            .anchor = sc.anchor,
             .cells = cells_bufs[i][0..sc.cell_count],
             .downgraded = tiers(sc.downgraded),
             .neutralized = sc.neutralized,
@@ -578,6 +579,13 @@ const JsonEggsHatched = struct {
 /// `downgraded` is bucketed by each cell's tier BEFORE the downgrade.
 const JsonShapeCast = struct {
     caster: u8,
+    /// The cell the cast was aimed at.  Travels even though `cells` is
+    /// absolute, because it is NOT derivable from them: clipping can drop the
+    /// anchor itself.  The renderer needs it to rebuild the shape's OFFSETS,
+    /// which is what lets it re-run the stamp locally and see the chain a
+    /// cast set off — the cell list alone only names the footprint, never
+    /// what a blast took outside it.
+    anchor: u16,
     cells: []const u16,
     downgraded: JsonTiers,
     /// Cells that reached defused (they were green).
@@ -647,3 +655,126 @@ const JsonEntity = struct {
     /// owner and gone when they leave.
     babies: JsonBabies,
 };
+
+// ---------------------------------------------------------------------------
+// Render-frame CONTRACT tests
+// ---------------------------------------------------------------------------
+// The browser renderer (web/game.js) reads this JSON and nothing else.  The
+// binary protocol is therefore not the contract with it — THIS is, and the
+// two can drift silently: a field can travel the whole way from the session
+// to `proto.ShapeCast` and still never reach the tab, because building the
+// Json* mirror above is a hand copy.
+//
+// That is not hypothetical.  `anchor` was added to proto.ShapeCast, carried
+// correctly, and simply not copied here; game.js read `ev.anchor`, got
+// undefined, computed NaN offsets, and every bounds test it fed silently
+// passed (NaN comparisons are false).  The whole feature was dead and
+// nothing failed.  These tests assert the fields the renderer names are
+// really in the bytes it receives.
+
+const testing = std.testing;
+
+/// Render one GameState to JSON, as `write_render` does.
+fn render_to_json(buf: []u8, game: *const GameState) ![]const u8 {
+    var w = std.io.Writer.fixed(buf);
+    try write_render_inner(&w, .game, game);
+    return w.buffered();
+}
+
+test "a landed cast reaches the renderer with its ANCHOR" {
+    // The anchor is not derivable from `cells` — clipping can drop the
+    // anchor cell itself — so a renderer that wants the shape's offsets back
+    // has only this field to rebuild them from.
+    var game = GameState{};
+    game.snapshot.grid_rows = 3;
+    game.snapshot.grid_cols = 3;
+    game.shape_cast_count = 1;
+    game.shape_casts[0] = .{
+        .caster = 2,
+        .anchor = 4,
+        .cell_count = 2,
+        .cells = blk: {
+            var cells = [_]u16{0} ** proto.MAX_SHAPE_CELLS_WIRE;
+            cells[0] = 4;
+            cells[1] = 5;
+            break :blk cells;
+        },
+        .neutralized = 1,
+        .off_grid = 3,
+        .inert = 0,
+        .rocks_broken = 1,
+    };
+
+    var buf: [32768]u8 = undefined;
+    const json = try render_to_json(&buf, &game);
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        json,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const casts = parsed.value.object.get("game").?.object
+        .get("shape_casts").?.array;
+    try testing.expectEqual(@as(usize, 1), casts.items.len);
+    const cast = casts.items[0].object;
+
+    // Every field web/game.js names on a shape_cast event.  Read as a list
+    // of what the renderer is allowed to rely on.
+    try testing.expectEqual(@as(i64, 2), cast.get("caster").?.integer);
+    try testing.expectEqual(@as(i64, 4), cast.get("anchor").?.integer);
+    try testing.expectEqual(@as(i64, 1), cast.get("neutralized").?.integer);
+    try testing.expectEqual(@as(i64, 3), cast.get("off_grid").?.integer);
+    try testing.expectEqual(@as(i64, 0), cast.get("inert").?.integer);
+    try testing.expectEqual(@as(i64, 1), cast.get("rocks_broken").?.integer);
+    try testing.expect(cast.get("downgraded") != null);
+
+    // The footprint arrives pre-clipped and verbatim.
+    const cells = cast.get("cells").?.array;
+    try testing.expectEqual(@as(usize, 2), cells.items.len);
+    try testing.expectEqual(@as(i64, 4), cells.items[0].integer);
+    try testing.expectEqual(@as(i64, 5), cells.items[1].integer);
+}
+
+test "the anchor survives even when clipping drops it from the cell list" {
+    // The case the field exists FOR: aimed off the board's edge, so the
+    // anchor cell is not among the cells that landed.  A renderer deriving
+    // the anchor from `cells` would place the shape wrong here; one reading
+    // it gets the aim the player actually took.
+    var game = GameState{};
+    game.snapshot.grid_rows = 3;
+    game.snapshot.grid_cols = 3;
+    game.shape_cast_count = 1;
+    game.shape_casts[0] = .{
+        .caster = 0,
+        .anchor = 8, // bottom-right corner
+        .cell_count = 1,
+        .cells = blk: {
+            var cells = [_]u16{0} ** proto.MAX_SHAPE_CELLS_WIRE;
+            cells[0] = 4; // the only offset that stayed in bounds
+            break :blk cells;
+        },
+        .off_grid = 8,
+    };
+
+    var buf: [32768]u8 = undefined;
+    const json = try render_to_json(&buf, &game);
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        json,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const cast = parsed.value.object.get("game").?.object
+        .get("shape_casts").?.array.items[0].object;
+    try testing.expectEqual(@as(i64, 8), cast.get("anchor").?.integer);
+    // ...and the anchor is genuinely absent from the footprint, which is the
+    // whole reason it cannot be re-derived.
+    const cells = cast.get("cells").?.array;
+    try testing.expectEqual(@as(usize, 1), cells.items.len);
+    try testing.expectEqual(@as(i64, 4), cells.items[0].integer);
+}
