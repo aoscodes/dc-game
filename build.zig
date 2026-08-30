@@ -271,4 +271,21 @@ pub fn build(b: *std.Build) !void {
         }),
     });
     test_step.dependOn(&b.addRunArtifact(stdout_writer_tests).step);
+
+    // -----------------------------------------------------------------------
+    // JS mirror harnesses  (zig build web-test)
+    // -----------------------------------------------------------------------
+    //
+    // web/game.js re-implements server rules so the replay can show the same
+    // meal the server served; web/test asserts the two still agree.  Wired
+    // into `test` on purpose — these ran as loose scratch files for months and
+    // one of them silently rotted against a deleted API, which is precisely
+    // what an unrun test does.
+    const web_test = b.addSystemCommand(&.{ "node", "web/test/run.mjs" });
+    web_test.setCwd(b.path("."));
+    // Node is already a hard dependency of `zig build run` (the bridge), so
+    // requiring it here adds nothing new to the toolchain.
+    const web_test_step = b.step("web-test", "Run the JS mirror harnesses");
+    web_test_step.dependOn(&web_test.step);
+    test_step.dependOn(&web_test.step);
 }
