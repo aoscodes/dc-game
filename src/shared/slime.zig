@@ -499,7 +499,6 @@ pub const SlimeField = struct {
                         // block it fires is already the chain's first link
                         // — the same rung a cast-activated neutralizer's
                         // block sits on, so both paths chain alike.
-                        out.agents += 1;
                         var fired = ShapeOutcome{};
                         self.stamp(
                             bal,
@@ -521,7 +520,6 @@ pub const SlimeField = struct {
                         // The blast levels the 3x3 where the bomb was eaten,
                         // on the board AS IT STANDS — a cell it empties
                         // ahead of the walk is skipped when reached.
-                        out.bombs += 1;
                         out.destroyed += self.detonate(
                             bal,
                             flat,
@@ -560,6 +558,18 @@ pub const SlimeField = struct {
                 if (kind.eat_is_food()) {
                     out.score += 1;
                     out.hunger += bal.hunger_cost_normal;
+                }
+                // Counted as MOUTHFULS, before the gate below: these two
+                // are the free-equipment kinds, swallowed without scoring,
+                // so the session's ledger (slime_total = score + left +
+                // agents) only closes if every one that went down is here —
+                // including one whose effect is about to be forfeit.
+                // Whether a swallow actually FIRED is a different question,
+                // answered by `agent_activated` and `destroyed`.
+                switch (kind) {
+                    .neutralizer => out.agents += 1,
+                    .bomb => out.bombs += 1,
+                    .egg, .canister, .rock => {},
                 }
                 const effect = kind.eat_effect() orelse return null;
                 // A unit armed for the CAST is still swallowed — scored and
@@ -902,9 +912,12 @@ pub const FeastOutcome = struct {
     hatched: u16 = 0,
     hatched_cells: [c.MAX_GRID_CELLS]u16 = [_]u16{0} ** c.MAX_GRID_CELLS,
     /// Neutralizers consumed.  Free — counted in `cells` but never in score
-    /// or hunger — each firing a 3x3 Agent block as it was swallowed.  Like
-    /// `bombs`, this counts the ones that FIRED: a neutralizer armed for the
-    /// cast is eaten silently and is absent here.
+    /// or hunger — each normally firing a 3x3 Agent block as it goes down.
+    /// A MOUTHFUL count, like `bombs`: one armed for the cast is swallowed
+    /// silently and still counted, because the session's conservation
+    /// ledger (slime_total = score + slime_left + agents) is what this
+    /// feeds, and the board lost the unit either way.  For what the blocks
+    /// did, read `agent_downgraded` and friends.
     agents: u16 = 0,
     /// What those blocks downgraded, per tier the cell was AT, and how many
     /// went all the way to defused (most of which this same feast then ate).
@@ -922,14 +935,10 @@ pub const FeastOutcome = struct {
     /// Charges the swallowed canisters refill into the team pool
     /// (`charge_refill` per canister); the caller credits the pool.
     charges_refilled: u32 = 0,
-    /// Bombs that DETONATED on being SWALLOWED.  Free — counted in `cells`,
-    /// never in score or hunger — each destroying its 3x3 surroundings.
-    ///
-    /// Neither "bombs eaten" nor "blasts": a bomb armed for the cast is
-    /// still eaten and still counted in `cells`, but goes off silently and
-    /// is absent here; a bomb set off further down a chain blasted without
-    /// being eaten and lands in `agent_activated` and `destroyed` instead.
-    /// `agents` is scoped the same way — neutralizers that FIRED.
+    /// Bombs SWALLOWED.  Free — counted in `cells`, never in score or
+    /// hunger.  A MOUTHFUL count, not a blast count: a bomb armed for the
+    /// cast is eaten silently and still counted here, and a bomb set off by
+    /// a chain was never eaten and is not.  For the blast, read `destroyed`.
     bombs: u16 = 0,
     /// Units the bombs DESTROYED: removed from play outright, not eaten —
     /// no score, no hunger, and nothing returns to the reservoir.
@@ -2316,10 +2325,12 @@ test "an armed special is still EATEN — but its effect is LOST" {
     try testing.expectEqual(fired.cells, lost.cells);
     try testing.expectEqual(fired.hunger, lost.hunger);
     try testing.expectEqual(fired.score, lost.score);
-    // `bombs` counts BLASTS, not mouthfuls, so the armed one is absent from
-    // it — which is exactly what keeps a client's explosion FX honest.
+    // `bombs` is a MOUTHFUL count, so it cannot tell them apart either:
+    // both bombs went down.  This is deliberate — it is what the session's
+    // conservation ledger needs, and it is why "did it go off?" has to be
+    // asked of `destroyed` instead.
     try testing.expectEqual(@as(u16, 1), fired.bombs);
-    try testing.expectEqual(@as(u16, 0), lost.bombs);
+    try testing.expectEqual(@as(u16, 1), lost.bombs);
     // ...and there they part: one board was blasted, one was not.
     try testing.expect(fired.destroyed > 0);
     try testing.expectEqual(@as(u16, 0), lost.destroyed);
@@ -2491,6 +2502,42 @@ test "a stamp activates IN OFFSET ORDER against the standing board" {
     // second activation.
     try testing.expect(out.inert > 0);
     try testing.expectEqual(@as(u16, 0), field.grid.occupied());
+}
+
+test "the conservation ledger closes even when the mouth WASTES a special" {
+    // The session asserts slime_total = score + slime_left + agents_consumed
+    // (see bot_harness_test): a neutralizer is equipment, so it leaves the
+    // board without scoring and has to be booked separately or units simply
+    // vanish from the ledger.  Arming it for the CAST does not change that
+    // — the mouth still swallows it, it just wastes it — so the count has
+    // to be a MOUTHFUL count, taken before the effect gate.
+    //
+    // The regression this pins: counting "neutralizers that FIRED" instead
+    // reads correctly under the default tuning and silently unbalances the
+    // ledger the moment a designer arms one.
+    for ([_]balance.Activation{ .eat, .cast, .eatcast }) |mode| {
+        const bal = armed(.neutralizer, mode);
+
+        var field = empty_field(3, 3);
+        // The neutralizer and one plain unit, far enough apart that the
+        // block cannot reach the other cell: no second door for a unit to
+        // leave by, so the ledger is the only thing under test.
+        field.grid.put(field.grid.index(0, 0), .{ .special = .neutralizer });
+        field.grid.put(field.grid.index(2, 2), .neutral);
+        const before = field.grid.occupied();
+
+        const out = field.feast(&bal, 3);
+
+        // Every unit that left the board is on the books exactly once.
+        try testing.expectEqual(
+            before,
+            out.score + field.grid.occupied() + out.agents,
+        );
+        // ...and specifically: the neutralizer went down in all three modes.
+        try testing.expectEqual(@as(u16, 1), out.agents);
+        // Nothing was destroyed, so nothing left play off the books.
+        try testing.expectEqual(@as(u16, 0), out.destroyed);
+    }
 }
 
 test "the deepest chain a full board can supply does not overflow the counter" {
