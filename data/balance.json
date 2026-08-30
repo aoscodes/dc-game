@@ -25,6 +25,9 @@
       "back_ranks_only": true,
       "guaranteed_at_start": true
     },
+    "rock": {
+      "bite_costs_hunger": false
+    },
     "canister": {
       "charge_refill": 3
     },

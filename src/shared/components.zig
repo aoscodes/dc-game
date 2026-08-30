@@ -127,8 +127,10 @@ pub const SpecialKind = enum(u8) {
     /// HATCHES a baby Lil Guy (uniform-random BabyType) who joins the
     /// encounter and grows the hunger pool.
     egg = 1,
-    /// INCONSUMABLE: a boulder.  The bite skips it (no hunger, no score, no
-    /// change) and it never matches, but it is NOT permanent: Neutralizing
+    /// INCONSUMABLE: a boulder.  The bite can never swallow or move it — it
+    /// skips it for nothing, or, with the kind's `bite_costs_hunger` tuning
+    /// set, GNAWS it for hunger and no score — and it never matches.  But it
+    /// is NOT permanent: Neutralizing
     /// Agent — a cast or an inline block — BREAKS it into red slime, the
     /// hardest tier, four applications from edible; a bomb's blast removes
     /// one instantly.  Clearable, so it counts toward the win like any unit;

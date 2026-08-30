@@ -216,6 +216,19 @@ pub const SpecialTuning = struct {
     /// else in the blast survives.  Only meaningful for kinds whose eat
     /// effect is `explode` (the bomb); ignored for every other kind.
     explode_rocks_only: bool = false,
+    /// When true, the bite GNAWS a unit of this kind it cannot swallow:
+    /// hunger is filled by `hunger_cost_normal` and nothing else happens —
+    /// no score, no downgrade, the unit stays put and is gnawed again next
+    /// bite.  Only meaningful for INCONSUMABLE kinds (the rock); a kind the
+    /// bite can swallow is eaten before this is consulted, so the flag is
+    /// ignored for every other kind.
+    ///
+    /// Off, a rock is inert: it neither feeds the Lil Guys nor moves, so a
+    /// field of nothing but rocks and no charges to break them can never
+    /// end (see slime.SlimeField.feast).  On, the mouths chew stone for
+    /// nothing — the clock always advances, at the price of making a rock a
+    /// live drain on hunger rather than dead weight.
+    bite_costs_hunger: bool = false,
 };
 
 /// All designer-tunable balance numbers.  Loaded from `data/balance.json`

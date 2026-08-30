@@ -33,7 +33,8 @@
 //!   feast       — the turn-end bite: the Lil Guys chew through the leftmost
 //!                 `n_cols` columns.  An EDIBLE unit is consumed whole; a
 //!                 live hazard is NIBBLED — downgraded one tier in place,
-//!                 filling hunger but scoring nothing; a rock is skipped.
+//!                 filling hunger but scoring nothing; a rock is skipped,
+//!                 or GNAWED for hunger alone where balance says so.
 //!                 Specials are consumed with their effects: an egg HATCHES a
 //!                 baby (reported, not resolved here), a neutralizer fires a
 //!                 3x3 Agent block INLINE mid-bite, a canister refills
@@ -319,10 +320,14 @@ pub const SlimeField = struct {
     ///     (red -> yellow -> green -> defused), never removed.  A nibble
     ///     fills hunger like a meal but scores NOTHING: hazards the casts
     ///     failed to defuse in time run the clock down for free.
-    ///   - A ROCK (inconsumable special) — skipped outright: no hunger, no
-    ///     score, no change.  The bite cannot break one; only Neutralizing
-    ///     Agent (a cast or an inline block, cracking it to red) starts it
-    ///     down the ladder, and only a bomb removes one instantly.
+    ///   - A ROCK (inconsumable special) — never swallowed and never moved
+    ///     by the bite.  With the kind's `bite_costs_hunger` off it is
+    ///     skipped outright (no hunger, no score, no change); with it on the
+    ///     bite GNAWS it: hunger fills, nothing scores, the rock stays, and
+    ///     the next bite gnaws it again.  Either way the bite cannot break
+    ///     one: only Neutralizing Agent (a cast or an inline block, cracking
+    ///     it to red) starts it down the ladder, and only a bomb removes one
+    ///     instantly.
     ///   - EMPTY — nothing there.
     ///
     /// Nothing shelters anything: every cell in the bitten columns is
@@ -355,7 +360,19 @@ pub const SlimeField = struct {
                     }
                     continue;
                 }
-                if (!cell.is_edible()) continue; // empty, or an unbroken rock
+                if (cell == .special and !cell.special.consumable()) {
+                    // The GNAW: teeth on something they cannot swallow.  Off
+                    // by default the rock is inert and this is a plain skip;
+                    // on, the mouths chew stone — hunger fills, nothing
+                    // scores, and the rock is untouched, so it is gnawed
+                    // again every bite until an Agent cracks it.
+                    if (bal.special_tuning(cell.special).bite_costs_hunger) {
+                        out.gnawed += 1;
+                        out.hunger += bal.hunger_cost_normal;
+                    }
+                    continue;
+                }
+                if (!cell.is_edible()) continue; // empty
                 const effect = self.consume(flat, bal, &out) orelse continue;
                 switch (effect) {
                     // Recorded in `consume`; nothing on the board changes.
@@ -708,6 +725,12 @@ pub const FeastOutcome = struct {
     /// Of those, nibbles that took a green all the way to defused (next
     /// bite, that unit is food).
     bitten_defused: u16 = 0,
+    /// Units the bite GNAWED: inconsumable specials (rocks) whose kind has
+    /// `bite_costs_hunger` set, each of which filled hunger and did nothing
+    /// else.  Zero unless that flag is on, in which case it is pure waste —
+    /// counted apart from `bitten_downgraded` because a gnaw does not even
+    /// move the unit down a tier.
+    gnawed: u16 = 0,
     /// Eggs eaten, and where each sat: one baby hatches per entry.  The type
     /// roll is the caller's (the session owns the seed); this module only
     /// reports the eggs.  Only the first `hatched` entries are live.
@@ -1588,7 +1611,7 @@ test "turn settlement is bite, slide, refill from the right: the conveyor advanc
     try testing.expectEqual(c.SlimeCell.neutral, field.grid.at(0, 1));
 }
 
-test "a rock is INERT: the bite skips it — no hunger, no score, no change" {
+test "a rock is INERT by default: the bite skips it — no hunger, no score" {
     var field = empty_field(3, 1);
     field.grid.set(0, 0, .neutral);
     field.grid.set(1, 0, .{ .special = .rock });
@@ -1599,7 +1622,73 @@ test "a rock is INERT: the bite skips it — no hunger, no score, no change" {
     try testing.expectEqual(@as(u16, 2), out.cells);
     try testing.expectEqual(2 * test_bal.hunger_cost_normal, out.hunger);
     try testing.expectEqual(@as(u16, 0), out.total_bitten());
+    try testing.expectEqual(@as(u16, 0), out.gnawed);
     try testing.expectEqual(c.SlimeCell{ .special = .rock }, field.grid.at(1, 0));
+}
+
+test "bite_costs_hunger: the bite GNAWS a rock — hunger, no score, no change" {
+    var bal = fixtures.test_config.balance;
+    bal.specials[@intFromEnum(c.SpecialKind.rock)].bite_costs_hunger = true;
+
+    var field = empty_field(3, 1);
+    field.grid.set(0, 0, .neutral);
+    field.grid.set(1, 0, .{ .special = .rock });
+    field.grid.set(2, 0, .neutral);
+
+    const out = field.feast(&bal, 1);
+    // The two neutrals are still eaten; the rock now costs a third mouthful
+    // of hunger while yielding nothing and staying exactly where it is.
+    try testing.expectEqual(@as(u16, 2), out.cells);
+    try testing.expectEqual(@as(u16, 1), out.gnawed);
+    try testing.expectEqual(3 * test_bal.hunger_cost_normal, out.hunger);
+    try testing.expectEqual(c.SlimeCell{ .special = .rock }, field.grid.at(1, 0));
+
+    // A gnaw is NOT a nibble: it moves nothing down a tier, so it stays out
+    // of the bitten counters that drive the team's "front reached us hot"
+    // feedback.
+    try testing.expectEqual(@as(u16, 0), out.total_bitten());
+
+    // Differential against the same board with the flag off: the ONLY thing
+    // the flag changes is hunger — exactly one extra mouthful, for the one
+    // rock.  Score is untouched, so a gnaw is pure waste and never pay.
+    var plain = empty_field(3, 1);
+    plain.grid.set(0, 0, .neutral);
+    plain.grid.set(1, 0, .{ .special = .rock });
+    plain.grid.set(2, 0, .neutral);
+    const off = plain.feast(test_bal, 1);
+
+    try testing.expectEqual(off.score, out.score);
+    try testing.expectEqual(off.cells, out.cells);
+    try testing.expectEqual(off.hunger + test_bal.hunger_cost_normal, out.hunger);
+}
+
+test "bite_costs_hunger is ignored for kinds the bite can swallow" {
+    // The flag lives on every kind's tuning but only inconsumable ones ever
+    // reach the gnaw: a consumable is eaten first, on its own terms.  Set it
+    // on the canister — free equipment — and it stays free.
+    var bal = fixtures.test_config.balance;
+    bal.specials[@intFromEnum(c.SpecialKind.canister)].bite_costs_hunger = true;
+
+    var field = empty_field(1, 1);
+    field.grid.set(0, 0, .{ .special = .canister });
+
+    const out = field.feast(&bal, 1);
+    try testing.expectEqual(@as(u16, 1), out.cells);
+    try testing.expectEqual(@as(u16, 0), out.gnawed);
+    try testing.expectEqual(@as(u32, 0), out.hunger);
+}
+
+test "bite_costs_hunger: an EMPTY cell is never gnawed" {
+    // Both empties and rocks fail `is_edible`, and only the rock may be
+    // charged for: an empty column must stay free or an eaten-out board
+    // would run the clock by itself.
+    var bal = fixtures.test_config.balance;
+    bal.specials[@intFromEnum(c.SpecialKind.rock)].bite_costs_hunger = true;
+
+    var field = empty_field(3, 1); // all empty
+    const out = field.feast(&bal, 1);
+    try testing.expectEqual(@as(u16, 0), out.gnawed);
+    try testing.expectEqual(@as(u32, 0), out.hunger);
 }
 
 test "a field holding only rocks is NOT won: rocks are clearable and owed" {
@@ -1626,7 +1715,7 @@ test "a field holding only rocks is NOT won: rocks are clearable and owed" {
     try testing.expect(field.is_exhausted());
 }
 
-test "a rocks-only field is a STALL: the bite cannot move it on its own" {
+test "a rocks-only field STALLS by default, and bite_costs_hunger ends it" {
     // The counterpart to the win above, and the reason session.check_end's
     // "the game always moves" invariant now needs the Agent to hold.
     //
@@ -1654,6 +1743,33 @@ test "a rocks-only field is a STALL: the bite cannot move it on its own" {
     // The Agent is the only thing that moves it — and it costs charges.
     _ = field.apply_shape(DOT, 0, 0);
     try testing.expectEqual(c.SlimeCell{ .tiered = .red }, field.grid.at(0, 0));
+
+    // With `bite_costs_hunger` on, the same board is no longer a stall.  The
+    // rocks still cannot be eaten, downgraded or moved by the bite — the
+    // board is as frozen as before — but every bite now fills hunger, so the
+    // clock runs and the encounter reaches `hunger_full` on its own.  This is
+    // the knob that restores check_end's "the game always moves" without
+    // making a rock breakable by teeth.
+    var bal = fixtures.test_config.balance;
+    bal.specials[@intFromEnum(c.SpecialKind.rock)].bite_costs_hunger = true;
+
+    var stone = empty_field(1, 2);
+    stone.grid.put(0, .{ .special = .rock });
+    stone.grid.put(1, .{ .special = .rock });
+
+    var total: u32 = 0;
+    for (0..8) |_| {
+        const out = stone.feast(&bal, 2);
+        try testing.expectEqual(@as(u16, 2), out.gnawed); // both, every bite
+        try testing.expectEqual(@as(u16, 0), out.cells);
+        try testing.expectEqual([_]u16{ 0, 0, 0 }, out.bitten_downgraded);
+        total += out.hunger;
+        _ = stone.shift_left();
+    }
+    try testing.expectEqual(16 * test_bal.hunger_cost_normal, total);
+    // Still owed, still unbroken — the flag buys an ENDING, not progress.
+    try testing.expectEqual(@as(u16, 2), stone.grid.occupied());
+    try testing.expect(!stone.is_exhausted());
 }
 
 test "a rock rides the conveyor like any unit" {

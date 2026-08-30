@@ -389,6 +389,7 @@ async function loadBalanceData(hash = PAGE_CONFIG_HASH) {
   CAST_COOLDOWN_MS = bal.cast_cooldown_ms ?? 750;
   TEAM_WINDOW_MS = bal.team_window_ms ?? 3000;
   BOMB_ROCKS_ONLY = bal.specials?.bomb?.explode_rocks_only ?? false;
+  ROCK_BITE_COSTS_HUNGER = bal.specials?.rock?.bite_costs_hunger ?? false;
   FEAST_COLUMNS = bal.feast_columns ?? 1;
   FEAST_COLUMNS_PER_GUY = bal.feast_columns_per_guy ?? 0;
   PLAYER_RECIPES = bal.player_recipes.map((r) => ({
@@ -1597,6 +1598,15 @@ const BOMB_COLOR = "rgba(225,110,40,1)";
  *  did. */
 let BOMB_ROCKS_ONLY = false;
 
+/** Whether the bite GNAWS a rock it cannot swallow — hunger for no score,
+ *  the rock unmoved (balance specials.rock.bite_costs_hunger).  Read with
+ *  the balance tables like BOMB_ROCKS_ONLY: it changes which cells the bite
+ *  visits, so the replay and the reachability preview must agree with the
+ *  server about it or the two boards drift.
+ *
+ *  Off, a rock is inert and the bite steps over it. */
+let ROCK_BITE_COSTS_HUNGER = false;
+
 /** Bite width knobs (balance feast_columns / feast_columns_per_guy) — read
  *  with the balance tables so the replay bites exactly the columns the
  *  server bit.  MIRRORS balance.Balance.feast_width. */
@@ -1848,6 +1858,8 @@ function biteFeast(board, rows, cols, width, overrides) {
   const order = [];
   const eaten = new Set();
   const nibbled = new Set();
+  /** Rocks the bite chewed for hunger alone — visited, but unchanged. */
+  const gnawed = new Set();
 
   const w = Math.min(width, cols);
   for (let col = 0; col < w; col++) {
@@ -1862,7 +1874,18 @@ function biteFeast(board, rows, cols, width, overrides) {
         nibbled.add(flat);
         continue;
       }
-      if (!cellIsEdible(name)) continue; // empty, or an unbroken rock
+      if (name === "special_rock") {
+        // The GNAW: teeth on stone.  Costs the team hunger and changes
+        // NOTHING on the board, so the rock is visited (the mouths react)
+        // but neither eaten nor downgraded — and it is gnawed again on
+        // every later bite until an Agent cracks it.
+        if (ROCK_BITE_COSTS_HUNGER) {
+          order.push(flat);
+          gnawed.add(flat);
+        }
+        continue;
+      }
+      if (!cellIsEdible(name)) continue; // empty
       work[flat] = "empty";
       order.push(flat);
       eaten.add(flat);
@@ -1880,7 +1903,7 @@ function biteFeast(board, rows, cols, width, overrides) {
     }
   }
 
-  return { eaten, nibbled, order };
+  return { eaten, nibbled, gnawed, order };
 }
 
 /**
@@ -1939,8 +1962,8 @@ function detonateOn(board, center, rows, cols, onDestroy) {
 
 /**
  * `biteFeast` over a render frame's own grid at this frame's bite width,
- * memoised per frame — "what will the NEXT bite consume, and what will it
- * only nibble?".
+ * memoised per frame — "what will the NEXT bite consume, what will it only
+ * nibble, and what will it gnaw for nothing?".
  *
  * @param {object} game    - render frame (grid + dims + seated crowd)
  * @param {Map<number,string>} [overrides] - see biteFeast
@@ -2346,7 +2369,7 @@ function drawSlimeField(game) {
   // — `opened` — is the payoff of the cast, and it is almost never the cell
   // being aimed at, so nothing else on screen can show it.
   const reach = replay
-    ? { eaten: new Set(), nibbled: new Set() }
+    ? { eaten: new Set(), nibbled: new Set(), gnawed: new Set() }
     : reachability(game);
   const after = preview.size > 0
     ? reachability(game, new Map([...preview].map(([f, b]) => [f, b])))
@@ -2382,10 +2405,12 @@ function drawSlimeField(game) {
         withAlpha(C_SHELTERED, FIELD.biteStripAlpha));
     }
 
-    // A hazard the coming bite will NIBBLE — hunger spent for no score: a
-    // cold hatch across the socket, brightened to green where the pending
-    // cast would defuse it in time to be consumed instead.
-    if (reach.nibbled.has(flat)) {
+    // A hazard the coming bite will NIBBLE, or a rock it will GNAW — either
+    // way hunger spent for no score: a cold hatch across the socket,
+    // brightened to green where the pending cast would defuse it in time to
+    // be consumed instead.  (A gnaw is never brightened: breaking the rock
+    // makes it a hazard, which the same bite still only nibbles.)
+    if (reach.nibbled.has(flat) || reach.gnawed.has(flat)) {
       drawNibbleMark(x0, y0, inset, body,
         opened.has(flat) ? FIELD.openedAlpha : FIELD.shelteredAlpha,
         opened.has(flat) ? C_SLIME_HDR : C_SHELTERED);
@@ -3199,6 +3224,16 @@ function biteAt(game, flat) {
     // The NIBBLE: the survivor steps one tier in place and blooms.  No
     // score triangle — a nibble feeds nobody.
     c.board[flat] = downgradeName(name);
+    cellAnim.set(flat, { kind: "flash", dur: FIELD.flashS, t: FIELD.flashS });
+    return;
+  }
+
+  if (name === "special_rock") {
+    // The GNAW (only reachable with ROCK_BITE_COSTS_HUNGER — biteFeast puts
+    // a rock in `order` under no other condition).  The mouths close on it
+    // and the board does not move: no pop, no downgrade, no score.  It
+    // flashes so the chew is legible as an event rather than a dropped
+    // frame, but the stone is still there afterwards.
     cellAnim.set(flat, { kind: "flash", dur: FIELD.flashS, t: FIELD.flashS });
     return;
   }

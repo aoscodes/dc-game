@@ -154,6 +154,7 @@ const SpecialTuningJson = struct {
     guaranteed_at_start: bool = false,
     charge_refill: u16 = balance.DEFAULT_CHARGE_REFILL,
     explode_rocks_only: bool = false,
+    bite_costs_hunger: bool = false,
 };
 
 /// Per-kind tuning table.  Every kind defaults, so `"specials"` and any kind
@@ -346,6 +347,7 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
             .guaranteed_at_start = t.guaranteed_at_start,
             .charge_refill = t.charge_refill,
             .explode_rocks_only = t.explode_rocks_only,
+            .bite_costs_hunger = t.bite_costs_hunger,
         };
     }
     const longest_line = @max(raw.slime_grid.rows, raw.slime_grid.cols);

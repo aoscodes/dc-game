@@ -195,6 +195,7 @@ async function load() {
         guaranteed_at_start: bal.specials?.[k]?.guaranteed_at_start ?? false,
         charge_refill: bal.specials?.[k]?.charge_refill ?? DEFAULT_CHARGE_REFILL,
         explode_rocks_only: bal.specials?.[k]?.explode_rocks_only ?? false,
+        bite_costs_hunger: bal.specials?.[k]?.bite_costs_hunger ?? false,
       }])),
       player_recipes: bal.player_recipes.map((r) => ({
         label: r.label,
@@ -488,6 +489,14 @@ function specialsRows() {
         el("label", {},
           el("span", {}, "bomb blast destroys ONLY rocks (everything else survives)"),
           boolInput(tuning, "explode_rocks_only")),
+        el("br"),
+      );
+    }
+    if (k === "rock") {
+      rows.push(
+        el("label", {},
+          el("span", {}, "the bite GNAWS a rock: hunger for no score, rock unmoved"),
+          boolInput(tuning, "bite_costs_hunger")),
         el("br"),
       );
     }
