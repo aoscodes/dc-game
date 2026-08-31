@@ -1,12 +1,18 @@
-// Runner for the JS MIRROR harnesses.
+// Runner for the JS harnesses.
 //
-// web/game.js re-implements rules the Zig server owns — the feast walk, slime
-// downgrades, chain reactions, cast placement — because the replay has to show
-// the player the same meal the server served.  Two implementations of one rule
-// is a standing invitation to drift, so each harness extracts the real
-// functions out of game.js by name and asserts them against the mirrored Zig
-// behaviour.  Extraction (rather than import) is what lets game.js stay a
-// plain browser script with no module system.
+// Most of these are MIRRORS.  web/game.js re-implements rules the Zig server
+// owns — the feast walk, slime downgrades, chain reactions, cast placement —
+// because the replay has to show the player the same meal the server served.
+// Two implementations of one rule is a standing invitation to drift, so each
+// harness extracts the real functions out of game.js by name and asserts them
+// against the mirrored Zig behaviour.  Extraction (rather than import) is what
+// lets game.js stay a plain browser script with no module system.
+//
+// A few mirror nothing and are here because this is where JS gets tested:
+// palette_harness covers the badge onboarding colour rules (statistical, so
+// only a few thousand seeds can show them holding), and link_harness covers
+// the bridge's palette protocol (a liveness property — a roll that fails to
+// settle hangs the onboarding kiosk).
 //
 // These ran for months as loose files in a scratch directory, which is exactly
 // how one of them rotted: bite_harness kept asserting against a `batches` /
@@ -47,6 +53,6 @@ for (const h of harnesses) {
 }
 
 console.log(failed === 0
-  ? `\n${harnesses.length} mirror harnesses passed`
-  : `\n${failed}/${harnesses.length} mirror harnesses FAILED`);
+  ? `\n${harnesses.length} harnesses passed`
+  : `\n${failed}/${harnesses.length} harnesses FAILED`);
 process.exit(failed === 0 ? 0 : 1);

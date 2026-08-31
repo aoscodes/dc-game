@@ -18,6 +18,8 @@
  *                                              absent on old firmware = all 0.
  *                      CTRL:SCORE_ACK g=<u32>  score banked to flash (sent
  *                                              AFTER the save; re-sent on retries)
+ *                      CTRL:LED_ACK g=<u32>    palette banked to flash, on
+ *                                              exactly the same terms
  *   bridge -> board:   GAME:HELLO v=1          link request (repeated until acked)
  *                      GAME:HB                 1s keepalive
  *                      GAME:PHASE <game|over>  session phase edge: "game" while
@@ -35,6 +37,19 @@
  *                                              per-game id; retried every 1s
  *                                              until acked, bounded.
  *                      FB:SHAPE <label|->      selected-shape feedback (e-paper)
+ *                      LED:LIVE c=<rrggbb>,<rrggbb>,<rrggbb>
+ *                                              the /onboard screen's colour
+ *                                              spin, streamed ~20Hz. Transient
+ *                                              and unacked; the board never
+ *                                              saves it and lets it expire on
+ *                                              its own after 500ms, so a dead
+ *                                              host cannot strand the LEDs.
+ *                      LED:SET c=<rrggbb>,<rrggbb>,<rrggbb> g=<u32>
+ *                                              the colours the spin landed on,
+ *                                              one per colour LED, for the
+ *                                              board to bank into its flash.
+ *                                              g = per-roll id; retried every
+ *                                              1s until acked, bounded.
  *
  * Unknown lines in either direction are ignored (the board emits unrelated
  * sibling-link chatter like "dev cnt=..." until the link is established).
@@ -88,6 +103,24 @@ const LINK_TIMEOUT_MS = 3000;
 // giving up long before the next game could end.
 const SCORE_RETRY_MS = 1000;
 const SCORE_RETRY_MAX = 5;
+// LED:SET retry cadence and cap. Same reasoning as the score — the board's
+// flash save parks its e-paper renderer around the erase — but the /onboard
+// screen is waiting on this ack before it moves to the next badge, so the cap
+// doubles as how long a player stares at a stalled kiosk.
+const PALETTE_RETRY_MS = 1000;
+const PALETTE_RETRY_MAX = 5;
+
+// How many colours a palette carries: one per RGB LED on the badge
+// (LED_RGB_COUNT in the firmware's led/rgb.h). The onboarding screen's three
+// zones are these three LEDs.
+const PALETTE_COLOR_COUNT = 3;
+
+/** True for exactly PALETTE_COLOR_COUNT six-digit hex colours. */
+function isPalette(colors) {
+  return Array.isArray(colors) &&
+    colors.length === PALETTE_COLOR_COUNT &&
+    colors.every((c) => typeof c === "string" && /^[0-9a-fA-F]{6}$/.test(c));
+}
 
 // Board button -> browser KeyboardEvent.key (the Zig client's KEY: protocol).
 // D-pad = aim, face buttons = shape wheel + cast (see src/client/input.zig).
@@ -156,6 +189,24 @@ function nextScoreId() {
   return lastScoreId;
 }
 
+// Roll ids for LED:SET, on the same monotonic-per-process terms as score ids
+// (the board dedupes on them in RAM, so they only have to be unique for as
+// long as a board stays powered).
+let lastPaletteId = 0;
+function nextPaletteId() {
+  const t = Date.now() >>> 0;
+  lastPaletteId = t > lastPaletteId ? t : (lastPaletteId + 1) >>> 0;
+  return lastPaletteId;
+}
+
+// Identifies one LINK, not one board.  The /onboard screen addresses badges by
+// this and nothing else, which is what makes its queue correct: a badge that
+// is unplugged and replugged is a new link and so is rolled again, while a
+// badge that just sits there keeps its id and is rolled once.  It also means a
+// queued command can never land on a board that was swapped underneath it —
+// the id simply stops resolving.
+let lastLinkId = 0;
+
 /** One physical board on a serial port. */
 class Controller {
   /**
@@ -169,6 +220,8 @@ class Controller {
     this.manager = manager;
     this.port = null;
     this.linked = false;
+    /** Identity of this link once established, else null (see lastLinkId). */
+    this.linkId = null;
     /** Owned headless ControllerSession (the board IS the player), or null. */
     this.playerSession = null;
     this.lastRxMs = 0;
@@ -187,6 +240,9 @@ class Controller {
     /** In-flight GAME:SCORE ({ line, gid, attempts }), or null. */
     this.scorePending = null;
     this.scoreTimer = null;
+    /** In-flight LED:SET ({ line, gid, attempts, done }), or null. */
+    this.palettePending = null;
+    this.paletteTimer = null;
     this.closed = false;
   }
 
@@ -239,7 +295,9 @@ class Controller {
     if (line.startsWith("CTRL:HELLO")) {
       if (!this.linked) {
         this.linked = true;
-        console.log(`[ctrl] linked ${this.path} (uid=${this.uid})`);
+        this.linkId = ++lastLinkId;
+        console.log(
+          `[ctrl] linked ${this.path} (uid=${this.uid}, link=${this.linkId})`);
         this.hbTimer = setInterval(() => {
           this.write("GAME:HB");
           if (Date.now() - this.lastRxMs > LINK_TIMEOUT_MS) {
@@ -248,6 +306,8 @@ class Controller {
           }
         }, HB_INTERVAL_MS);
         this.manager.assign();
+        // A new link is a new badge for the onboarding queue to roll.
+        this.manager.boardsChanged();
       }
       return;
     }
@@ -309,6 +369,18 @@ class Controller {
       if (this.scorePending !== null && arg === `g=${this.scorePending.gid}`) {
         console.log(`[ctrl] score banked (uid=${this.uid}, ${arg})`);
         this.clearScoreRetry();
+      }
+      return;
+    }
+
+    if (line.startsWith("CTRL:LED_ACK ")) {
+      // Palette banked on the board (again, the ack follows its flash save):
+      // stop retrying and let the onboarding screen move on.  Stale acks (an
+      // earlier roll's retries) are ignored.
+      const arg = line.slice("CTRL:LED_ACK ".length).trim();
+      if (this.palettePending !== null && arg === `g=${this.palettePending.gid}`) {
+        console.log(`[ctrl] palette banked (uid=${this.uid}, ${arg})`);
+        this.clearPaletteRetry(null); // null is the success reason; see below
       }
       return;
     }
@@ -380,11 +452,91 @@ class Controller {
     this.scorePending = null;
   }
 
+  /**
+   * Stream one frame of the onboarding colour spin to the board's LEDs.
+   *
+   * Fire-and-forget by design: this runs ~20 times a second, so it carries no
+   * id, expects no ack, keeps no state, and is never written to flash.  A
+   * dropped frame is invisible, and if these simply stop arriving the board's
+   * own 500ms timeout hands the LEDs back to the saved palette — there is no
+   * "stop" message to lose.
+   *
+   * @param {string[]} colors  PALETTE_COLOR_COUNT six-digit hex colours
+   */
+  sendLive(colors) {
+    if (!this.linked || !isPalette(colors)) return;
+    this.write(`LED:LIVE c=${colors.join(",")}`);
+  }
+
+  /**
+   * Commit the colours the spin landed on for the board to bank into flash:
+   * LED:SET retried until CTRL:LED_ACK (or the bounded attempts run out).  The
+   * board dedupes by the id, so retries — and a replay across a relink — can
+   * never double-erase the sector.
+   *
+   * @param {string[]} colors  PALETTE_COLOR_COUNT six-digit hex colours
+   * @param {(err: string | null) => void} done  called exactly once: null on
+   *   ack, else a reason.  A superseding roll, or the board going away,
+   *   settles the outstanding one as an error rather than leaving the
+   *   onboarding screen waiting forever.
+   */
+  sendPalette(colors, done) {
+    if (!isPalette(colors)) { done("bad_palette"); return; }
+    if (!this.linked) { done("not_linked"); return; }
+    const gid = nextPaletteId();
+    this.clearPaletteRetry("superseded"); // a newer roll supersedes any in flight
+    this.palettePending = {
+      line: `LED:SET c=${colors.join(",")} g=${gid}`,
+      gid,
+      attempts: 0,
+      done,
+    };
+    const attempt = () => {
+      const p = this.palettePending;
+      if (p === null) return;
+      if (p.attempts >= PALETTE_RETRY_MAX) {
+        console.warn(
+          `[ctrl] palette never acked (uid=${this.uid}, g=${p.gid}); giving up`,
+        );
+        // Settled through clearPaletteRetry, not by calling p.done here: one
+        // place decides that a roll is over, so there is no way to grow a
+        // second path that settles it twice or not at all.
+        this.clearPaletteRetry("no_ack");
+        return;
+      }
+      p.attempts++;
+      this.write(p.line);
+    };
+    this.paletteTimer = setInterval(attempt, PALETTE_RETRY_MS);
+    attempt();
+  }
+
+  /**
+   * Drop any in-flight LED:SET, settling its callback exactly once.
+   *
+   * This is the ONLY place a roll ends, which is what makes "settled exactly
+   * once" checkable by reading one function: `null` banks it, a string fails
+   * it, and omitting the argument means there was no roll to settle (the
+   * pre-emptive clear in sendPalette, and close() on a board that was idle).
+   *
+   * @param {string | null} [reason]  null = acked, string = why it failed
+   */
+  clearPaletteRetry(reason) {
+    if (this.paletteTimer !== null) clearInterval(this.paletteTimer);
+    this.paletteTimer = null;
+    const pending = this.palettePending;
+    this.palettePending = null;
+    if (pending !== null && reason !== undefined) pending.done(reason);
+  }
+
   close() {
     this.closed = true;
     if (this.helloTimer !== null) clearInterval(this.helloTimer);
     if (this.hbTimer !== null) clearInterval(this.hbTimer);
     this.clearScoreRetry();
+    // Unplugged mid-roll: settle the waiting onboarding screen so it can skip
+    // this badge instead of hanging on an ack that can never arrive.
+    this.clearPaletteRetry("unlinked");
     this.helloTimer = null;
     this.hbTimer = null;
     if (this.port && this.port.isOpen) {
@@ -501,17 +653,52 @@ class ControllerManager {
    * @param {(configHash: string | null) => string[]} hooks.moveLabels  move
    *   labels in balance-file order for a room's config (index space of
    *   `selected_shape`)
+   * @param {(() => void)} [hooks.boardsChanged]  the set of linked boards grew
+   *   or shrank; the onboarding screen re-reads listLinked().  Optional: board
+   *   players work fine without anyone watching.
    */
-  constructor({ clientBin, pickRoom, roomJoined, roomLeft, isRoomAlive, moveLabels }) {
+  constructor({ clientBin, pickRoom, roomJoined, roomLeft, isRoomAlive, moveLabels,
+    boardsChanged }) {
     this.clientBin = clientBin;
     this.pickRoom = pickRoom;
     this.roomJoined = roomJoined;
     this.roomLeft = roomLeft;
     this.isRoomAlive = isRoomAlive;
     this.moveLabels = moveLabels;
+    this.onBoardsChanged = boardsChanged ?? (() => {});
     /** @type {Map<string, Controller>} port path -> controller */
     this.controllers = new Map();
     this.scanTimer = null;
+  }
+
+  /** A board linked or went away. */
+  boardsChanged() {
+    this.onBoardsChanged();
+  }
+
+  /**
+   * Every board currently linked, in link order — which is the order the
+   * onboarding screen rolls them in.
+   * @returns {{ linkId: number, uid: string }[]}
+   */
+  listLinked() {
+    return [...this.controllers.values()]
+      .filter((c) => c.linked)
+      .sort((a, b) => a.linkId - b.linkId)
+      .map((c) => ({ linkId: c.linkId, uid: c.uid }));
+  }
+
+  /**
+   * Resolve a link id to its board, or null if that link is gone.  Returning
+   * null IS the unplugged case — callers skip it and move on.
+   * @param {number} linkId
+   * @returns {Controller | null}
+   */
+  linkedById(linkId) {
+    for (const c of this.controllers.values()) {
+      if (c.linked && c.linkId === linkId) return c;
+    }
+    return null;
   }
 
   start() {
@@ -589,6 +776,7 @@ class ControllerManager {
   dropController(ctrl) {
     if (ctrl.closed) return;
     const player = ctrl.playerSession;
+    const wasLinked = ctrl.linked;
     ctrl.playerSession = null;
     ctrl.close();
     this.controllers.delete(ctrl.path);
@@ -597,6 +785,9 @@ class ControllerManager {
       player.controller = null;
       player.destroy("controller disconnected");
     }
+    // After the teardown, so a watcher re-reading listLinked() sees the
+    // settled world rather than a half-dismantled one.
+    if (wasLinked) this.boardsChanged();
   }
 }
 

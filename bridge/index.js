@@ -34,6 +34,9 @@
  *   - Hardware controller discovery over USB serial (controllers.js): every
  *     board is its own player with a dedicated Zig client; selected-shape
  *     feedback flows back to the board's e-paper.
+ *   - /onboard + /onboard-ws (OnboardSession): the badge colour kiosk.  No Zig
+ *     client, no lobby, no session slot — it only needs the bridge because the
+ *     bridge is what holds the serial ports.
  *
  * Stdio protocol (Zig ↔ bridge):
  *   Zig stdin  ← WIRE:<hex>\n   raw server message bytes, hex-encoded
@@ -169,6 +172,14 @@ const httpServer = http.createServer((req, res) => {
   // /tune — the config editor (query string carries ?from=<hash>).
   if (rawPath === "/tune") {
     serveFile(res, WEB_DIR, "/tune.html", { "Cache-Control": "no-cache" });
+    return;
+  }
+
+  // /onboard — the badge colour kiosk.  Standalone, like /tune: it never
+  // touches a lobby or the Zig binaries, it just needs the bridge because the
+  // bridge is what holds the serial ports.
+  if (rawPath === "/onboard") {
+    serveFile(res, WEB_DIR, "/onboard.html", { "Cache-Control": "no-cache" });
     return;
   }
 
@@ -466,6 +477,9 @@ function roomTabJoined(room) {
 /** @type {Set<TabSession>} */
 const activeSessions = new Set();
 
+/** The single open onboarding kiosk (/onboard), or null.  @type {OnboardSession | null} */
+let onboardSession = null;
+
 // Hardware controllers (dc_rp2040 boards on USB serial).  Every linked board
 // is its own player (ControllerSession) in the active lobby.
 const controllerManager = new ControllerManager({
@@ -482,6 +496,9 @@ const controllerManager = new ControllerManager({
   roomLeft: (room) => roomTabLeft(room),
   isRoomAlive: (room) => lobbyRegistry.get(room.code) === room,
   moveLabels: (configHash) => moveLabelsFor(configHash ?? null),
+  // The onboarding kiosk, when one is open, re-reads the board list on every
+  // link/unlink.  Nothing else cares.
+  boardsChanged: () => { if (onboardSession !== null) onboardSession.sendQueue(); },
 });
 
 class TabSession extends PlayerSession {
@@ -637,10 +654,139 @@ class TabSession extends PlayerSession {
 }
 
 // ---------------------------------------------------------------------------
+// Onboarding kiosk session  (/onboard-ws)
+// ---------------------------------------------------------------------------
+
+/**
+ * The /onboard page's link to the serial ports.  Deliberately NOT a
+ * PlayerSession: onboarding spawns no Zig client, joins no lobby, and consumes
+ * no session slot — it colours badges, which has nothing to do with a game
+ * being in progress.
+ *
+ * The bridge holds no queue.  It publishes the set of currently linked boards
+ * and routes two verbs at them; the page decides which board it is rolling and
+ * remembers which link ids it has finished.  That split is what makes the
+ * "roll each badge once, but roll a replugged one again" rule fall out for
+ * free: ids identify a LINK, so a badge left plugged in keeps its id and stays
+ * done, while a replugged one arrives with a new id and is rolled afresh.
+ */
+class OnboardSession {
+  /** @param {WebSocket} ws */
+  constructor(ws) {
+    this.ws = ws;
+    this.closed = false;
+  }
+
+  send(obj) {
+    if (!this.closed && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(obj));
+    }
+  }
+
+  /** Publish the currently linked boards, newest last. */
+  sendQueue() {
+    this.send({ tag: "queue", links: controllerManager.listLinked().map((b) => b.linkId) });
+  }
+
+  /**
+   * @param {{ action?: string, linkId?: unknown, colors?: unknown }} msg
+   */
+  handle(msg) {
+    // An unresolvable link id is the unplugged case, not an error: the board
+    // went away mid-roll and the page skips it on the next queue message.
+    if (msg.action === "live") {
+      if (typeof msg.linkId !== "number") return;
+      const ctrl = controllerManager.linkedById(msg.linkId);
+      if (ctrl !== null) ctrl.sendLive(msg.colors);
+      return;
+    }
+
+    if (msg.action === "commit") {
+      if (typeof msg.linkId !== "number") return;
+      const linkId = msg.linkId;
+      const ctrl = controllerManager.linkedById(linkId);
+      if (ctrl === null) {
+        this.send({ tag: "commit_failed", linkId, reason: "unlinked" });
+        return;
+      }
+      // sendPalette calls back exactly once — on the board's post-save ack, on
+      // running out of retries, or on the board going away mid-roll — so the
+      // page can never be left waiting on a badge that will never answer.
+      ctrl.sendPalette(msg.colors, (err) => {
+        if (err === null) this.send({ tag: "committed", linkId });
+        else this.send({ tag: "commit_failed", linkId, reason: err });
+      });
+      return;
+    }
+
+    console.warn("[onboard] unknown action:", msg.action);
+  }
+
+  teardown() {
+    if (this.closed) return;
+    this.closed = true;
+    if (onboardSession === this) onboardSession = null;
+    console.log("[onboard] kiosk closed");
+  }
+}
+
+// noServer, not { server, path }: see the upgrade router below.
+const onboardWss = new WebSocketServer({ noServer: true });
+
+onboardWss.on("connection", (ws) => {
+  // One kiosk at a time.  Two pages rolling the same badge would race on its
+  // LEDs and on its flash, and there is no sensible way to arbitrate that.
+  if (onboardSession !== null) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ tag: "busy" }));
+    ws.close();
+    console.warn("[onboard] rejected kiosk: one already open");
+    return;
+  }
+
+  const session = new OnboardSession(ws);
+  onboardSession = session;
+  console.log("[onboard] kiosk opened");
+
+  ws.on("close", () => session.teardown());
+  ws.on("error", () => session.teardown());
+  ws.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if (typeof msg !== "object" || msg === null) return;
+    session.handle(msg);
+  });
+
+  // Whatever is already plugged in is already waiting to be rolled.
+  session.sendQueue();
+});
+
+// ---------------------------------------------------------------------------
 // Browser WebSocket server  (/ws)
 // ---------------------------------------------------------------------------
 
-const browserWss = new WebSocketServer({ server: httpServer, path: "/ws" });
+const browserWss = new WebSocketServer({ noServer: true });
+
+// Upgrade router.
+//
+// Both socket servers are `noServer` and dispatched here by hand.  They have
+// to be: a WebSocketServer constructed with { server, path } installs its own
+// upgrade listener that ABORTS every request whose path it does not recognise
+// (ws/lib/websocket-server.js: !shouldHandle -> abortHandshake 400).  With two
+// of them on one HTTP server, each one kills the other's connections depending
+// on listener order — which presented as the onboarding kiosk being silently
+// dropped a moment after connecting, and the next tab being let in as if the
+// first had never opened.
+httpServer.on("upgrade", (req, socket, head) => {
+  const pathname = new URL(req.url, "http://localhost").pathname;
+  const wss = pathname === "/ws" ? browserWss
+    : pathname === "/onboard-ws" ? onboardWss
+    : null;
+  if (wss === null) {
+    socket.destroy();
+    return;
+  }
+  wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+});
 
 browserWss.on("connection", (tabWs) => {
   if (activeSessions.size >= MAX_SESSIONS) {
