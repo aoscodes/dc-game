@@ -38,8 +38,9 @@ const LAYOUT = {
     // units read as discrete candies rather than a contiguous mass
     tileRadius: 0.28,   // body corner radius as a fraction of the body size
     symbolAlpha: 0.55,  // tier glyph opacity stamped on the body
-    // Per-cell animation durations (seconds) and idle wobble.
-    dropS: 0.15,        // refill slide-in from above
+    // Per-cell animation durations (seconds) and idle wobble.  Travel is NOT
+    // here: every tile that moves does so along the conveyor, at the one
+    // speed in LAYOUT.cinematic.collapseS, whoever queued it.
     popS: 0.22,         // eaten-tile burst (driven by the feast cinematic)
     flashS: 0.25,       // downgraded-tile white bloom
     bobAmp: 0.02,       // idle breathing: ±fraction of tile size
@@ -167,12 +168,20 @@ const LAYOUT = {
     eatMinS: 0.8,
     eatCapS: 2,
     chompPauseS: 0.1,   // beat held on each bitten column, so a bite is legible
-    collapseS: 0.4,     // one advance: survivors sliding left, refills sliding in
-    // Longest frame the replay will honour.  requestAnimationFrame stops firing
-    // in a hidden tab, so returning to one delivers a single frame worth however
-    // long it was away — and spending it would eat the whole meal in one step,
-    // which is the jump cut the replay exists to avoid.  Time the player was not
-    // watching is not time the feast ran.
+    // One advance of the conveyor: survivors sliding left, refills sliding in.
+    // THE speed for every travelling tile, including the ones the grid diff
+    // queues outside a replay — a tile that crosses a cell should take as long
+    // doing it whoever set it moving.
+    collapseS: 0.4,
+    matchBeatS: 0.4,    // pause to read a resolved match before the feast reopens
+    // Longest frame ANYTHING on the board will honour — the replay, the tiles
+    // the grid diff queues outside one, and the flying tris.
+    // requestAnimationFrame stops firing in a hidden tab, so returning to one
+    // delivers a single frame worth however long it was away. Spending that
+    // would eat a whole meal in one step, which is the jump cut the replay
+    // exists to avoid — and outside a replay it finished every slide and flash
+    // on the frame it started them, so the board changed with no animation at
+    // all. Time the player was not watching is not time the board moved.
     maxStepS: 1 / 15,
   },
 
@@ -546,7 +555,7 @@ function clearEntityState() {
   prevGrid = [];
   cellAnim.clear();
   chainParticles.length = 0;
-  stampedThisFrame.clear();
+  castRecord.discard();
   lastTransientGame = null;
   chargesSeenMax = 0;
   menuFx.clear();
@@ -710,7 +719,7 @@ function drawShapeDemo(cx, top, rows, cell) {
       if (rows[r][cl] === "#") {
         // Covered cell: inverted hazard tile + footprint outline, exactly the
         // pair the live cast preview paints on the field.
-        drawTile("red", cxp, cyp, cell, 1, 0, 1, true);
+        drawTile("red", cxp, cyp, cell, 1, 1, true);
         ctx.save();
         ctx.strokeStyle = SHAPE_COLOR;
         ctx.lineWidth = 1.5;
@@ -1003,77 +1012,6 @@ function spawnRecipeFloaters(game) {
       isTeam ? RECIPE_COLOR_TEAM : RECIPE_COLOR_PLAYER,
       LAYOUT.floater.lifetime, LAYOUT.floater.recipeFont);
   });
-}
-
-/**
- * Stamp-outcome floaters (`game.shape_casts`, transient): what each landed
- * shape actually accomplished, floated over the cells it covered.
- *
- * Also records every covered cell, so updateGridAnims can tell a cell a stamp
- * DOWNGRADED from one that was merely refilled.  That set is consumed and
- * cleared by updateGridAnims on the same frame.
- */
-function spawnStampFloaters(game) {
-  const events = game.shape_casts ?? [];
-  if (events.length === 0) return;
-
-  for (const ev of events) {
-    // Unstaged: this path has no board to work the links out from (that is
-    // recordCastChain's job), so every cell is reported as the first link.
-    for (const flat of ev.cells ?? []) {
-      stampedThisFrame.set(flat, { depth: 0, source: "cast" });
-    }
-  }
-
-  // A cast that lands while the feast is replaying is held until the replay
-  // ends.  The board on screen is the pre-feast one, so floating "3 downgraded"
-  // now would point at cells that visibly have not changed — and the cells it
-  // names may not even exist after the collapse.  The stamped-cell record above
-  // is NOT deferred: the diff after the replay needs it to tell a downgrade from
-  // a refill, and it is bookkeeping rather than something on screen.
-  const sink = cinematic ? cinematic.deferred.stamps : null;
-  if (sink) {
-    sink.push(...events);
-    return;
-  }
-
-  const { rows, cols } = gridDims(game);
-  events.forEach((ev, i) => floatStampOutcome(ev, i, rows, cols));
-}
-
-/** One landed shape's readout, stacked at `slot` to keep simultaneous casts apart. */
-function floatStampOutcome(ev, slot, rows, cols) {
-  const STACK = LAYOUT.floater.stack;
-
-  // Anchor the readout on the footprint itself — the whole point of aiming
-  // is that the outcome is local, so a field-centre label would hide it.
-  const at = (ev.cells ?? []).length > 0
-    ? cellCenter(ev.cells[0], rows, cols)
-    : fieldCenter();
-  const y = at.y + slot * STACK;
-
-  // A broken rock is accomplishment on par with a downgrade: it joins the
-  // head line (never the waste line) and keeps "no effect" honest.
-  const hits = sumTiers(ev.downgraded);
-  const cracked = ev.rocks_broken ?? 0;
-  const parts = [];
-  if (hits > 0) {
-    parts.push(`${hits} downgraded`);
-    if (ev.neutralized > 0) parts.push(`${ev.neutralized} defused`);
-  }
-  if (cracked > 0) parts.push(`${cracked} cracked`);
-  const head = parts.length > 0 ? parts.join(", ") : "no effect";
-  spawnFloater(head, at.x, y, parts.length > 0 ? C_SLIME_HDR : C_BAD,
-    LAYOUT.floater.lifetime, LAYOUT.floater.font);
-
-  // Nothing is destroyed by a stamp, so the only waste is coverage thrown
-  // away: cells clipped off the grid edge, or in-bounds cells with nothing
-  // left to downgrade.  Both are aiming feedback.
-  const wasted = (ev.off_grid ?? 0) + (ev.inert ?? 0);
-  if (wasted > 0) {
-    spawnFloater(`(${wasted} wasted)`, at.x, y + STACK * 0.7,
-      C_MUTED, LAYOUT.floater.lifetime, LAYOUT.floater.font);
-  }
 }
 
 /** Turn-loop floater color (matches the cast-budget gauge). */
@@ -1922,6 +1860,37 @@ function downgradeName(name) {
   return null;
 }
 
+/** The ladder's length: rock → red → yellow → green → defused. */
+const LADDER_RUNGS = 4;
+
+/**
+ * How many stamps take `from` to `to` down the ladder, or null when `to` is
+ * not below `from` on it.
+ *
+ * A cell can be stepped down MORE THAN ONCE in a single server tick.  A cast
+ * that covers a cast-armed neutralizer fires a 3x3 CENTRED INSIDE its own
+ * footprint (see activateOn), so every cell in the overlap is downgraded
+ * twice — once by the outer stamp and once by the block it set off — and a
+ * chain can do it again.  Breaking a rock and then chewing it is the same
+ * story in one offset.
+ *
+ * The grid diff sees only the ENDPOINTS of a tick, so asking for a single
+ * rung calls `red -> green` a replacement rather than a downgrade, and a
+ * replacement travels: that was the tile that appeared to arrive from
+ * somewhere else instead of changing where it stood.
+ */
+function downgradeSteps(from, to) {
+  let at = from;
+  // Bounded by the ladder, and downgradeName bottoms out at null anyway, so
+  // a malformed pair cannot spin here.
+  for (let n = 1; n <= LADDER_RUNGS; n++) {
+    at = downgradeName(at);
+    if (at === null) return null;
+    if (at === to) return n;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Hunger bar + score
 // ---------------------------------------------------------------------------
@@ -2411,7 +2380,7 @@ const TILE_RGB = {
  *   "empty"               → null (no tile; the socket shows through)
  *   "neutral"             → grey body, no glyph  (harmless filler)
  *   "red"                 → red body + ≡ glyph   (hazard, 3 stamps from harmless)
- *   "defused"             → grey body + a dim ring (was a hazard, now harmless)
+ *   "defused"             → grey body, no glyph  (was a hazard, now harmless)
  *   "special_neutralizer" → violet body + ★ glyph (free pickup: eaten for no
  *                            score, fires a 3x3 Agent block)
  *   "special_egg"         → cream body + ○ glyph  (food with a baby inside)
@@ -2421,8 +2390,18 @@ const TILE_RGB = {
  *                            team's charge pool)
  *   "special_bomb"        → orange body + ✱ glyph (free pickup: destroys its
  *                            3x3 surroundings — or just the rocks in it)
- * A defused cell is safe to eat, so its BODY is grey like neutral; the ring
- * distinguishes "someone defused this" from "this was never a threat".
+ * NOT IMPLEMENTED, and stated here rather than left to be rediscovered: a
+ * defused cell renders IDENTICAL to a naturally-neutral one.  Both are safe to
+ * eat, so both take the grey body — but nothing distinguishes "someone defused
+ * this" from "this was never a threat", so the only cue a neutralize happened
+ * is the transient flash the diff queues.
+ *
+ * `ring` is the intended distinction and every branch below returns false, so
+ * the ring stroke in tileSprite is unreachable.  Two things are needed to
+ * finish it: the ring has to be drawn in the ATLAS path too (today's stroke
+ * sits after that path's early return), and it needs a colour that reads on
+ * 1-bit line art.  A `defused` atlas frame would be cleaner still, but the
+ * source art lives in the sibling board repo (see scripts/gen_slime_tiles.py).
  */
 function cellStyle(name) {
   if (!name || name === "empty") return null;
@@ -2613,9 +2592,9 @@ let prevGrid = [];
 
 /**
  * flat → queued animation, `t` counting down from `dur` in seconds:
- *   { kind: "drop",  dur, t, cells? }        a tile arriving from above
  *   { kind: "slide", dur, t, cells? }        a tile arriving from the RIGHT
- *     (the conveyor: the shift packing left, or the refill entering)
+ *     (the conveyor: the shift packing left, the refill entering, or any
+ *     other replacement — the board's only direction of travel)
  *   { kind: "pop",   dur, t, from, cells? }  a bitten tile bursting outward,
  *     with any replacement arriving behind it
  *   { kind: "flash", dur, t }                a downgraded tile blooming
@@ -2633,11 +2612,11 @@ let prevGrid = [];
 const cellAnim = new Map();
 
 /**
- * flat -> `{depth, source}`, what a cast did to each cell it reached this
- * frame (see recordCastChain).
+ * flat -> `{depth, source}`: what a reaction did to each cell it reached,
+ * accumulated since the last grid diff (see recordCastChain).
  *
  * Two jobs.  A covered cell that stepped DOWN a tier flashes in place rather
- * than dropping in as new slime: a downgrade rewrites the cell, and arriving
+ * than arriving as new slime: a downgrade rewrites the cell, and arriving
  * slime is a different event that must not look the same.  A covered cell the
  * cast EMPTIED — a spent special, or a victim of a blast it set off — is
  * neither: it bursts, because it was destroyed.
@@ -2645,9 +2624,75 @@ const cellAnim = new Map();
  * And `depth` says which link of the reaction reached it, which is the only
  * thing that can pace a cascade the server resolved in a single tick.
  *
- * Consumed and cleared by updateGridAnims on the same frame.
+ * A WRITE-THEN-READ-ONCE value with a real lifetime, which is why it is this
+ * rather than a bare Map:
+ *
+ *   - producers fill it (recordCastChain, recordMatchBlocks),
+ *   - the grid diff empties it,
+ *   - a starting replay DISCARDS it unread — the cast is folded into the
+ *     board the replay begins from and bloomed there, so the covered set has
+ *     already been spent.
+ *
+ * It outlives a single frame on purpose: the team keeps casting while a
+ * replay plays, and the first diff after the replay lands is what has to tell
+ * those downgrades from refills.
+ *
+ * `consume` SEALS it for the rest of the frame.  A producer running after the
+ * diff has read is not a late arrival, it is a write nothing will ever see —
+ * and that failure went unnoticed for as long as it did precisely because it
+ * was silent (spawnMatchFloaters used to write eight lines below the call
+ * that cleared it).  A sealed write is reported and still recorded:
+ * degrading to the old behaviour beats throwing inside a render loop.
  */
-const stampedThisFrame = new Map();
+function makeCastRecord() {
+  let cells = new Map();
+  let sealed = false;
+  let carriedIn = 0;
+  return {
+    /** Note that `source` reached `flat` on link `depth`.
+     *
+     *  DEEPEST LINK WINS when several things reach one cell in a frame: the
+     *  cell settles when the LAST thing that touched it is done, and holding
+     *  it that long is what keeps it from visibly changing twice. */
+    note(flat, depth, source) {
+      if (sealed) {
+        console.error(
+          "[game] cast record written after the diff read it", flat, source);
+      }
+      const prev = cells.get(flat);
+      if (prev && prev.depth >= depth) return;
+      cells.set(flat, { depth, source });
+    },
+    get(flat) { return cells.get(flat); },
+    /** Read this generation and empty it; nothing more may be written this frame. */
+    consume() {
+      const out = cells;
+      cells = new Map();
+      sealed = true;
+      return out;
+    },
+    /** Spend it unread (a replay is starting), or reset it (a new match). */
+    discard() { cells = new Map(); carriedIn = 0; },
+    /** A new server frame: writes are open again.
+     *
+     *  Notes from earlier frames are KEPT, not cleared, and that is load-bearing:
+     *  a cast landing mid-replay is noted for the diff that runs when the replay
+     *  LANDS, which is many frames later (see recordCastChain). Clearing here
+     *  would silently swallow its bloom. */
+    open() {
+      carriedIn = cells.size;
+      sealed = false;
+    },
+    /** Cells noted in an earlier frame and still unread, as of the last `open`.
+     *
+     *  Nonzero is normal only while a replay owns the board. Anything else means
+     *  a frame's reaction was noted and no diff ever read it, which is invisible
+     *  on screen — the bloom just never happens — so the caller reports it. */
+    carried() { return carriedIn; },
+  };
+}
+
+const castRecord = makeCastRecord();
 
 /** flat → idle wobble phase.  Derived from the flat index so a cell always
  *  breathes on the same beat, and memoised because the draw loop would
@@ -2667,37 +2712,62 @@ function bobPhase(flat) {
  * cell.
  *
  * Turn-end frames never reach here: drawGame hands those to the cinematic,
- * which owns the eat/fall/refill animations and adopts the grid when it is done.
+ * which owns the eat/shift/refill animations and adopts the grid when it is
+ * done.
+ *
+ * OWNS `record` end to end: it collects the last producer, reads, and empties.
+ * That is why recordMatchBlocks is called from in HERE rather than beside the
+ * other transient-event handlers in drawGame.  While the two were free
+ * functions over one shared Map, the match producer sat eight lines BELOW
+ * this call and every record it wrote was cleared before anything read it —
+ * so a 5x5's downgrades read as replacements and travelled.  A producer the
+ * consumer invokes itself cannot be moved after it.
+ *
+ * Casts are the one producer not collected here, because they cannot be: a
+ * cast landing mid-replay has to be recorded on the frame it lands, and this
+ * does not run during a replay.  `record` is an accumulator handed in for
+ * exactly that reason (see makeCastRecord).
  */
-function updateGridAnims(grid, rows, cols) {
+function updateGridAnims(record, game, grid, rows, cols) {
+  // A resolved match is one event with no reaction behind it, so every cell
+  // it touched is the first and only link.  Written before the read below,
+  // structurally.
+  recordMatchBlocks(record, game, rows, cols);
+  const stamped = record.consume();
+
   for (let flat = 0; flat < grid.length; flat++) {
     const now = grid[flat];
     const was = prevGrid[flat];
     if (was === undefined) continue; // first frame: no animation, just adopt
     if (now === was) continue;
 
-    // The cast's own account of this cell, if it touched it.  The DIFF stays
-    // the authority on what changed — it compares two boards the server sent,
-    // where the record is only a local replay of the rules — so the record is
-    // read for its link and its cause, never for the outcome.
-    const rec = stampedThisFrame.get(flat);
+    // The reaction's own account of this cell, if it touched it.  The DIFF
+    // stays the authority on what changed — it compares two boards the server
+    // sent, where the record is only a local replay of the rules — so the
+    // record is read for its link and its cause, never for the outcome.
+    const rec = stamped.get(flat);
 
-    if (rec && (now === downgradeName(was) || now === "empty")) {
-      // A cell the cast reached: it either stepped down a tier in place, or
-      // was erased outright (a special it set off, or something the blast
-      // that followed took).  Either way it is staged by its link, so a
-      // reaction arrives in waves instead of all at once.
+    if (rec && (downgradeSteps(was, now) !== null || now === "empty")) {
+      // A cell the reaction reached: it either stepped DOWN the ladder in
+      // place — one rung or several, since a cast and the block it sets off
+      // both reach the overlap — or was erased outright (a special it spent,
+      // or something the blast behind it took).  Either way it is staged by
+      // its link, so a reaction arrives in waves instead of all at once.
       scheduleChainFx(
         { flat, from: was, to: now, depth: rec.depth, source: rec.source },
         rows, cols,
       );
     } else {
-      // A refilled hole, or any other replacement, sliding in from above.
-      cellAnim.set(flat, { kind: "drop", dur: FIELD.dropS, t: FIELD.dropS });
+      // A refilled hole, or any other replacement, arriving along the
+      // conveyor from the RIGHT.  Nothing on this board falls.
+      cellAnim.set(flat, {
+        kind: "slide",
+        dur: LAYOUT.cinematic.collapseS,
+        t: LAYOUT.cinematic.collapseS,
+      });
     }
   }
   prevGrid = grid.slice();
-  stampedThisFrame.clear();
 }
 
 /** Advance queued cell animations, dropping the finished ones.
@@ -2860,10 +2930,10 @@ function drawSlimeField(game) {
     const anim = cellAnim.get(flat);
 
     // A popping tile bursts outward over its socket; its replacement (below)
-    // drops in behind it.
+    // arrives behind it along the conveyor, from the right.
     if (anim?.kind === "pop") {
       const p = animProgress(anim);           // 0 → 1
-      drawTile(anim.from, x0, y0, g.cell, 1 + p * 0.3, 0, 1 - p);
+      drawTile(anim.from, x0, y0, g.cell, 1 + p * 0.3, 1 - p);
     }
 
     // Projected footprint.  `coveredBy` marks EVERY covered cell — inert
@@ -2903,18 +2973,16 @@ function drawSlimeField(game) {
     }
 
     let scale = 1;
-    let dy = 0;
     let dx = 0;
-    if (anim?.kind === "drop" || anim?.kind === "pop") {
-      // Fall in from `cells` rows above (one, unless the cinematic set a real
-      // fall distance), easing out, with a landing squash.
-      const p = animProgress(anim);
-      const ease = 1 - (1 - p) * (1 - p);
-      dy = -(1 - ease) * g.cell * (anim.cells ?? 1);
-      scale = 1 + Math.sin(p * Math.PI) * 0.08;
-    } else if (anim?.kind === "slide") {
-      // The conveyor: slide in from `cells` columns to the RIGHT (the shift
-      // packing left, or the refill entering at the right edge), easing out.
+    if (anim?.kind === "slide" || anim?.kind === "pop") {
+      // The conveyor, and the ONLY direction anything travels on this board:
+      // in from `cells` columns to the RIGHT — survivors packing left, the
+      // refill entering at the right edge, or a replacement arriving behind a
+      // burst — easing out, with a landing squash.
+      //
+      // Nothing FALLS.  The field has no gravity: the server only ever packs
+      // left (slime.shift_left) and pours in from the right (slime.fill), so
+      // a tile arriving from above would claim a rule the game does not have.
       const p = animProgress(anim);
       const ease = 1 - (1 - p) * (1 - p);
       dx = (1 - ease) * g.cell * (anim.cells ?? 1);
@@ -2927,7 +2995,7 @@ function drawSlimeField(game) {
     // Selected cells (covered by a stamp or under a cursor) swap to the
     // inverted tile art — already-defused slime inverts too, so the stamp's
     // shape stays unbroken over cells it would not change.
-    drawTile(name, x0 + dx, y0, g.cell, scale, dy, 1,
+    drawTile(name, x0 + dx, y0, g.cell, scale, 1,
       coveredBy !== undefined || cursorCells.has(flat));
 
     // Footprint outline in the owner's seat color (solid = live aim, dotted
@@ -3103,11 +3171,15 @@ function drawCursorBox(x0, y0, cell, lineW, color) {
 }
 
 /**
- * Blit one cached tile into the cell at (x0, y0), scaled about the cell centre
- * and offset vertically by `dy` (animation).  `alpha` < 1 fades it out.
- * `selected` draws the inverted tile art (cast preview / cursor coverage).
+ * Blit one cached tile into the cell at (x0, y0), scaled about the cell centre.
+ * `alpha` < 1 fades it out.  `selected` draws the inverted tile art (cast
+ * preview / cursor coverage).
+ *
+ * Travel is the CALLER's, applied to `x0`, and it is horizontal: this takes no
+ * vertical offset because nothing on this board moves vertically.  It used to,
+ * and the parameter no caller passed is how tiles came to arrive from above.
  */
-function drawTile(name, x0, y0, cell, scale, dy, alpha, selected = false) {
+function drawTile(name, x0, y0, cell, scale, alpha, selected = false) {
   const sprite = tileSprite(name, Math.round(cell), selected);
   if (!sprite) return;
   const size = cell * scale;
@@ -3115,10 +3187,10 @@ function drawTile(name, x0, y0, cell, scale, dy, alpha, selected = false) {
   if (alpha < 1) {
     ctx.save();
     ctx.globalAlpha = alpha;
-    ctx.drawImage(sprite, x0 + off, y0 + off + dy, size, size);
+    ctx.drawImage(sprite, x0 + off, y0 + off, size, size);
     ctx.restore();
   } else {
-    ctx.drawImage(sprite, x0 + off, y0 + off + dy, size, size);
+    ctx.drawImage(sprite, x0 + off, y0 + off, size, size);
   }
 }
 
@@ -3358,7 +3430,7 @@ function drawLilGuys(game, dt) {
  * @property {number} chompS   - per-column pause, fitted so the whole meal
  *   lasts about as long as the server's settle window (see armEatPass)
  * @property {number} t        - seconds left in a timed stage (collapse, fill)
- * @property {{score: number, hunger: number, stamps: object[]}} deferred - things
+ * @property {{score: number, hunger: number}} deferred - things
  *   the server already applied, held back until the screen catches up: the feast's
  *   score and hunger (paid when the eating finishes) and any casts that landed
  *   mid-replay (floated when it ends, over the board they actually apply to)
@@ -3424,21 +3496,38 @@ function startFeastCinematic(game) {
     bitten: te?.hazards_bitten ?? 0,
   };
 
+  // A malformed frame is unreplayable whatever the board history is, and this
+  // costs nothing to know, so it is settled before anything is spent below.
+  if (target.length !== rows * cols) {
+    //spawnFeastTallyFloaters(tally);
+    return false;
+  }
+
   // A replay in flight when another bite settles: routine on the realtime
   // clock.  Land the old one on its board first — half a meal is not a
   // state to start a second one from.
   if (cinematic) snapFinishCinematic();
 
-  // Any cast on this frame is folded into the board the replay starts from
-  // (below) and bloomed there, so the covered set has been spent: leaving it for
-  // the next diff would have those cells read as downgrades a second time.
-  stampedThisFrame.clear();
-
+  // Read AFTER the snap, deliberately: a replay landing just above set
+  // `prevGrid` to the board it landed on, and this meal must start from there.
   const before = prevGrid;
-  if (before.length !== target.length || target.length !== rows * cols) {
+  if (before.length !== target.length) {
+    // Nothing to replay FROM — the first frame of a match, or the board's
+    // dimensions changed under us. The caller draws the server's board as sent
+    // and the normal grid diff takes over.
+    //
+    // BAILING BEFORE the discard below matters: the diff path taking over is
+    // exactly the cast record's consumer, and discarding here left it with
+    // nothing to read, so a cast landing on such a frame lost its bloom.
     //spawnFeastTallyFloaters(tally);
     return false;
   }
+
+  // Any cast on this frame is folded into the board the replay starts from
+  // (below) and bloomed there, so the covered set has been spent: leaving it for
+  // the next diff would have those cells read as downgrades a second time.
+  // DISCARDED rather than consumed — nothing reads it, so nothing is sealed.
+  castRecord.discard();
 
   const board = before.slice();
   // The cast that ENDED the turn resolved in the same server tick as the feast,
@@ -3497,7 +3586,7 @@ function startFeastCinematic(game) {
     holdT: 0,
     chompS: LAYOUT.cinematic.chompPauseS,
     t: 0,
-    deferred: { score: 0, hunger: 0, stamps: [] },
+    deferred: { score: 0, hunger: 0 },
     tally,
   };
 
@@ -3593,11 +3682,19 @@ function armEatPass(game) {
  * clock.
  *
  * The clamp covers the queued cell animations too, since the replay's stage
- * timers and its falling tiles have to stay in lockstep or tiles land before (or
- * after) the stage that owns them.
+ * timers and its travelling tiles have to stay in lockstep or tiles land before
+ * (or after) the stage that owns them.
+ *
+ * UNCONDITIONAL, not just while a replay runs. The grid's own slide and flash
+ * animations have exactly the same problem: a returning tab handed them a
+ * multi-second step and they finished in the frame they started, so the change
+ * appeared instantly with no animation at all. That looked identical to the
+ * dropped-frame bug and shared none of its cause, which is how it hid for so
+ * long. There is nothing to be gained by spending an absence: no animation here
+ * chases a clock, they all just play.
  */
 function boardStep(dt) {
-  return cinematic ? Math.min(dt, LAYOUT.cinematic.maxStepS) : dt;
+  return Math.min(dt, LAYOUT.cinematic.maxStepS);
 }
 
 /** Advance the replay one frame.  Drives the Lil Guys for its duration. */
@@ -4029,8 +4126,9 @@ function beginMatchFx() {
   });
 
   c.stage = "matchFx";
-  // A beat to read the reaction before the feast re-opens.
-  c.t = LAYOUT.cinematic.collapseS;
+  // A beat to read the reaction before the feast re-opens.  Its OWN knob:
+  // this is a pause, not travel, so retuning the conveyor must not retime it.
+  c.t = LAYOUT.cinematic.matchBeatS;
 }
 
 /**
@@ -4063,6 +4161,7 @@ function nextPassOrFinish() {
  */
 function finishSettle() {
   const c = cinematic;
+  tallyReplayEnd(false);
   for (let flat = 0; flat < c.target.length; flat++) {
     if (c.board[flat] === c.target[flat]) continue;
     console.warn("[game] feast replay diverged from the server board at", flat,
@@ -4072,9 +4171,40 @@ function finishSettle() {
   endCinematic();
 }
 
+/**
+ * Replays cut short vs. replays that ran to the end.
+ *
+ * A snap is the visible symptom of a replay that could not finish in the time
+ * the bite clock allowed: the meal jump-cuts to the server's board. One here and
+ * there is by design — the realtime clock does not wait — but a HIGH RATE means
+ * the replay is systematically slower than the interval feeding it, and every
+ * cut one is an animation the player never saw. That is exactly the complaint
+ * this whole investigation started from, so measure before tuning: the fix for a
+ * 2% rate (nothing) and a 60% rate (the replay is too long, or the passes are)
+ * are not the same fix, and guessing between them is how you make it worse.
+ *
+ * Reported on a change of whole percent so a healthy game stays quiet.
+ */
+const replayTally = { snapped: 0, landed: 0, lastPct: -1 };
+
+/** Count a replay ending, and report the snap rate when it moves. */
+function tallyReplayEnd(snapped) {
+  if (snapped) replayTally.snapped++;
+  else replayTally.landed++;
+  const total = replayTally.snapped + replayTally.landed;
+  // Under 10 is noise, not a rate.
+  if (total < 10) return;
+  const pct = Math.round((replayTally.snapped / total) * 100);
+  if (pct === replayTally.lastPct) return;
+  replayTally.lastPct = pct;
+  console.log(
+    `[game] feast replays cut short: ${pct}% (${replayTally.snapped}/${total})`);
+}
+
 /** Cut the replay short and land it on the server's board immediately. */
 function snapFinishCinematic() {
   if (!cinematic) return;
+  tallyReplayEnd(true);
   cellAnim.clear();
   // Fliers belong to the meal being cut: land them all as one arrival — a
   // single swell stands in for the flock, and drawScoreHud's idle sync snaps
@@ -4099,10 +4229,6 @@ function endCinematic() {
   // silently here.
   prevGrid = c.target.slice();
   //spawnFeastTallyFloaters(c.tally);
-  // Casts held during the replay, released now that the board they describe is
-  // the one on screen.  Stacked after the tally so the headline reads first.
-  c.deferred.stamps.forEach((ev, i) => floatStampOutcome(ev, i + 1, c.rows, c.cols));
-  c.deferred.stamps.length = 0;
 }
 
 /**
@@ -4394,8 +4520,13 @@ let lastTransientGame = null;
  * and the diff in updateGridAnims — two boards the server actually sent — is
  * what decides what changed.  Should this mirror ever drift from the server,
  * the worst it can do is mistime a spark.
+ *
+ * The one producer updateGridAnims cannot call for itself: a cast landing
+ * mid-replay has to be recorded on the frame it lands, and the diff does not
+ * run during a replay.  Hence the accumulator, and hence its seal — this
+ * running after the diff would be a write nothing ever reads.
  */
-function recordCastChain(game) {
+function recordCastChain(record, game) {
   const events = game.shape_casts ?? [];
   if (events.length === 0) return;
   const { rows, cols } = gridDims(game);
@@ -4423,15 +4554,9 @@ function recordCastChain(game) {
   for (const ev of events) {
     stampOn(board, castOffsets(ev, cols), Math.floor(ev.anchor / cols),
       ev.anchor % cols, rows, cols, shapeOutcome(), 0,
-      // Deepest link wins when several casts in one frame reach the same
-      // cell: the cell settles when the LAST thing that touched it is done,
-      // and holding it that long is what keeps it from changing twice.
-      ({ flat, depth, source }) => {
-        const link = staged ? depth : 0;
-        const prev = stampedThisFrame.get(flat);
-        if (prev && prev.depth >= link) return;
-        stampedThisFrame.set(flat, { depth: link, source });
-      });
+      // `note` keeps the deepest link when several casts in one frame reach
+      // the same cell — see makeCastRecord.
+      ({ flat, depth, source }) => record.note(flat, staged ? depth : 0, source));
   }
 }
 
@@ -4450,17 +4575,39 @@ function matchBlockCells(center, rows, cols) {
   return cells;
 }
 
-/** One floater per resolved match, anchored at the run's centre. */
+/**
+ * Note every cell this frame's resolved matches reached, so the diff can tell
+ * a 5x5's downgrades from arriving slime.
+ *
+ * Called by updateGridAnims and by nothing else, deliberately: it is a
+ * PRODUCER of a record that same function consumes and empties, and while the
+ * two sat side by side in drawGame this ran second and every cell it noted was
+ * discarded unread — so a match's downgrades read as replacements and
+ * travelled.  Being invoked by its own consumer is what makes that
+ * unwritable.
+ *
+ * Only frames that could not be replayed reach here at all: a replay pops and
+ * flashes its matches itself, at the moment in its pass structure they fired.
+ */
+function recordMatchBlocks(record, game, rows, cols) {
+  for (const ev of game.special_matches ?? []) {
+    for (const flat of matchBlockCells(ev.center, rows, cols)) {
+      // A resolved match is one event with no reaction behind it: every cell
+      // is the first and only link, so none of them is held.
+      record.note(flat, 0, "block");
+    }
+  }
+}
+
+/** One floater per resolved match, anchored at the run's centre.
+ *
+ *  Cosmetic only — the cells are recorded by recordMatchBlocks, which the grid
+ *  diff calls itself — so this is free to run anywhere in the frame. */
 function spawnMatchFloaters(game) {
   const events = game.special_matches ?? [];
   if (events.length === 0) return;
   const { rows, cols } = gridDims(game);
   events.forEach((ev, i) => {
-    for (const flat of matchBlockCells(ev.center, rows, cols)) {
-      // A resolved match is one event with no reaction behind it: every cell
-      // is the first and only link, so none of them is held.
-      stampedThisFrame.set(flat, { depth: 0, source: "block" });
-    }
     const at = cellCenter(ev.center, rows, cols);
     const hits = sumTiers(ev.downgraded);
     const head = hits > 0
@@ -4654,21 +4801,45 @@ function drawBabies(game) {
 const BABY_CHOMP_S = 0.25;
 
 function drawGame(game, dt) {
-  // The render loop redraws `latestMsg` every animation frame (~60Hz) while
-  // server frames arrive at ~20Hz, so the same frame is drawn ~3 times.
-  // Transient events (dispense outcomes, recipe fires, turn ends, refusals) are
-  // per-frame facts, NOT per-draw, and must be consumed exactly once or they
-  // spawn triplicate floaters.
+  // The render loop redraws the newest frame every animation frame (~60Hz)
+  // while frames arrive at the server's tick rate (~20Hz), so the same frame is
+  // drawn ~3 times over. Transient events (dispense outcomes, recipe fires,
+  // settled bites, refusals) are per-FRAME facts, not per-draw, and must be
+  // consumed exactly once or they spawn triplicate floaters.
+  //
+  // Frame identity is the whole test, and it is sound in both directions: a
+  // redraw of an unchanged frame is literally the same object, and every merge
+  // builds a new one (see mergeFrames). It used to be the client that sent each
+  // board three times; now it sends one frame per tick and this catches the
+  // renderer's own repeats.
   const fresh = game !== lastTransientGame;
   lastTransientGame = game;
 
   tickFloaters(dt);
 
-  // Stamp outcomes are read first: they tell the grid diff which cells were
-  // covered (a downgrade blooms in place; a replacement drops in), and the feast
+  // A new server frame: the cast record accepts writes again (see
+  // makeCastRecord).  Non-fresh draws neither produce nor consume, so the seal
+  // set by the last diff stands until the next frame actually arrives.
+  if (fresh) {
+    castRecord.open();
+    // TRIPWIRE. Cells noted by an earlier frame that no diff ever read. A
+    // replay in flight explains it and is the common case — a mid-replay cast
+    // is deliberately held for the diff that runs when the replay lands — and
+    // nothing else does. They are kept regardless, since consuming them late is
+    // the behaviour that makes that held cast bloom at all; this only says so
+    // out loud, because the failure is otherwise invisible: the bloom simply
+    // never happens and the cell changes with no reaction on it.
+    const carried = castRecord.carried();
+    if (carried > 0 && !cinematicActive()) {
+      console.warn(
+        `[game] cast record: ${carried} cell(s) noted last frame and never read`);
+    }
+  }
+
+  // Casts are recorded first: they tell the grid diff which cells a reaction
+  // reached (a downgrade blooms in place; a replacement travels), and the feast
   // replay below starts from the board those same stamps produced.
-  //if (fresh) spawnStampFloaters(game);
-  if (fresh) recordCastChain(game);
+  if (fresh) recordCastChain(castRecord, game);
 
   // A settled bite starts the feast replay, which then owns the board and the
   // Lil Guys until it lands.  It must start BEFORE anything reads the board,
@@ -4681,7 +4852,7 @@ function drawGame(game, dt) {
     : false;
   updateFeastTracking(game);
 
-  // The replay and the cells it drops share one clamped step, or tiles land out
+  // The replay and the cells it moves share one clamped step, or tiles land out
   // of step with the stage that owns them.  Idle Lil Guys keep real time: they
   // are ambient, and nobody minds them teleporting a little after a hidden tab.
   const step = boardStep(dt);
@@ -4692,14 +4863,17 @@ function drawGame(game, dt) {
   }
 
   tickGridAnims(step);
-  // Diffing is the replay's job while it runs: it queues the eats, falls and
+  // Diffing is the replay's job while it runs: it queues the eats, slides and
   // refills itself, and adopts the board it landed on when it ends.  Cells
   // stamped meanwhile are kept, not dropped: the team keeps casting while the
   // replay plays, and the first diff after it lands is what has to tell those
   // downgrades from refills.
+  //
+  // The diff collects the match producer itself and empties the record, so
+  // this is the LAST thing in the frame that may touch it.
   if (fresh && !cinematicActive() && !startedReplay) {
     const d = gridDims(game);
-    updateGridAnims(game.grid ?? [], d.rows, d.cols);
+    updateGridAnims(castRecord, game, game.grid ?? [], d.rows, d.cols);
   }
   if (fresh) {
     spawnRefusalFloater(game);
@@ -4707,6 +4881,8 @@ function drawGame(game, dt) {
     // Match reactions belong to the replay's pass structure — it pops and
     // flashes them at the moment they fired.  Only when a frame could not be
     // replayed (no prior board) do they float here, over the board as sent.
+    // Floaters ONLY: the cells were recorded by the diff above, which is why
+    // this may sit after it (see recordMatchBlocks).
     if (!startedReplay && !cinematicActive()) spawnMatchFloaters(game);
     updateMenuFx(game);
   }
@@ -4993,6 +5169,97 @@ let latestMsg = null;
 let lastTs = null;
 let lastPhase = null;
 
+/**
+ * Render frames wait here between arriving on the socket and the next
+ * animation frame.
+ *
+ * They used to overwrite each other in a single `latestMsg` slot, and a frame
+ * overwritten before rAF next ran took its ONE-SHOT events to the grave: the
+ * pops, the flashes and the whole settle replay never played, because the
+ * renderer only ever looked at the newest frame. A server tick is 50ms and an
+ * animation frame is ~17, so this is not the normal case — but a throttled
+ * tab, a GC pause, or one heavy cinematic frame is all it takes, and the loss
+ * was completely silent.
+ *
+ * @type {object[]}
+ */
+const inbox = [];
+
+/**
+ * How a merge folds each TRANSIENT frame field. Anything absent from this
+ * table comes from the newest frame, which is correct for the board and every
+ * scalar: those are absolute state, so the newest IS the truth.
+ *
+ * - `concat` — additive one-shots (a flash, a floater, a popped run). They are
+ *   independent of each other and of the board, so every tick's worth must
+ *   survive, in arrival order.
+ * - `last` — one-shots stating a single latest fact. A second one inside the
+ *   window says the same thing about a newer moment, so it wins outright.
+ * - `bite` — the settle replay, which is NOT additive. See mergeFrames.
+ *
+ * KEEP THIS EXHAUSTIVE. A transient field missing from here falls through to
+ * "newest wins", silently dropping the older ticks' copies — precisely the bug
+ * this merge exists to fix. frame_harness.mjs reads the field list back out of
+ * the Zig writer and fails if the two ever drift.
+ */
+const FRAME_TRANSIENTS = {
+  shape_casts: "concat",
+  recipes_fired: "concat",
+  special_matches: "concat",
+  refills: "bite",
+  bite_settled: "bite",
+  eggs_hatched: "last",
+  over_budget: "last",
+  cast_refused: "last",
+};
+
+/**
+ * Fold every frame that arrived since the last animation frame into one.
+ *
+ * @param {object[]} frames - render frames, in arrival order (never empty).
+ * @returns {object} the frame to draw.
+ */
+function mergeFrames(frames) {
+  // One tick is already coherent: the client emits a frame per server tick,
+  // with every event beside the board that reflects it. So the normal path
+  // merges nothing at all, and only a stalled renderer pays for this.
+  if (frames.length === 1) return frames[0];
+
+  const newest = frames[frames.length - 1];
+  if (!newest.game) return newest;
+  const games = frames.map((f) => f.game).filter((g) => g);
+
+  const game = { ...newest.game };
+
+  for (const [field, how] of Object.entries(FRAME_TRANSIENTS)) {
+    if (how === "concat") {
+      game[field] = games.flatMap((g) => g[field] ?? []);
+    } else if (how === "last") {
+      game[field] = undefined;
+      for (const g of games) if (g[field]) game[field] = g[field];
+    }
+  }
+
+  // The settle replay is a COUPLED unit, not an additive event: `bite_settled`
+  // carries the pass count the replay loops on, and `refills` are keyed by a
+  // pass index that every bite numbers from zero. Concatenating two bites'
+  // passes would let the second bite's pass 0 masquerade as the first's, and
+  // the replay would walk a cascade that never happened. So the newest bite
+  // wins WHOLE and the superseded one's passes go with it: that costs one
+  // skipped animation and lands on the same board — the snapshot is the truth
+  // either way. The Zig client guards identically when one tick settles two
+  // bites; this is the same rule one layer out.
+  const lastBite = games.filter((g) => g.bite_settled).pop();
+  game.bite_settled = lastBite?.bite_settled;
+  game.refills = lastBite?.refills ?? [];
+  // `special_matches` has two readers and they are mutually exclusive: the
+  // replay walks it per pass, and the no-replay path just flashes the lot. So
+  // while a bite is replaying, only that bite's matches mean anything.
+  if (lastBite) game.special_matches = lastBite.special_matches ?? [];
+
+  return { ...newest, game };
+}
+
 function renderFrame(msg, dt) {
   // A game_over frame without a board is nothing to replay: the outro is
   // skipped and the report drawn immediately, exactly as before.
@@ -5043,6 +5310,14 @@ function renderFrame(msg, dt) {
 function gameLoop(ts) {
   const dt = lastTs !== null ? (ts - lastTs) / 1000 : 0;
   lastTs = ts;
+  if (inbox.length > 0) {
+    latestMsg = mergeFrames(inbox);
+    inbox.length = 0;
+  }
+  // Drawn every animation frame, inbox or not: animations advance on `dt`, and
+  // a frame already seen is drawn again with `fresh` false so its one-shots
+  // cannot fire twice. drawGame keys that off frame identity, and an unchanged
+  // `latestMsg` is by definition the same object.
   if (latestMsg) renderFrame(latestMsg, dt);
   requestAnimationFrame(gameLoop);
 }
@@ -5066,16 +5341,23 @@ function connect() {
     try { msg = JSON.parse(ev.data); } catch { return; }
 
     if (msg.tag === "render") {
-      latestMsg = msg;
+      // QUEUED, not assigned: the next animation frame folds everything that
+      // landed since the last one, so a frame arriving in the same rAF gap as
+      // another cannot bury its one-shot events.
+      inbox.push(msg);
     } else if (msg.tag === "pre_lobby") {
       // Bridge is asking us to pick a room.
       resetPreLobby();
+      // Not a render frame: queued frames describe a game we are leaving, and
+      // replaying their events over a lobby screen would be nonsense.
+      inbox.length = 0;
       latestMsg = { phase: "pre_lobby" };
     } else if (msg.tag === "joining") {
       // Bridge confirmed the room exists and is connecting us.
       // Switch to connecting screen immediately so the user gets feedback
       // and any stale error text disappears.
       resetPreLobby();
+      inbox.length = 0;
       latestMsg = { phase: "connecting" };
       // Adopt the lobby's config: a room created from /config/{hash} uses
       // that hash's balance tables; joiners from any page must match.
@@ -5093,6 +5375,7 @@ function connect() {
             `Error: ${msg.reason}`;
       resetPreLobby();
       preLobbyError = errMsg;
+      inbox.length = 0;
       latestMsg = { phase: "pre_lobby" };
     } else if (msg.tag === "full") {
       drawFull();

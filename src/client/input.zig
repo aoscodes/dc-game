@@ -15,6 +15,25 @@ const shared = @import("shared");
 const c = shared.components;
 const protocol = shared.protocol;
 
+/// One line of bridge text, delimiter consumed and stripped; null at clean EOF.
+///
+/// This exists to name a trap.  The obvious-looking `takeDelimiterExclusive`
+/// tosses only the line's own bytes and LEAVES the '\n' in the buffer, so the
+/// next call finds the delimiter at offset 0, returns an empty slice, tosses
+/// nothing, and spins on empty lines forever — a silent livelock that starves
+/// the whole client of input while looking, from the outside, like a stall.
+/// `takeDelimiter` consumes the delimiter and reports clean EOF as null.
+///
+/// `error.StreamTooLong` means the line outran the reader's buffer and NOTHING
+/// was consumed; the caller must discard to the next newline or it will spin on
+/// the same line.  `error.ReadFailed` leaves the cause in the reader's `err`.
+pub fn next_line(reader: *std.io.Reader) error{ ReadFailed, StreamTooLong }!?[]const u8 {
+    const line = try reader.takeDelimiter('\n') orelse return null;
+    // The bridge is line-oriented; a CRLF pipe must not smuggle a '\r' into a
+    // key name or a hex payload.
+    return std.mem.trimRight(u8, line, "\r");
+}
+
 pub fn parse_key_name(name: []const u8) ?RawKey {
     if (std.mem.eql(u8, name, "Enter")) return .enter;
     if (std.mem.eql(u8, name, "Escape")) return .escape;
@@ -321,4 +340,49 @@ test "drain: seat keys surface as flags and block nothing" {
     try std.testing.expect(out.take_seat);
     try std.testing.expect(out.leave_seat);
     try std.testing.expectEqualSlices(protocol.CursorDir, &.{.left}, out.cursor_steps());
+}
+
+test "next_line: consumes the delimiter instead of spinning on it" {
+    // The regression this function is named for. With takeDelimiterExclusive
+    // this loop never terminates: line 2 onward come back as empty slices
+    // forever, because the '\n' is never consumed.
+    var r = std.io.Reader.fixed("READY\nJOIN\nWIRE:abcd\n");
+    var seen: [8][]const u8 = undefined;
+    var n: usize = 0;
+    while (try next_line(&r)) |line| {
+        // A spin shows up here as an unbounded run of empty lines, so cap it
+        // rather than hanging the test runner.
+        try std.testing.expect(n < seen.len);
+        seen[n] = line;
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("READY", seen[0]);
+    try std.testing.expectEqualStrings("JOIN", seen[1]);
+    try std.testing.expectEqualStrings("WIRE:abcd", seen[2]);
+}
+
+test "next_line: a blank line is a line, not end of stream" {
+    // Distinct from the spin: one genuine empty line must be reported once and
+    // must not be mistaken for EOF, or a stray newline would kill the reader.
+    var r = std.io.Reader.fixed("\nJOIN\n");
+    const first = try next_line(&r);
+    try std.testing.expectEqualStrings("", first.?);
+    const second = try next_line(&r);
+    try std.testing.expectEqualStrings("JOIN", second.?);
+    try std.testing.expectEqual(@as(?[]const u8, null), try next_line(&r));
+}
+
+test "next_line: an unterminated final line still arrives" {
+    // The bridge can die mid-write; whatever it managed to send is still a
+    // line, and the EOF after it is clean.
+    var r = std.io.Reader.fixed("READY\nJOI");
+    _ = try next_line(&r);
+    try std.testing.expectEqualStrings("JOI", (try next_line(&r)).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), try next_line(&r));
+}
+
+test "next_line: strips a CRLF carriage return" {
+    var r = std.io.Reader.fixed("KEY:Enter\r\n");
+    try std.testing.expectEqualStrings("KEY:Enter", (try next_line(&r)).?);
 }

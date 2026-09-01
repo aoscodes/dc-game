@@ -44,6 +44,53 @@ pub const Writer = struct {
     }
 };
 
+/// Decides WHEN a render frame goes out.
+///
+/// The server ends every tick by broadcasting `game_state` (unconditionally —
+/// see the session's tick, and `end_game` for the closing board), so that
+/// message is a reliable END-OF-TICK MARKER: everything the tick had to say —
+/// the casts, the matches, the settled feast — was already sent, and the board
+/// that reflects it has now landed.  Emitting on THAT is what keeps a tick's
+/// transients in the same frame as the board they describe.
+///
+/// A wall-clock timer cannot do this, and that was the bug: the events and the
+/// board are separate socket writes, so a timer firing between them SPLIT them
+/// — the events into one frame against the pre-event board, the board into the
+/// next with the transients already drained.  The renderer, which keeps only
+/// the newest frame, then dropped whichever half it saw second, and the
+/// animation simply did not play.  It also emitted every tick's board three
+/// times (60Hz out, 20Hz in), which is what made the loss look intermittent.
+///
+/// STRICT BY DESIGN: no heartbeat.  A frame goes out only when the client has
+/// something new to say, so a held game costs nothing — and both holds (the
+/// pre-match guide and the end screen) stop broadcasting `game_state`
+/// entirely, which is why `note_standing` exists.  The renderer keeps drawing
+/// the last frame it was given, so one emit is all a static screen needs.
+pub const RenderGate = struct {
+    pending: bool = false,
+
+    /// A tick's board arrived: every event that tick sent is now complete and
+    /// the board that reflects them is in hand.
+    pub fn note_state(self: *RenderGate) void {
+        self.pending = true;
+    }
+
+    /// This connection's STANDING changed — phase, seat, or encounter identity
+    /// (game_start, game_over).  The held screens broadcast no `game_state`,
+    /// so this is the only thing that ever gets them drawn.
+    pub fn note_standing(self: *RenderGate) void {
+        self.pending = true;
+    }
+
+    /// Take the pending emit, if any.  Checked ONCE PER LOOP ITERATION, after
+    /// the whole recv queue is drained, so a tick's `game_state` and the
+    /// `game_over` behind it coalesce into a single frame instead of two.
+    pub fn take(self: *RenderGate) bool {
+        defer self.pending = false;
+        return self.pending;
+    }
+};
+
 pub const ClientPhaseTag = enum { connecting, pre_match, game, game_over };
 
 pub const LastActionEntry = struct { entity: u32, anim: c.ActionAnimation };
@@ -81,8 +128,14 @@ pub const GameState = struct {
     recipes_fired: [16]proto.RecipeFired = undefined,
     recipe_count: u8 = 0,
     /// The feast that settled, if a bite settled since the last render
-    /// write (transient).  At most one per frame: when a slow frame swallows
-    /// two, the later wins — it describes the next snapshot's board.
+    /// write (transient).  At most one per frame: when a frame swallows two,
+    /// the later wins — it describes the next snapshot's board.
+    ///
+    /// A frame now covers exactly one server tick (see RenderGate), so this
+    /// collapses only when the server settles two bites in ONE tick — a
+    /// catch-up path that needs the tick to overrun a whole bite interval
+    /// (seconds).  When it does, the earlier bite's per-pass events below are
+    /// dropped with it, so the replay never mixes two feasts' passes.
     bite_settled: ?proto.BiteSettled = null,
     /// Shapes stamped since the last render write (transient): the resolved
     /// footprint of each landed cast, so the renderer can flash exactly the
@@ -856,4 +909,50 @@ test "an open board reports no settle window and no refusal" {
     // Absent, not null: transient fields are omitted from the frame entirely,
     // which is what lets `game.cast_refused` read as falsy in the renderer.
     try testing.expect(g.get("cast_refused") == null);
+}
+
+// ---------------------------------------------------------------------------
+// RenderGate
+// ---------------------------------------------------------------------------
+
+test "RenderGate: a fresh gate has nothing to say" {
+    // The loop wakes 60 times a second.  If an idle wake emitted, the gate
+    // would be a timer with extra steps.
+    var gate: RenderGate = .{};
+    try testing.expect(!gate.take());
+    try testing.expect(!gate.take());
+}
+
+test "RenderGate: a tick's board arms exactly one frame" {
+    var gate: RenderGate = .{};
+    gate.note_state();
+    try testing.expect(gate.take());
+    // Drained.  The server ticks at 20Hz and the loop wakes at 60, so the two
+    // wakes that follow must stay silent — emitting on them is what sent every
+    // board three times over.
+    try testing.expect(!gate.take());
+    try testing.expect(!gate.take());
+}
+
+test "RenderGate: a tick's messages coalesce into one frame" {
+    // The closing tick sends the board and then the report, and a settling
+    // tick sends its events before the board.  All of it is drained before the
+    // gate is read, so the whole tick costs ONE frame — that co-arrival is the
+    // entire point: transients and the board they describe stay together.
+    var gate: RenderGate = .{};
+    gate.note_state();
+    gate.note_standing();
+    gate.note_state();
+    try testing.expect(gate.take());
+    try testing.expect(!gate.take());
+}
+
+test "RenderGate: standing alone arms a frame, with no board" {
+    // Both holds — the pre-match guide and the end screen — return from the
+    // session tick BEFORE it broadcasts game_state, so a gate that waited for
+    // a board would leave those screens undrawn forever.
+    var gate: RenderGate = .{};
+    gate.note_standing();
+    try testing.expect(gate.take());
+    try testing.expect(!gate.take());
 }

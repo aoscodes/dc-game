@@ -288,4 +288,30 @@ pub fn build(b: *std.Build) !void {
     const web_test_step = b.step("web-test", "Run the JS mirror harnesses");
     web_test_step.dependOn(&web_test.step);
     test_step.dependOn(&web_test.step);
+
+    // -----------------------------------------------------------------------
+    // Render-gate probe  (zig build gate-probe)
+    // -----------------------------------------------------------------------
+    //
+    // The only test that runs the CLIENT BINARY.  `zig build e2e` drives the
+    // server with protocol-level bots and never spawns a client, so the whole
+    // client emit path — stdin reader, render gate, JSON writer — was untested
+    // end to end.  A stdin reader that livelocked and emitted zero frames once
+    // passed every other step in this file; that is the gap this closes.
+    //
+    // Wired into `test` despite taking ~14s of wall clock, because the failure
+    // it catches is invisible to every cheaper check and fatal to the game.
+    // Override the window with PROBE_SECONDS when iterating.
+    const probe_client_install = b.addInstallArtifact(client_exe, .{});
+    const probe_server_install = b.addInstallArtifact(server_exe, .{});
+    const gate_probe = b.addSystemCommand(&.{ "node", "bridge/test/gate_probe.mjs" });
+    gate_probe.setCwd(b.path("."));
+    gate_probe.step.dependOn(&probe_client_install.step);
+    gate_probe.step.dependOn(&probe_server_install.step);
+    // It spawns a real server on a real port and measures real elapsed time, so
+    // it is never up to date and must not be cached.
+    gate_probe.has_side_effects = true;
+    const gate_probe_step = b.step("gate-probe", "Measure the client's render frames end to end");
+    gate_probe_step.dependOn(&gate_probe.step);
+    test_step.dependOn(&gate_probe.step);
 }

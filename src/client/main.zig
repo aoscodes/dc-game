@@ -19,8 +19,13 @@ const STAT_APPETITE_PREFIX = "STAT:appetite=";
 /// bridge before JOIN.
 const STAT_BABIES_PREFIX = "STAT:babies=";
 
-const RENDER_HZ: u64 = 60;
-const TICK_NS: u64 = std.time.ns_per_s / RENDER_HZ;
+/// How often the loop WAKES.  Not how often it emits: input is forwarded at
+/// this rate to keep presses responsive, while render frames go out only when
+/// the server gives us something new to draw (see sw.RenderGate).  Emitting at
+/// this rate was the animation-loss bug — it split a tick's events from the
+/// board they described, and sent each board three times over.
+const POLL_HZ: u64 = 60;
+const TICK_NS: u64 = std.time.ns_per_s / POLL_HZ;
 
 const MsgQueue = struct {
     buf: [16384]u8 = undefined,
@@ -94,6 +99,9 @@ const ClientState = struct {
     send_buf: [512]u8 = undefined,
     recv_queue: MsgQueue = .{},
     recv_scratch: [4096]u8 = undefined,
+    /// Whether this frame has anything new to draw.  Armed by the messages
+    /// that complete a tick or change our standing, never by the clock.
+    render_gate: sw.RenderGate = .{},
 };
 
 var g_state: ClientState = .{};
@@ -114,19 +122,36 @@ fn stdout_writer() sw.Writer {
 }
 
 fn stdin_reader(_: void) void {
-    var stdin_file = std.fs.File.stdin();
-    const stdin = stdin_file.deprecatedReader();
-    var line_buf: [4096]u8 = undefined;
+    const stdin_file = std.fs.File.stdin();
+    // BUFFERED, and that matters for more than syscall count.  Unbuffered, a
+    // line cost one read() per byte, which stretched the delivery of a single
+    // wire message over milliseconds — wide enough for the render loop to run
+    // between a tick's events and the board that described them, and split
+    // them into two frames.  The gate (sw.RenderGate) is what makes that
+    // harmless; this is what makes it rare.  Streaming mode because stdin is a
+    // pipe: positional reads would just fail a syscall first.
+    var read_buf: [8192]u8 = undefined;
+    var stdin_reader_state = stdin_file.readerStreaming(&read_buf);
+    const stdin = &stdin_reader_state.interface;
     var hex_buf: [2048]u8 = undefined;
 
     while (true) {
-        const line = stdin.readUntilDelimiter(&line_buf, '\n') catch |err| {
-            if (err == error.EndOfStream) return;
-            std.log.err("stdin read error: {}", .{err});
-            std.Thread.sleep(10 * std.time.ns_per_ms);
-            continue;
-        };
-        const trimmed = std.mem.trimRight(u8, line, "\r");
+        const trimmed = inp.next_line(stdin) catch |err| switch (err) {
+            // The line outran the buffer, and NOTHING was consumed — returning
+            // to the top would spin on the same line forever.  Discard it up to
+            // its newline and carry on with the next.
+            error.StreamTooLong => {
+                std.log.err("stdin line longer than {} bytes; discarding it", .{read_buf.len});
+                _ = stdin.discardDelimiterInclusive('\n') catch return;
+                continue;
+            },
+            error.ReadFailed => {
+                std.log.err("stdin read error: {?}", .{stdin_reader_state.err});
+                std.Thread.sleep(10 * std.time.ns_per_ms);
+                continue;
+            },
+            // The bridge closed our stdin: it is done with us, so stop reading.
+        } orelse return;
 
         if (std.mem.eql(u8, trimmed, "READY")) {
             // The bridge's server socket is open.  Nothing to send: every
@@ -271,16 +296,28 @@ fn process_recv() void {
                 // A holding encounter shows the pre-match guide until a
                 // browser tab clicks past it (another game_start follows).
                 g_state.phase = if (p.prematch) .pre_match else .game;
+                // ALWAYS, not just on a phase change: a re-issued game_start
+                // is how a seat grant reaches us, and player_id is on screen.
+                // The pre-match guide also depends on this — a holding session
+                // broadcasts no game_state at all, so nothing else would ever
+                // get the guide drawn.
+                g_state.render_gate.note_standing();
             },
             .game_state => {
                 const p = proto.decode_game_state(r) catch continue;
                 g_state.game.snapshot = p;
+                // The tick's board: its events are all in hand now, so this
+                // is the moment the frame is complete.
+                g_state.render_gate.note_state();
             },
             .game_over => {
                 const p = proto.decode_game_over(r) catch continue;
                 g_state.game.final_score = p.score;
                 g_state.game.final_stats = p.stats;
                 g_state.phase = .game_over;
+                // The closing board came first (end_game broadcasts it before
+                // the report), so this coalesces with it into one frame.
+                g_state.render_gate.note_standing();
             },
             .action_result => {
                 const p = proto.decode_action_result(r) catch continue;
@@ -337,7 +374,29 @@ fn process_recv() void {
                 // Transient, drained per frame: the renderer plays the devour
                 // animation off this.  A later bite in the same frame wins —
                 // it describes the field the next snapshot will show.
-                g_state.game.bite_settled = p;
+                //
+                // A frame is one server tick now (see sw.RenderGate), so this
+                // only collapses when the server settles two bites in a single
+                // tick: the catch-up path that needs a tick to overrun a whole
+                // bite interval (seconds).  Rare, but it must not CORRUPT.
+                // The per-pass events carry only a pass index, numbered from 0
+                // by each bite, so keeping both bites' passes would let the
+                // second bite's pass 0 masquerade as the first's and the
+                // renderer would replay a cascade that never happened.  Drop
+                // the superseded bite's passes with it: replaying only the
+                // later feast is wrong by an animation, not by a board — the
+                // snapshot we land on is the truth either way.
+                const gs = &g_state.game;
+                if (gs.bite_settled != null) {
+                    std.log.warn(
+                        "two bites settled in one tick (bite {} superseded {}); " ++
+                            "dropping the earlier feast's {} refills and {} matches",
+                        .{ p.bite, gs.bite_settled.?.bite, gs.refill_count, gs.special_match_count },
+                    );
+                    gs.refill_count = 0;
+                    gs.special_match_count = 0;
+                }
+                gs.bite_settled = p;
             },
             .special_matched => {
                 const p = proto.decode_special_matched(r) catch continue;
@@ -411,7 +470,12 @@ pub fn main() !void {
             },
         }
 
-        out.write_render(g_state.phase, &g_state.game);
+        // Only when there is something new to say.  Checked here, after the
+        // whole queue is drained, so every message a tick sent rides out in
+        // ONE frame together with the board that reflects it.
+        if (g_state.render_gate.take()) {
+            out.write_render(g_state.phase, &g_state.game);
+        }
 
         next_tick += TICK_NS;
         const now = std.time.nanoTimestamp();
