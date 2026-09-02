@@ -9,21 +9,30 @@
     /* Near-black rather than the game's paper white: this screen is three
        saturated colours edge to edge, and anything lighter than the colours
        would read as the subject instead of the frame. */
-    body {
+    html, body {
       background: rgb(8, 8, 10);
       display: flex;
       align-items: center;
       justify-content: center;
-      min-height: 100vh;
+      width: 100vw;
+      height: 100vh;
       overflow: hidden;
     }
-    /* Same 2x backing store as the game (see LAYOUT in onboard.js): CSS pins
-       the on-screen size to the design space so the labels stay crisp. */
-    canvas { display: block; width: 1024px; height: 768px; }
+    /* Same panel and the same 1:1 backing store as the game (see LAYOUT in
+       onboard.js and web/index.html): aspect-locked to the design space so it
+       fills whatever viewport the kiosk browser hands us. */
+    canvas {
+      display: block;
+      aspect-ratio: 1024 / 600;
+      width: 100vw;
+      height: auto;
+      max-height: 100vh;
+      max-width: calc(100vh * 1024 / 600);
+    }
   </style>
 </head>
 <body>
-<canvas id="canvas" width="2048" height="1536"></canvas>
+<canvas id="canvas" width="1024" height="600"></canvas>
 <!-- ?v= is a cache buster: CI rewrites "dev" to the commit SHA on deploy. -->
 <script src="/onboard.js?v=dev"></script>
 </body>

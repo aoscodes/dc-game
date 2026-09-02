@@ -2,6 +2,24 @@ const std = @import("std");
 const proto = @import("shared").protocol;
 const c = @import("shared").components;
 
+/// Room for the widest render frame the wire caps admit.
+///
+/// Not hand-derived: the theoretical worst case is dominated by the 16 stored
+/// per-pass refills, each of which may name every one of MAX_GRID_CELLS cells,
+/// and it measures ~260 KB at 16x32 — far past what belongs on a stack, and
+/// far past what a realistic frame costs (~22 KB for a full board alone,
+/// ~61 KB with a full refill and heavy match/cast traffic on top).
+///
+/// So the buffer is static rather than stack, and the bound is PINNED BY A
+/// TEST ("the widest frame the wire caps admit fits frame_buf") that builds a
+/// maximal frame and measures it, because the grid caps are a tuning knob and
+/// arithmetic done by hand here rots the moment they move.
+const RENDER_BUF_BYTES = 320 * 1024;
+
+/// Guarded by `Writer.mu`: `write_render` is the only reader or writer, and
+/// it holds the lock across the whole encode-and-emit.
+var render_buf: [RENDER_BUF_BYTES]u8 = undefined;
+
 pub const Writer = struct {
     mu: *std.Thread.Mutex,
 
@@ -12,10 +30,11 @@ pub const Writer = struct {
     ) void {
         self.mu.lock();
         defer self.mu.unlock();
-        // Sized for the largest render frame: a MAX_GRID_CELLS grid of cell
-        // strings plus the full entity/stats payload.
-        var frame_buf: [32768]u8 = undefined;
-        var w = std.io.Writer.fixed(&frame_buf);
+        var w = std.io.Writer.fixed(&render_buf);
+        // Overflow here would be SILENT — these drop the frame, so a buffer
+        // that cannot hold the widest frame presents as a renderer that
+        // freezes under load rather than as an error.  RENDER_BUF_BYTES is
+        // sized so it cannot happen; the catches are for the writev.
         write_render_inner(&w, phase, game) catch return;
         w.writeByte('\n') catch return;
         const out = std.fs.File.stdout();
@@ -955,4 +974,52 @@ test "RenderGate: standing alone arms a frame, with no board" {
     gate.note_standing();
     try testing.expect(gate.take());
     try testing.expect(!gate.take());
+}
+
+test "the widest frame the wire caps admit fits render_buf" {
+    // write_render drops a frame it cannot encode, in silence, so an
+    // undersized render_buf does not fail — it just stops drawing, under
+    // exactly the load that matters.  The grid caps that dominate this are a
+    // tuning knob (components.MAX_GRID_*), so the bound is measured here
+    // rather than reasoned about at the declaration.
+    //
+    // Every count is pushed to its wire cap at once.  No real session reaches
+    // this — 16 passes each refilling the entire grid is not a board that can
+    // happen — which is the point: it is the bound the TYPES allow, so
+    // nothing a server can legally send overflows.
+    const alloc = testing.allocator;
+    const buf = try alloc.alloc(u8, 4 * RENDER_BUF_BYTES);
+    defer alloc.free(buf);
+
+    var game = GameState{};
+    game.snapshot.grid_rows = c.MAX_GRID_ROWS;
+    game.snapshot.grid_cols = c.MAX_GRID_COLS;
+    // Specials encode wider than plain slime, so a board of them is the
+    // expensive board.
+    for (0..c.MAX_GRID_CELLS) |i| game.snapshot.grid[i] = .{ .special = .neutralizer };
+    game.snapshot.entity_count = proto.MAX_ENTITIES_WIRE;
+    game.last_action_count = proto.MAX_ENTITIES_WIRE;
+    for (0..proto.MAX_ENTITIES_WIRE) |i|
+        game.last_actions[i] = .{ .entity = 1, .anim = .attack };
+    game.refill_count = game.refills.len;
+    for (&game.refills, 0..) |*r, i| {
+        r.* = .{ .pass = @intCast(i), .count = proto.MAX_REFILL_WIRE };
+        for (0..proto.MAX_REFILL_WIRE) |k| {
+            r.cells[k] = @intCast(k);
+            r.contents[k] = .{ .special = .neutralizer };
+        }
+    }
+    game.special_match_count = game.special_matches.len;
+    for (&game.special_matches) |*m|
+        m.* = .{ .kind = .neutralizer, .cell_count = proto.MAX_MATCH_CELLS_WIRE };
+    game.shape_cast_count = game.shape_casts.len;
+    for (&game.shape_casts) |*sc|
+        sc.* = .{ .caster = 1, .anchor = 1, .cell_count = proto.MAX_SHAPE_CELLS_WIRE };
+    game.recipe_count = game.recipes_fired.len;
+    for (&game.recipes_fired) |*r| r.* = .{ .kind = .player, .index = 0 };
+    game.eggs_hatched = .{ .count = proto.MAX_HATCHES_WIRE };
+
+    // +1 for the newline write_render appends after the payload.
+    const len = (try render_to_json(buf, &game)).len + 1;
+    try testing.expect(len <= RENDER_BUF_BYTES);
 }

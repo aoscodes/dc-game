@@ -26,7 +26,7 @@ const MIN_GROUP_MOVES = 2;
 const MAX_GROUP_MOVES = 6;
 /** Mirrors components.MAX_GRID_ROWS / MAX_GRID_COLS. */
 const MAX_GRID_ROWS = 16;
-const MAX_GRID_COLS = 16;
+const MAX_GRID_COLS = 32;
 /** Shapes are bounded by the grid: mirrors balance.MAX_SHAPE_ROWS/COLS. */
 const MAX_SHAPE_ROWS = MAX_GRID_ROWS;
 const MAX_SHAPE_COLS = MAX_GRID_COLS;

@@ -5,8 +5,17 @@ const LAYOUT = {
   // The canvas backing store is `renderScale` times larger (index.html) and a
   // single setTransform at boot scales design units up to it, so art and text
   // gain resolution without any coordinate in here changing.
-  screen: { w: 1024, h: 768 },
-  renderScale: 2,
+  //
+  // Sized to the cabinet's panel: 1024x600, driven by a Pi serving the game
+  // locally.  `renderScale` is 1 because the design space MATCHES that panel,
+  // so a design unit is a device pixel.  Supersampling only helps when the
+  // display is denser than the design space; here it would render 4x the
+  // pixels only to throw three of every four away on the way down — and with
+  // `image-rendering: pixelated` that downscale is a nearest-neighbour
+  // decimation, so it cost fill rate AND sharpness.  Raise this only if the
+  // game is ever pointed at a higher-density display.
+  screen: { w: 1024, h: 600 },
+  renderScale: 1,
   // The whole screen is the same PAPER as the slime field (see
   // slimeField.paper): one continuous e-paper surface, with everything on it
   // drawn as ink.
@@ -15,8 +24,22 @@ const LAYOUT = {
   // Slime field: the server-authoritative grid.  Its rows × cols come from
   // the wire (balance.slime_grid), so cell size is derived, not fixed: the
   // grid is square-celled and letterboxed inside this rect (see gridRect).
+  //
+  // This rect is the single control over how much board the screen gets: it
+  // takes every pixel the HUD above and the seat menus below do not, which is
+  // what lets `slime_grid` be tuned up to the caps without the tiles becoming
+  // unreadable.  Height is the binding constraint for any grid squarer than
+  // the rect, so rows are always the expensive axis.
   slimeField: {
-    x0: 40, x1: 984, y0: 220, y1: 620,
+    x0: 14, x1: 1010, y0: 96, y1: 504,
+
+    // Reserved strip along the LEFT of the rect that the grid may not use:
+    // the corral the Lil Guys and babies stand in (see lilGuyPost/babyPost).
+    // Carved out BEFORE the grid is fitted, so a grid wide enough to fill the
+    // rect cannot push the crew off-screen or under column 0.  Wide enough to
+    // hold the largest guy `lilGuySize` will draw, which is clamped to it.
+    doorGutter: 76,
+
     labelDy: 24,
     border: "rgba(0,0,0,0.22)",
     reservoirFont: 14,
@@ -85,9 +108,14 @@ const LAYOUT = {
     biteStripAlpha: 0.08,
   },
 
+  // The two gauges stop short of the right margin (x1 well inside the screen)
+  // so the score/join-code/observer stack can sit BESIDE them rather than
+  // above: that column of dead space is what pays for the compressed top
+  // band, and every pixel saved up here goes to the field.  Their numeric
+  // readouts sit INSIDE the bar for the same reason (see drawHungerBar).
   hungerBar: {
-    x0: 40, x1: 984, y: 150, h: 18,
-    labelFont: 14, labelDy: -8,
+    x0: 14, x1: 700, y: 44, h: 16,
+    labelFont: 13, labelDy: -5,
     bg: "rgba(0,0,0,0.12)",
     // Grey, matching neutral/defused slime.  The bar is a one-way clock now:
     // there is nothing to segment it by, because nothing takes hunger back.
@@ -100,11 +128,11 @@ const LAYOUT = {
   // hunger bar: the two are read together, since one fills as the other
   // empties and the game ends whichever way round they finish.
   chargeBar: {
-    x0: 40, x1: 984, y: 196, h: 10,
-    labelFont: 13, labelDy: -6,
+    x0: 14, x1: 700, y: 76, h: 10,
+    labelFont: 12, labelDy: -5,
     bg: "rgba(0,0,0,0.12)",
     lowBorder: "rgba(200,140,0,0.95)",
-    textFont: 13,
+    textFont: 11,
   },
 
   // Score HUD, top-right: a big golden triangle with the collected count to
@@ -113,9 +141,9 @@ const LAYOUT = {
   // displayed count steps up with it, so the score visibly ACCRUES rather
   // than jumping.  `x/y` is the big triangle's centre and the fliers' target.
   scoreHud: {
-    x: 968, y: 58,
-    triSize: 15,          // big triangle circumradius (design px)
-    font: 26, gap: 14,    // score digits: size, and clearance from the triangle
+    x: 988, y: 22,
+    triSize: 13,          // big triangle circumradius (design px)
+    font: 22, gap: 12,    // score digits: size, and clearance from the triangle
     pulseS: 0.35, pulseScale: 1.3, // arrival swell: one beat, and back
     // Flying triangles: a brief random pop off the bitten cell, then an
     // accelerating homing run.  `steer` is how hard velocity bends toward the
@@ -128,12 +156,12 @@ const LAYOUT = {
     trailAlpha: 0.55, trailWidth: 4, // streak: alpha and width at the head
   },
 
-  headers: { waveX: 40, waveY: 50, waveFont: 20, labelDy: -30, labelFont: 18 },
+  headers: { waveX: 14, waveY: 22, waveFont: 18, labelDy: -30, labelFont: 18 },
 
-  // Per-player shape-wheel rows, bottom-left beside the action menu.
-  // `labelW` is the widest move label the row reserves; longer labels are
-  // clipped by the columns after it rather than reflowing the panel.
-  wheelPanel: { x: 24, y0: 652, rowH: 18, font: 13, labelW: 84, nameW: 42 },
+  // Right margin the top-right HUD stack (join code, observer hint) is
+  // right-aligned against.  Tighter than the old 24 so the stack clears the
+  // gauges' x1 with room to spare.
+  hudMargin: 14,
 
   // Lil Guys: one per connected player, cosmetic bodies — they STAND at the
   // LEFT edge of the field (the mouths the conveyor feeds) and chomp in
@@ -230,11 +258,16 @@ const LAYOUT = {
   },
 
   // Per-player action menus: one box per SEAT (max `seats`), bottom row,
-  // to the right of the wheel panel.  Each shows only the spell shape its
-  // player is holding plus their lock-in state; pulse/shake are the physical
-  // feedback for valid / refused selections (see the menu FX section).
+  // CENTRED on the screen — four chairs at the cabinet, in the order people
+  // sit in them.  Each shows only the spell shape its player is holding plus
+  // their lock-in state; pulse/shake are the physical feedback for valid /
+  // refused selections (see the menu FX section).
+  //
+  // `x0` is the centring solution for the row's own width, and `y`/`h` are
+  // what is left under the field: keep `x0 = (screen.w - (seats*w +
+  // (seats-1)*gap)) / 2` and `y + h < screen.h` whenever any of them move.
   playerMenus: {
-    seats: 4, w: 160, h: 96, gap: 14, x0: 291, y: 656,
+    seats: 4, w: 160, h: 84, gap: 14, x0: 171, y: 510,
     labelDy: 16, labelFont: 12,
     shapeCellMax: 13, shapeCellGap: 2,
     statusDy: 10, statusFont: 12,      // up from the box's bottom edge
@@ -288,7 +321,6 @@ const LAYOUT = {
     sectionFont: 15, rowFont: 13, rowH: 20,
     feastY: 150,
     // Match-wide feast tallies (one row per measure, label + colored cells).
-    fcols: { label: 40, cells: 260 },
     pcols: { name: 40, casts: 190, covered: 250, defused: 420, recipes: 590 },
     hintFont: 14,
     // The clickable "next round" button, bottom-centred under the report.
@@ -1020,54 +1052,6 @@ const CAST_EVENT_COLOR = "rgba(0,130,200,1)";
 // The turn-end headline ("Lil Guys Eating!", then the tally) is spawned by the
 // feast cinematic, which is the only thing that knows when the meal starts and
 // when it is over — see spawnFeastTallyFloaters.
-
-/**
- * Compact per-player shape-wheel rows (bottom-left UI panel).  No player
- * sprites are rendered — the wheel selection is the only per-player element on
- * screen.  The local player's row is highlighted, and every row shows that
- * player's cast COOLDOWN: a row still cooling is a row that cannot fire yet,
- * so "who can act right now" is readable at a glance.
- *
- * Showing EVERY player's selection (not just the local one) is what makes
- * groups playable: you can see a teammate is holding the move your group needs
- * before you spend a charge on the square.
- */
-function drawWheelPanel(game) {
-  const CP = LAYOUT.wheelPanel;
-  const entities = game.entities || [];
-  entities.forEach((e, i) => {
-    const y = CP.y0 + i * CP.rowH;
-    text(`P${e.owner}`, CP.x, y, CP.font, playerColor(e.owner));
-
-    // Selection is server-authoritative, so this is what that player WILL
-    // cast.  A stale frame against a freshly reloaded (shorter) move table
-    // falls back to the first move, matching the server's own clamp.
-    const move = PLAYER_RECIPES[e.selected_shape ?? 0] ?? PLAYER_RECIPES[0];
-    text(move?.label ?? "-", CP.x + CP.nameW, y, CP.font, RECIPE_COLOR_PLAYER);
-
-    // The cast cooldown, as the server reports it: "ready" the instant it
-    // hits zero, otherwise a draining pip bar (each pip a fifth of the full
-    // cooldown, so the bar's LENGTH is the wait at a glance).
-    const usedX = CP.x + CP.nameW + CP.labelW;
-    const cd = e.cooldown_ms ?? 0;
-    if (cd <= 0) {
-      text("ready", usedX, y, CP.font, SHAPE_COLOR);
-    } else {
-      const pips = Math.max(1, Math.ceil((cd / Math.max(1, CAST_COOLDOWN_MS)) * 5));
-      text("◆".repeat(Math.min(pips, 5)), usedX, y, CP.font, CAST_EVENT_COLOR);
-    }
-    // Where that player is aimed — and, if they have a cast still ripe in
-    // the group window, the square it is waiting on (the one a partner has
-    // to aim at).
-    const mine = (game.recent ?? []).filter((rc) => rc.player_id === e.owner);
-    const last = mine.length > 0 ? mine[mine.length - 1] : null;
-    const cols = gridDims(game).cols;
-    const at = last !== null
-      ? `!${Math.floor(last.square / cols)},${last.square % cols}`
-      : `@${e.cursor_row ?? 0},${e.cursor_col ?? 0}`;
-    text(at, usedX + 60, y, CP.font, playerColor(e.owner));
-  });
-}
 
 /** @type {Floater[]} */
 const floaters = [];
@@ -1916,8 +1900,31 @@ function drawHungerBar(game) {
   rectStroke(H.x0 - 2, H.y - 2, w + 4, H.h + 4, nearFull ? 3 : 1,
     nearFull ? H.dangerBorder : "rgba(0,0,0,0.25)");
 
-  text(`${hunger.current}/${hunger.max}`,
-    H.x0 + w - 90, H.y + H.h + 14, H.textFont, "rgba(70,70,85,0.95)");
+  // The readout rides INSIDE the bar, right-aligned against its end, rather
+  // than on a line of its own beneath it: on a 600px panel the gauges are
+  // paying for themselves in field height, and a number that has a bar to sit
+  // on does not need a row.
+  barReadout(`${hunger.current}/${hunger.max}`, H, H.textFont,
+    "rgba(70,70,85,0.95)");
+}
+
+/**
+ * Draw a gauge's numeric readout inside the gauge, right-aligned against its
+ * end and vertically centred on it.  `bar` is a hungerBar/chargeBar block.
+ *
+ * Drawn over whatever fill has reached that end, so it is deliberately dark
+ * enough to read on both the fill and the empty track.
+ */
+function barReadout(str, bar, font, color) {
+  ctx.save();
+  ctx.font = `${font}px monospace`;
+  const pad = 6;
+  // Baseline that centres a cap-height glyph in the bar.  0.34 rather than a
+  // half: monospace digits sit above the baseline, so centring the BOX would
+  // hang them low.
+  const y = bar.y + bar.h / 2 + font * 0.34;
+  text(str, bar.x1 - pad - ctx.measureText(str).width, y, font, color);
+  ctx.restore();
 }
 
 /**
@@ -1951,7 +1958,7 @@ function drawChargeBar(game) {
   rectStroke(B.x0 - 2, B.y - 2, w + 4, B.h + 4, low ? 3 : 1,
     low ? B.lowBorder : "rgba(0,0,0,0.25)");
 
-  text(`\u26a1 ${charges}`, B.x0 + w - 90, B.y + B.h + 14, B.textFont, C_CHARGE);
+  barReadout(`\u26a1 ${charges}`, B, B.textFont, C_CHARGE);
 }
 
 // ---------------------------------------------------------------------------
@@ -1980,21 +1987,35 @@ function gridDims(game) {
 }
 
 /**
- * Placement of a rows×cols grid inside the slime field: square cells, sized
+ * The part of the field rect a GRID may occupy: everything but the door
+ * gutter, the strip along the left the Lil Guy corral stands in.
+ *
+ * Carving the corral out here rather than letting the grid have the whole
+ * rect is what makes "the crew never overlaps column 0" a property of the
+ * layout instead of a coincidence of the current grid shape: a grid wide
+ * enough to fill the rect would otherwise start at FIELD.x0 with nowhere left
+ * to put the guys.
+ */
+function gridArea() {
+  const x0 = FIELD.x0 + FIELD.doorGutter;
+  return { x0, y0: FIELD.y0, w: FIELD.x1 - x0, h: FIELD.y1 - FIELD.y0 };
+}
+
+/**
+ * Placement of a rows×cols grid inside the grid area: square cells, sized
  * to fit and capped at FIELD.tileMax, then centered — small grids letterbox
- * inside the field rather than stretching to fill it.  Square cells keep the
+ * inside the area rather than stretching to fill it.  Square cells keep the
  * tile art circular at any grid shape and make the sprite cache one
  * dimensional (see tileSprite).
  */
 function gridRect(rows, cols) {
-  const fieldW = FIELD.x1 - FIELD.x0;
-  const fieldH = FIELD.y1 - FIELD.y0;
-  const cell = Math.min(fieldW / cols, fieldH / rows, FIELD.tileMax);
+  const a = gridArea();
+  const cell = Math.min(a.w / cols, a.h / rows, FIELD.tileMax);
   const w = cell * cols;
   const h = cell * rows;
   return {
-    x0: FIELD.x0 + (fieldW - w) / 2,
-    y0: FIELD.y0 + (fieldH - h) / 2,
+    x0: a.x0 + (a.w - w) / 2,
+    y0: a.y0 + (a.h - h) / 2,
     w, h, cell,
   };
 }
@@ -2013,9 +2034,12 @@ function cellCenter(flat, rows, cols) {
   return { x: (r.x0 + r.x1) / 2, y: (r.y0 + r.y1) / 2 };
 }
 
-/** Center of the whole field: the fallback anchor for cast-wide floaters. */
+/** Center of the playable area: the fallback anchor for cast-wide floaters.
+ *  The GRID area, not the whole rect — a floater about the board should be
+ *  centred on the board, not pulled left by the corral's gutter. */
 function fieldCenter() {
-  return { x: (FIELD.x0 + FIELD.x1) / 2, y: (FIELD.y0 + FIELD.y1) / 2 };
+  const a = gridArea();
+  return { x: a.x0 + a.w / 2, y: a.y0 + a.h / 2 };
 }
 
 // --- The turn-end bite -------------------------------------------------------
@@ -3236,9 +3260,19 @@ const LIL_GUY_ANIM_BASE = 1_000_000;
  * grid currently letterboxes to — the guys stay proportioned to the food
  * they eat instead of towering over a dense board or drowning on a sparse
  * one.
+ *
+ * Clamped to what the door gutter can hold.  That clamp is what makes the
+ * corral fit BY CONSTRUCTION: with the gutter carved out of the grid area
+ * (see gridArea), a guy no wider than `doorGutter - doorGap` always has room
+ * between FIELD.x0 and the grid's left edge, at every grid shape, so the
+ * layout never has to fall back on shoving him on-screen.  A grid sparse
+ * enough to hit FIELD.tileMax is the only place the clamp bites, and there
+ * the guys are already comically large.
  */
 function lilGuySize(rows, cols) {
-  return gridRect(rows, cols).cell * LAYOUT.lilGuys.scale;
+  const L = LAYOUT.lilGuys;
+  return Math.min(gridRect(rows, cols).cell * L.scale,
+    FIELD.doorGutter - L.doorGap);
 }
 
 /**
@@ -3246,15 +3280,17 @@ function lilGuySize(rows, cols) {
  * position fully LEFT of the grid — the mouths the conveyor feeds into, with
  * `doorGap` of clearance so the corral never overlaps the first column of
  * cells — spread evenly down the grid's height so the crew reads as a queue
- * at the door rather than a stack.  Clamped on-screen for the degenerate
- * grid that fills the field wall to wall.
+ * at the door rather than a stack.
+ *
+ * Needs no on-screen clamp: the door gutter guarantees the room (see
+ * gridArea / lilGuySize).
  */
 function lilGuyPost(i, count, rows, cols) {
   const size = lilGuySize(rows, cols);
   const g = gridRect(rows, cols);
   const cy = g.y0 + ((i + 0.5) * rows * g.cell) / Math.max(1, count);
   return {
-    x: Math.max(4, g.x0 - size - LAYOUT.lilGuys.doorGap),
+    x: g.x0 - size - LAYOUT.lilGuys.doorGap,
     y: cy - size / 2,
   };
 }
@@ -4654,8 +4690,12 @@ function babyRadius(rows, cols) {
  * Resting spot for the i-th baby: the same corral the Lil Guys queue in.
  * The first column sits inside the guys' door column — the brood mills among
  * the crew — and overflow columns march LEFT, behind their backs, staggered a
- * half pitch so it reads as a scatter rather than a parade grid.  Clamped
- * on-screen like the guys' own posts.
+ * half pitch so it reads as a scatter rather than a parade grid.
+ *
+ * Unlike the guys' own posts, this DOES still need a clamp: the gutter is
+ * budgeted for one column of bodies, and a large enough brood keeps marching
+ * past it.  Overflow piles up on the field's left edge rather than walking
+ * off the screen.
  */
 function babyPost(i, rows, cols) {
   const g = gridRect(rows, cols);
@@ -4665,10 +4705,10 @@ function babyPost(i, rows, cols) {
   const perCol = Math.max(1, Math.floor(g.h / pitch));
   const col = Math.floor(i / perCol);
   const row = i % perCol;
-  const doorX = Math.max(4, g.x0 - size - LAYOUT.lilGuys.doorGap);
+  const doorX = g.x0 - size - LAYOUT.lilGuys.doorGap;
   const jog = (col % 2) * pitch * 0.5;
   return {
-    x: Math.max(4, doorX + size * 0.5 - col * pitch),
+    x: Math.max(FIELD.x0, doorX + size * 0.5 - col * pitch),
     y: g.y0 + r * 1.5 + row * pitch + jog,
   };
 }
@@ -4910,19 +4950,23 @@ function drawGame(game, dt) {
 
   // The game id (join code), tucked under the score HUD top right, so anyone
   // watching can tell others what to join.
+  // This stack occupies the column to the RIGHT of the gauges (which stop at
+  // hungerBar.x1), not the space above them — that is the whole trick that
+  // frees the top band for the field, so keep it right-aligned and keep the
+  // gauges short.
   const gameId = `Game ${game.join_code ?? "------"}`;
   const idFont = 14;
   ctx.font = `${idFont}px monospace`;
-  text(gameId, SW - ctx.measureText(gameId).width - 24,
-    LAYOUT.scoreHud.y + 34, idFont, C_HEADER);
+  text(gameId, SW - ctx.measureText(gameId).width - LAYOUT.hudMargin,
+    LAYOUT.scoreHud.y + 26, idFont, C_HEADER);
 
   // Observers watch the same board; the only key that means anything to them
   // is the one that puts them in it.
   if (game.observer) {
     const hint = "OBSERVING — press P to take a seat";
     ctx.font = `${H.labelFont - 4}px monospace`;
-    text(hint, SW - ctx.measureText(hint).width - 24,
-      LAYOUT.scoreHud.y + 54, H.labelFont - 4, C_TEXT);
+    text(hint, SW - ctx.measureText(hint).width - LAYOUT.hudMargin,
+      LAYOUT.scoreHud.y + 46, H.labelFont - 4, C_TEXT);
   }
 
   drawHungerBar(game);
@@ -4941,25 +4985,6 @@ function drawGame(game, dt) {
   drawFloaters();
   drawFlyTris();
   drawScoreHud(game);
-}
-
-/**
- * Draw non-zero per-tier values as colored "≡12 -5" cells starting at x.
- * Draws a grey dash when everything is zero.
- */
-function drawTierCells(x, y, font, obj) {
-  let dx = x;
-  let any = false;
-  for (const name of TIER_NAMES) {
-    const v = obj?.[name] ?? 0;
-    if (!v) continue;
-    any = true;
-    const str = `${TIER_CHAR[name]}${v}`;
-    text(str, dx, y, font, TIER_COLOR[name]);
-    ctx.font = `${font}px monospace`;
-    dx += ctx.measureText(str).width + 8;
-  }
-  if (!any) text("—", dx, y, font, "rgba(120,120,140,0.6)");
 }
 
 /**
@@ -4990,31 +5015,10 @@ function drawGameOver(msg) {
     return;
   }
 
-  // ---- Match-wide feast tallies -------------------------------------------
-  const F = L.fcols;
-  const feast = stats.feast ?? {};
+  // The per-player table starts where the match-wide feast tallies used to:
+  // that section computed a ledger it never drew, so it was reserving a
+  // screen of whitespace for nothing.
   let y = L.feastY;
-  y += L.rowH;
-
-  const feastRow = (label, obj) => {
-    text(label, F.label, y, L.rowFont, "rgba(70,70,85,0.95)");
-    drawTierCells(F.cells, y, L.rowFont, obj);
-    y += L.rowH;
-  };
-
-  y += 4;
-  const spent = feast.charges_spent ?? 0;
-  const left = feast.charges_left ?? 0;
-  const consumed = (feast.neutral ?? 0) + (feast.defused ?? 0);
-  y += L.rowH;
-  // The headline tuning number: food that existed, was edible, and was never
-  // reached.  A high figure means the charges went somewhere that did not open
-  // a road, which is the only way this game is really lost.
-  y += L.rowH;
-  // Charges per unit of food: the single ratio that says whether the encounter
-  // was priced right.  Guarded, because a team can finish having spent nothing.
-  const perUnit = consumed > 0 ? (spent / consumed).toFixed(2) : "—";
-  y += L.rowH + 14;
 
   // ---- Per-player table ----------------------------------------------------
   const P = L.pcols;

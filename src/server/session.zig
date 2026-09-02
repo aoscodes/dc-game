@@ -784,7 +784,7 @@ pub const Session = struct {
                 refill.contents[refill.count] = cell;
                 refill.count += 1;
             }
-            var rbuf: [1024]u8 = undefined;
+            var rbuf: [proto.FieldRefilled.MAX_ENCODED]u8 = undefined;
             var rfbs = std.io.fixedBufferStream(&rbuf);
             try proto.encode(rfbs.writer(), .field_refilled, refill);
             try self.broadcast_raw(rfbs.getWritten());
@@ -805,7 +805,7 @@ pub const Session = struct {
                     .rocks_broken = m.rocks_broken,
                 };
                 @memcpy(msg.cells[0..m.len], m.cells[0..m.len]);
-                var mbuf: [80]u8 = undefined;
+                var mbuf: [proto.SpecialMatched.MAX_ENCODED]u8 = undefined;
                 var mfbs = std.io.fixedBufferStream(&mbuf);
                 try proto.encode(mfbs.writer(), .special_matched, msg);
                 try self.broadcast_raw(mfbs.getWritten());
@@ -843,7 +843,7 @@ pub const Session = struct {
         // Announce the bite's hatches (aggregated over every pass) before
         // the summary, so clients animate them on the board it describes.
         if (hatch_msg.count > 0) {
-            var hbuf: [1024]u8 = undefined;
+            var hbuf: [proto.EggsHatched.MAX_ENCODED]u8 = undefined;
             var hfbs = std.io.fixedBufferStream(&hbuf);
             try proto.encode(hfbs.writer(), .eggs_hatched, hatch_msg);
             try self.broadcast_raw(hfbs.getWritten());

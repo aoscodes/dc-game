@@ -238,6 +238,17 @@ pub const SpecialMatched = struct {
     neutralized: u16 = 0,
     /// Rocks the effect BROKE into red slime (see slime.ShapeOutcome).
     rocks_broken: u16 = 0,
+
+    /// Bytes `encode` can write for the fullest possible message.  Lives here
+    /// so a sender's buffer is sized BY the wire format instead of alongside
+    /// it: these grow with MAX_GRID_CELLS, and a caller carrying its own
+    /// hand-added constant would not.  See the round-trip tests, which pin
+    /// each of these against a maxed-out message.
+    pub const MAX_ENCODED = 1 + // tag
+        1 + 1 + 2 + 1 + // kind, pass, center, cell_count
+        2 * @as(usize, MAX_MATCH_CELLS_WIRE) + // cells
+        2 * components.Tier.size + // downgraded
+        2 + 2; // neutralized, rocks_broken
 };
 
 pub fn decode_special_matched(reader: anytype) !SpecialMatched {
@@ -269,6 +280,11 @@ pub const EggsHatched = struct {
     cells: [MAX_HATCHES_WIRE]u16 = [_]u16{0} ** MAX_HATCHES_WIRE,
     types: [MAX_HATCHES_WIRE]components.BabyType =
         [_]components.BabyType{.rose} ** MAX_HATCHES_WIRE,
+
+    /// See SpecialMatched.MAX_ENCODED.
+    pub const MAX_ENCODED = 1 + // tag
+        2 + // count
+        3 * @as(usize, MAX_HATCHES_WIRE); // cell u16 + type byte, each
 };
 
 pub fn decode_eggs_hatched(reader: anytype) !EggsHatched {
@@ -300,6 +316,11 @@ pub const FieldRefilled = struct {
     cells: [MAX_REFILL_WIRE]u16 = [_]u16{0} ** MAX_REFILL_WIRE,
     contents: [MAX_REFILL_WIRE]components.SlimeCell =
         [_]components.SlimeCell{.empty} ** MAX_REFILL_WIRE,
+
+    /// See SpecialMatched.MAX_ENCODED.
+    pub const MAX_ENCODED = 1 + // tag
+        1 + 2 + // pass, count
+        3 * @as(usize, MAX_REFILL_WIRE); // cell u16 + content byte, each
 };
 
 pub fn decode_field_refilled(reader: anytype) !FieldRefilled {
@@ -1758,4 +1779,32 @@ test "round-trip: a cursor position survives per entity" {
     try std.testing.expectEqual(@as(u8, 7), decoded.entities[0].cursor_col);
     try std.testing.expectEqual(@as(u8, 0), decoded.entities[1].cursor_row);
     try std.testing.expectEqual(@as(u8, 0), decoded.entities[1].cursor_col);
+}
+
+test "MAX_ENCODED bounds a maxed-out message, exactly" {
+    // The senders in server/session.zig size their stack buffers off these,
+    // so a bound that drifts under the real encoding is a broadcast that
+    // fails the moment a grid gets big enough to reach it — and the grid caps
+    // are a tuning knob.  Encode the fullest message each type admits and
+    // pin the result: too small breaks the sender, too large wastes stack,
+    // and equality catches BOTH.
+    var buf: [64 * 1024]u8 = undefined;
+
+    {
+        var fbs = std.io.fixedBufferStream(&buf);
+        var p = SpecialMatched{ .kind = .neutralizer, .cell_count = MAX_MATCH_CELLS_WIRE };
+        p.downgraded = [_]u16{std.math.maxInt(u16)} ** components.Tier.size;
+        try encode(fbs.writer(), .special_matched, p);
+        try std.testing.expectEqual(SpecialMatched.MAX_ENCODED, fbs.getWritten().len);
+    }
+    {
+        var fbs = std.io.fixedBufferStream(&buf);
+        try encode(fbs.writer(), .eggs_hatched, EggsHatched{ .count = MAX_HATCHES_WIRE });
+        try std.testing.expectEqual(EggsHatched.MAX_ENCODED, fbs.getWritten().len);
+    }
+    {
+        var fbs = std.io.fixedBufferStream(&buf);
+        try encode(fbs.writer(), .field_refilled, FieldRefilled{ .count = MAX_REFILL_WIRE });
+        try std.testing.expectEqual(FieldRefilled.MAX_ENCODED, fbs.getWritten().len);
+    }
 }

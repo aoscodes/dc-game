@@ -289,9 +289,9 @@ pub const SlimeField = struct {
     /// `depth` is the reaction's distance from whatever started the chain: a
     /// player's cast and a swallowed special both begin at 0, and an effect
     /// fired by an activation runs one deeper.  The counter is WIDER than
-    /// `max_chain_depth`'s u8 on purpose: a full board can supply one more
-    /// link than that type can hold (MAX_GRID_CELLS is 256), so a u8 here
-    /// would overflow one step past the largest cap a designer can write.  A stamp may only ACTIVATE
+    /// `max_chain_depth`'s u8 on purpose: the chain runs to one PAST the cap
+    /// to discover it has gone too far, so the largest cap a designer can
+    /// write (255) reaches depth 256 — which a u8 here could not hold.  A stamp may only ACTIVATE
     /// what it covers while `depth <= bal.max_chain_depth`; past that it
     /// still downgrades and breaks normally, it just sets nothing off.  So
     /// raising the cap lengthens chains and never changes a lone cast.
@@ -2540,18 +2540,27 @@ test "the conservation ledger closes even when the mouth WASTES a special" {
     }
 }
 
-test "the deepest chain a full board can supply does not overflow the counter" {
-    // Regression: `max_chain_depth` is a u8, so a designer can write 255,
-    // but the LARGEST grid holds MAX_GRID_CELLS (256) cells and therefore
-    // can supply 256 links — one more than a u8 counter can hold.  With the
-    // depth counter narrowed to u8 this panics with integer overflow, and
-    // only from certain anchors: the chain has to be long enough to reach
-    // 256, which depends on where it starts.  So every start cell is tried.
+test "the deepest chain a designer can author does not overflow the counter" {
+    // Regression: `max_chain_depth` is a u8, so a designer can write 255 —
+    // and a chain runs to one PAST its cap to find out it has gone too far,
+    // so that cap reaches depth 256.  With the depth counter narrowed to u8
+    // this panics with integer overflow, and only from certain anchors: the
+    // chain has to be long enough to get there, which depends on where it
+    // starts.  So every start cell on the largest board is tried.
     var bal = armed(.neutralizer, .cast);
     bal.max_chain_depth = std.math.maxInt(u8);
 
     const rows = c.MAX_GRID_ROWS;
     const cols = c.MAX_GRID_COLS;
+    // Which bound actually stopped the chain depends on the anchor, because
+    // an Agent block branches: a chain started mid-board floods outward and
+    // clears everything well inside 255 hops, while one started in a corner
+    // has to walk.  Both endings are correct, so neither is asserted per
+    // anchor — only that BOTH were seen, which is what proves this test
+    // still reaches past 255 and is worth running at all.
+    var any_board_bound = false;
+    var any_depth_bound = false;
+
     for (0..rows) |r| {
         for (0..cols) |cl| {
             var field = empty_field(rows, cols);
@@ -2559,10 +2568,23 @@ test "the deepest chain a full board can supply does not overflow the counter" {
                 field.grid.put(@intCast(i), .{ .special = .neutralizer });
             }
             const out = field.apply_shape(&bal, DOT, @intCast(r), @intCast(cl));
-            // Whatever the anchor, the board is the real bound: the chain
-            // eats the grid and stops because there is nothing left.
-            try testing.expectEqual(@as(u16, 0), field.grid.occupied());
-            try testing.expectEqual(c.MAX_GRID_CELLS, out.activated);
+
+            // Every link strictly empties one cell (see activate), and the
+            // board is nothing but neutralizers, so each one either went off
+            // or is still standing.  No cell is lost or counted twice.
+            const left = field.grid.occupied();
+            try testing.expectEqual(c.MAX_GRID_CELLS, out.activated + left);
+
+            if (left == 0) {
+                any_board_bound = true;
+            } else {
+                // Died of depth.  Survivors were covered and armed but too
+                // deep to set off, which stamp() reports as waste.
+                any_depth_bound = true;
+                try testing.expect(out.inert > 0);
+            }
         }
     }
+    try testing.expect(any_board_bound);
+    try testing.expect(any_depth_bound);
 }

@@ -29,10 +29,12 @@
 // ---------------------------------------------------------------------------
 
 // Design space, mirroring game.js: all drawing below is in these coordinates
-// and the 2x backing store is applied once as a transform.
+// and the backing store scale is applied once as a transform.  Same cabinet
+// panel as the game, so the same 1024x600 at 1:1 — see the note on
+// LAYOUT.screen in game.js for why this is not supersampled.
 const LAYOUT = {
-  screen: { w: 1024, h: 768 },
-  renderScale: 2,
+  screen: { w: 1024, h: 600 },
+  renderScale: 1,
   zones: 3,
   status: { h: 96, font: "600 30px system-ui, -apple-system, sans-serif" },
   hint: { font: "400 20px system-ui, -apple-system, sans-serif" },

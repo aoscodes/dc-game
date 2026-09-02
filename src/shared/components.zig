@@ -253,8 +253,20 @@ pub fn baby_total(counts: BabyCounts) u32 {
 
 /// Upper bounds on the slime grid (wire + array sizing).  The config loader
 /// rejects `slime_grid` dimensions exceeding these.
+///
+/// Sized to what the renderer can still draw legibly, which is the real
+/// constraint: the client fits the grid into a ~920x408 design-px area with
+/// SQUARE cells (see LAYOUT.slimeField / gridRect in web/game.js), so height
+/// bounds the rows and 16x32 is where the tiles bottom out at ~25px.  Columns
+/// are the cheap axis because that area is roughly 2.25:1.
+///
+/// Raising these grows several fixed encode buffers along with them — see
+/// `broadcast_bite` in server/session.zig and `write_render` in
+/// client/stdout_writer.zig, both of which size against MAX_GRID_CELLS and
+/// FAIL SILENTLY (a dropped frame, not an error) if they are left behind.
+/// web/tune.js mirrors these for the config editor's bounds.
 pub const MAX_GRID_ROWS: u8 = 16;
-pub const MAX_GRID_COLS: u8 = 16;
+pub const MAX_GRID_COLS: u8 = 32;
 pub const MAX_GRID_CELLS: u16 = @as(u16, MAX_GRID_ROWS) * @as(u16, MAX_GRID_COLS);
 
 /// One cell of the slime grid — exactly one slime unit, or nothing.
@@ -684,7 +696,7 @@ test "baby_total sums the per-type tallies, saturating" {
 }
 
 test "grid capacity bounds agree" {
-    try testing.expectEqual(@as(u16, 256), MAX_GRID_CELLS);
+    try testing.expectEqual(@as(u16, 512), MAX_GRID_CELLS);
     try testing.expectEqual(@as(usize, MAX_GRID_CELLS), (SlimeGrid{ .rows = 1, .cols = 1 }).cells.len);
 }
 

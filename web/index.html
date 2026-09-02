@@ -6,23 +6,37 @@
   <title>DC Game</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
+    html, body {
       /* Same paper white as the slime field (LAYOUT.slimeField.paper), so the
          board, the UI and the page read as one continuous e-paper surface. */
       background: rgb(238, 242, 250);
       display: flex;
       align-items: center;
       justify-content: center;
-      min-height: 100vh;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
     }
-    /* The backing store is 2x the design space (see LAYOUT.screen /
-       LAYOUT.renderScale in game.js): CSS pins the on-screen size to the
-       design space so text and tile art render at 2x device resolution. */
-    canvas { display: block; image-rendering: pixelated; width: 1024px; height: 768px; }
+    /* The target is a 1024x600 panel, which the backing store matches 1:1
+       (see LAYOUT.screen / LAYOUT.renderScale in game.js) — design units ARE
+       device pixels, so `pixelated` is a no-op scale rather than a resample.
+       The box is aspect-locked to the design space rather than pinned in px:
+       it fills whatever viewport the kiosk browser actually hands us (chrome,
+       overscan, a dev machine) without ever letterboxing INSIDE the element,
+       which is what keeps canvasCoords' getBoundingClientRect mapping exact. */
+    canvas {
+      display: block;
+      image-rendering: pixelated;
+      aspect-ratio: 1024 / 600;
+      width: 100vw;
+      height: auto;
+      max-height: 100vh;
+      max-width: calc(100vh * 1024 / 600);
+    }
   </style>
 </head>
 <body>
-<canvas id="canvas" width="2048" height="1536"></canvas>
+<canvas id="canvas" width="1024" height="600"></canvas>
 <!-- ?v= is a cache buster: CI rewrites "dev" to the commit SHA on deploy.
      Absolute path: this shell is also served at /config/{hash}. -->
 <script src="/game.js?v=dev"></script>
