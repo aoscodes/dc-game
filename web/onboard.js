@@ -67,6 +67,22 @@ function hslToRgb(h, s, l) {
   ];
 }
 
+/**
+ * Rec. 709 relative luminance of an [r,g,b], 0..255.
+ *
+ * THE axis a palette is ordered in (see rollPalette), and deliberately not
+ * HSL lightness, which is the axis the harmony bounds are drawn in. The two
+ * are not the same ordering and swapping them is not a detail: 709 weights
+ * green at 0.7152 and blue at 0.0722, so a blue at l=0.62 comes out darker to
+ * the eye than a green at l=0.42. Ordering by `l` would put that blue last and
+ * hand the creature a pale outline over a dark body — the exact inversion the
+ * ordering exists to prevent. `l` still does its own job: it is what the LED
+ * spacing (HARMONY.minLumGap) is tuned for, and spacing is order-free.
+ */
+function luminance([r, g, b]) {
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
 /** [r,g,b] -> "rrggbb", the wire form the firmware parses. */
 function rgbToHex(rgb) {
   return rgb.map((v) => Math.max(0, Math.min(255, v)).toString(16).padStart(2, "0")).join("");
@@ -177,7 +193,7 @@ const HARMONY = {
 };
 
 /**
- * Roll one harmonic triad.
+ * Roll one harmonic triad, DARKEST ZONE FIRST.
  *
  * The lightness step deserves a note: rather than resampling until three
  * independent draws happen to be far enough apart (unbounded, and biased
@@ -185,8 +201,36 @@ const HARMONY = {
  * over after reserving the gaps, then adds the gaps back. That is exactly
  * uniform over the valid orderings and cannot fail.
  *
+ * The last thing this does, and the load-bearing one, is put the three in
+ * order of how dark they actually look. Zone index is LED index the whole way
+ * down (paletteHex, then LED:SET, then store.h led_rgb, then CTRL:STAT led=),
+ * and game.js tintedSheet reads that index as a ROLE: LED 0 paints the
+ * creature's outline, LED 1 its body, LED 2 its highlight. Two things follow,
+ * and both are the point:
+ *
+ *   - A badge means the same thing as every other badge. Its leftmost lamp is
+ *     its creature's outline on the shared screen, on every badge in the room.
+ *     Unordered, LED 0 was a different role per badge and the lamps taught the
+ *     player nothing.
+ *   - The outline is always darker than the body it bounds. A renderer handed
+ *     the three in a random order gets that backwards about two times in three
+ *     and the creature flattens into a blob, which is why game.js used to sort
+ *     them itself. Ordering the palette where it is BORN serves both; sorting
+ *     in the renderer could only ever serve the second.
+ *
+ * Ordered in `luminance`, NOT in the `l` the lightness ladder above is built
+ * in — see that function for why the two disagree and why this is the one that
+ * decides. A consequence worth naming: luminance is hue-dependent, so blues
+ * drift towards the ink slot and greens towards the accent. That is not bias
+ * to be corrected, it is what "darkest first" means when blue really is darker.
+ *
+ * Hue and saturation still shuffle, so the scheme's ROTATION carries no zone
+ * bias. That is the bias worth breaking: which hue leads should be luck, which
+ * end of the palette leads is a contract.
+ *
  * @param {() => number} rand
- * @returns {{h: number, s: number, l: number}[]} one entry per zone
+ * @returns {{h: number, s: number, l: number}[]} one entry per zone, ascending
+ *   in `luminance` — ink, fill, accent
  */
 function rollPalette(rand) {
   const base = rand() * 360;
@@ -202,11 +246,18 @@ function rollPalette(rand) {
   const offsets = [];
   for (let i = 0; i < LAYOUT.zones; i++) offsets.push(rand());
   offsets.sort((a, b) => a - b);
-  // Ascending by construction; shuffled so zone order carries no bias.
-  const lums = shuffle(rand, offsets.map((u, i) => lo + u * slack + i * gap));
+  // Ascending, but only as a way to hand each zone a different rung: the sort
+  // below is what actually decides which colour goes where.
+  const lums = offsets.map((u, i) => lo + u * slack + i * gap);
 
-  const triad = hues.map((h, i) => ({ h, s: sats[i], l: lums[i] }));
-  return shuffle(rand, triad);
+  // Hue and saturation travel together — a jittered scheme offset and the
+  // saturation drawn for it are a pair — so they shuffle as one unit.
+  const tint = shuffle(rand, hues.map((h, i) => ({ h, s: sats[i] })));
+  const triad = tint.map((t, i) => ({ h: t.h, s: t.s, l: lums[i] }));
+
+  // Darkest first, in the axis the eye uses. See the note above.
+  return triad.sort((a, b) =>
+    luminance(hslToRgb(a.h, a.s, a.l)) - luminance(hslToRgb(b.h, b.s, b.l)));
 }
 
 // ---------------------------------------------------------------------------

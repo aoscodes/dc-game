@@ -1030,11 +1030,6 @@ function drawPreMatch(game) {
  */
 const tintedSheets = new Map();
 
-/** Rec. 709 relative luminance of an [r,g,b], 0..255. */
-function luminance([r, g, b]) {
-  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-}
-
 /**
  * The shadow colour for a recoloured body: the ink mixed toward the fill by
  * the fraction the artist drew.
@@ -1074,9 +1069,10 @@ function deriveShadow(ink, fill, ratio) {
  * because it belongs to the world, not to the creature.
  *
  * @param {string} kind
- * @param {number[][]|null} led - three [r,g,b] triples, or null to draw the
- *   sheet as authored. Callers drawing a player pass a palette either way
- *   (`appearance` substitutes a seat colour when a badge reported none), so
+ * @param {number[][]|null} led - three [r,g,b] triples IN ROLE ORDER — ink,
+ *   fill, accent, which is LED order and ascending in luminance — or null to
+ *   draw the sheet as authored. Callers drawing a player pass a palette either
+ *   way (`appearance` substitutes a seat colour when a badge reported none), so
  *   the null path is for sprites that have no owner to borrow from.
  * @returns {CanvasImageSource|null}
  */
@@ -1101,21 +1097,27 @@ function tintedSheet(kind, led) {
   const px = c2.getImageData(0, 0, cv.width, cv.height);
   const d = px.data;
 
-  // Roles are assigned BY LIGHTNESS, not by LED index.
+  // Roles are assigned BY LED INDEX, in the order the art was drawn in:
+  // ink < fill < accent (authored 0, 65, 131). The shadow is derived to sit
+  // between the first two.
   //
-  // A badge's three LEDs are three lamps in a row; which is "first" is a fact
-  // about the board's wiring, and onboard.js's rollPalette shuffles its triad
-  // on purpose so that zone order carries no bias. Taking them in LED order
-  // therefore hands the ink slot a random one of the three, and roughly two
-  // times in three the outline comes out lighter than the body it is meant to
-  // bound - the creature dissolves into a flat blob (web/test/tint_harness).
+  // Taken on trust, not checked, and the trust is placed deliberately. The
+  // ordering is a property of the palette, guaranteed where the palette is
+  // born: onboard.js rollPalette returns its triad sorted darkest-first by
+  // Rec. 709 luminance, and zone index is LED index all the way down the wire.
+  // seatPalette, for players with no badge to report one, builds its three by
+  // mixing away from the fill and so lands in the same order by construction.
   //
-  // Sorted darkest-first they land in the order the art was drawn in:
-  // ink < fill < accent (0, 65, 131). The shadow is then derived to sit
-  // between the first two. onboard.js keeps the three lightnesses
-  // HARMONY.minLumGap apart, so this ordering is never a coin toss between
-  // near-equal colours.
-  const byLightness = [...led].sort((a, b) => luminance(a) - luminance(b));
+  // Sorting here instead would be strictly worse, and it is what this used to
+  // do. It buys the same guarantee about lightness while destroying a second
+  // one that only the index can give: that a badge means the same thing as
+  // every other badge. A player looking at their own lamps should be able to
+  // say which one is their creature's outline, and get the same answer as
+  // everyone else in the room.
+  //
+  // The cost of the trust is that a palette from before the ordering rule (or
+  // one set by hand over LED:SET) renders inverted — light outline, dark body.
+  // That is visible, local to the one badge, and fixed by re-rolling it.
 
   // authored grey -> replacement. Every tone is neutral, so the red channel
   // identifies it, and building the table once keeps the per-pixel loop to a
@@ -1125,12 +1127,12 @@ function tintedSheet(kind, led) {
     const src = tones[role];
     if (src !== undefined && rgb !== undefined) replace[src[0]] = rgb;
   };
-  put("ink", byLightness[0]);
-  put("fill", byLightness[1]);
-  put("accent", byLightness[2]);
+  put("ink", led[0]);
+  put("fill", led[1]);
+  put("accent", led[2]);
   if (tones.shadow !== undefined) {
     replace[tones.shadow[0]] =
-      deriveShadow(byLightness[0], byLightness[1], meta.shadow_ratio ?? 0.63);
+      deriveShadow(led[0], led[1], meta.shadow_ratio ?? 0.63);
   }
 
   for (let i = 0; i < d.length; i += 4) {

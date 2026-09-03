@@ -50,7 +50,7 @@ function extractConst(src, name) {
 }
 
 const GAME_NAMES = [
-  "luminance", "deriveShadow", "parseRgba", "playerColor", "seatPalette",
+  "deriveShadow", "parseRgba", "playerColor", "seatPalette",
 ];
 const GAME_CONSTS = [
   "PLAYER_COLORS", "C_UNSEATED", "SEAT_INK_MIX", "SEAT_ACCENT_MIX",
@@ -63,6 +63,7 @@ const game = new Function(`
 
 const ONBOARD_NAMES = [
   "hslToRgb", "wrapHue", "mulberry32", "randRange", "shuffle", "rollPalette",
+  "luminance",
 ];
 const onboard = new Function(`
   ${["LAYOUT", "HARMONY"].map((n) => extractConst(onboardSrc, n)).join("\n")}
@@ -70,8 +71,10 @@ const onboard = new Function(`
   return { ${ONBOARD_NAMES.join(", ")}, HARMONY };
 `)();
 
-const { luminance, deriveShadow, seatPalette, PLAYER_COLORS } = game;
-const { hslToRgb, mulberry32, rollPalette, HARMONY } = onboard;
+const { deriveShadow, seatPalette, PLAYER_COLORS } = game;
+// luminance comes from onboard.js, which is where the ordering rule that uses
+// it lives — so the rule and this check cannot come to measure different axes.
+const { hslToRgb, mulberry32, rollPalette, luminance, HARMONY } = onboard;
 
 let failures = 0;
 function check(cond, what) {
@@ -134,14 +137,25 @@ for (let seed = 0; seed < SEEDS; seed++) {
   const rand = mulberry32(seed);
   const triad = rollPalette(rand).map((c) => hslToRgb(c.h, c.s, c.l));
 
-  // LED order is the wire's order and carries no lightness information -
-  // rollPalette shuffles it. tintedSheet sorts darkest-first to recover the
-  // roles, and this mirrors that.
-  const [ink, fill, accent] =
-    [...triad].sort((a, b) => luminance(a) - luminance(b));
+  // LED order IS role order: rollPalette deals its lightness ladder onto the
+  // zones ascending, and zone index survives unchanged all the way to the
+  // renderer. Taken here exactly as tintedSheet takes it - positionally, with
+  // no sort - so this measures the contract rather than a repair of it.
+  const [ink, fill, accent] = triad;
   const shadow = deriveShadow(ink, fill, ratio);
 
   const li = luminance(ink), ls = luminance(shadow), lf = luminance(fill);
+
+  // The ordering the renderer trusts, checked in the renderer's own axis.
+  // palette_harness asserts the same thing in HSL lightness, where the roller
+  // builds it; these are different axes and a saturated triad can be well
+  // spread on one and tight on the other, so both are worth stating.
+  check(li <= lf,
+    `seed ${seed}: LED 0 is lighter than LED 1, so the ink would outline ` +
+    `the fill in a paler colour than the fill itself`);
+  check(lf <= luminance(accent),
+    `seed ${seed}: LED 2 is darker than LED 1, so the highlight would be ` +
+    `darker than the body it highlights`);
 
   // The invariant the drawing depends on: the outline never comes out lighter
   // than the shading, and the shading never lighter than the body. Mixing

@@ -48,7 +48,7 @@ function extractConst(name) {
 }
 
 const NAMES = [
-  "hslToRgb", "rgbToHex", "wrapHue", "hueDelta", "hueSeparation",
+  "hslToRgb", "rgbToHex", "luminance", "wrapHue", "hueDelta", "hueSeparation",
   "mulberry32", "randRange", "randInt", "shuffle", "rollPalette",
   "easeOutQuint", "makeNoise", "makeSpin", "spinSample", "spinColors",
   "spinDone", "paletteHex", "zoneRect",
@@ -61,7 +61,7 @@ const api = new Function(`
 `)();
 
 const {
-  hslToRgb, rgbToHex, hueSeparation, mulberry32, rollPalette,
+  hslToRgb, rgbToHex, luminance, hueSeparation, mulberry32, rollPalette,
   easeOutQuint, makeSpin, spinSample, spinColors, spinDone, paletteHex,
   zoneRect, LAYOUT, HARMONY,
 } = api;
@@ -116,6 +116,49 @@ const EPS = 1e-9;
   check(worstDist >= 24,
     `closest pair of landed colours differed by only ${worstDist}/255 on its widest channel`);
   console.log(`  harmony: worst hue ${worstHue.toFixed(1)}deg, worst lum ${worstLum.toFixed(3)}, worst channel ${worstDist}/255`);
+}
+
+// --- zone order ------------------------------------------------------------
+//
+// The contract game.js tintedSheet reads the palette under: zone index is LED
+// index, and the renderer takes LED 0 as the creature's ink, LED 1 as its fill
+// and LED 2 as its accent WITHOUT looking at the colours. That only produces a
+// creature whose outline is darker than its body if the roll hands them over
+// in that order, so the ordering is asserted here, at the source, rather than
+// repaired downstream.
+//
+// Asserted in LUMINANCE, not in the HSL `l` the ladder above is drawn in. The
+// two orderings genuinely disagree — 709 weights green ten times as heavily as
+// blue — and it is luminance that decides whether an outline reads as one. An
+// earlier attempt at this ordered by `l` and passed here while leaving roughly
+// a third of creatures inverted on screen; tint_harness caught it.
+//
+// The hue check is the other half, and it is what stops this being "fixed" by
+// sorting harder: which end of the palette leads is a contract, which HUE
+// leads is luck. If an edit ever pinned hue to zone, every badge would wear
+// the same colour in the same lamp and the roll would mean nothing. Note this
+// asserts hue is not FIXED by position, not that it is uncorrelated with it:
+// luminance is hue-dependent, so blues really do drift towards zone 0.
+{
+  let ascending = 0;
+  // Which zone holds the smallest / middle / largest hue, as a "012"-style
+  // key. All six orderings must show up, or hue has become positional.
+  const hueOrders = new Set();
+  for (let seed = 1; seed <= SEEDS; seed++) {
+    const p = rollPalette(mulberry32(seed));
+    const lum = p.map((c) => luminance(hslToRgb(c.h, c.s, c.l)));
+    if (lum[0] <= lum[1] && lum[1] <= lum[2]) ascending++;
+    hueOrders.add(
+      [...p.keys()].sort((a, b) => p[a].h - p[b].h).join(""));
+  }
+  check(ascending === SEEDS,
+    `${SEEDS - ascending} of ${SEEDS} rolls were not ascending in luminance ` +
+    `by zone; game.js tintedSheet reads zone order as ink, fill, accent`);
+  check(hueOrders.size === 6,
+    `hue landed in only ${hueOrders.size} of the 6 possible zone orderings, ` +
+    `so hue has become a function of position`);
+  console.log(`  order: ${ascending}/${SEEDS} ascending in luminance, ` +
+    `hue in all ${hueOrders.size} orderings`);
 }
 
 // --- determinism -----------------------------------------------------------
