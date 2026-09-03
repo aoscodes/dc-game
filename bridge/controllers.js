@@ -477,6 +477,17 @@ class Controller {
         console.warn(`[ctrl] unknown stat line '${line}' from ${this.path}`);
         return;
       }
+      // Logged rather than left to inference: this report is sent once per
+      // link and nothing downstream ever asks again, so when it goes missing
+      // the only symptom is a player who quietly looks and eats like the
+      // defaults.  A board that firmware once dropped whole (its line did not
+      // fit the cdc fifo) looked exactly like a board with nothing to say.
+      console.log(
+        `[ctrl] stat ${this.path} (appetite=${this.appetite}, ` +
+        `babies=${this.babies.join(",")}, ` +
+        `critter=${this.critter === null ? "unreported" : this.critter}, ` +
+        `led=${this.led === null ? "unset" : this.led
+          .map((c) => c.toString(16).padStart(6, "0")).join(",")})`);
       // Forward to the player; the stats only count if they land before the
       // seat is taken (the server freezes the share at count time).  Usually
       // a no-op: the board reports once per link, which is normally before
