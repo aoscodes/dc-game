@@ -497,8 +497,9 @@ fn run_bot_inner(ctx: *BotCtx) !void {
 
 /// Ask for a player seat in the running game (appetite 0, like a browser).
 fn send_take_slot(client: *ws.Client) !void {
-    // tag + appetite (u32) + five per-type baby counts (u32 each) = 25 bytes.
-    var buf: [32]u8 = undefined;
+    // tag + appetite (u32) + five per-type baby counts (u32 each)
+    // + appearance (critter, led-present flag, 3x rgb) = 36 bytes.
+    var buf: [64]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     try proto.encode(fbs.writer(), .take_slot, proto.TakeSlot{});
     try client.writeBin(fbs.getWritten());

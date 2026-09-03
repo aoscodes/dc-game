@@ -387,19 +387,38 @@ const C_FREE = "rgba(30,150,70,1)";
  *  a nibble is not a threat, it is wasted opportunity. */
 const C_SHELTERED = "rgba(60,120,170,1)";
 
-/** Sprite used for the cosmetic Lil Guys roaming the slime field.  Generated
- *  from the board build's authored art by scripts/gen_lilguy.py. */
-const LIL_GUY_SPRITE = "lilguy";
+/** BabyType ordinal → type name; matches components.BabyType.  Each has
+ *  authored art as a baby (one frame in the BABY_SPRITE atlas) and as an
+ *  adult (a whole sheet, lilGuySprite), keyed by these names. */
+const BABY_TYPES = ["rose", "mint", "sky", "gold", "plum"];
+
+/** Sprite class for one critter type's Lil Guy sheet (scripts/gen_lilguys.py).
+ *
+ *  One sheet per type rather than one indexed sheet, because the sprite CLASS
+ *  is an axis drawSprite and tickAnimator already have: a badge's resident
+ *  critter picks a class name and nothing else in the shared draw path needs
+ *  to learn that critters have variants.
+ *
+ *  @param {string} type - a BABY_TYPES name
+ */
+const lilGuySprite = (type) => `lilguy_${type}`;
+/** The type drawn for a player whose board never said (browsers, bots, old
+ *  firmware).  Not a placeholder: a boardless player is a real player and
+ *  gets a real creature, just not a chosen one. */
+const DEFAULT_CRITTER = "rose";
 /** The slime tile atlas (scripts/gen_slime_tiles.py): authored SlimeBlock art
  *  shared with the e-paper badge.  Frames are picked by NAME from its json
  *  (hard/medium/soft/goo + *_invert for selected cells). */
 const SLIME_SPRITE = "slime";
-/** The baby atlas (scripts/gen_babies.py): the authored critters, one frame
+/** The baby atlas (scripts/gen_lilguys.py): the authored critters, one frame
  *  per BabyType, picked by NAME from its json (rose..plum). */
 const BABY_SPRITE = "babies";
 
-/** Sprite sheets to load: the Lil Guys, the slime tile atlas and the brood. */
-const CLASSES = [LIL_GUY_SPRITE, SLIME_SPRITE, BABY_SPRITE];
+/** Sprite sheets to load: every critter's Lil Guy sheet, the slime tile atlas
+ *  and the brood.  All five critters load up front rather than on demand -
+ *  they are ~8KB each, and a player joining mid-game must not pop in as a
+ *  missing sprite while their sheet fetches. */
+const CLASSES = [...BABY_TYPES.map(lilGuySprite), SLIME_SPRITE, BABY_SPRITE];
 
 const sprites = new Map();
 
@@ -955,6 +974,132 @@ function drawPreMatch(game) {
 }
 
 /**
+ * Recoloured sheets, keyed by `${kind}|${r,g,b x3}`.
+ *
+ * Keyed by the COLOURS rather than by the player, so two badges that rolled
+ * the same palette share one canvas and a player who never changes theirs
+ * pays for it once.  A palette only changes on a fresh /onboard roll.
+ *
+ * @type {Map<string, HTMLCanvasElement>}
+ */
+const tintedSheets = new Map();
+
+/** Rec. 709 relative luminance of an [r,g,b], 0..255. */
+function luminance([r, g, b]) {
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+
+/**
+ * The shadow colour for a recoloured body: the ink mixed toward the fill by
+ * the fraction the artist drew.
+ *
+ * DERIVED rather than carried, because a badge has exactly three LEDs and the
+ * art has four recolourable tones.
+ *
+ * A MIX rather than a darkened fill, and that distinction is the whole
+ * correctness argument. Luminance is linear in R, G and B, so mixing puts the
+ * result at exactly `ratio` of the way from the ink's luminance to the fill's
+ * — it can never land outside them, whatever colours the badge rolled.
+ * Scaling the fill instead (`fill * ratio`) ignores the ink completely, and
+ * on a palette whose ink and fill are close in luminance it drops the shadow
+ * BELOW the ink and swallows the outline. That is not hypothetical: it failed
+ * on 17 of 5000 rolled palettes (web/test/tint_harness).
+ *
+ * `ratio` comes from the atlas json (TONE_SHADOW/TONE_FILL) and is a mix
+ * fraction only because the authored ink is 0 — mixing from black IS scaling.
+ * Re-toning the art therefore re-tunes this for free.
+ *
+ * @param {number[]} ink
+ * @param {number[]} fill
+ * @param {number} ratio - 0 = the ink, 1 = the fill
+ */
+function deriveShadow(ink, fill, ratio) {
+  return fill.map((c, i) => Math.round(ink[i] + (c - ink[i]) * ratio));
+}
+
+/**
+ * A critter sheet repainted in one badge's colours, or the source sheet when
+ * that badge never onboarded.
+ *
+ * The art ships as five flat authored greys, one per ROLE (see
+ * gen_lilguys.py), so this is an exact-value substitution rather than a hue
+ * shift: the badge's three colours become ink, fill and accent, the shadow is
+ * derived from the first two, and the food blob (`prop`) is left alone
+ * because it belongs to the world, not to the creature.
+ *
+ * @param {string} kind
+ * @param {number[][]|null} led - three [r,g,b] triples, or null when the
+ *   badge never onboarded (store.h led_rgb all-zero) - the art's own greys
+ *   are the honest answer then, not black.
+ * @returns {CanvasImageSource|null}
+ */
+function tintedSheet(kind, led) {
+  const sp = sprites.get(kind);
+  if (!sp) return null;
+  if (!led) return sp.img;
+
+  const key = `${kind}|${led.map((c) => c.join(",")).join("|")}`;
+  const cached = tintedSheets.get(key);
+  if (cached !== undefined) return cached;
+
+  const { img, meta } = sp;
+  const tones = meta.tones;
+  if (!tones) return img; // an atlas with no tone legend is not recolourable
+
+  const cv = document.createElement("canvas");
+  cv.width = img.width;
+  cv.height = img.height;
+  const c2 = cv.getContext("2d", { willReadFrequently: true });
+  c2.drawImage(img, 0, 0);
+  const px = c2.getImageData(0, 0, cv.width, cv.height);
+  const d = px.data;
+
+  // Roles are assigned BY LIGHTNESS, not by LED index.
+  //
+  // A badge's three LEDs are three lamps in a row; which is "first" is a fact
+  // about the board's wiring, and onboard.js's rollPalette shuffles its triad
+  // on purpose so that zone order carries no bias. Taking them in LED order
+  // therefore hands the ink slot a random one of the three, and roughly two
+  // times in three the outline comes out lighter than the body it is meant to
+  // bound - the creature dissolves into a flat blob (web/test/tint_harness).
+  //
+  // Sorted darkest-first they land in the order the art was drawn in:
+  // ink < fill < accent (0, 65, 131). The shadow is then derived to sit
+  // between the first two. onboard.js keeps the three lightnesses
+  // HARMONY.minLumGap apart, so this ordering is never a coin toss between
+  // near-equal colours.
+  const byLightness = [...led].sort((a, b) => luminance(a) - luminance(b));
+
+  // authored grey -> replacement. Every tone is neutral, so the red channel
+  // identifies it, and building the table once keeps the per-pixel loop to a
+  // single array index.
+  const replace = new Array(256).fill(null);
+  const put = (role, rgb) => {
+    const src = tones[role];
+    if (src !== undefined && rgb !== undefined) replace[src[0]] = rgb;
+  };
+  put("ink", byLightness[0]);
+  put("fill", byLightness[1]);
+  put("accent", byLightness[2]);
+  if (tones.shadow !== undefined) {
+    replace[tones.shadow[0]] =
+      deriveShadow(byLightness[0], byLightness[1], meta.shadow_ratio ?? 0.63);
+  }
+
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i + 3] === 0) continue; // paper: left transparent
+    const to = replace[d[i]];
+    if (to === null) continue; // prop, and anything unrecognised
+    d[i] = to[0];
+    d[i + 1] = to[1];
+    d[i + 2] = to[2];
+  }
+  c2.putImageData(px, 0, 0);
+  tintedSheets.set(key, cv);
+  return cv;
+}
+
+/**
  * Draw one sprite into a cell box, scaled preserving aspect ratio.
  *
  * @param {number} id  - animator id
@@ -966,12 +1111,17 @@ function drawPreMatch(game) {
  * @param {string|null} lastAction - "attack"|"die"|null
  * @param {number} dt  - seconds since last frame
  * @param {boolean} flip - mirror horizontally
+ * @param {number[][]|null} [led] - the owner badge's three LED colours, to
+ *   repaint the sheet in (see tintedSheet).  Omit for sprites that are not a
+ *   player's own creature.
  */
-function drawSprite(id, kind, cx, cy, cw, ch, lastAction, dt, flip) {
+function drawSprite(id, kind, cx, cy, cw, ch, lastAction, dt, flip, led) {
   const sp = sprites.get(kind);
   if (!sp) return;
 
-  const { img, meta } = sp;
+  const img = tintedSheet(kind, led ?? null);
+  if (img === null) return;
+  const { meta } = sp;
   const { frame_w, frame_h, clips } = meta;
   const { frame } = tickAnimator(id, kind, lastAction, dt);
   const clip = clips[animState.get(id)?.clip ?? "idle"] ?? clips["idle"];
@@ -1783,9 +1933,6 @@ function feastWidth(game, cols) {
   return Math.min(FEAST_COLUMNS + seated * FEAST_COLUMNS_PER_GUY, cols);
 }
 
-/** BabyType ordinal → type name; matches components.BabyType.  Each has
- *  authored art in the baby atlas (BABY_SPRITE), keyed by these names. */
-const BABY_TYPES = ["rose", "mint", "sky", "gold", "plum"];
 
 /** Colour per baby type.  The critters draw as black-and-white sprites for
  *  now; this table is the fallback dot when the atlas has not loaded, and
@@ -3318,7 +3465,11 @@ function syncLilGuys(game, spawnAt) {
 
   return players.map((e, i) => {
     const existing = lilGuys.get(e.owner);
-    if (existing) return existing;
+    // Appearance is refreshed every sync rather than fixed at birth: a board
+    // reports its critter and colours on its own schedule, so a guy created
+    // in the gap between joining and the first CTRL:STAT would otherwise wear
+    // the default for the rest of the encounter.
+    if (existing) return Object.assign(existing, appearance(e));
     const seat = spawnAt[i];
     let at;
     if (seat !== undefined && seat !== null) {
@@ -3335,10 +3486,27 @@ function syncLilGuys(game, spawnAt) {
       facingLeft: false,
       pendingClip: null,
       id: LIL_GUY_ANIM_BASE + e.owner,
+      ...appearance(e),
     };
     lilGuys.set(e.owner, g);
     return g;
   });
+}
+
+/**
+ * Which creature a player's board keeps, and the colours it wears.
+ *
+ * Both are absent for a player without a badge (a browser, a bot) and for a
+ * badge on firmware that predates them, so both fall back: an unreported
+ * critter draws as DEFAULT_CRITTER, and unreported colours draw the art's own
+ * authored greys rather than being invented.
+ *
+ * @param {object} e - a player entity from the snapshot
+ * @returns {{sprite: string, led: number[][]|null}}
+ */
+function appearance(e) {
+  const type = BABY_TYPES.includes(e.critter) ? e.critter : DEFAULT_CRITTER;
+  return { sprite: lilGuySprite(type), led: e.led ?? null };
 }
 
 /**
@@ -3397,8 +3565,8 @@ function drawLilGuys(game, dt) {
   const { rows, cols } = gridDims(game);
   const size = lilGuySize(rows, cols);
   for (const g of lilGuys.values()) {
-    drawSprite(g.id, LIL_GUY_SPRITE, g.x, g.y, size, size, g.pendingClip,
-      dt, g.facingLeft);
+    drawSprite(g.id, g.sprite, g.x, g.y, size, size, g.pendingClip,
+      dt, g.facingLeft, g.led);
     g.pendingClip = null; // one-shot: the animator owns the clip from here
   }
 }

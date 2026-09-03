@@ -18,6 +18,14 @@ const STAT_APPETITE_PREFIX = "STAT:appetite=";
 /// "STAT:babies=1,0,2,0,0".  Same lifecycle as the appetite line: sent by the
 /// bridge before JOIN.
 const STAT_BABIES_PREFIX = "STAT:babies=";
+/// The board's resident critter as a BabyType ordinal, e.g. "STAT:critter=2",
+/// and its three LED colours as hex, e.g. "STAT:led=d4506e,7ac0a0,e8c46a".
+/// Both are purely cosmetic (what this player's Lil Guy looks like) and both
+/// are sent only once the board has actually reported them - the bridge
+/// withholds the line rather than sending a placeholder, so absent stays
+/// distinguishable from chosen.
+const STAT_CRITTER_PREFIX = "STAT:critter=";
+const STAT_LED_PREFIX = "STAT:led=";
 
 /// How often the loop WAKES.  Not how often it emits: input is forwarded at
 /// this rate to keep presses responsive, while render frames go out only when
@@ -114,6 +122,9 @@ var g_appetite: u32 = 0;
 // Babies for take_slot, set via the STAT:babies= stdio line; same lifecycle
 // and threading story as g_appetite.
 var g_babies: c.BabyCounts = [_]u32{0} ** c.BabyType.size;
+// Cosmetic appearance for take_slot, set via the STAT:critter= and STAT:led=
+// stdio lines; same lifecycle and threading story as g_appetite.
+var g_appearance: proto.Appearance = .{};
 
 var g_stdout_mu: std.Thread.Mutex = .{};
 
@@ -192,8 +203,40 @@ fn stdin_reader(_: void) void {
                 std.log.warn("bad babies stat line: {s}", .{trimmed});
                 continue;
             };
+        } else if (std.mem.startsWith(u8, trimmed, STAT_CRITTER_PREFIX)) {
+            const value = trimmed[STAT_CRITTER_PREFIX.len..];
+            const ordinal = std.fmt.parseInt(u8, value, 10) catch {
+                std.log.warn("bad critter stat line: {s}", .{trimmed});
+                continue;
+            };
+            g_appearance.critter = std.meta.intToEnum(c.BabyType, ordinal) catch {
+                std.log.warn("bad critter stat line: {s}", .{trimmed});
+                continue;
+            };
+        } else if (std.mem.startsWith(u8, trimmed, STAT_LED_PREFIX)) {
+            g_appearance.led = parse_led_colours(trimmed[STAT_LED_PREFIX.len..]) orelse {
+                std.log.warn("bad led stat line: {s}", .{trimmed});
+                continue;
+            };
         }
     }
+}
+
+/// Parse "rrggbb,rrggbb,rrggbb" into the badge's three LED colours.  Null on
+/// any malformed or miscounted list, so a garbled line leaves the previous
+/// palette (or none) standing rather than half-applying a new one.
+fn parse_led_colours(list: []const u8) ?[proto.LED_COUNT][3]u8 {
+    var leds: [proto.LED_COUNT][3]u8 = undefined;
+    var it = std.mem.splitScalar(u8, list, ',');
+    for (&leds) |*rgb| {
+        const field = std.mem.trim(u8, it.next() orelse return null, " ");
+        if (field.len != 6) return null;
+        for (rgb, 0..) |*channel, i| {
+            channel.* = std.fmt.parseInt(u8, field[i * 2 ..][0..2], 16) catch return null;
+        }
+    }
+    if (it.next() != null) return null;
+    return leds;
 }
 
 fn emit_send(bytes: []const u8) void {
@@ -223,6 +266,7 @@ fn send_take_slot() void {
     proto.encode(fbs.writer(), .take_slot, proto.TakeSlot{
         .appetite = g_appetite,
         .babies = g_babies,
+        .appearance = g_appearance,
     }) catch return;
     emit_send(fbs.getWritten());
 }

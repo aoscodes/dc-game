@@ -235,8 +235,7 @@ pub const BotHarness = struct {
 /// both count up from 0.  Returns the seat id, or null when the game is full.
 fn seat_bot(sess: *Session, transport: shared.Transport) ?u8 {
     const conn_id = sess.connect(transport) orelse return null;
-    const no_babies = [_]u32{0} ** shared.components.BabyType.size;
-    sess.take_slot(conn_id, 0, no_babies) catch return null;
+    sess.take_slot(conn_id, .{}) catch return null;
     return sess.connections[conn_id].player_id;
 }
 

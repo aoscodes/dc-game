@@ -290,6 +290,31 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&web_test.step);
 
     // -----------------------------------------------------------------------
+    // Sprite atlases  (zig build assets)
+    // -----------------------------------------------------------------------
+    //
+    // The critter art lives in the BOARD repo, in the same 5-tone masters the
+    // e-paper badge draws from, and scripts/gen_lilguys.py converts it into
+    // the atlases web/game.js loads.  Generated output is COMMITTED, because
+    // the browser fetches web/assets straight off disk and a clone that has
+    // not run a build step must still be able to serve a playable game.
+    //
+    // Committed output rots, so `assets-check` regenerates into memory and
+    // compares — wired into `test` so that editing the art on the board side
+    // and forgetting to re-run this is a failing build rather than a game
+    // quietly drawing last month's creature.
+    const gen_assets = b.addSystemCommand(&.{ "python3", "scripts/gen_lilguys.py" });
+    gen_assets.setCwd(b.path("."));
+    const assets_step = b.step("assets", "Regenerate the sprite atlases from the board's art");
+    assets_step.dependOn(&gen_assets.step);
+
+    const check_assets = b.addSystemCommand(&.{ "python3", "scripts/gen_lilguys.py", "--check" });
+    check_assets.setCwd(b.path("."));
+    const assets_check_step = b.step("assets-check", "Verify the committed atlases match the board's art");
+    assets_check_step.dependOn(&check_assets.step);
+    test_step.dependOn(&check_assets.step);
+
+    // -----------------------------------------------------------------------
     // Render-gate probe  (zig build gate-probe)
     // -----------------------------------------------------------------------
     //

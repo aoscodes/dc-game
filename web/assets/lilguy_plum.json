@@ -1,0 +1,58 @@
+{
+  "frame_w": 96,
+  "frame_h": 96,
+  "clips": {
+    "idle": {
+      "row": 0,
+      "frames": 5,
+      "fps": 6,
+      "loop": true
+    },
+    "attack": {
+      "row": 1,
+      "frames": 6,
+      "fps": 12,
+      "loop": false
+    },
+    "hurt": {
+      "row": 0,
+      "frames": 5,
+      "fps": 10,
+      "loop": false
+    },
+    "die": {
+      "row": 0,
+      "frames": 5,
+      "fps": 8,
+      "loop": false
+    }
+  },
+  "tones": {
+    "ink": [
+      0,
+      0,
+      0
+    ],
+    "shadow": [
+      41,
+      41,
+      41
+    ],
+    "fill": [
+      65,
+      65,
+      65
+    ],
+    "accent": [
+      131,
+      131,
+      131
+    ],
+    "prop": [
+      189,
+      189,
+      189
+    ]
+  },
+  "shadow_ratio": 0.6307692307692307
+}

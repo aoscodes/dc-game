@@ -200,6 +200,10 @@ fn write_render_inner(
             .cursor_row = e.cursor_row,
             .cursor_col = e.cursor_col,
             .babies = babies(e.babies),
+            .critter = critter_name(e.appearance.critter),
+            // Null and "black" are DIFFERENT pictures downstream (null draws
+            // the art's authored greys), so this travels unflattened.
+            .led = e.appearance.led,
         };
     }
 
@@ -450,6 +454,14 @@ fn babies(values: c.BabyCounts) JsonBabies {
         .gold = values[3],
         .plum = values[4],
     };
+}
+
+/// The critter name the renderer keys its sprite sheets by, or null when the
+/// board never said (browsers, bots, old firmware).  The NAME rather than the
+/// ordinal because game.js already names the five types and looks its atlases
+/// up by them; a number here would put the enum order in two places.
+fn critter_name(ct: ?c.BabyType) ?[]const u8 {
+    return if (ct) |t| @tagName(t) else null;
 }
 
 /// Same, from the u16 tallies (session hatches, match stats).
@@ -751,6 +763,14 @@ const JsonEntity = struct {
     /// The babies this player's board brought, per type — drawn beside their
     /// owner and gone when they leave.
     babies: JsonBabies,
+    /// Which of the five critters this player's board keeps, by name, or null
+    /// when it never said — the renderer falls back to a default creature
+    /// rather than drawing nothing.
+    critter: ?[]const u8,
+    /// The board's three LED colours, `[[r,g,b], [r,g,b], [r,g,b]]`, or null
+    /// for a badge that never onboarded.  The renderer repaints its Lil Guy
+    /// in these; null means it draws the art as authored.
+    led: ?[proto.LED_COUNT][3]u8,
 };
 
 // ---------------------------------------------------------------------------
@@ -1022,4 +1042,77 @@ test "the widest frame the wire caps admit fits render_buf" {
     // +1 for the newline write_render appends after the payload.
     const len = (try render_to_json(buf, &game)).len + 1;
     try testing.expect(len <= RENDER_BUF_BYTES);
+}
+
+test "a player's critter and colours reach the renderer" {
+    // web/game.js `appearance()` reads exactly `e.critter` and `e.led`, and
+    // dresses that player's Lil Guy from them. Both are hand-copied into
+    // JsonEntity, which is the drift this file's tests exist to catch.
+    var game = GameState{};
+    game.snapshot.grid_rows = 3;
+    game.snapshot.grid_cols = 3;
+    game.snapshot.entity_count = 1;
+    game.snapshot.entities[0] = blk: {
+        var e = proto.EntitySnapshot.blank;
+        e.entity = 9;
+        e.owner = 0;
+        e.appearance = .{ .critter = .gold, .led = .{
+            .{ 0xD4, 0x50, 0x6E }, .{ 0x7A, 0xC0, 0xA0 }, .{ 0xE8, 0xC4, 0x6A },
+        } };
+        break :blk e;
+    };
+
+    var buf: [32768]u8 = undefined;
+    const json = try render_to_json(&buf, &game);
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        json,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const ent = parsed.value.object.get("game").?.object
+        .get("entities").?.array.items[0].object;
+
+    // The NAME, not the ordinal: game.js keys its sprite sheets by it.
+    try testing.expectEqualStrings("gold", ent.get("critter").?.string);
+
+    const led = ent.get("led").?.array;
+    try testing.expectEqual(@as(usize, 3), led.items.len);
+    try testing.expectEqual(@as(i64, 0xD4), led.items[0].array.items[0].integer);
+    try testing.expectEqual(@as(i64, 0x6E), led.items[0].array.items[2].integer);
+    try testing.expectEqual(@as(i64, 0xA0), led.items[1].array.items[2].integer);
+    try testing.expectEqual(@as(i64, 0xE8), led.items[2].array.items[0].integer);
+}
+
+test "a boardless player's appearance is absent, not black" {
+    // The whole point of the optional. A browser tab has no badge, and the
+    // renderer must be able to tell that apart from a badge whose LEDs are
+    // genuinely off — the first draws the authored art, the second would
+    // paint the creature solid black.
+    //
+    // The frame is written with `emit_null_optional_fields = false`, so
+    // "absent" is a MISSING KEY rather than a null. game.js reads both the
+    // same way (`e.led ?? null`), and this pins which one it actually gets.
+    var game = GameState{};
+    game.snapshot.grid_rows = 3;
+    game.snapshot.grid_cols = 3;
+    game.snapshot.entity_count = 1;
+    game.snapshot.entities[0] = proto.EntitySnapshot.blank;
+
+    var buf: [32768]u8 = undefined;
+    const json = try render_to_json(&buf, &game);
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        json,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const ent = parsed.value.object.get("game").?.object
+        .get("entities").?.array.items[0].object;
+    try testing.expect(ent.get("critter") == null);
+    try testing.expect(ent.get("led") == null);
 }

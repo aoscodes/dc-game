@@ -9,13 +9,18 @@
  *                      CTRL:HB                 1s keepalive
  *                      CTRL:BTN <name> <D|U>   button press/release edges
  *                      CTRL:STAT appetite=<u32> babies=<a,b,c,d,e>
+ *                                critter=<0..4> led=<rrggbb>,<rrggbb>,<rrggbb>
  *                                              persistent flash stats, sent
  *                                              once after CTRL:HELLO; appetite
  *                                              feeds the player's hunger
  *                                              capacity, babies (per BabyType,
  *                                              ordinal order) join the game
- *                                              with their owner.  `babies` is
- *                                              absent on old firmware = all 0.
+ *                                              with their owner, and critter +
+ *                                              led are what that player's Lil
+ *                                              Guy looks like on the shared
+ *                                              screen.  Every key but appetite
+ *                                              is absent on old firmware; each
+ *                                              falls back on its own.
  *                      CTRL:SCORE_ACK g=<u32>  score banked to flash (sent
  *                                              AFTER the save; re-sent on retries)
  *                      CTRL:LED_ACK g=<u32>    palette banked to flash, on
@@ -70,6 +75,21 @@
 // the board's flash layout. The wire carries counts as a bare comma list in
 // exactly this order.
 const BABY_TYPE_COUNT = 5;
+
+/** How many LEDs a badge has, and so how many colours it reports. */
+const LED_COUNT = 3;
+
+/** Parse "rrggbb,rrggbb,rrggbb" into 3 packed u24s, or null when malformed. */
+function parseLedList(text) {
+  const parts = text.split(",");
+  if (parts.length !== LED_COUNT) return null;
+  const leds = [];
+  for (const p of parts) {
+    if (!/^[0-9a-fA-F]{6}$/.test(p.trim())) return null;
+    leds.push(parseInt(p.trim(), 16) >>> 0);
+  }
+  return leds;
+}
 
 /** Parse "a,b,c,d,e" into 5 u32s, or null when malformed/miscounted. */
 function parseBabyList(text) {
@@ -232,6 +252,13 @@ class Controller {
     /** Babies banked on the board (CTRL:STAT), per BabyType; zeros until the
      *  stat arrives (and forever, for old firmware that never sends it). */
     this.babies = new Array(BABY_TYPE_COUNT).fill(0);
+    /** Which critter this badge keeps (CTRL:STAT), as a BabyType ordinal, or
+     *  null until it says. The board picks one and keeps it, so this is the
+     *  creature drawn for its player all game. */
+    this.critter = null;
+    /** The badge's three LED colours (CTRL:STAT) as packed u24s, or null
+     *  until it says. The client repaints its Lil Guy in these. */
+    this.led = null;
     this.lastShape = null; // last FB:SHAPE payload sent (dedupe)
     /** Last GAME:PHASE activity sent (boolean), or null before the first. */
     this.lastActive = null;
@@ -348,6 +375,29 @@ class Controller {
           }
           continue;
         }
+        const critter = arg.match(/^critter=(\d+)$/);
+        if (critter !== null) {
+          const n = Number(critter[1]);
+          if (n < BABY_TYPE_COUNT) {
+            this.critter = n;
+            known = true;
+          }
+          continue;
+        }
+        const led = arg.match(/^led=([0-9a-fA-F,]+)$/);
+        if (led !== null) {
+          const colours = parseLedList(led[1]);
+          if (colours !== null) {
+            // A badge reports 000000 x3 until someone runs the /onboard flow
+            // (store.h led_rgb). That is not a palette of black, it is NO
+            // palette, and it stays null so the renderer draws the authored
+            // art rather than a solid black creature. The key was still
+            // understood, so the line is not a mystery.
+            this.led = colours.every((c) => c === 0) ? null : colours;
+            known = true;
+          }
+          continue;
+        }
       }
       if (!known) {
         console.warn(`[ctrl] unknown stat line '${line}' from ${this.path}`);
@@ -358,6 +408,16 @@ class Controller {
       if (this.playerSession !== null) {
         this.playerSession.writeToZig(`STAT:appetite=${this.appetite}\n`);
         this.playerSession.writeToZig(`STAT:babies=${this.babies.join(",")}\n`);
+        // Appearance is sent only once the board has said - the server's
+        // default is "unreported", which the client draws as plain art, and
+        // an invented value here would be indistinguishable from a real one.
+        if (this.critter !== null) {
+          this.playerSession.writeToZig(`STAT:critter=${this.critter}\n`);
+        }
+        if (this.led !== null) {
+          const hex = this.led.map((c) => c.toString(16).padStart(6, "0"));
+          this.playerSession.writeToZig(`STAT:led=${hex.join(",")}\n`);
+        }
       }
       return;
     }

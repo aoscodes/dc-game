@@ -72,7 +72,60 @@ pub const TakeSlot = struct {
     /// balance.baby_hunger to the bar's capacity.  All zero for boardless
     /// players.
     babies: components.BabyCounts = [_]u32{0} ** components.BabyType.size,
+    /// What this player's Lil Guy looks like on the shared screen.  Absent in
+    /// both halves for boardless players, who get drawn as authored art.
+    appearance: Appearance = .{},
 };
+
+/// How many LEDs a badge has, and so how many colours it reports.
+pub const LED_COUNT = 3;
+
+/// What a player's Lil Guy looks like: which of the five critters their badge
+/// keeps, and the colours it wears.  PURELY COSMETIC - nothing in game_logic
+/// reads it, and two players with the same critter are not related in any way
+/// the rules care about.
+///
+/// The two halves are independently optional because the board knows them
+/// independently: it always has a critter (derived from its badge id at
+/// store.h critter_of), but its LEDs stay unset until someone runs the
+/// /onboard flow.  A player with no board at all has neither.  Absent is not
+/// the same as a default value here - the client draws the art's own authored
+/// greys for an absent palette, which is a different picture from any colour
+/// this could invent.
+pub const Appearance = struct {
+    critter: ?components.BabyType = null,
+    /// Three RGB triples in LED order.  What the roles ink/fill/accent mean
+    /// is the renderer's business, not the wire's: these are three lamps.
+    led: ?[LED_COUNT][3]u8 = null,
+};
+
+/// Sentinel for `Appearance.critter == null` on the wire.  Out of range of
+/// BabyType, so a real ordinal can never be mistaken for it.
+const CRITTER_NONE: u8 = 0xFF;
+
+fn encode_appearance(writer: anytype, a: Appearance) !void {
+    try writer.writeByte(if (a.critter) |ct| @intFromEnum(ct) else CRITTER_NONE);
+    // The colours are always written, present or not, so take_slot stays a
+    // fixed size - a variable-length tail here would be the only one in the
+    // message for the sake of nine bytes.
+    try writer.writeByte(@intFromBool(a.led != null));
+    const led = a.led orelse [_][3]u8{[_]u8{0} ** 3} ** LED_COUNT;
+    for (led) |rgb| try writer.writeAll(&rgb);
+}
+
+fn decode_appearance(reader: anytype) !Appearance {
+    var a: Appearance = .{};
+    const ct = try reader.readByte();
+    if (ct != CRITTER_NONE) {
+        a.critter = std.meta.intToEnum(components.BabyType, ct) catch
+            return DecodeError.InvalidBabyType;
+    }
+    const has_led = (try reader.readByte()) != 0;
+    var led: [LED_COUNT][3]u8 = undefined;
+    for (&led) |*rgb| _ = try reader.readAll(rgb);
+    if (has_led) a.led = led;
+    return a;
+}
 
 /// One step of the shape wheel.  A DIRECTION, not a destination, for the same
 /// reason as `MoveCursor`: the server owns the selection, so a client can never
@@ -458,6 +511,10 @@ pub const EntitySnapshot = struct {
     /// (from take_slot).  Snapshotted so every client renders every player's
     /// babies — and a reconnect recovers them.
     babies: components.BabyCounts,
+    /// What this player's Lil Guy looks like (from take_slot).  Snapshotted
+    /// for the same reason as the babies: every client draws every player, so
+    /// the appearance has to reach clients that are not its owner.
+    appearance: Appearance,
 
     pub const blank = EntitySnapshot{
         .entity = 0,
@@ -468,6 +525,7 @@ pub const EntitySnapshot = struct {
         .cursor_row = 0,
         .cursor_col = 0,
         .babies = [_]u32{0} ** components.BabyType.size,
+        .appearance = .{},
     };
 };
 
@@ -675,6 +733,7 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
         .take_slot => {
             try writer.writeInt(u32, payload.appetite, .little);
             for (payload.babies) |b| try writer.writeInt(u32, b, .little);
+            try encode_appearance(writer, payload.appearance);
         },
         .leave_slot => {},
         .restart => {},
@@ -814,6 +873,7 @@ fn encode_game_state(w: anytype, p: GameState) !void {
         try w.writeByte(e.cursor_row);
         try w.writeByte(e.cursor_col);
         for (e.babies) |b| try w.writeInt(u32, b, .little);
+        try encode_appearance(w, e.appearance);
     }
     try encode_bar_summary(w, p.hunger);
     try w.writeInt(u32, p.charges, .little);
@@ -973,6 +1033,7 @@ pub fn read_tag(reader: anytype) !MsgTag {
 pub fn decode_take_slot(reader: anytype) !TakeSlot {
     var p = TakeSlot{ .appetite = try reader.readInt(u32, .little) };
     for (&p.babies) |*b| b.* = try reader.readInt(u32, .little);
+    p.appearance = try decode_appearance(reader);
     return p;
 }
 
@@ -1025,6 +1086,7 @@ pub fn decode_game_state(reader: anytype) !GameState {
         e.cursor_row = try reader.readByte();
         e.cursor_col = try reader.readByte();
         for (&e.babies) |*b| b.* = try reader.readInt(u32, .little);
+        e.appearance = try decode_appearance(reader);
         p.entities[i] = e;
     }
     p.hunger = try decode_bar_summary(reader);
@@ -1162,18 +1224,43 @@ test "round-trip: game_over carries score and match stats" {
 }
 
 test "round-trip: take_slot carries the appetite stat and the board's babies" {
-    var buf: [32]u8 = undefined;
+    var buf: [64]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
 
     try encode(fbs.writer(), .take_slot, TakeSlot{
         .appetite = 17,
         .babies = .{ 1, 0, 2, 0, 5 },
+        .appearance = .{
+            .critter = .sky,
+            .led = .{ .{ 0xD4, 0x50, 0x6E }, .{ 0x7A, 0xC0, 0xA0 }, .{ 0xE8, 0xC4, 0x6A } },
+        },
     });
     fbs.reset();
     try std.testing.expectEqual(MsgTag.take_slot, try read_tag(fbs.reader()));
     const decoded = try decode_take_slot(fbs.reader());
     try std.testing.expectEqual(@as(u32, 17), decoded.appetite);
     try std.testing.expectEqual([_]u32{ 1, 0, 2, 0, 5 }, decoded.babies);
+    try std.testing.expectEqual(components.BabyType.sky, decoded.appearance.critter.?);
+    try std.testing.expectEqual(
+        [_][3]u8{ .{ 0xD4, 0x50, 0x6E }, .{ 0x7A, 0xC0, 0xA0 }, .{ 0xE8, 0xC4, 0x6A } },
+        decoded.appearance.led.?,
+    );
+}
+
+test "round-trip: an unreported appearance survives as absent, not as a colour" {
+    // The distinction the whole cosmetic path rests on: a browser with no
+    // board must arrive at the renderer as "no palette" so it draws the
+    // authored art, NOT as a black one. Encoding writes the colour bytes
+    // either way, so this checks the presence flag really gates them.
+    var buf: [64]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    try encode(fbs.writer(), .take_slot, TakeSlot{});
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    const decoded = try decode_take_slot(fbs.reader());
+    try std.testing.expect(decoded.appearance.critter == null);
+    try std.testing.expect(decoded.appearance.led == null);
 }
 
 test "round-trip: leave_slot carries no payload" {
@@ -1231,6 +1318,9 @@ test "round-trip: game_state — bite, hunger, score, grid, and selection surviv
         .cursor_row = 2,
         .cursor_col = 5,
         .babies = .{ 0, 4, 0, 0, 1 },
+        .appearance = .{ .critter = .plum, .led = .{
+            .{ 0x11, 0x22, 0x33 }, .{ 0x44, 0x55, 0x66 }, .{ 0x77, 0x88, 0x99 },
+        } },
     };
 
     try encode(fbs.writer(), .game_state, gs);
@@ -1275,6 +1365,13 @@ test "round-trip: game_state — bite, hunger, score, grid, and selection surviv
     try std.testing.expectEqual(@as(u8, 5), decoded.entities[0].cursor_col);
     // The board's babies travel with their owner.
     try std.testing.expectEqual([_]u32{ 0, 4, 0, 0, 1 }, decoded.entities[0].babies);
+    // ...and so does what its Lil Guy looks like, so that OTHER clients can
+    // draw this player as their board dressed them.
+    const look = decoded.entities[0].appearance;
+    try std.testing.expectEqual(components.BabyType.plum, look.critter.?);
+    try std.testing.expectEqual([_][3]u8{
+        .{ 0x11, 0x22, 0x33 }, .{ 0x44, 0x55, 0x66 }, .{ 0x77, 0x88, 0x99 },
+    }, look.led.?);
 }
 
 test "round-trip: game_start — join code, grid dims and realtime pacing survive" {

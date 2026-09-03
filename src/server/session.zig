@@ -159,6 +159,10 @@ pub const PlayerSlot = struct {
     /// They join the encounter with their owner — each adds baby_hunger to
     /// the bar via the owner's share — and leave with them.
     babies: c.BabyCounts = [_]u32{0} ** c.BabyType.size,
+    /// What this player's Lil Guy looks like (take_slot).  COSMETIC ONLY: it
+    /// is copied into the snapshot for the renderer and read nowhere else, so
+    /// it can never affect who wins.
+    appearance: proto.Appearance = .{},
     entity: ecs.Entity = std.math.maxInt(ecs.Entity),
     /// Index into the session's connection registry; meaningful only while
     /// occupied.
@@ -393,6 +397,7 @@ pub const Session = struct {
         slot.occupied = false;
         slot.appetite = 0;
         slot.babies = [_]u32{0} ** c.BabyType.size;
+        slot.appearance = .{};
         self.connections[slot.conn].player_id = null;
     }
 
@@ -1037,7 +1042,7 @@ pub const Session = struct {
         switch (tag) {
             .take_slot => {
                 const p = try proto.decode_take_slot(fbs.reader());
-                try self.take_slot(conn_id, p.appetite, p.babies);
+                try self.take_slot(conn_id, p);
             },
             .leave_slot => {
                 const pid = seat orelse return;
@@ -1207,8 +1212,10 @@ pub const Session = struct {
     /// the asker simply stays what it was.
     ///
     /// Public as a test seam: in play this runs from the `take_slot` wire
-    /// message.
-    pub fn take_slot(self: *Session, conn_id: usize, appetite: u32, babies: c.BabyCounts) !void {
+    /// message.  Takes the decoded payload whole rather than its fields, so
+    /// that what a board reports about itself can grow without every caller
+    /// (mostly tests) being rewritten to pass another zero.
+    pub fn take_slot(self: *Session, conn_id: usize, req: proto.TakeSlot) !void {
         const conn = &self.connections[conn_id];
         if (conn.player_id != null) return;
         const slot = for (&self.players) |*p| {
@@ -1219,8 +1226,9 @@ pub const Session = struct {
         };
 
         slot.occupied = true;
-        slot.appetite = appetite;
-        slot.babies = babies;
+        slot.appetite = req.appetite;
+        slot.babies = req.babies;
+        slot.appearance = req.appearance;
         slot.conn = conn_id;
         conn.player_id = slot.player_id;
         // A freed seat keeps nothing of its previous owner.
@@ -1233,7 +1241,7 @@ pub const Session = struct {
         try self.spawn_player_midgame(slot.player_id);
         try self.send_game_start_to_conn(conn_id);
         std.log.info("player {} took a seat (appetite {}, babies {}, {} seated)", .{
-            slot.player_id, appetite, c.baby_total(babies), self.seated_players(),
+            slot.player_id, req.appetite, c.baby_total(req.babies), self.seated_players(),
         });
     }
 
@@ -1448,6 +1456,7 @@ pub const Session = struct {
                 .cursor_row = self.field.grid.row_of(self.cursors[own]),
                 .cursor_col = self.field.grid.col_of(self.cursors[own]),
                 .babies = self.players[own].babies,
+                .appearance = self.players[own].appearance,
             };
             snap.entity_count += 1;
         }

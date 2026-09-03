@@ -442,7 +442,7 @@ fn init_two_player_session_cfg(
 /// which equals the connection id for sessions built strictly this way.
 fn seat_player(sess: *Session, transport: shared.Transport, appetite: u32) !u8 {
     const conn_id = sess.connect(transport) orelse return error.JoinFailed;
-    try sess.take_slot(conn_id, appetite, NO_BABIES);
+    try sess.take_slot(conn_id, .{ .appetite = appetite });
     const pid = sess.connections[conn_id].player_id orelse return error.JoinFailed;
     std.debug.assert(@as(usize, pid) == conn_id);
     return pid;
@@ -648,14 +648,14 @@ test "the fifth take_slot is silently ignored" {
     for (&extra_conns) |*cid| {
         cid.* = s.sess.connect(s.p[0].transport()) orelse return error.JoinFailed;
     }
-    try s.sess.take_slot(extra_conns[0], 0, NO_BABIES);
-    try s.sess.take_slot(extra_conns[1], 0, NO_BABIES);
+    try s.sess.take_slot(extra_conns[0], .{});
+    try s.sess.take_slot(extra_conns[1], .{});
     try std.testing.expectEqual(@as(u8, 4), s.sess.seated_players());
 
     // The fifth asker: no error, no seat, still an observer.
     const bar_before = s.sess.hunger.max;
     const charges_before = s.sess.charges;
-    try s.sess.take_slot(extra_conns[2], 0, NO_BABIES);
+    try s.sess.take_slot(extra_conns[2], .{});
     try std.testing.expectEqual(@as(u8, 4), s.sess.seated_players());
     try std.testing.expectEqual(@as(?u8, null), s.sess.connections[extra_conns[2]].player_id);
     try std.testing.expectEqual(bar_before, s.sess.hunger.max);
@@ -2410,7 +2410,7 @@ test "a board's babies join the bar with their owner and leave with them" {
     extra.init(allocator);
     defer extra.deinit(allocator);
     const conn_id = s.sess.connect(extra.transport()) orelse return error.JoinFailed;
-    try s.sess.take_slot(conn_id, 2, .{ 1, 0, 2, 0, 0 });
+    try s.sess.take_slot(conn_id, .{ .appetite = 2, .babies = .{ 1, 0, 2, 0, 0 } });
 
     const share = logic.player_hunger(BAL, 2, 3);
     try std.testing.expectEqual(max_before + share, s.sess.hunger.max);
@@ -4030,7 +4030,7 @@ test "the last player out leaves the pool in trust for the next taker" {
     next.init(allocator);
     defer next.deinit(allocator);
     const conn_id = s.sess.connect(next.transport()) orelse return error.JoinFailed;
-    try s.sess.take_slot(conn_id, 0, NO_BABIES);
+    try s.sess.take_slot(conn_id, .{});
     try std.testing.expectEqual(@as(u32, 12), s.sess.charges);
 }
 
