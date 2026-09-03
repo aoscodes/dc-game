@@ -49,10 +49,16 @@ function extractConst(src, name) {
   return src.slice(start, i + 1) + ";";
 }
 
-const GAME_NAMES = ["luminance", "deriveShadow"];
+const GAME_NAMES = [
+  "luminance", "deriveShadow", "parseRgba", "playerColor", "seatPalette",
+];
+const GAME_CONSTS = [
+  "PLAYER_COLORS", "C_UNSEATED", "SEAT_INK_MIX", "SEAT_ACCENT_MIX",
+];
 const game = new Function(`
+  ${GAME_CONSTS.map((n) => extractConst(gameSrc, n)).join("\n")}
   ${GAME_NAMES.map((n) => extract(gameSrc, n)).join("\n")}
-  return { ${GAME_NAMES.join(", ")} };
+  return { ${GAME_NAMES.join(", ")}, PLAYER_COLORS };
 `)();
 
 const ONBOARD_NAMES = [
@@ -64,7 +70,7 @@ const onboard = new Function(`
   return { ${ONBOARD_NAMES.join(", ")}, HARMONY };
 `)();
 
-const { luminance, deriveShadow } = game;
+const { luminance, deriveShadow, seatPalette, PLAYER_COLORS } = game;
 const { hslToRgb, mulberry32, rollPalette, HARMONY } = onboard;
 
 let failures = 0;
@@ -215,6 +221,48 @@ check(flatPalettes / SEEDS < 0.05,
   const shadow = deriveShadow([0, 0, 0], [10, 10, 10], ratio);
   check(luminance(shadow) >= 0 && luminance(shadow) <= luminance([10, 10, 10]),
     "a near-black fill still lands inside the ink..fill range");
+}
+
+// --- the seat-colour fallback ----------------------------------------------
+//
+// A player without a badge borrows their seat colour, and the result is fed to
+// exactly the same recolour path as a rolled palette. So it has to satisfy
+// exactly the same ordering: ink darkest, then shadow, then fill, then accent,
+// or the outline stops reading as an outline. Held to the real standard rather
+// than assumed safe because it is synthesised — nobody looks at these the way
+// somebody looks at a colour they picked at the kiosk.
+{
+  const seats = [...PLAYER_COLORS.keys(), 0xff]; // every seat, plus unseated
+  let worstSeatGap = Infinity;
+  for (const seat of seats) {
+    const [ink, fill, accent] = seatPalette(seat);
+    const shadow = deriveShadow(ink, fill, ratio);
+    const [li, ls, lf, la] =
+      [ink, shadow, fill, accent].map(luminance);
+
+    check(li < ls && ls < lf && lf < la,
+      `seat ${seat}: ink<shadow<fill<accent ` +
+      `(got ${li.toFixed(0)}, ${ls.toFixed(0)}, ${lf.toFixed(0)}, ${la.toFixed(0)})`);
+
+    // Ordered is not the same as legible: a correctly ordered palette spread
+    // over three luminance steps is still one flat blob on screen. Rolled
+    // palettes are allowed a rare near-flat tail because a player chose them;
+    // these were chosen by this file, so they get no such excuse.
+    worstSeatGap = Math.min(worstSeatGap, la - li);
+
+    for (const ch of [...ink, ...fill, ...accent]) {
+      check(Number.isInteger(ch) && ch >= 0 && ch <= 255,
+        `seat ${seat}: channel ${ch} is a byte`);
+    }
+  }
+  check(worstSeatGap > 60,
+    `every seat palette spans a visible range (worst ${worstSeatGap.toFixed(0)})`);
+
+  // Distinct seats must stay distinct as creatures, or the fallback defeats
+  // the only purpose it has.
+  const fills = PLAYER_COLORS.map((_, i) => seatPalette(i)[1].join(","));
+  check(new Set(fills).size === fills.length,
+    "the four seats yield four different creature colours");
 }
 
 if (failures > 0) {

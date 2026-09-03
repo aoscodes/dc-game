@@ -23,6 +23,11 @@
  *   stdin  <- READY\n       server WS is open   stdin <- JOIN\n  take a seat
  *   stdin  <- STAT:appetite=<n>\n board flash stat
  *   stdin  <- STAT:babies=<a,b,c,d,e>\n board flash babies (BabyType order)
+ *   stdin  <- STAT:critter=<0..4>\n   the badge's resident Lil Guy
+ *   stdin  <- STAT:led=<hex,hex,hex>\n its three onboarded colours
+ *     The last two are OMITTED, not defaulted, when the board has not said —
+ *     see Controller.statLines.  All four must land before JOIN; the server
+ *     freezes a player's stats when they take their seat.
  *   stdin  <- RESTART\n     start the next round (tab button click)
  *   stdout -> {"tag":"render",...}\n            stdout -> {"tag":"send","bytes":"<hex>"}\n
  */

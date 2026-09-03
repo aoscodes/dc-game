@@ -1240,9 +1240,18 @@ pub const Session = struct {
         self.count_hunger_share(slot.player_id);
         try self.spawn_player_midgame(slot.player_id);
         try self.send_game_start_to_conn(conn_id);
-        std.log.info("player {} took a seat (appetite {}, babies {}, {} seated)", .{
-            slot.player_id, req.appetite, c.baby_total(req.babies), self.seated_players(),
-        });
+        // Appearance is logged because it is invisible otherwise: a missing
+        // critter or palette is a legal state that still renders a creature,
+        // so a break anywhere upstream of here looks exactly like a player
+        // who never onboarded.  This line is the one place to tell them apart.
+        std.log.info(
+            "player {} took a seat (appetite {}, babies {}, critter {?}, palette {}, {} seated)",
+            .{
+                slot.player_id,             req.appetite,
+                c.baby_total(req.babies),   req.appearance.critter,
+                req.appearance.led != null, self.seated_players(),
+            },
+        );
     }
 
     /// Saturating u32 → u16 for stats fields.
@@ -1499,5 +1508,4 @@ fn set_world_system_signatures(world: *GameWorld) void {
     sig.set(GameWorld.component_type(c.Owner));
     sig.set(GameWorld.component_type(c.PlayerMarker));
     world.set_system_signature(PlayerTeam, sig);
-
 }

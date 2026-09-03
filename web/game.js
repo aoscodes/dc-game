@@ -351,8 +351,9 @@ const C_GOLD_DARK = "rgba(170,120,15,1)";
  * pips, menu frame — wears their color, so four people can read one board.
  * Dark enough to hold contrast on the paper field.
  *
- * Future: controllers will inject custom colors; route any override through
- * `playerColor` so the default palette stays the fallback.
+ * A badge's own LED colours override these for its creature only (see
+ * `seatPalette`); every other mark stays on this palette, so a seat is still
+ * readable at a glance even when its Lil Guy is wearing something else.
  */
 const PLAYER_COLORS = [
   "rgba(190,140,0,1)", // P0 amber
@@ -367,6 +368,51 @@ const C_UNSEATED = "rgba(110,110,130,0.8)";
  *  here, so controller-injected palettes later only touch this. */
 function playerColor(owner) {
   return PLAYER_COLORS[owner] ?? C_UNSEATED;
+}
+
+/** The [r,g,b] of a `rgba(r,g,b,a)` literal from this file's palette.
+ *
+ *  Parsed rather than kept as a second numeric table, so the colours a seat
+ *  wears and the colours its creature wears cannot drift apart. */
+function parseRgba(css) {
+  const m = /^rgba?\((\d+),\s*(\d+),\s*(\d+)/.exec(css);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+/** How far a seat's ink and accent are pushed off its fill.  A RENDERING
+ *  choice, not a fact about the art: set to land the three roughly where a
+ *  rolled badge palette sits, so a synthesised creature and a real one look
+ *  like the same kind of thing. */
+const SEAT_INK_MIX = 0.72; // toward black
+const SEAT_ACCENT_MIX = 0.42; // toward white
+
+/**
+ * Three creature tones synthesised from a seat's identity colour, standing in
+ * for the LED palette a player without a badge does not have.
+ *
+ * A player with an onboarded badge wears the colours they physically rolled.
+ * Everyone else — a browser, a bot, a badge still in its factory state — would
+ * otherwise draw in the art's authored greys, which is truthful (they really
+ * did not choose) but leaves a field of identical grey creatures that reads as
+ * a broken feature rather than an honest one. Their seat colour is the next
+ * most meaningful thing about them, and it is already what the rest of the
+ * screen uses to tell them apart.
+ *
+ * The seat colour becomes the FILL — the body, the largest area, so the
+ * creature reads as that colour — with the outline mixed toward black and the
+ * highlight toward white. Mixing toward the extremes rather than scaling means
+ * neither end can clip or invert: the three land in luminance order by
+ * construction, for any input, so `tintedSheet`'s ordering is satisfied
+ * without a special case there.
+ *
+ * @param {number} owner - seat id, or 0xFF/unknown for nobody
+ * @returns {number[][]} ink, fill, accent
+ */
+function seatPalette(owner) {
+  const fill = parseRgba(playerColor(owner)) ?? [128, 128, 128];
+  const ink = fill.map((c) => Math.round(c * (1 - SEAT_INK_MIX)));
+  const accent = fill.map((c) => Math.round(c + (255 - c) * SEAT_ACCENT_MIX));
+  return [ink, fill, accent];
 }
 
 const C_MENU_BG = "rgba(0,0,0,0.05)";
@@ -1018,8 +1064,8 @@ function deriveShadow(ink, fill, ratio) {
 }
 
 /**
- * A critter sheet repainted in one badge's colours, or the source sheet when
- * that badge never onboarded.
+ * A critter sheet repainted in one palette, or the source sheet when there is
+ * none to paint with.
  *
  * The art ships as five flat authored greys, one per ROLE (see
  * gen_lilguys.py), so this is an exact-value substitution rather than a hue
@@ -1028,9 +1074,10 @@ function deriveShadow(ink, fill, ratio) {
  * because it belongs to the world, not to the creature.
  *
  * @param {string} kind
- * @param {number[][]|null} led - three [r,g,b] triples, or null when the
- *   badge never onboarded (store.h led_rgb all-zero) - the art's own greys
- *   are the honest answer then, not black.
+ * @param {number[][]|null} led - three [r,g,b] triples, or null to draw the
+ *   sheet as authored. Callers drawing a player pass a palette either way
+ *   (`appearance` substitutes a seat colour when a badge reported none), so
+ *   the null path is for sprites that have no owner to borrow from.
  * @returns {CanvasImageSource|null}
  */
 function tintedSheet(kind, led) {
@@ -3498,15 +3545,21 @@ function syncLilGuys(game, spawnAt) {
  *
  * Both are absent for a player without a badge (a browser, a bot) and for a
  * badge on firmware that predates them, so both fall back: an unreported
- * critter draws as DEFAULT_CRITTER, and unreported colours draw the art's own
- * authored greys rather than being invented.
+ * critter draws as DEFAULT_CRITTER, and unreported colours fall back to the
+ * player's seat colour (see `seatPalette`).
+ *
+ * The fallback is decided HERE, not on the wire. The snapshot keeps "this
+ * badge reported no palette" distinct from any colour, because the server
+ * cannot know what a missing palette should look like and a default sent in
+ * its place would be indistinguishable from a real roll. What that absence
+ * looks like is a question about this screen, so this screen answers it.
  *
  * @param {object} e - a player entity from the snapshot
- * @returns {{sprite: string, led: number[][]|null}}
+ * @returns {{sprite: string, led: number[][]}}
  */
 function appearance(e) {
   const type = BABY_TYPES.includes(e.critter) ? e.critter : DEFAULT_CRITTER;
-  return { sprite: lilGuySprite(type), led: e.led ?? null };
+  return { sprite: lilGuySprite(type), led: e.led ?? seatPalette(e.owner) };
 }
 
 /**

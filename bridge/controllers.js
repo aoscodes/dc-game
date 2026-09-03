@@ -314,6 +314,37 @@ class Controller {
     }
   }
 
+  /**
+   * This board's flash stats as stdio lines for its player's Zig client.
+   *
+   * ONE definition, used by both delivery points: `onLine`'s CTRL:STAT
+   * handler and ControllerSession.onZigSpawned.  They exist because neither
+   * alone is sufficient - the board reports once per link, typically before
+   * the player's Zig process is spawned (so the write would be dropped), and
+   * onZigSpawned replays whatever is known by the time it is running.  When
+   * the two disagreed about which stats to send, the ones only listed in the
+   * handler silently never arrived, and every Lil Guy on the field rendered
+   * in its authored greys.
+   *
+   * Critter and led are OMITTED when the board has not reported them, rather
+   * than sent as a default.  The client's "unreported" is a distinct state
+   * from any value that could stand in for it.
+   *
+   * @returns {string[]} newline-terminated lines, in read order
+   */
+  statLines() {
+    const lines = [
+      `STAT:appetite=${this.appetite}\n`,
+      `STAT:babies=${this.babies.join(",")}\n`,
+    ];
+    if (this.critter !== null) lines.push(`STAT:critter=${this.critter}\n`);
+    if (this.led !== null) {
+      const hex = this.led.map((c) => c.toString(16).padStart(6, "0"));
+      lines.push(`STAT:led=${hex.join(",")}\n`);
+    }
+    return lines;
+  }
+
   /** @param {string} line */
   onLine(line) {
     if (!line.startsWith("CTRL:")) return; // sibling-link chatter etc.
@@ -404,20 +435,12 @@ class Controller {
         return;
       }
       // Forward to the player; the stats only count if they land before the
-      // seat is taken (the server freezes the share at count time).
+      // seat is taken (the server freezes the share at count time).  Usually
+      // a no-op: the board reports once per link, which is normally before
+      // its player process exists, and onZigSpawned is what actually delivers
+      // them.  This covers the board that re-reports while already seated.
       if (this.playerSession !== null) {
-        this.playerSession.writeToZig(`STAT:appetite=${this.appetite}\n`);
-        this.playerSession.writeToZig(`STAT:babies=${this.babies.join(",")}\n`);
-        // Appearance is sent only once the board has said - the server's
-        // default is "unreported", which the client draws as plain art, and
-        // an invented value here would be indistinguishable from a real one.
-        if (this.critter !== null) {
-          this.playerSession.writeToZig(`STAT:critter=${this.critter}\n`);
-        }
-        if (this.led !== null) {
-          const hex = this.led.map((c) => c.toString(16).padStart(6, "0"));
-          this.playerSession.writeToZig(`STAT:led=${hex.join(",")}\n`);
-        }
+        for (const l of this.statLines()) this.playerSession.writeToZig(l);
       }
       return;
     }
@@ -641,10 +664,11 @@ class ControllerSession extends PlayerSession {
   // ---- PlayerSession hooks --------------------------------------------------
 
   onZigSpawned() {
-    // Before READY/JOIN so the take_slot carries the board's stats.
+    // Before READY/JOIN so the take_slot carries the board's stats — the
+    // server freezes them at seat time, and this is the delivery that
+    // actually lands (see Controller.statLines).
     if (this.controller !== null) {
-      this.writeToZig(`STAT:appetite=${this.controller.appetite}\n`);
-      this.writeToZig(`STAT:babies=${this.controller.babies.join(",")}\n`);
+      for (const line of this.controller.statLines()) this.writeToZig(line);
     }
   }
 

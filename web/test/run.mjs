@@ -10,9 +10,12 @@
 //
 // A few mirror nothing and are here because this is where JS gets tested:
 // palette_harness covers the badge onboarding colour rules (statistical, so
-// only a few thousand seeds can show them holding), and link_harness covers
-// the bridge's palette protocol (a liveness property — a roll that fails to
-// settle hangs the onboarding kiosk).
+// only a few thousand seeds can show them holding), link_harness covers the
+// bridge's palette protocol (a liveness property — a roll that fails to settle
+// hangs the onboarding kiosk), and stat_harness covers delivery of a board's
+// flash stats to its player (they are forwarded from two places, and when the
+// two disagreed about what to send, every creature on the field silently lost
+// its colours).
 //
 // These ran for months as loose files in a scratch directory, which is exactly
 // how one of them rotted: bite_harness kept asserting against a `batches` /
