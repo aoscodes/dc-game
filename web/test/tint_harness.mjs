@@ -14,13 +14,18 @@
 // outline has vanished into its body — a legible drawing on nine badges and a
 // grey smear on the tenth, discovered at the event.
 //
-// The palettes are therefore not invented here. They come from onboard.js's
-// real rollPalette over thousands of seeds, so this asserts against the actual
-// reachable input space rather than a guess at it.
+// The palettes are therefore not invented here. They come from palette.js's
+// real rollers over thousands of seeds, so this asserts against the actual
+// reachable input space rather than a guess at it. BOTH rollers: the adults
+// wear rollPalette and their babies wear rollBroodPalette, the two are drawn
+// from different saturation bands, and the same substitution has to hold for
+// each. Desaturating is exactly the direction that makes an ordering fragile
+// — the three colours span less of the cube — so the baby band is not a
+// weaker case of the adult one and is checked in its own right.
 import { readFileSync } from "node:fs";
 
 const gameSrc = readFileSync(new URL("../game.js", import.meta.url), "utf8");
-const onboardSrc = readFileSync(new URL("../onboard.js", import.meta.url), "utf8");
+const paletteSrc = readFileSync(new URL("../palette.js", import.meta.url), "utf8");
 
 /** Slice out `function NAME(...) { ... }` by brace matching. */
 function extract(src, name) {
@@ -61,20 +66,23 @@ const game = new Function(`
   return { ${GAME_NAMES.join(", ")}, PLAYER_COLORS };
 `)();
 
-const ONBOARD_NAMES = [
-  "hslToRgb", "wrapHue", "mulberry32", "randRange", "shuffle", "rollPalette",
-  "luminance",
+const PALETTE_NAMES = [
+  "hslToRgb", "wrapHue", "mulberry32", "randRange", "shuffle", "rollHarmonic",
+  "rollPalette", "rollBroodPalette", "luminance",
 ];
-const onboard = new Function(`
-  ${["LAYOUT", "HARMONY"].map((n) => extractConst(onboardSrc, n)).join("\n")}
-  ${ONBOARD_NAMES.map((n) => extract(onboardSrc, n)).join("\n")}
-  return { ${ONBOARD_NAMES.join(", ")}, HARMONY };
+const PALETTE_CONSTS = ["PALETTE_SIZE", "HUE_SCHEMES", "HARMONY", "BABY_HARMONY"];
+const palette = new Function(`
+  ${PALETTE_CONSTS.map((n) => extractConst(paletteSrc, n)).join("\n")}
+  ${PALETTE_NAMES.map((n) => extract(paletteSrc, n)).join("\n")}
+  return { ${PALETTE_NAMES.join(", ")}, ${PALETTE_CONSTS.join(", ")} };
 `)();
 
 const { deriveShadow, seatPalette, PLAYER_COLORS } = game;
-// luminance comes from onboard.js, which is where the ordering rule that uses
+// luminance comes from palette.js, which is where the ordering rule that uses
 // it lives — so the rule and this check cannot come to measure different axes.
-const { hslToRgb, mulberry32, rollPalette, luminance, HARMONY } = onboard;
+const {
+  hslToRgb, mulberry32, rollPalette, rollBroodPalette, luminance, HARMONY,
+} = palette;
 
 let failures = 0;
 function check(cond, what) {
@@ -123,87 +131,136 @@ check(
   "authored ink < shadow < fill",
 );
 
+// The BABY atlas is recoloured by the same code, from a different palette, so
+// it needs the same legend. It shipped without one for as long as babies were
+// nobody's — they belonged to the table, and there was no badge behind them to
+// borrow colours from. Now that a player's babies wear their badge's brood
+// palette, a missing legend here is a silent no-op: tintedSheet returns the
+// authored sheet unchanged and every brood on the field is grey, which looks
+// like the feature was never wired up rather than like a broken asset.
+{
+  const babies = JSON.parse(
+    readFileSync(new URL("../assets/babies.json", import.meta.url), "utf8"),
+  );
+  for (const role of ["ink", "shadow", "fill", "accent"]) {
+    check(Array.isArray(babies.tones?.[role]), `baby atlas legend names ${role}`);
+  }
+  check(typeof babies.shadow_ratio === "number",
+    "baby atlas carries a shadow_ratio");
+  // Same authored greys as the adults, which is what lets one substitution
+  // serve both. If the two ever diverged, the shared deriveShadow ratio and
+  // the shared role ordering would each be right for only one of them.
+  for (const role of ["ink", "shadow", "fill", "accent"]) {
+    check(JSON.stringify(babies.tones?.[role]) === JSON.stringify(meta.tones[role]),
+      `baby atlas tone ${role} matches the adults'`);
+  }
+}
+
 // ---------------------------------------------------------------------------
-// The ordering survives every palette the roller can produce
+// The ordering survives every palette the rollers can produce
 // ---------------------------------------------------------------------------
 
 const SEEDS = 5000;
 const ratio = meta.shadow_ratio;
 
-let worstContrast = Infinity;
-let flatPalettes = 0;
+/**
+ * Run one roller's whole reachable output through the substitution.
+ * @param {string} label which palette, for the failure text
+ * @param {(seed: number) => {h,s,l}[]} roll
+ * @returns {{worstContrast: number, flat: number}}
+ */
+function checkRoller(label, roll) {
+  let worstContrast = Infinity;
+  let flatPalettes = 0;
+  const before = failures;
 
-for (let seed = 0; seed < SEEDS; seed++) {
-  const rand = mulberry32(seed);
-  const triad = rollPalette(rand).map((c) => hslToRgb(c.h, c.s, c.l));
+  for (let seed = 0; seed < SEEDS; seed++) {
+    const triad = roll(seed).map((c) => hslToRgb(c.h, c.s, c.l));
 
-  // LED order IS role order: rollPalette deals its lightness ladder onto the
-  // zones ascending, and zone index survives unchanged all the way to the
-  // renderer. Taken here exactly as tintedSheet takes it - positionally, with
-  // no sort - so this measures the contract rather than a repair of it.
-  const [ink, fill, accent] = triad;
-  const shadow = deriveShadow(ink, fill, ratio);
+    // INDEX IS ROLE: the roller deals its lightness ladder out ascending, and
+    // that index survives unchanged all the way to the renderer (for adults it
+    // is also LED index). Taken here exactly as tintedSheet takes it -
+    // positionally, with no sort - so this measures the contract rather than a
+    // repair of it.
+    const [ink, fill, accent] = triad;
+    const shadow = deriveShadow(ink, fill, ratio);
 
-  const li = luminance(ink), ls = luminance(shadow), lf = luminance(fill);
+    const li = luminance(ink), ls = luminance(shadow), lf = luminance(fill);
 
-  // The ordering the renderer trusts, checked in the renderer's own axis.
-  // palette_harness asserts the same thing in HSL lightness, where the roller
-  // builds it; these are different axes and a saturated triad can be well
-  // spread on one and tight on the other, so both are worth stating.
-  check(li <= lf,
-    `seed ${seed}: LED 0 is lighter than LED 1, so the ink would outline ` +
-    `the fill in a paler colour than the fill itself`);
-  check(lf <= luminance(accent),
-    `seed ${seed}: LED 2 is darker than LED 1, so the highlight would be ` +
-    `darker than the body it highlights`);
+    // The ordering the renderer trusts, checked in the renderer's own axis.
+    // palette_harness asserts the same thing in HSL lightness, where the
+    // roller builds it; these are different axes and a saturated triad can be
+    // well spread on one and tight on the other, so both are worth stating.
+    check(li <= lf,
+      `${label} seed ${seed}: entry 0 is lighter than entry 1, so the ink ` +
+      `would outline the fill in a paler colour than the fill itself`);
+    check(lf <= luminance(accent),
+      `${label} seed ${seed}: entry 2 is darker than entry 1, so the ` +
+      `highlight would be darker than the body it highlights`);
 
-  // The invariant the drawing depends on: the outline never comes out lighter
-  // than the shading, and the shading never lighter than the body. Mixing
-  // makes this true by construction, so a failure here means deriveShadow
-  // stopped being a mix - which is exactly the regression worth catching,
-  // since the previous "darkened fill" version broke it on real palettes.
-  //
-  // ROUND is the one slack. Each channel is rounded to a byte, and luminance
-  // weights sum to 1, so the result can sit up to half a unit outside the
-  // exact mix. That only ever matters when the ink and fill are within a
-  // unit of each other in luminance, where the two colours are indis-
-  // tinguishable anyway - it cannot hide a real inversion, which would be
-  // tens of units wide.
-  const ROUND = 0.5;
-  check(ls >= li - ROUND, `seed ${seed}: shadow fell below the ink`);
-  check(lf >= ls - ROUND, `seed ${seed}: shadow rose above the fill`);
+    // The invariant the drawing depends on: the outline never comes out
+    // lighter than the shading, and the shading never lighter than the body.
+    // Mixing makes this true by construction, so a failure here means
+    // deriveShadow stopped being a mix - which is exactly the regression worth
+    // catching, since the previous "darkened fill" version broke it on real
+    // palettes.
+    //
+    // ROUND is the one slack. Each channel is rounded to a byte, and luminance
+    // weights sum to 1, so the result can sit up to half a unit outside the
+    // exact mix. That only ever matters when the ink and fill are within a
+    // unit of each other in luminance, where the two colours are indis-
+    // tinguishable anyway - it cannot hide a real inversion, which would be
+    // tens of units wide.
+    const ROUND = 0.5;
+    check(ls >= li - ROUND, `${label} seed ${seed}: shadow fell below the ink`);
+    check(lf >= ls - ROUND, `${label} seed ${seed}: shadow rose above the fill`);
 
-  // And it lands at the depth the artist drew, not merely somewhere between.
-  // Rounding is per channel, so a unit of slack.
-  for (let ch = 0; ch < 3; ch++) {
-    const want = ink[ch] + (fill[ch] - ink[ch]) * ratio;
-    check(Math.abs(shadow[ch] - want) <= 1,
-      `seed ${seed}: shadow channel ${ch} off the authored depth`);
-    check(Number.isInteger(shadow[ch]) && shadow[ch] >= 0 && shadow[ch] <= 255,
-      `seed ${seed}: shadow channel ${ch} out of byte range`);
+    // And it lands at the depth the artist drew, not merely somewhere between.
+    // Rounding is per channel, so a unit of slack.
+    for (let ch = 0; ch < 3; ch++) {
+      const want = ink[ch] + (fill[ch] - ink[ch]) * ratio;
+      check(Math.abs(shadow[ch] - want) <= 1,
+        `${label} seed ${seed}: shadow channel ${ch} off the authored depth`);
+      check(Number.isInteger(shadow[ch]) && shadow[ch] >= 0 && shadow[ch] <= 255,
+        `${label} seed ${seed}: shadow channel ${ch} out of byte range`);
+    }
+    for (const ch of accent) {
+      check(ch >= 0 && ch <= 255, `${label} seed ${seed}: accent channel out of range`);
+    }
+
+    const contrast = luminance(accent) - li;
+    worstContrast = Math.min(worstContrast, contrast);
+    if (contrast < 25) flatPalettes++;
+    if (failures > before + 20) break; // a systematic break floods; 20 shows it
   }
-  for (const ch of accent) {
-    check(ch >= 0 && ch <= 255, `seed ${seed}: accent channel out of range`);
-  }
-
-  const contrast = luminance(accent) - li;
-  worstContrast = Math.min(worstContrast, contrast);
-  if (contrast < 25) flatPalettes++;
-  if (failures > 20) break; // a systematic break floods; 20 is enough to see it
+  return { worstContrast, flat: flatPalettes };
 }
 
+const adult = checkRoller("adult", (seed) => rollPalette(mulberry32(seed)));
+const brood = checkRoller("brood", rollBroodPalette);
+
 // HOW MUCH contrast a creature ends up with is the palette's business, not
-// this code's. onboard.js separates its three colours by HSL lightness
-// (HARMONY.minLumGap), which is the axis the LEDs and the badge screen are
-// tuned for; Rec. 709 luminance is a different axis, and a saturated triad can
-// be well spread on the first and nearly flat on the second. Such a badge gets
-// a low-contrast Lil Guy, and that is FAITHFUL - it is wearing its own colours.
+// this code's. palette.js separates its three colours by HSL lightness
+// (minLumGap), which is the axis the LEDs and the badge screen are tuned for;
+// Rec. 709 luminance is a different axis, and a saturated triad can be well
+// spread on the first and nearly flat on the second. Such a badge gets a
+// low-contrast Lil Guy, and that is FAITHFUL - it is wearing its own colours.
 //
-// What is asserted is only that this stays a rare tail. If a change to the
+// What is asserted is only that this stays a rare tail. If a change to a
 // palette roller ever made flat triads common, every creature on the field
 // would go mushy at once, and that should not be discovered at an event.
-check(flatPalettes / SEEDS < 0.05,
-  `too many near-flat palettes (${flatPalettes}/${SEEDS})`);
+//
+// The BABY band is where this bound earns its keep. Desaturating pulls all
+// three colours toward the same grey, so it is the change most likely to push
+// the tail up, and the one whose damage is least visible in review: a brood
+// too flat to read is five small smudges, not an obviously broken adult.
+check(adult.flat / SEEDS < 0.05,
+  `too many near-flat adult palettes (${adult.flat}/${SEEDS})`);
+check(brood.flat / SEEDS < 0.05,
+  `too many near-flat brood palettes (${brood.flat}/${SEEDS})`);
+console.log(`  contrast: adult worst ${adult.worstContrast.toFixed(1)} ` +
+  `(${adult.flat} flat), brood worst ${brood.worstContrast.toFixed(1)} ` +
+  `(${brood.flat} flat), of ${SEEDS} each`);
 
 // ---------------------------------------------------------------------------
 // Adversarial inputs the roller cannot currently produce
@@ -284,6 +341,6 @@ if (failures > 0) {
   process.exit(1);
 }
 console.log(
-  `OK  tint: ink<=shadow<=fill over ${SEEDS} palettes ` +
-  `(${flatPalettes} near-flat, worst contrast ${worstContrast.toFixed(1)})`,
+  `OK  tint: ink<=shadow<=fill over ${SEEDS} adult + ${SEEDS} brood palettes ` +
+  `(${adult.flat} + ${brood.flat} near-flat)`,
 );

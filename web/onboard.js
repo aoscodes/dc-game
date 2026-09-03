@@ -21,7 +21,11 @@
 //
 // Nothing here tracks which physical badge is which, and nothing needs to.
 //
-// Extracted by name in web/test/palette_harness.mjs, which is why the colour
+// The colour maths and the palette roll live in palette.js, shared with the
+// game (which rolls baby palettes under the same rules).  This file owns the
+// SPIN: how the zones travel to the colours palette.js picked.
+//
+// Extracted by name in web/test/palette_harness.mjs, which is why the spin
 // maths lives in plain top-level functions with no DOM in sight.
 
 // ---------------------------------------------------------------------------
@@ -35,229 +39,24 @@
 const LAYOUT = {
   screen: { w: 1024, h: 600 },
   renderScale: 1,
-  zones: 3,
+  // One zone per colour in the palette, which is one per LED on the badge.
+  // Taken from palette.js rather than restated so the screen cannot end up
+  // showing a different number of colours than the roll produces.
+  zones: PALETTE_SIZE,
   status: { h: 96, font: "600 30px system-ui, -apple-system, sans-serif" },
   hint: { font: "400 20px system-ui, -apple-system, sans-serif" },
 };
 
-// ---------------------------------------------------------------------------
-// Colour
-// ---------------------------------------------------------------------------
-
-/**
- * HSL -> 8-bit RGB.  Hue in degrees (any range, wrapped), s/l in 0..1.
- * @returns {number[]} [r, g, b], each 0..255
- */
-function hslToRgb(h, s, l) {
-  const hp = ((((h % 360) + 360) % 360)) / 60;
-  const c = (1 - Math.abs(2 * l - 1)) * s;
-  const x = c * (1 - Math.abs((hp % 2) - 1));
-  const m = l - c / 2;
-  let r = 0, g = 0, b = 0;
-  if (hp < 1) { r = c; g = x; }
-  else if (hp < 2) { r = x; g = c; }
-  else if (hp < 3) { g = c; b = x; }
-  else if (hp < 4) { g = x; b = c; }
-  else if (hp < 5) { r = x; b = c; }
-  else { r = c; b = x; }
-  return [
-    Math.round((r + m) * 255),
-    Math.round((g + m) * 255),
-    Math.round((b + m) * 255),
-  ];
-}
-
-/**
- * Rec. 709 relative luminance of an [r,g,b], 0..255.
- *
- * THE axis a palette is ordered in (see rollPalette), and deliberately not
- * HSL lightness, which is the axis the harmony bounds are drawn in. The two
- * are not the same ordering and swapping them is not a detail: 709 weights
- * green at 0.7152 and blue at 0.0722, so a blue at l=0.62 comes out darker to
- * the eye than a green at l=0.42. Ordering by `l` would put that blue last and
- * hand the creature a pale outline over a dark body — the exact inversion the
- * ordering exists to prevent. `l` still does its own job: it is what the LED
- * spacing (HARMONY.minLumGap) is tuned for, and spacing is order-free.
- */
-function luminance([r, g, b]) {
-  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
-}
-
-/** [r,g,b] -> "rrggbb", the wire form the firmware parses. */
-function rgbToHex(rgb) {
-  return rgb.map((v) => Math.max(0, Math.min(255, v)).toString(16).padStart(2, "0")).join("");
-}
+// The colour maths this page spins through — hslToRgb, luminance, rgbToHex,
+// the hue helpers, the PRNG, HARMONY and rollPalette — lives in palette.js,
+// loaded before this file.  It moved there when the game started rolling baby
+// palettes from the same rules: the roll became a contract between two pages
+// rather than this page's private business.  Only rgbToCss stayed, because
+// only this page paints with a canvas fill string.
 
 /** [r,g,b] -> a canvas fill string. */
 function rgbToCss(rgb) {
   return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
-}
-
-/** Fold any hue onto 0..360. */
-function wrapHue(h) {
-  return ((h % 360) + 360) % 360;
-}
-
-/**
- * Signed shortest way round the colour wheel from `a` to `b`, in -180..180.
- * Used so a zone's final approach drifts the short way into its target
- * instead of doubling back across the wheel.
- */
-function hueDelta(a, b) {
-  return ((wrapHue(b - a) + 540) % 360) - 180;
-}
-
-/** Distance between two hues ignoring direction, 0..180. */
-function hueSeparation(a, b) {
-  return Math.abs(hueDelta(a, b));
-}
-
-// ---------------------------------------------------------------------------
-// Randomness
-// ---------------------------------------------------------------------------
-
-/**
- * Small seedable PRNG.  Seeded rather than Math.random so the harness can
- * assert the harmony invariants over thousands of reproducible rolls — a
- * palette rule that holds "usually" is a palette rule that will eventually
- * hand a player three muddy browns.
- * @param {number} seed
- * @returns {() => number} uniform in [0, 1)
- */
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function next() {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-/** Uniform in [lo, hi). */
-function randRange(rand, lo, hi) {
-  return lo + rand() * (hi - lo);
-}
-
-/** Uniform integer in [lo, hi]. */
-function randInt(rand, lo, hi) {
-  return lo + Math.floor(rand() * (hi - lo + 1));
-}
-
-/** Fisher-Yates, in place, returning the same array. */
-function shuffle(rand, arr) {
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = Math.floor(rand() * (i + 1));
-    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
-  }
-  return arr;
-}
-
-// ---------------------------------------------------------------------------
-// Harmony
-// ---------------------------------------------------------------------------
-
-/**
- * The rules a landed palette must satisfy.  These are not decoration: three
- * colours picked independently at random are, more often than not, ugly and —
- * worse on a badge with three small LEDs a few millimetres apart —
- * indistinguishable.  Every bound here is defending one of those two failures.
- */
-const HARMONY = {
-  // Hue offsets from a random base.  Classical schemes; the tightest pair in
-  // the table is split-complementary's 150/210, 60 degrees apart.
-  schemes: [
-    [0, 120, 240], // triadic
-    [0, 150, 210], // split-complementary
-    [0, 90, 180],  // tetradic, three of four
-  ],
-  // Enough wobble that repeat rolls of one scheme do not look identical, small
-  // enough that the scheme is still recognisable.
-  hueJitterDeg: 8,
-  // The floor the harness asserts, and it is TIGHT: the worst case is that
-  // 60-degree pair jittered apart in opposite directions, 60 - 2*8 = 44, which
-  // is what the harness actually observes. Widening the jitter or adding a
-  // closer scheme breaks this immediately — which is the point of asserting it
-  // rather than trusting the arithmetic to survive the next edit.
-  minSeparationDeg: 44,
-  // Saturated enough to read as a colour on a diffused LED, short of the
-  // full-blast primaries that all look like "on".
-  sat: [0.62, 0.88],
-  // Kept off both ends: near-black loses the hue, near-white washes it out.
-  lum: [0.42, 0.62],
-  // Three colours of equal lightness read as one smear at a glance, so the
-  // three are forced onto distinct steps.  2 * 0.08 fits inside the 0.20 band
-  // above with room to spare, so this is always satisfiable.
-  minLumGap: 0.08,
-};
-
-/**
- * Roll one harmonic triad, DARKEST ZONE FIRST.
- *
- * The lightness step deserves a note: rather than resampling until three
- * independent draws happen to be far enough apart (unbounded, and biased
- * towards the extremes), it draws three sorted offsets from the SLACK left
- * over after reserving the gaps, then adds the gaps back. That is exactly
- * uniform over the valid orderings and cannot fail.
- *
- * The last thing this does, and the load-bearing one, is put the three in
- * order of how dark they actually look. Zone index is LED index the whole way
- * down (paletteHex, then LED:SET, then store.h led_rgb, then CTRL:STAT led=),
- * and game.js tintedSheet reads that index as a ROLE: LED 0 paints the
- * creature's outline, LED 1 its body, LED 2 its highlight. Two things follow,
- * and both are the point:
- *
- *   - A badge means the same thing as every other badge. Its leftmost lamp is
- *     its creature's outline on the shared screen, on every badge in the room.
- *     Unordered, LED 0 was a different role per badge and the lamps taught the
- *     player nothing.
- *   - The outline is always darker than the body it bounds. A renderer handed
- *     the three in a random order gets that backwards about two times in three
- *     and the creature flattens into a blob, which is why game.js used to sort
- *     them itself. Ordering the palette where it is BORN serves both; sorting
- *     in the renderer could only ever serve the second.
- *
- * Ordered in `luminance`, NOT in the `l` the lightness ladder above is built
- * in — see that function for why the two disagree and why this is the one that
- * decides. A consequence worth naming: luminance is hue-dependent, so blues
- * drift towards the ink slot and greens towards the accent. That is not bias
- * to be corrected, it is what "darkest first" means when blue really is darker.
- *
- * Hue and saturation still shuffle, so the scheme's ROTATION carries no zone
- * bias. That is the bias worth breaking: which hue leads should be luck, which
- * end of the palette leads is a contract.
- *
- * @param {() => number} rand
- * @returns {{h: number, s: number, l: number}[]} one entry per zone, ascending
- *   in `luminance` — ink, fill, accent
- */
-function rollPalette(rand) {
-  const base = rand() * 360;
-  const scheme = HARMONY.schemes[Math.floor(rand() * HARMONY.schemes.length)];
-  const j = HARMONY.hueJitterDeg;
-  const hues = scheme.map((off) => wrapHue(base + off + randRange(rand, -j, j)));
-
-  const sats = hues.map(() => randRange(rand, HARMONY.sat[0], HARMONY.sat[1]));
-
-  const [lo, hi] = HARMONY.lum;
-  const gap = HARMONY.minLumGap;
-  const slack = (hi - lo) - gap * (LAYOUT.zones - 1);
-  const offsets = [];
-  for (let i = 0; i < LAYOUT.zones; i++) offsets.push(rand());
-  offsets.sort((a, b) => a - b);
-  // Ascending, but only as a way to hand each zone a different rung: the sort
-  // below is what actually decides which colour goes where.
-  const lums = offsets.map((u, i) => lo + u * slack + i * gap);
-
-  // Hue and saturation travel together — a jittered scheme offset and the
-  // saturation drawn for it are a pair — so they shuffle as one unit.
-  const tint = shuffle(rand, hues.map((h, i) => ({ h, s: sats[i] })));
-  const triad = tint.map((t, i) => ({ h: t.h, s: t.s, l: lums[i] }));
-
-  // Darkest first, in the axis the eye uses. See the note above.
-  return triad.sort((a, b) =>
-    luminance(hslToRgb(a.h, a.s, a.l)) - luminance(hslToRgb(b.h, b.s, b.l)));
 }
 
 // ---------------------------------------------------------------------------

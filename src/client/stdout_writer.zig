@@ -204,6 +204,7 @@ fn write_render_inner(
             // Null and "black" are DIFFERENT pictures downstream (null draws
             // the art's authored greys), so this travels unflattened.
             .led = e.appearance.led,
+            .brood_seed = e.appearance.brood_seed,
         };
     }
 
@@ -771,6 +772,12 @@ const JsonEntity = struct {
     /// for a badge that never onboarded.  The renderer repaints its Lil Guy
     /// in these; null means it draws the art as authored.
     led: ?[proto.LED_COUNT][3]u8,
+    /// The board's brood seed, or null for a badge that never said.  The
+    /// renderer rolls this owner's BABY palette from it (web/palette.js
+    /// rollBroodPalette) — one palette per badge, so a player's babies are a
+    /// matching set and a stranger's are visibly not.  Null draws them in the
+    /// art's authored greys, same rule as `led`.
+    brood_seed: ?u32,
 };
 
 // ---------------------------------------------------------------------------
@@ -1048,6 +1055,8 @@ test "a player's critter and colours reach the renderer" {
     // web/game.js `appearance()` reads exactly `e.critter` and `e.led`, and
     // dresses that player's Lil Guy from them. Both are hand-copied into
     // JsonEntity, which is the drift this file's tests exist to catch.
+    // `brood_seed` rides along for the same reason: see the brood seed test
+    // below.
     var game = GameState{};
     game.snapshot.grid_rows = 3;
     game.snapshot.grid_cols = 3;
@@ -1114,5 +1123,51 @@ test "a boardless player's appearance is absent, not black" {
     const ent = parsed.value.object.get("game").?.object
         .get("entities").?.array.items[0].object;
     try testing.expect(ent.get("critter") == null);
+    try testing.expect(ent.get("led") == null);
+    try testing.expect(ent.get("brood_seed") == null);
+}
+
+test "a player's brood seed reaches the renderer, whole" {
+    // web/game.js rolls this owner's BABY palette from `e.brood_seed`, so the
+    // number has to arrive EXACTLY: the roll is a PRNG walk, and a seed that
+    // is off by one bit is not a near-miss colour, it is a different family.
+    //
+    // Two hazards this pins down, both of which JSON invites:
+    //   - it must be a NUMBER, not a hex string — game.js feeds it straight
+    //     to mulberry32, and "1f3c9a04" would seed as NaN;
+    //   - it must survive the top of the u32 range, where a signedness slip
+    //     anywhere on the path shows up as a negative and nowhere else.
+    var game = GameState{};
+    game.snapshot.grid_rows = 3;
+    game.snapshot.grid_cols = 3;
+    game.snapshot.entity_count = 1;
+    game.snapshot.entities[0] = blk: {
+        var e = proto.EntitySnapshot.blank;
+        e.entity = 9;
+        e.owner = 0;
+        e.appearance = .{ .brood_seed = 0xFFEE_DDCC };
+        break :blk e;
+    };
+
+    var buf: [32768]u8 = undefined;
+    const json = try render_to_json(&buf, &game);
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        json,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const ent = parsed.value.object.get("game").?.object
+        .get("entities").?.array.items[0].object;
+    try testing.expectEqual(@as(i64, 0xFFEE_DDCC), ent.get("brood_seed").?.integer);
+
+    // And it travels INDEPENDENTLY of the adult palette. The badge derives
+    // its seed from its uid, so it has one before anyone onboards it and the
+    // wire has no business deciding when that counts. Whether a brood with no
+    // LEDs behind it is actually painted is the renderer's call, and it
+    // declines (web/game.js broodPalette) — but it gets to make that call
+    // only because the seat arrives with both facts, not one.
     try testing.expect(ent.get("led") == null);
 }

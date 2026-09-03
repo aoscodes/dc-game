@@ -33,7 +33,9 @@
 </head>
 <body>
 <canvas id="canvas" width="1024" height="600"></canvas>
-<!-- ?v= is a cache buster: CI rewrites "dev" to the commit SHA on deploy. -->
+<!-- ?v= is a cache buster: CI rewrites "dev" to the commit SHA on deploy.
+     palette.js FIRST: onboard.js reads its constants at load time. -->
+<script src="/palette.js?v=dev"></script>
 <script src="/onboard.js?v=dev"></script>
 </body>
 </html>

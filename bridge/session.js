@@ -25,8 +25,9 @@
  *   stdin  <- STAT:babies=<a,b,c,d,e>\n board flash babies (BabyType order)
  *   stdin  <- STAT:critter=<0..4>\n   the badge's resident Lil Guy
  *   stdin  <- STAT:led=<hex,hex,hex>\n its three onboarded colours
- *     The last two are OMITTED, not defaulted, when the board has not said —
- *     see Controller.statLines.  All four must land before JOIN; the server
+ *   stdin  <- STAT:seed=<u32 hex>\n    its brood seed: what its BABIES wear
+ *     The last three are OMITTED, not defaulted, when the board has not said —
+ *     see Controller.statLines.  All five must land before JOIN; the server
  *     freezes a player's stats when they take their seat.
  *   stdin  <- RESTART\n     start the next round (tab button click)
  *   stdout -> {"tag":"render",...}\n            stdout -> {"tag":"send","bytes":"<hex>"}\n

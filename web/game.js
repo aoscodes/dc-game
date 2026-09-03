@@ -1064,24 +1064,31 @@ function deriveShadow(ink, fill, ratio) {
  *
  * The art ships as five flat authored greys, one per ROLE (see
  * gen_lilguys.py), so this is an exact-value substitution rather than a hue
- * shift: the badge's three colours become ink, fill and accent, the shadow is
- * derived from the first two, and the food blob (`prop`) is left alone
- * because it belongs to the world, not to the creature.
+ * shift: three colours become ink, fill and accent, the shadow is derived
+ * from the first two, and the food blob (`prop`) is left alone because it
+ * belongs to the world, not to the creature.
+ *
+ * Serves both sheets an owner can dress: a player's ADULT, in the colours
+ * their badge's LEDs wear, and the BABY atlas, in the palette rolled from
+ * that badge's brood seed. Neither is a special case here — the atlas names
+ * the same roles in both files, so the only difference is which palette
+ * arrives.
  *
  * @param {string} kind
- * @param {number[][]|null} led - three [r,g,b] triples IN ROLE ORDER — ink,
- *   fill, accent, which is LED order and ascending in luminance — or null to
- *   draw the sheet as authored. Callers drawing a player pass a palette either
- *   way (`appearance` substitutes a seat colour when a badge reported none), so
- *   the null path is for sprites that have no owner to borrow from.
+ * @param {number[][]|null} palette - three [r,g,b] triples IN ROLE ORDER —
+ *   ink, fill, accent, ascending in luminance (and, for an adult, LED order)
+ *   — or null to draw the sheet as authored. Adults always pass a palette
+ *   (`appearance` substitutes a seat colour when a badge reported none), so
+ *   the null path is for sprites with no owner to borrow from: the babies
+ *   this session hatched at the table.
  * @returns {CanvasImageSource|null}
  */
-function tintedSheet(kind, led) {
+function tintedSheet(kind, palette) {
   const sp = sprites.get(kind);
   if (!sp) return null;
-  if (!led) return sp.img;
+  if (!palette) return sp.img;
 
-  const key = `${kind}|${led.map((c) => c.join(",")).join("|")}`;
+  const key = `${kind}|${palette.map((c) => c.join(",")).join("|")}`;
   const cached = tintedSheets.get(key);
   if (cached !== undefined) return cached;
 
@@ -1097,14 +1104,15 @@ function tintedSheet(kind, led) {
   const px = c2.getImageData(0, 0, cv.width, cv.height);
   const d = px.data;
 
-  // Roles are assigned BY LED INDEX, in the order the art was drawn in:
+  // Roles are assigned BY INDEX, in the order the art was drawn in:
   // ink < fill < accent (authored 0, 65, 131). The shadow is derived to sit
   // between the first two.
   //
   // Taken on trust, not checked, and the trust is placed deliberately. The
   // ordering is a property of the palette, guaranteed where the palette is
-  // born: onboard.js rollPalette returns its triad sorted darkest-first by
-  // Rec. 709 luminance, and zone index is LED index all the way down the wire.
+  // born: palette.js rollHarmonic returns its triad sorted darkest-first by
+  // Rec. 709 luminance, and that index survives to here unchanged — for an
+  // adult it is also zone index, then LED index, all the way down the wire.
   // seatPalette, for players with no badge to report one, builds its three by
   // mixing away from the fill and so lands in the same order by construction.
   //
@@ -1127,12 +1135,12 @@ function tintedSheet(kind, led) {
     const src = tones[role];
     if (src !== undefined && rgb !== undefined) replace[src[0]] = rgb;
   };
-  put("ink", led[0]);
-  put("fill", led[1]);
-  put("accent", led[2]);
+  put("ink", palette[0]);
+  put("fill", palette[1]);
+  put("accent", palette[2]);
   if (tones.shadow !== undefined) {
     replace[tones.shadow[0]] =
-      deriveShadow(led[0], led[1], meta.shadow_ratio ?? 0.63);
+      deriveShadow(palette[0], palette[1], meta.shadow_ratio ?? 0.63);
   }
 
   for (let i = 0; i < d.length; i += 4) {
@@ -2565,17 +2573,10 @@ function reachability(game, overrides) {
 // would mean thousands of gradient allocations per second, so the cache is
 // what makes the look affordable.  Animation varies only the destination rect.
 
-/** Deterministic PRNG (mulberry32); same seed → same value.  Used to give
- *  every cell a stable idle-wobble phase from its flat index. */
-function mulberry32(seed) {
-  let s = seed | 0;
-  return function () {
-    s = (s + 0x6d2b79f5) | 0;
-    let t = Math.imul(s ^ (s >>> 15), 1 | s);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
+// mulberry32 — the deterministic PRNG that gives every cell a stable idle
+// wobble from its flat index — is in palette.js, which this page loads first.
+// It used to be duplicated here; the two copies were the same algorithm, and
+// palette.js needs it anyway to roll a brood palette from a badge's seed.
 
 /** Parse "rgb(a)(r,g,b…)" → [r,g,b]; white fallback for malformed input. */
 function parseRgb(str) {
@@ -3562,6 +3563,52 @@ function syncLilGuys(game, spawnAt) {
 function appearance(e) {
   const type = BABY_TYPES.includes(e.critter) ? e.critter : DEFAULT_CRITTER;
   return { sprite: lilGuySprite(type), led: e.led ?? seatPalette(e.owner) };
+}
+
+/** Brood palettes already rolled, by seed.  Rolling is pure and cheap, but it
+ *  happens per baby per frame and the result is a small array; caching it
+ *  turns a screenful of babies back into one lookup each. */
+const broodPalettes = new Map();
+
+/**
+ * The three colours THIS ENTITY'S babies wear, or null to draw them as
+ * authored.
+ *
+ * Rolled from the badge's brood seed rather than from its LEDs, which is what
+ * makes a player's brood a matching set that is theirs specifically: the seed
+ * comes off the badge's flash uid, so it is stable across power cycles and
+ * unrelated to whatever the kiosk spun onto its lamps.
+ *
+ * Null — the authored greys — in two cases, and the second is a deliberate
+ * choice rather than a missing input:
+ *
+ *   - No seed. Nobody's badge is behind these babies (a browser, a bot, or
+ *     the ones hatched at the table mid-game), so there is no family to be a
+ *     member of. Same rule the adults follow for `led`, except that there is
+ *     no seat-colour stand-in here (see seatPalette): an adult IS its player
+ *     and has to be tellable apart even when boardless, whereas these babies
+ *     are already standing beside a seat-coloured adult that identifies them.
+ *   - A seed, but no LEDs. The badge exists and has never been through
+ *     /onboard. Colour on this screen is the thing onboarding GIVES you, and
+ *     a factory badge whose owner never rolled it should not quietly receive
+ *     it anyway — a grey brood beside a grey-ish adult is a legible "this
+ *     badge is not set up yet", and it is the same answer its adult gets.
+ *
+ * The seed still travels for that second case, and that is not waste: the
+ * badge derives it from its uid, so it is already true before onboarding and
+ * the wire has no business deciding when it counts.
+ *
+ * @param {object} e a render-frame entity
+ * @returns {number[][]|null} ink, fill, accent
+ */
+function broodPalette(e) {
+  const seed = e?.brood_seed;
+  if (typeof seed !== "number" || !e.led) return null;
+  const cached = broodPalettes.get(seed);
+  if (cached !== undefined) return cached;
+  const rolled = rollBroodPalette(seed).map((c) => hslToRgb(c.h, c.s, c.l));
+  broodPalettes.set(seed, rolled);
+  return rolled;
 }
 
 /**
@@ -4889,20 +4936,50 @@ function spawnMatchFloaters(game) {
 // picture.  A hatch additionally animates: the new baby spawns at the eaten
 // egg's cell and wanders down to its post.
 
-/** @type {{type: string, x: number, y: number, phase: number}[]} */
+/** @type {{type: string, owner: string, palette: number[][]|null,
+ *          x: number, y: number, phase: number}[]} */
 const babyViews = [];
 
 /** Wall clock for the babies' idle bob. */
 let babyClock = 0;
 
-/** Per-type target counts for the current frame. */
+/** The owner bucket for babies with no badge behind them: the ones this
+ *  session hatched at the table.  A string so it can never collide with a
+ *  real owner key, which is a seat id. */
+const BABY_OWNER_TABLE = "table";
+
+/**
+ * Target counts for the current frame, keyed by OWNER as well as by type.
+ *
+ * Owner-keyed because babies are no longer interchangeable: they wear their
+ * owner's brood palette, so "one more mint" is not an answer to "which mint
+ * left". Summed per type only, the reconcile below would happily delete a
+ * departing player's mint by removing someone else's, and the two broods
+ * would silently swap colours.
+ *
+ * @returns {Map<string, {type: string, owner: string,
+ *                        palette: number[][]|null, n: number}>} keyed
+ *   `owner|type`
+ */
 function babyTargets(game) {
-  const counts = Object.fromEntries(BABY_TYPES.map((n) => [n, 0]));
+  const want = new Map();
+  const add = (owner, palette, type, n) => {
+    if (n <= 0) return;
+    const key = `${owner}|${type}`;
+    const at = want.get(key);
+    if (at === undefined) want.set(key, { type, owner, palette, n });
+    else at.n += n;
+  };
   for (const e of game.entities ?? []) {
-    for (const n of BABY_TYPES) counts[n] += e.babies?.[n] ?? 0;
+    const palette = broodPalette(e);
+    for (const n of BABY_TYPES) add(String(e.owner), palette, n, e.babies?.[n] ?? 0);
   }
-  for (const n of BABY_TYPES) counts[n] += game.hatched?.[n] ?? 0;
-  return counts;
+  // Hatched babies belong to the encounter, not to a player: nobody's badge
+  // brought them and nobody takes them home, so they draw as authored.
+  for (const n of BABY_TYPES) {
+    add(BABY_OWNER_TABLE, null, n, game.hatched?.[n] ?? 0);
+  }
+  return want;
 }
 
 function babyRadius(rows, cols) {
@@ -4981,29 +5058,48 @@ function tickBabies(game, dt, fresh) {
     });
   }
 
-  const counts = babyTargets(game);
-  for (const n of BABY_TYPES) {
+  const want = babyTargets(game);
+
+  // Buckets that have gone entirely: a player left, so their whole brood does.
+  for (let i = babyViews.length - 1; i >= 0; i--) {
+    if (!want.has(`${babyViews[i].owner}|${babyViews[i].type}`)) babyViews.splice(i, 1);
+  }
+
+  for (const [, t] of want) {
     let have = 0;
-    for (const b of babyViews) if (b.type === n) have++;
+    for (const b of babyViews) if (b.type === t.type && b.owner === t.owner) have++;
     // Surplus leaves with its owner (or the old encounter): newest first.
-    for (let i = babyViews.length - 1; i >= 0 && have > counts[n]; i--) {
-      if (babyViews[i].type === n) {
+    for (let i = babyViews.length - 1; i >= 0 && have > t.n; i--) {
+      if (babyViews[i].type === t.type && babyViews[i].owner === t.owner) {
         babyViews.splice(i, 1);
         have--;
       }
     }
     // Deficit spawns: at the eaten egg when this frame hatched one, else
     // straight onto a post (board babies arriving with a joiner).
-    while (have < counts[n]) {
-      const burst = hatchAt.get(n)?.shift();
+    while (have < t.n) {
+      // Only the table bucket bursts out of an egg. A deficit anywhere else
+      // is a player arriving with their brood already banked, and letting one
+      // of those consume a hatch would both misplace the newcomer and rob the
+      // real hatch of its animation.
+      const burst = t.owner === BABY_OWNER_TABLE ? hatchAt.get(t.type)?.shift() : undefined;
       const post = babyPost(babyViews.length, rows, cols);
       babyViews.push({
-        type: n,
+        type: t.type,
+        owner: t.owner,
+        palette: t.palette,
         x: burst?.x ?? post.x,
         y: burst?.y ?? post.y,
         phase: Math.random() * Math.PI * 2,
       });
       have++;
+    }
+    // Refreshed every frame rather than only at spawn: a badge's stats can
+    // land AFTER its player is already on screen (the bridge forwards a
+    // re-report while seated), and a brood that kept the palette it was born
+    // with would stay grey for the rest of the game.
+    for (const b of babyViews) {
+      if (b.type === t.type && b.owner === t.owner) b.palette = t.palette;
     }
   }
 
@@ -5035,14 +5131,17 @@ function drawBabies(game) {
     // Lil Guys' attack clip (the babies' sheet has no action frames).
     const puff = (b.chompT ?? 0) > 0 ? 1 + 0.45 * (b.chompT / BABY_CHOMP_S) : 1;
     const idx = atlas?.meta.frames[b.type];
-    if (atlas !== undefined && idx !== undefined) {
+    // Repainted in its owner's brood palette; null draws the sheet as
+    // authored, which is what the table's own hatchlings get.
+    const sheet = tintedSheet(BABY_SPRITE, b.palette);
+    if (atlas !== undefined && idx !== undefined && sheet !== null) {
       // The authored critter, centred where the dot used to sit.  4r reads
       // as half a Lil Guy: recognisably the same species, clearly a baby.
       const s = r * 4 * puff;
       const { frame_w, frame_h } = atlas.meta;
       ctx.save();
       ctx.imageSmoothingEnabled = false;
-      ctx.drawImage(atlas.img, idx * frame_w, 0, frame_w, frame_h,
+      ctx.drawImage(sheet, idx * frame_w, 0, frame_w, frame_h,
         b.x - s / 2, b.y + bob - s / 2, s, s);
       ctx.restore();
       continue;

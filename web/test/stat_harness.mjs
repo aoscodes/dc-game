@@ -3,7 +3,8 @@
 //
 // This guards a DELIVERY property, and it exists because the delivery broke.
 // A board reports its flash stats once per link — appetite, babies, its
-// resident critter and its three LED colours — and the client folds them into
+// resident critter, its three LED colours and its brood seed — and the client
+// folds them into
 // the take_slot it sends when it takes a seat. There are two places that can
 // forward them and neither is sufficient alone: the CTRL:STAT handler fires
 // when the line arrives, which is normally before the player's Zig process
@@ -129,7 +130,7 @@ function stdinLines(ctrl) {
 }
 
 const FULL = "CTRL:STAT appetite=7 babies=1,0,2,0,0 critter=3 " +
-  "led=d4506e,7ac0a0,e8c46a";
+  "led=d4506e,7ac0a0,e8c46a seed=1f3c9a04";
 
 // --- the parser ------------------------------------------------------------
 {
@@ -140,6 +141,14 @@ const FULL = "CTRL:STAT appetite=7 babies=1,0,2,0,0 critter=3 " +
   eq(ctrl.critter, 3, "critter parsed");
   eq(JSON.stringify(ctrl.led), JSON.stringify([0xd4506e, 0x7ac0a0, 0xe8c46a]),
     "led parsed as packed u24s");
+  eq(ctrl.broodSeed, 0x1f3c9a04, "brood seed parsed as a u32");
+
+  // The top of the range, where a parse that lands in a signed int32 turns
+  // negative. The renderer feeds this straight to a PRNG, so a negative is
+  // not a smaller number, it is a different family.
+  const hi = mkBoard();
+  hi.onLine("CTRL:STAT seed=ffffffff");
+  eq(hi.broodSeed, 0xffffffff, "a top-of-range brood seed stays unsigned");
 }
 
 // --- the delivery that actually lands --------------------------------------
@@ -157,10 +166,11 @@ const FULL = "CTRL:STAT appetite=7 babies=1,0,2,0,0 critter=3 " +
   check(sent.includes("STAT:critter=3\n"), "critter reaches the client");
   check(sent.includes("STAT:led=d4506e,7ac0a0,e8c46a\n"),
     "led reaches the client");
+  check(sent.includes("STAT:seed=1f3c9a04\n"), "brood seed reaches the client");
 
   // Stated as a count too, so a stat added to the report and forgotten here
   // shows up as a failure rather than passing by omission.
-  eq(sent.length, 4, "every reported stat is forwarded and nothing else");
+  eq(sent.length, 5, "every reported stat is forwarded and nothing else");
 
   // Hex is zero-padded per channel: "0a" must not collapse to "a", which
   // would shift every following digit and recolour the creature.
@@ -188,6 +198,21 @@ const FULL = "CTRL:STAT appetite=7 babies=1,0,2,0,0 critter=3 " +
     "...but its critter still travels — the board knows that regardless");
 }
 
+// --- a brood seed of zero --------------------------------------------------
+//
+// The rule that is NOT the led rule, and the reason the two are parsed
+// differently. All-zero LEDs mean "never onboarded" because black is not a
+// colour anyone rolls; a zero brood seed means zero, because it is derived
+// from the flash uid rather than chosen and no value of it is reserved. Zero
+// dropped as "unset" would hand one badge in four billion a grey brood.
+{
+  const ctrl = mkBoard();
+  ctrl.onLine("CTRL:STAT seed=00000000");
+  eq(ctrl.broodSeed, 0, "a zero brood seed is a seed");
+  check(stdinLines(ctrl).includes("STAT:seed=00000000\n"),
+    "...and it is forwarded, zero-padded, like any other");
+}
+
 // --- old firmware ----------------------------------------------------------
 //
 // Boards in the field predate every field but appetite. Unknown keys are
@@ -199,6 +224,7 @@ const FULL = "CTRL:STAT appetite=7 babies=1,0,2,0,0 critter=3 " +
   eq(ctrl.appetite, 5, "old firmware's appetite is read");
   eq(ctrl.critter, null, "old firmware reports no critter");
   eq(ctrl.led, null, "old firmware reports no palette");
+  eq(ctrl.broodSeed, null, "old firmware reports no brood seed");
   const sent = stdinLines(ctrl);
   eq(sent.length, 2, "only the stats it actually has are forwarded");
   check(sent.includes("STAT:babies=0,0,0,0,0\n"),
@@ -250,6 +276,7 @@ const FULL = "CTRL:STAT appetite=7 babies=1,0,2,0,0 critter=3 " +
     const sent = b.built[0];
     check(sent.includes("STAT:critter=3\n") &&
       sent.includes("STAT:led=d4506e,7ac0a0,e8c46a\n") &&
+      sent.includes("STAT:seed=1f3c9a04\n") &&
       sent.includes("STAT:appetite=7\n"),
       "the player is built knowing its stats, not after the fact");
     eq(b.pendingTimers(), 0, "the deadline is cancelled once the board reports");

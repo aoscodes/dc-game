@@ -216,8 +216,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Every ?v=dev in every shell, not one named script. The game shell now
+      # loads two files (palette.js before game.js) and they have to be busted
+      # TOGETHER: a fresh game.js against a cached palette.js is worse than
+      # both being stale, because the two are one program split across two
+      # requests. Matching the marker rather than the filename also means the
+      # next script added to either page is stamped without anyone remembering
+      # to come back here — and it picks up onboard.html, which this step had
+      # simply never covered.
       - name: stamp cache buster with commit sha
-        run: sed -i "s/game\.js?v=dev/game.js?v=${GITHUB_SHA::12}/" web/index.html
+        run: sed -i "s/?v=dev/?v=${GITHUB_SHA::12}/g" web/*.html
 
       - name: scp static web assets to VPS
         uses: appleboy/scp-action@v1

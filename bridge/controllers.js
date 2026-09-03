@@ -10,6 +10,7 @@
  *                      CTRL:BTN <name> <D|U>   button press/release edges
  *                      CTRL:STAT appetite=<u32> babies=<a,b,c,d,e>
  *                                critter=<0..4> led=<rrggbb>,<rrggbb>,<rrggbb>
+ *                                seed=<u32 hex>
  *                                              persistent flash stats, sent
  *                                              once after CTRL:HELLO; appetite
  *                                              feeds the player's hunger
@@ -18,9 +19,14 @@
  *                                              with their owner, and critter +
  *                                              led are what that player's Lil
  *                                              Guy looks like on the shared
- *                                              screen.  Every key but appetite
- *                                              is absent on old firmware; each
- *                                              falls back on its own.
+ *                                              screen.  seed is the badge's
+ *                                              brood seed, which is what its
+ *                                              BABIES look like: the renderer
+ *                                              rolls one palette per badge
+ *                                              from it.  Every key but
+ *                                              appetite is absent on old
+ *                                              firmware; each falls back on
+ *                                              its own.
  *                      CTRL:SCORE_ACK g=<u32>  score banked to flash (sent
  *                                              AFTER the save; re-sent on retries)
  *                      CTRL:LED_ACK g=<u32>    palette banked to flash, on
@@ -272,6 +278,13 @@ class Controller {
     /** The badge's three LED colours (CTRL:STAT) as packed u24s, or null
      *  until it says. The client repaints its Lil Guy in these. */
     this.led = null;
+    /** The badge's brood seed (CTRL:STAT) as a u32, or null until it says.
+     *  The one number that names the colours this badge's BABY Lil Guys wear;
+     *  the renderer rolls the actual palette from it (web/palette.js
+     *  rollBroodPalette).  Not a colour, and deliberately so: the badge's own
+     *  panel is 1bpp, so it has no reason to own an opinion about the shade,
+     *  and a seed is the whole brood in four bytes with nothing in flash. */
+    this.broodSeed = null;
     /** Whether this board's one-per-link CTRL:STAT has been accounted for.
      *
      *  This board does not become a player until it has (see
@@ -354,9 +367,9 @@ class Controller {
    * handler silently never arrived, and every Lil Guy on the field rendered
    * in its authored greys.
    *
-   * Critter and led are OMITTED when the board has not reported them, rather
-   * than sent as a default.  The client's "unreported" is a distinct state
-   * from any value that could stand in for it.
+   * Critter, led and seed are OMITTED when the board has not reported them,
+   * rather than sent as a default.  The client's "unreported" is a distinct
+   * state from any value that could stand in for it.
    *
    * @returns {string[]} newline-terminated lines, in read order
    */
@@ -369,6 +382,9 @@ class Controller {
     if (this.led !== null) {
       const hex = this.led.map((c) => c.toString(16).padStart(6, "0"));
       lines.push(`STAT:led=${hex.join(",")}\n`);
+    }
+    if (this.broodSeed !== null) {
+      lines.push(`STAT:seed=${this.broodSeed.toString(16).padStart(8, "0")}\n`);
     }
     return lines;
   }
@@ -472,6 +488,15 @@ class Controller {
           }
           continue;
         }
+        const seed = arg.match(/^seed=([0-9a-fA-F]{1,8})$/);
+        if (seed !== null) {
+          // No zero-is-absent rule here, unlike led: the seed is derived from
+          // the flash uid rather than stored, so a badge that has one always
+          // has one, and 0 is as good a seed as any other.
+          this.broodSeed = parseInt(seed[1], 16) >>> 0;
+          known = true;
+          continue;
+        }
       }
       if (!known) {
         console.warn(`[ctrl] unknown stat line '${line}' from ${this.path}`);
@@ -487,7 +512,9 @@ class Controller {
         `babies=${this.babies.join(",")}, ` +
         `critter=${this.critter === null ? "unreported" : this.critter}, ` +
         `led=${this.led === null ? "unset" : this.led
-          .map((c) => c.toString(16).padStart(6, "0")).join(",")})`);
+          .map((c) => c.toString(16).padStart(6, "0")).join(",")}, ` +
+        `seed=${this.broodSeed === null ? "unreported"
+          : this.broodSeed.toString(16).padStart(8, "0")})`);
       // Forward to the player; the stats only count if they land before the
       // seat is taken (the server freezes the share at count time).  Usually
       // a no-op: the board reports once per link, which is normally before
@@ -951,4 +978,9 @@ module.exports = {
   ControllerSession,
   shapeFromRender,
   finalScoreFromRender,
+  // Shapes of a board's stats, for validating anything that rewrites them
+  // (index.js's /api/dev routes) against the same constants the parser uses.
+  BABY_TYPE_COUNT,
+  PALETTE_COLOR_COUNT,
+  isPalette,
 };

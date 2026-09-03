@@ -81,22 +81,32 @@ pub const TakeSlot = struct {
 pub const LED_COUNT = 3;
 
 /// What a player's Lil Guy looks like: which of the five critters their badge
-/// keeps, and the colours it wears.  PURELY COSMETIC - nothing in game_logic
-/// reads it, and two players with the same critter are not related in any way
-/// the rules care about.
+/// keeps, the colours it wears, and the colours its BABIES wear.  PURELY
+/// COSMETIC - nothing in game_logic reads it, and two players with the same
+/// critter are not related in any way the rules care about.
 ///
-/// The two halves are independently optional because the board knows them
-/// independently: it always has a critter (derived from its badge id at
-/// store.h critter_of), but its LEDs stay unset until someone runs the
-/// /onboard flow.  A player with no board at all has neither.  Absent is not
-/// the same as a default value here - the client draws the art's own authored
-/// greys for an absent palette, which is a different picture from any colour
-/// this could invent.
+/// Every field is independently optional because the board knows them
+/// independently: it always has a critter and a brood seed (both derived from
+/// its badge id - store.h critter_of, seed.h brood_seed_from_uid), but its
+/// LEDs stay unset until someone runs the /onboard flow.  A player with no
+/// board at all has none of the three.  Absent is not the same as a default
+/// value here - the client draws the art's own authored greys for an absent
+/// palette, which is a different picture from any colour this could invent.
 pub const Appearance = struct {
     critter: ?components.BabyType = null,
     /// Three RGB triples in LED order.  What the roles ink/fill/accent mean
     /// is the renderer's business, not the wire's: these are three lamps.
     led: ?[LED_COUNT][3]u8 = null,
+    /// The badge's brood seed: the one number that names the palette its baby
+    /// Lil Guys wear, one palette per badge.  A SEED and not a palette, which
+    /// is the whole reason babies cost four bytes here and nothing in flash:
+    /// the badge derives it from its uid and never renders it (its own panel
+    /// is 1bpp), so the only place with an opinion about the actual shade is
+    /// the renderer, and that is where the roll lives (web/palette.js
+    /// rollBroodPalette).
+    ///
+    /// Nothing in Zig interprets it.  It is carried, not read.
+    brood_seed: ?u32 = null,
 };
 
 /// Sentinel for `Appearance.critter == null` on the wire.  Out of range of
@@ -111,6 +121,12 @@ fn encode_appearance(writer: anytype, a: Appearance) !void {
     try writer.writeByte(@intFromBool(a.led != null));
     const led = a.led orelse [_][3]u8{[_]u8{0} ** 3} ** LED_COUNT;
     for (led) |rgb| try writer.writeAll(&rgb);
+    // Same deal, and for the same reason: a flag plus a fixed slot, rather
+    // than a five-byte tail that is sometimes there.  Zero is a perfectly
+    // good seed, so it cannot double as the absent case the way an all-black
+    // palette can.
+    try writer.writeByte(@intFromBool(a.brood_seed != null));
+    try writer.writeInt(u32, a.brood_seed orelse 0, .little);
 }
 
 fn decode_appearance(reader: anytype) !Appearance {
@@ -124,6 +140,9 @@ fn decode_appearance(reader: anytype) !Appearance {
     var led: [LED_COUNT][3]u8 = undefined;
     for (&led) |*rgb| _ = try reader.readAll(rgb);
     if (has_led) a.led = led;
+    const has_seed = (try reader.readByte()) != 0;
+    const seed = try reader.readInt(u32, .little);
+    if (has_seed) a.brood_seed = seed;
     return a;
 }
 
@@ -1233,6 +1252,10 @@ test "round-trip: take_slot carries the appetite stat and the board's babies" {
         .appearance = .{
             .critter = .sky,
             .led = .{ .{ 0xD4, 0x50, 0x6E }, .{ 0x7A, 0xC0, 0xA0 }, .{ 0xE8, 0xC4, 0x6A } },
+            // Deliberately top-of-range: the seed is the one field here that
+            // uses the full u32, so a signedness or width slip in encode or
+            // decode can only show up at this end of it.
+            .brood_seed = 0xFFEE_DDCC,
         },
     });
     fbs.reset();
@@ -1245,6 +1268,23 @@ test "round-trip: take_slot carries the appetite stat and the board's babies" {
         [_][3]u8{ .{ 0xD4, 0x50, 0x6E }, .{ 0x7A, 0xC0, 0xA0 }, .{ 0xE8, 0xC4, 0x6A } },
         decoded.appearance.led.?,
     );
+    try std.testing.expectEqual(@as(u32, 0xFFEE_DDCC), decoded.appearance.brood_seed.?);
+}
+
+test "round-trip: a brood seed of zero is a seed, not an absence" {
+    // Unlike `led`, where all-black doubles as "never onboarded", 0 is an
+    // ordinary seed: it is derived from the flash uid rather than chosen, and
+    // the roll treats it like any other number.  If the presence flag were
+    // ever dropped in favour of a zero check, this is the test that fails.
+    var buf: [64]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    try encode(fbs.writer(), .take_slot, TakeSlot{ .appearance = .{ .brood_seed = 0 } });
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    const decoded = try decode_take_slot(fbs.reader());
+    try std.testing.expect(decoded.appearance.brood_seed != null);
+    try std.testing.expectEqual(@as(u32, 0), decoded.appearance.brood_seed.?);
 }
 
 test "round-trip: an unreported appearance survives as absent, not as a colour" {
@@ -1261,6 +1301,7 @@ test "round-trip: an unreported appearance survives as absent, not as a colour" 
     const decoded = try decode_take_slot(fbs.reader());
     try std.testing.expect(decoded.appearance.critter == null);
     try std.testing.expect(decoded.appearance.led == null);
+    try std.testing.expect(decoded.appearance.brood_seed == null);
 }
 
 test "round-trip: leave_slot carries no payload" {
@@ -1318,7 +1359,7 @@ test "round-trip: game_state — bite, hunger, score, grid, and selection surviv
         .cursor_row = 2,
         .cursor_col = 5,
         .babies = .{ 0, 4, 0, 0, 1 },
-        .appearance = .{ .critter = .plum, .led = .{
+        .appearance = .{ .critter = .plum, .brood_seed = 0x0BAD_F00D, .led = .{
             .{ 0x11, 0x22, 0x33 }, .{ 0x44, 0x55, 0x66 }, .{ 0x77, 0x88, 0x99 },
         } },
     };
@@ -1372,6 +1413,9 @@ test "round-trip: game_state — bite, hunger, score, grid, and selection surviv
     try std.testing.expectEqual([_][3]u8{
         .{ 0x11, 0x22, 0x33 }, .{ 0x44, 0x55, 0x66 }, .{ 0x77, 0x88, 0x99 },
     }, look.led.?);
+    // Including the brood seed: a player's babies are drawn on every client,
+    // not just their own, so the seed has to survive the broadcast too.
+    try std.testing.expectEqual(@as(u32, 0x0BAD_F00D), look.brood_seed.?);
 }
 
 test "round-trip: game_start — join code, grid dims and realtime pacing survive" {

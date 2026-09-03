@@ -19,13 +19,15 @@ const STAT_APPETITE_PREFIX = "STAT:appetite=";
 /// bridge before JOIN.
 const STAT_BABIES_PREFIX = "STAT:babies=";
 /// The board's resident critter as a BabyType ordinal, e.g. "STAT:critter=2",
-/// and its three LED colours as hex, e.g. "STAT:led=d4506e,7ac0a0,e8c46a".
-/// Both are purely cosmetic (what this player's Lil Guy looks like) and both
-/// are sent only once the board has actually reported them - the bridge
-/// withholds the line rather than sending a placeholder, so absent stays
-/// distinguishable from chosen.
+/// its three LED colours as hex, e.g. "STAT:led=d4506e,7ac0a0,e8c46a", and its
+/// brood seed as hex, e.g. "STAT:seed=1f3c9a04" - the number the renderer
+/// rolls this badge's BABY palette from.  All three are purely cosmetic (what
+/// this player's family looks like) and all three are sent only once the board
+/// has actually reported them - the bridge withholds the line rather than
+/// sending a placeholder, so absent stays distinguishable from chosen.
 const STAT_CRITTER_PREFIX = "STAT:critter=";
 const STAT_LED_PREFIX = "STAT:led=";
+const STAT_SEED_PREFIX = "STAT:seed=";
 
 /// How often the loop WAKES.  Not how often it emits: input is forwarded at
 /// this rate to keep presses responsive, while render frames go out only when
@@ -216,6 +218,12 @@ fn stdin_reader(_: void) void {
         } else if (std.mem.startsWith(u8, trimmed, STAT_LED_PREFIX)) {
             g_appearance.led = parse_led_colours(trimmed[STAT_LED_PREFIX.len..]) orelse {
                 std.log.warn("bad led stat line: {s}", .{trimmed});
+                continue;
+            };
+        } else if (std.mem.startsWith(u8, trimmed, STAT_SEED_PREFIX)) {
+            const value = trimmed[STAT_SEED_PREFIX.len..];
+            g_appearance.brood_seed = std.fmt.parseInt(u32, value, 16) catch {
+                std.log.warn("bad brood seed stat line: {s}", .{trimmed});
                 continue;
             };
         }

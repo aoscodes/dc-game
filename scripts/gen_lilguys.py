@@ -214,14 +214,19 @@ def baby_sheet() -> tuple[bytes, dict]:
                          f"baby_{name}_idle_{BABY}x{BABY}x{BABY_IDLE_FRAMES}.bmp"),
             BABY, BABY_IDLE_FRAMES)
         _blit(canvas, frames[0], i, 0, BABY)
-    # No tone legend: babies are never recoloured. They belong to the table
-    # rather than to a player - a hatched one has no badge behind it - so
-    # there are no LEDs to dress them in, and shipping the legend anyway
-    # would advertise a capability nothing implements.
+    # Same legend as the adults, and the same substitution: a baby wears the
+    # palette of the BADGE THAT BROUGHT IT, rolled from that badge's brood
+    # seed (web/palette.js rollBroodPalette) rather than from its LEDs. The
+    # seed is per badge, so one player's babies are a matching set.
+    #
+    # Babies with no badge behind them - the ones hatched at the table - keep
+    # the authored greys, which is what the client draws for a null palette.
     meta = {
         "frame_w": BABY,
         "frame_h": BABY,
         "frames": {name: i for i, name in enumerate(TYPES)},
+        "tones": {role: list(rgba(t)[:3]) for role, t in TONE_ROLES},
+        "shadow_ratio": pixelart.TONE_SHADOW / pixelart.TONE_FILL,
     }
     return png_bytes(w, h, canvas), meta
 

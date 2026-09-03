@@ -55,13 +55,19 @@ const fs          = require("fs");
 const path        = require("path");
 const { WebSocketServer, WebSocket } = require("ws");
 const { PlayerSession } = require("./session");
-const { ControllerManager } = require("./controllers");
+const { ControllerManager, BABY_TYPE_COUNT, PALETTE_COLOR_COUNT, isPalette } =
+  require("./controllers");
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
 const PORT        = parseInt(process.env.PORT || "3000", 10);
+// Opt-in, off by default, and deliberately not a config file: the /api/dev
+// routes rewrite what a board claims to be, which is a thing a dev box should
+// be able to do and a thing the event machine must not.  An env var is the
+// one switch that cannot be reached by anyone holding only the HTTP port.
+const DEV_INJECT  = process.env.DEV_INJECT === "1";
 // Locally: zig build puts the binaries at zig-out/bin/ (one level up from bridge/).
 // On the VPS: deploy installs them flat at /opt/dragoncon/ (same level as bridge/).
 const _binDir     = path.resolve(__dirname, "..");
@@ -166,6 +172,23 @@ const httpServer = http.createServer((req, res) => {
 
   if (req.method === "POST" && rawPath === "/api/tune/save") {
     handleTuneSave(req, res);
+    return;
+  }
+
+  // /api/dev/* — the board-stat override used by bridge/tools/inject.mjs.
+  // 404 rather than 403 when disabled: a bridge without DEV_INJECT should be
+  // indistinguishable from one built without these routes at all.
+  if (rawPath.startsWith("/api/dev/")) {
+    if (!DEV_INJECT) { res.writeHead(404); res.end("Not found"); return; }
+    if (req.method === "GET" && rawPath === "/api/dev/boards") {
+      handleDevBoards(res);
+      return;
+    }
+    if (req.method === "POST" && rawPath === "/api/dev/inject") {
+      handleDevInject(req, res);
+      return;
+    }
+    res.writeHead(404); res.end("Not found");
     return;
   }
 
@@ -332,6 +355,160 @@ function handleTuneSave(req, res) {
     }
     console.log(`[tune] saved config ${hash}`);
     reply(200, { url, hash });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Dev board-stat override  (/api/dev/*, DEV_INJECT=1 only)
+// ---------------------------------------------------------------------------
+//
+// A board's stats reach the game exactly once, at one instant: the server
+// freezes a player's Appearance when they take their seat, and the board
+// reports CTRL:STAT once per link.  That is the right shape for the event and
+// a miserable one to develop a RENDERER against — eyeballing a brood palette
+// meant reflashing a badge and replugging it, per palette.
+//
+// So these routes rewrite the bridge's in-memory picture of a board and then
+// reseat it.  Nothing is written to the badge: no GAME:SCORE, no LED:SET, no
+// flash erase.  An override lives exactly as long as the link does, because
+// the next CTRL:STAT (i.e. the next replug) overwrites these same fields with
+// what the flash actually holds.  Unplug the badge and the lie is gone.
+//
+// The reseat is not a detail, it IS the mechanism: destroy() drops the board's
+// player, and the assignment pass immediately rebuilds one, whose fresh Zig
+// client is handed the rewritten statLines() before its JOIN.
+
+/** Serialise one board for /api/dev/boards. */
+function devBoardView(ctrl) {
+  return {
+    linkId: ctrl.linkId,
+    uid: ctrl.uid,
+    appetite: ctrl.appetite,
+    babies: ctrl.babies,
+    critter: ctrl.critter,
+    colors: ctrl.led === null
+      ? null
+      : ctrl.led.map((c) => c.toString(16).padStart(6, "0")),
+    seed: ctrl.broodSeed === null
+      ? null
+      : ctrl.broodSeed.toString(16).padStart(8, "0"),
+    seated: ctrl.playerSession !== null,
+  };
+}
+
+function handleDevBoards(res) {
+  const boards = controllerManager.listLinked()
+    .map((b) => controllerManager.linkedById(b.linkId))
+    .filter((c) => c !== null)
+    .map(devBoardView);
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ boards }));
+}
+
+/**
+ * POST body: { target?: "all" | <linkId number> | <uid string>,
+ *              babies?: [a,b,c,d,e], colors?: ["rrggbb" x3] | null,
+ *              seed?: <u32> | null, reseat?: boolean }
+ *
+ * An ABSENT key leaves that stat alone; an explicit null clears it.  The two
+ * have to be distinguishable because "no palette" is a state a real board can
+ * be in (never onboarded) and therefore a state worth being able to test.
+ *
+ * Responds 200 { applied: [<board view>] } or 400 { errors: [...] }.
+ */
+function handleDevInject(req, res) {
+  const reply = (status, obj) => {
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(obj));
+  };
+
+  let body = "";
+  let overflow = false;
+  req.on("data", (chunk) => {
+    body += chunk;
+    if (body.length > 8192) { overflow = true; req.destroy(); }
+  });
+  req.on("close", () => { if (overflow) reply(413, { errors: ["body too large"] }); });
+  req.on("end", () => {
+    if (overflow) return;
+    let msg;
+    try { msg = JSON.parse(body); } catch {
+      reply(400, { errors: ["body is not valid JSON"] });
+      return;
+    }
+    if (typeof msg !== "object" || msg === null) {
+      reply(400, { errors: ["expected an object"] });
+      return;
+    }
+
+    // Validate everything BEFORE touching a single board: a half-applied
+    // injection across several badges is not a state worth being able to
+    // reach, and reporting it would be worse than refusing it.
+    const errors = [];
+
+    let babies;
+    if ("babies" in msg) {
+      if (!Array.isArray(msg.babies) || msg.babies.length !== BABY_TYPE_COUNT ||
+          !msg.babies.every((n) => Number.isInteger(n) && n >= 0)) {
+        errors.push(`babies must be ${BABY_TYPE_COUNT} non-negative integers`);
+      } else {
+        babies = msg.babies.map((n) => n >>> 0);
+      }
+    }
+
+    let colors;
+    if ("colors" in msg) {
+      if (msg.colors === null) colors = null;
+      else if (isPalette(msg.colors)) colors = msg.colors.map((c) => parseInt(c, 16));
+      else errors.push(`colors must be null or ${PALETTE_COLOR_COUNT} six-digit hex strings`);
+    }
+
+    let seed;
+    if ("seed" in msg) {
+      if (msg.seed === null) seed = null;
+      else if (Number.isInteger(msg.seed) && msg.seed >= 0 && msg.seed <= 0xffffffff) {
+        seed = msg.seed >>> 0;
+      } else errors.push("seed must be null or a u32");
+    }
+
+    const target = "target" in msg ? msg.target : "all";
+    if (target !== "all" && typeof target !== "number" && typeof target !== "string") {
+      errors.push("target must be \"all\", a linkId number, or a uid string");
+    }
+
+    if (errors.length > 0) { reply(400, { errors }); return; }
+
+    const linked = controllerManager.listLinked()
+      .map((b) => controllerManager.linkedById(b.linkId))
+      .filter((c) => c !== null);
+    const targeted = target === "all"
+      ? linked
+      : linked.filter((c) => (typeof target === "number" ? c.linkId === target : c.uid === target));
+
+    if (targeted.length === 0) {
+      reply(404, { errors: [linked.length === 0
+        ? "no boards are linked"
+        : `no linked board matches ${JSON.stringify(target)}`] });
+      return;
+    }
+
+    const reseat = msg.reseat !== false;
+    const applied = [];
+    for (const ctrl of targeted) {
+      if (babies !== undefined) ctrl.babies = [...babies];
+      if (colors !== undefined) ctrl.led = colors === null ? null : [...colors];
+      if (seed !== undefined) ctrl.broodSeed = seed;
+      // Reseat AFTER the rewrite, and only if the board is actually playing:
+      // an unseated board has nothing to tear down and will pick the new
+      // stats up whenever the assignment pass next reaches it.
+      const wasSeated = ctrl.playerSession !== null;
+      if (reseat && wasSeated) ctrl.playerSession.destroy("dev inject");
+      applied.push({ ...devBoardView(ctrl), reseated: reseat && wasSeated });
+      console.log(`[dev] injected uid=${ctrl.uid} babies=${ctrl.babies.join(",")} ` +
+        `seed=${ctrl.broodSeed === null ? "-" : ctrl.broodSeed.toString(16)} ` +
+        `reseat=${reseat && wasSeated}`);
+    }
+    reply(200, { applied });
   });
 }
 
