@@ -61,7 +61,11 @@
  *
  * Player model: every linked board IS a player — it gets its own headless
  * ControllerSession (dedicated Zig client + server connection) in the active
- * lobby, which takes one of the game's four seats (JOIN after READY).  A
+ * lobby, which takes one of the game's four seats (JOIN after READY).  Not
+ * the instant it links, though: it becomes a player once it has reported its
+ * flash stats (CTRL:STAT, see Controller.statSeen), because the server
+ * freezes a player's stats when they take their seat and a board seated
+ * before it has spoken is stuck at defaults for the whole game.  A
  * full game means the board connects as a mere observer: its buttons do
  * nothing until a seat frees up and it relinks.
  *
@@ -115,6 +119,15 @@ const BAUD_RATE = 115200;
 const SCAN_INTERVAL_MS = 2000;
 const HELLO_INTERVAL_MS = 1000;
 const HB_INTERVAL_MS = 1000;
+// How long a freshly linked board is given to send its one-per-link
+// CTRL:STAT before it is made a player anyway (Controller.statSeen).  The
+// board arms that report at link-up and emits it on its next task tick, so
+// this is orders of magnitude more than the happy path needs; it is sized to
+// be unmissable for a board that is merely slow, and short enough that a
+// board which will never report is not left standing at the door.  Below
+// LINK_TIMEOUT_MS, so a board whose link is already dying is dropped rather
+// than seated blind.
+const STAT_WAIT_MS = 1000;
 // Link drops after this much CTRL: silence (board sends CTRL:HB every 1s).
 const LINK_TIMEOUT_MS = 3000;
 // GAME:SCORE retry cadence and cap. The board's flash save takes ~100ms+
@@ -259,6 +272,21 @@ class Controller {
     /** The badge's three LED colours (CTRL:STAT) as packed u24s, or null
      *  until it says. The client repaints its Lil Guy in these. */
     this.led = null;
+    /** Whether this board's one-per-link CTRL:STAT has been accounted for.
+     *
+     *  This board does not become a player until it has (see
+     *  ControllerManager.assign), because a player is built in one
+     *  synchronous burst — assign -> makePlayer -> spawnZig -> onZigSpawned —
+     *  and everything that burst knows about the board is whatever arrived
+     *  BEFORE it.  CTRL:HELLO and CTRL:STAT are two separate serial lines and
+     *  the stats are always the later one, so building the player on HELLO
+     *  built it blind: appetite 0, no babies, no critter, no palette.
+     *
+     *  Set by the CTRL:STAT handler, or by statTimer giving up on a board
+     *  that is never going to send one. */
+    this.statSeen = false;
+    /** Deadline for the above, armed at link-up; null when not waiting. */
+    this.statTimer = null;
     this.lastShape = null; // last FB:SHAPE payload sent (dedupe)
     /** Last GAME:PHASE activity sent (boolean), or null before the first. */
     this.lastActive = null;
@@ -363,7 +391,22 @@ class Controller {
             this.manager.dropController(this);
           }
         }, HB_INTERVAL_MS);
+        // Held back until CTRL:STAT lands (statSeen); this call covers the
+        // rest of the assignment pass, not this board.
         this.manager.assign();
+        // Old firmware predates CTRL:STAT entirely, and any single line is
+        // best-effort over serial, so waiting for one cannot be unconditional
+        // or such a board would never play at all.  It joins blind instead,
+        // which is the degradation controller.c already documents.
+        this.statTimer = setTimeout(() => {
+          this.statTimer = null;
+          if (this.closed || this.statSeen) return;
+          console.warn(
+            `[ctrl] no CTRL:STAT from ${this.path} in ${STAT_WAIT_MS}ms; ` +
+            `joining at defaults (no appetite, babies, critter or palette)`);
+          this.statSeen = true;
+          this.manager.assign();
+        }, STAT_WAIT_MS);
         // A new link is a new badge for the onboarding queue to roll.
         this.manager.boardsChanged();
       }
@@ -442,6 +485,15 @@ class Controller {
       if (this.playerSession !== null) {
         for (const l of this.statLines()) this.playerSession.writeToZig(l);
       }
+      // Release the assignment gate: this board can now be made a player
+      // that knows what it is.  Idempotent — a board that re-reports while
+      // already seated has a playerSession, so assign passes over it.
+      if (this.statTimer !== null) {
+        clearTimeout(this.statTimer);
+        this.statTimer = null;
+      }
+      this.statSeen = true;
+      this.manager.assign();
       return;
     }
 
@@ -616,6 +668,8 @@ class Controller {
     this.closed = true;
     if (this.helloTimer !== null) clearInterval(this.helloTimer);
     if (this.hbTimer !== null) clearInterval(this.hbTimer);
+    if (this.statTimer !== null) clearTimeout(this.statTimer);
+    this.statTimer = null;
     this.clearScoreRetry();
     // Unplugged mid-roll: settle the waiting onboarding screen so it can skip
     // this badge instead of hanging on an ack that can never arrive.
@@ -817,6 +871,11 @@ class ControllerManager {
   assign() {
     for (const ctrl of this.controllers.values()) {
       if (!ctrl.linked || ctrl.playerSession !== null) continue;
+      // Not until the board has said what it is (Controller.statSeen): the
+      // player is built synchronously from here and carries whatever is known
+      // at that instant, permanently — the server freezes a player's stats
+      // when they take their seat.
+      if (!ctrl.statSeen) continue;
       const room = this.pickRoom();
       if (room === null) continue;
       this.makePlayer(ctrl, room);
