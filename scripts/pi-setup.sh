@@ -34,6 +34,15 @@ ROOT="${ROOT:-/opt/slimefeast}"
 BRANCH="${BRANCH:-main}"
 PORT="${PORT:-3000}"
 KIOSK_URL="${KIOSK_URL:-http://localhost:${PORT}/}"
+# Shell snippet pi-kiosk.sh runs before Chromium, for display setup (rotation,
+# mode, overscan).  A TUNABLE rather than a hand-edit of the file this script
+# writes: /etc/default/slimefeast is rewritten wholesale on every re-run, and
+# re-running is the documented way to apply a boot-path change — so a rotation
+# typed into that file directly survives exactly until the next update nudge.
+# Empty by default: guessing a display config for a kiosk you have not seen is
+# worse than the compositor's own defaults.  For a panel mounted upside down:
+#   DISPLAY_SETUP='wlr-randr --output HDMI-A-1 --transform 180' sudo -E bash scripts/pi-setup.sh
+DISPLAY_SETUP="${DISPLAY_SETUP:-}"
 
 ZIG_VERSION="0.15.2"
 ZIG_TARBALL="https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz"
@@ -224,9 +233,10 @@ KEEP_BUILDS=3
 BRIDGE_WAIT=90
 
 # Shell snippet run before Chromium, for display setup (rotation, mode).
-# Left empty deliberately — set it once the kiosk display is decided, e.g.
-#   DISPLAY_SETUP='wlr-randr --output HDMI-A-1 --transform 90'
-DISPLAY_SETUP=
+# Set it by re-running pi-setup.sh with DISPLAY_SETUP in the environment, NOT
+# by editing this line: this whole file is rewritten on every re-run.
+#   DISPLAY_SETUP='wlr-randr --output HDMI-A-1 --transform 180' sudo -E bash scripts/pi-setup.sh
+DISPLAY_SETUP=${DISPLAY_SETUP@Q}
 EOF
 chmod 644 /etc/default/slimefeast
 

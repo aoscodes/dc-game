@@ -31,10 +31,18 @@ KIOSK_URL="${KIOSK_URL:-http://localhost:${PORT}/}"
 # an error page an operator can actually see.
 BRIDGE_WAIT="${BRIDGE_WAIT:-90}"
 # Shell snippet run once before the browser, for display setup that is not
-# yet decided (rotation, mode, overscan) — e.g.
-#   DISPLAY_SETUP='wlr-randr --output HDMI-A-1 --transform 90'
+# yet decided (rotation, mode, overscan) — e.g. a panel mounted upside down:
+#   DISPLAY_SETUP='wlr-randr --output HDMI-A-1 --transform 180'
 # Empty by default: guessing a display config for a kiosk you have not seen
 # is worse than leaving it at the compositor's own defaults.
+#
+# Rotation belongs HERE and not in web/'s CSS.  The compositor transform turns
+# the touchscreen's coordinates with the output, so a tap still lands where it
+# looks like it landed; a `transform: rotate(180deg)` on the page rotates only
+# the pixels, and every hit test on the far side of it — canvasCoords in
+# game.js, the browser's own on the kiosk buttons — would need inverting to
+# match.  Set it from pi-setup.sh (see DISPLAY_SETUP there), which is what
+# writes /etc/default/slimefeast.
 DISPLAY_SETUP="${DISPLAY_SETUP:-}"
 # Where the browser's PID and the exit request are exchanged with the bridge.
 # The bridge derives the same two filenames from KIOSK_STATE_DIR (see the

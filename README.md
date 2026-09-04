@@ -77,6 +77,31 @@ adds the kiosk user to `dialout` for the USB controllers, lays out
 `/opt/slimefeast`, writes the two systemd units, hooks the browser into the
 labwc session, and turns on desktop autologin with screen blanking off.
 
+### Display rotation
+
+A panel mounted upside down (or on its side) is rotated at the **compositor**,
+via the `DISPLAY_SETUP` snippet `pi-kiosk.sh` runs before Chromium:
+
+```
+# find the output name first
+wlr-randr
+
+DISPLAY_SETUP='wlr-randr --output HDMI-A-1 --transform 180' \
+  sudo -E bash dc-game/scripts/pi-setup.sh
+sudo reboot
+```
+
+Pass it to `pi-setup.sh` rather than editing `/etc/default/slimefeast` by
+hand: that file is rewritten wholesale on every re-run, and re-running is the
+documented way to apply a boot-path change.
+
+`--transform` takes `90` / `180` / `270` (and `flipped-*`).  The transform
+turns the **touchscreen's coordinates with the output**, so a tap still lands
+where it looks like it landed — which is why rotation lives here and not as a
+`transform: rotate()` in `web/`. CSS would rotate the pixels only, leaving
+every hit test (`canvasCoords` in `game.js`, the browser's own on the kiosk
+buttons) reading the pre-rotation frame.
+
 ### What runs at boot
 
 | Unit / hook                 | Does                                                     |
