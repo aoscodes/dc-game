@@ -34,15 +34,6 @@ ROOT="${ROOT:-/opt/slimefeast}"
 BRANCH="${BRANCH:-main}"
 PORT="${PORT:-3000}"
 KIOSK_URL="${KIOSK_URL:-http://localhost:${PORT}/}"
-# Shell snippet pi-kiosk.sh runs before Chromium, for display setup (rotation,
-# mode, overscan).  A TUNABLE rather than a hand-edit of the file this script
-# writes: /etc/default/slimefeast is rewritten wholesale on every re-run, and
-# re-running is the documented way to apply a boot-path change — so a rotation
-# typed into that file directly survives exactly until the next update nudge.
-# Empty by default: guessing a display config for a kiosk you have not seen is
-# worse than the compositor's own defaults.  For a panel mounted upside down:
-#   DISPLAY_SETUP='wlr-randr --output HDMI-A-1 --transform 180' sudo -E bash scripts/pi-setup.sh
-DISPLAY_SETUP="${DISPLAY_SETUP:-}"
 
 ZIG_VERSION="0.15.2"
 ZIG_TARBALL="https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz"
@@ -90,11 +81,10 @@ log "provisioning kiosk: user=$KIOSK_USER root=$ROOT branch=$BRANCH port=$PORT"
 log "installing base packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-# wlr-randr is what DISPLAY_SETUP is written in (see the tunable above), and
-# Pi OS does not ship it.  Installed unconditionally rather than only when
-# DISPLAY_SETUP mentions it: it is ~50KB, and it is also the only way to ASK
-# the running compositor for its output names, which is the first thing anyone
-# setting a rotation needs.
+# wlr-randr is the only way to ask the running compositor what outputs it has
+# and how they are configured, and Pi OS does not ship it.  Kept (~50KB) purely
+# as a diagnostic: nothing in the boot path calls it.  Do NOT reintroduce a
+# `--transform` here without reading the rotation note in the README first.
 apt-get install -y --no-install-recommends \
   git curl ca-certificates xz-utils rsync wlr-randr
 
@@ -115,20 +105,6 @@ if (( node_major < NODE_MAJOR )); then
   apt-get install -y nodejs
 else
   log "Node.js major $node_major already satisfies >= $NODE_MAJOR"
-fi
-
-# A DISPLAY_SETUP naming a command that does not exist is the worst kind of
-# wrong: pi-kiosk.sh runs it at session start, warns into a logfile nobody is
-# tailing, and launches Chromium anyway — so the symptom is a kiosk that comes
-# up looking completely normal and simply is not rotated.  Checked here, where
-# the operator is watching, and only for the leading word: the rest is an
-# arbitrary snippet whose arguments cannot be validated off the display.
-if [[ -n "$DISPLAY_SETUP" ]]; then
-  ds_cmd="${DISPLAY_SETUP%% *}"
-  if [[ "$ds_cmd" != *=* ]] && ! command -v "$ds_cmd" >/dev/null; then
-    die "DISPLAY_SETUP starts with '$ds_cmd', which is not installed"
-  fi
-  log "DISPLAY_SETUP: $DISPLAY_SETUP"
 fi
 
 # ---------------------------------------------------------------------------
@@ -257,12 +233,6 @@ KEEP_BUILDS=3
 # It keeps watching afterwards and reloads once the bridge appears, so this
 # does not need to cover a cold build.
 BRIDGE_WAIT=90
-
-# Shell snippet run before Chromium, for display setup (rotation, mode).
-# Set it by re-running pi-setup.sh with DISPLAY_SETUP in the environment, NOT
-# by editing this line: this whole file is rewritten on every re-run.
-#   DISPLAY_SETUP='wlr-randr --output HDMI-A-1 --transform 180' sudo -E bash scripts/pi-setup.sh
-DISPLAY_SETUP=${DISPLAY_SETUP@Q}
 EOF
 chmod 644 /etc/default/slimefeast
 

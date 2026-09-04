@@ -79,28 +79,35 @@ labwc session, and turns on desktop autologin with screen blanking off.
 
 ### Display rotation
 
-A panel mounted upside down (or on its side) is rotated at the **compositor**,
-via the `DISPLAY_SETUP` snippet `pi-kiosk.sh` runs before Chromium:
+**The boot path does not rotate the display, deliberately.**  There was a
+`DISPLAY_SETUP` hook here that ran `wlr-randr --transform 180` before Chromium.
+It reliably produced a **white screen**: `chromium --kiosk` on Ozone/Wayland
+sizes its window from the output bounds it reads at startup, and against a
+compositor-transformed output it maps a surface that never paints.  Chromium
+issue 40189002 is the same failure on wlroots; adding `--start-maximized` is a
+commonly cited workaround precisely because it "forces chromium to get the
+correct screen bounds".
+
+If a panel is mounted upside down, rotate it **below** the compositor instead,
+so neither labwc nor Chromium ever sees a transformed output.  Append to the
+single line in `/boot/firmware/cmdline.txt`:
 
 ```
-# find the output name first
-wlr-randr
-
-DISPLAY_SETUP='wlr-randr --output HDMI-A-1 --transform 180' \
-  sudo -E bash dc-game/scripts/pi-setup.sh
-sudo reboot
+video=HDMI-A-1:1024x600@60,rotate=180
 ```
 
-Pass it to `pi-setup.sh` rather than editing `/etc/default/slimefeast` by
-hand: that file is rewritten wholesale on every re-run, and re-running is the
-documented way to apply a boot-path change.
+That rotates pixels only — touch is still mapped to the untransformed frame —
+so pair it with a libinput calibration matrix (`180°` is `-1 0 1 0 -1 1`) in
+`/etc/udev/rules.d/99-slimefeast-touch.rules`:
 
-`--transform` takes `90` / `180` / `270` (and `flipped-*`).  The transform
-turns the **touchscreen's coordinates with the output**, so a tap still lands
-where it looks like it landed — which is why rotation lives here and not as a
-`transform: rotate()` in `web/`. CSS would rotate the pixels only, leaving
-every hit test (`canvasCoords` in `game.js`, the browser's own on the kiosk
-buttons) reading the pre-rotation frame.
+```
+ENV{ID_INPUT_TOUCHSCREEN}=="1", ENV{LIBINPUT_CALIBRATION_MATRIX}="-1 0 1 0 -1 1"
+```
+
+Both files are on partitions the Pi can be recovered through without a shell:
+`cmdline.txt` is FAT32 and editable from any machine with the SD card.  Verify
+the output name with `wlr-randr` (installed, but no longer called by anything
+at boot) before trusting `HDMI-A-1`.
 
 ### What runs at boot
 
@@ -191,12 +198,10 @@ sudo systemctl restart slimefeast-bridge
 
 Knobs live in `/etc/default/slimefeast` (`BRANCH`, `PORT`, `KIOSK_URL`,
 `NETWORK_WAIT`, `FETCH_TIMEOUT`, `KEEP_BUILDS`, `BRIDGE_WAIT`,
-`DISPLAY_SETUP`, `KIOSK_STATE_DIR`).  Edit, then
+`KIOSK_STATE_DIR`).  Edit, then
 restart the two units.  Raise `NETWORK_WAIT` if the venue's access point is
 slow to hand out a lease — it is the budget for wifi coming up, and spending
-it costs nothing on a Pi that is already online.  `DISPLAY_SETUP` is a shell
-hook for display config — see [Display rotation](#display-rotation), and note
-that it is set by passing it to `pi-setup.sh`, not by editing this file.
+it costs nothing on a Pi that is already online.
 `KIOSK_STATE_DIR` is the handshake directory that arms the hold-to-exit button
 (see [Closing the kiosk to the desktop](#closing-the-kiosk-to-the-desktop));
 comment it out to disable the button entirely.
