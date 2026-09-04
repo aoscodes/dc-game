@@ -101,7 +101,12 @@ systemctl enable dragoncon-bridge
 # ---------------------------------------------------------------------------
 cat > /etc/nginx/sites-available/dragoncon <<'EOF'
 server {
-    listen 80;
+    # default_server: the VPS also hosts name-based vhosts for the GRG sites
+    # (provisioned from the monorepo's scripts/sites-setup.sh).  Without an
+    # explicit default, nginx picks whichever `listen 80` it parses first,
+    # which is decided by alphabetical ordering of sites-enabled filenames.
+    # Pin it so bare-IP and unknown-Host requests keep reaching the game.
+    listen 80 default_server;
     server_name _;
 
     root /var/www/dragoncon;
