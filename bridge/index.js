@@ -30,7 +30,16 @@
  *   - Relay browser keydown events → Zig stdin as  KEY:<name>\n
  *
  * Shared:
- *   - HTTP static file server on port 3000 (serves web/)
+ *   - HTTP static file server on port 3000 (serves web/).  The page routes:
+ *       /                  the station directory (web/index.html) — what a
+ *                          kiosk boots into, and the only page that links the
+ *                          others.  /onboard and /powerups link back to it;
+ *                          /game does not (see the /game route below).
+ *       /game              the game shell (web/game.html)
+ *       /config/{hash}     the same shell, playing a saved /tune config
+ *       /onboard           the badge colour kiosk
+ *       /powerups          the powerup kiosk
+ *       /tune              the config editor
  *   - Hardware controller discovery over USB serial (controllers.js): every
  *     board is its own player with a dedicated Zig client; selected-shape
  *     feedback flows back to the board's e-paper.
@@ -217,13 +226,26 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
+  // /game — the game shell.  It lives here rather than at / so that / can be
+  // the station directory: the kiosks are touchscreens with no keyboard and no
+  // address bar, so without a page that links the stations there is no way to
+  // reach one but to edit KIOSK_URL over a shell on the Pi.
+  // NOTE: this page alone has no link back to the directory, unlike the two
+  // kiosks.  The canvas takes clicks for casting, so a corner control here is
+  // a misfire waiting to happen mid-round.  A station that should never show
+  // the directory at all wants KIOSK_URL=/game instead.
+  if (rawPath === "/game") {
+    serveFile(res, WEB_DIR, "/game.html", { "Cache-Control": "no-cache" });
+    return;
+  }
+
   // /config/{hash}[/...] — play (or fetch data for) a saved custom config.
   const cfgMatch = rawPath.match(/^\/config\/([0-9a-f]{16})(\/.*)?$/);
   if (cfgMatch) {
     const [, hash, rest] = cfgMatch;
     if (!rest || rest === "/") {
       // The game shell; game.js reads the hash from location.pathname.
-      serveFile(res, WEB_DIR, "/index.html", { "Cache-Control": "no-cache" });
+      serveFile(res, WEB_DIR, "/game.html", { "Cache-Control": "no-cache" });
     } else if (rest.startsWith("/data/")) {
       serveFile(res, path.join(CUSTOM_DIR, hash), rest.slice("/data".length));
     } else {
@@ -232,14 +254,20 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
-  const urlPath = rawPath === "/" ? "/index.html" : rawPath;
-
-  // /data/* serves the game data files (same ones the servers load).
-  if (urlPath.startsWith("/data/")) {
-    serveFile(res, DATA_DIR, urlPath.slice("/data".length));
+  // / — the station directory.  no-cache like every other page route: this is
+  // the one page a kiosk holds open indefinitely, so a stale copy is the one
+  // that survives longest.
+  if (rawPath === "/") {
+    serveFile(res, WEB_DIR, "/index.html", { "Cache-Control": "no-cache" });
     return;
   }
-  serveFile(res, WEB_DIR, urlPath);
+
+  // /data/* serves the game data files (same ones the servers load).
+  if (rawPath.startsWith("/data/")) {
+    serveFile(res, DATA_DIR, rawPath.slice("/data".length));
+    return;
+  }
+  serveFile(res, WEB_DIR, rawPath);
 });
 
 // ---------------------------------------------------------------------------

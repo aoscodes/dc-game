@@ -3,7 +3,7 @@
 Welcome! This doc tells you everything you need to play, and how to help us tune
 the game. No technical background needed.
 
-**Play here: http://198.74.58.178**
+**Play here: http://198.74.58.178/game**
 
 ---
 
@@ -118,7 +118,8 @@ feedback — it's the single most useful artifact you can send us.
 
 ## 5. Getting into a game
 
-1. Go to **http://198.74.58.178**. A game is always running; you join it.
+1. Go to **http://198.74.58.178/game** (or tap **Play** on the directory at
+   the bare address). A game is always running; you join it.
 2. Press **p** to take a seat (or watch as an observer).
 3. The pre-match guide lists every move and group; a click starts play.
 4. In game: `1`/`2` turn the wheel, arrows aim, `Enter` casts. The report's

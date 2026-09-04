@@ -124,6 +124,30 @@ server {
         proxy_send_timeout 3600s;
     }
 
+    # The kiosk WebSockets.  Same stanza as /ws and for the same reasons.
+    # Exact matches, like /ws: an exact location is settled before any regex or
+    # prefix block, so these can never be reordered into a static file handler
+    # by something added later.
+    location = /onboard-ws {
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade    $http_upgrade;
+        proxy_set_header   Connection "Upgrade";
+        proxy_set_header   Host       $host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
+    location = /powerups-ws {
+        proxy_pass         http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade    $http_upgrade;
+        proxy_set_header   Connection "Upgrade";
+        proxy_set_header   Host       $host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+
     # Tuning API (save configs) -> Node bridge
     location /api/ {
         proxy_pass       http://127.0.0.1:3000;
@@ -140,16 +164,31 @@ server {
 
     # /config/{hash} serves the regular game shell; game.js reads the hash
     # from location.pathname (all asset/script URLs are absolute).
-    location ~ "^/config/[0-9a-f]{16}$" {
+    # The optional trailing slash matches the bridge, which accepts it too
+    # (see the cfgMatch branch in bridge/index.js) — the two configs are
+    # independent, so every route has to agree in both or the Pi and the VPS
+    # disagree about what a URL means.
+    location ~ "^/config/[0-9a-f]{16}/?$" {
         add_header Cache-Control "no-cache";
-        try_files /index.html =404;
+        try_files /game.html =404;
     }
 
-    # /realtime serves the game shell defaulting lobby creation to realtime
-    # mode (game.js reads location.pathname).
-    location = /realtime {
+    # The extensionless page routes.  Each must be spelled out: the catch-all
+    # `location /` below is try_files-only, so anything without a file
+    # extension 404s unless it is named here.  This is what /onboard and
+    # /powerups were missing — they worked against the bridge directly on the
+    # Pi and had never worked on the VPS at all.
+    location = /game {
         add_header Cache-Control "no-cache";
-        try_files /index.html =404;
+        try_files /game.html =404;
+    }
+    location = /onboard {
+        add_header Cache-Control "no-cache";
+        try_files /onboard.html =404;
+    }
+    location = /powerups {
+        add_header Cache-Control "no-cache";
+        try_files /powerups.html =404;
     }
 
     # The tuning editor (static, ships with web/).
@@ -158,8 +197,12 @@ server {
         try_files /tune.html =404;
     }
 
-    # index.html must revalidate so the game.js?v=<sha> cache buster is seen
-    # on every deploy.  The versioned game.js itself can be cached forever.
+    # The shells must revalidate so the ?v=<sha> cache buster inside them is
+    # seen on every deploy.  The versioned scripts themselves can be cached
+    # forever.  index.html is the station directory, game.html the game.
+    location = /game.html {
+        add_header Cache-Control "no-cache";
+    }
     location = /index.html {
         add_header Cache-Control "no-cache";
     }

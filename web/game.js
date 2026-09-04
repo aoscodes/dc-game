@@ -2,7 +2,7 @@
 
 const LAYOUT = {
   // DESIGN SPACE.  Every coordinate in this file is authored in these units.
-  // The canvas backing store is `renderScale` times larger (index.html) and a
+  // The canvas backing store is `renderScale` times larger (game.html) and a
   // single setTransform at boot scales design units up to it, so art and text
   // gain resolution without any coordinate in here changing.
   //

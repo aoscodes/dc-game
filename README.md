@@ -23,7 +23,8 @@ Terminal 2 — bridge (builds client binary, then starts it + serves the browser
 zig build run
 ```
 
-Open `http://localhost:3000`.
+Open `http://localhost:3000` for the station directory, or
+`http://localhost:3000/game` to go straight to the game.
 
 ### How it works
 
@@ -54,9 +55,10 @@ The Zig client is headless — no window, no GPU. It reads server messages and k
 
 ## Raspberry Pi kiosk (self-hosted)
 
-A Pi that boots straight into the game: fast-forwards to the latest `main`,
-builds it, starts the bridge, and opens a fullscreen Chromium tab on
-`http://localhost:3000`.  No nginx and no network dependency at play time —
+A Pi that boots straight into the station directory: fast-forwards to the
+latest `main`, builds it, starts the bridge, and opens a fullscreen Chromium
+tab on `http://localhost:3000`.  Point `KIOSK_URL` at `/game` instead for a
+station that should come up playing without a tap.  No nginx and no network dependency at play time —
 the bridge serves `web/` and `data/` itself and spawns a game server per
 lobby, so the whole stack is local.
 
@@ -109,8 +111,8 @@ you a kiosk that looks fine and cannot play.
 
 **`pi-update.sh` always exits 0.** No network, a force-pushed branch, a broken
 commit, a full disk — every failure is logged and leaves the previous
-deployment serving.  The Pi always boots into a playable game; the journal
-explains why it is on the version it is on.
+deployment serving.  The Pi always boots into a working directory one tap
+from a playable game; the journal explains why it is on the version it is on.
 
 The boot scripts themselves are *not* self-updating (rewriting a shell script
 under its own running interpreter is a hazard, and changing how the kiosk
@@ -156,7 +158,11 @@ SSH in as root and run the setup script:
 bash scripts/vps-setup.sh
 ```
 
-This installs Nginx and Node.js, creates a `dragoncon` service user, writes the `dragoncon-bridge` systemd unit (the bridge spawns a game-server process per lobby), and configures Nginx to serve `web/` static files and proxy `/ws` to the bridge.
+This installs Nginx and Node.js, creates a `dragoncon` service user, writes the `dragoncon-bridge` systemd unit (the bridge spawns a game-server process per lobby), and configures Nginx to serve `web/` static files and proxy `/ws`, `/onboard-ws` and `/powerups-ws` to the bridge.
+
+Nginx re-declares the page routes independently of the bridge, so **a new
+extensionless route has to be added in both places** — the catch-all
+`location /` is `try_files`-only and 404s anything without a file extension.
 
 After the script:
 
@@ -222,6 +228,27 @@ start with the exact field and reason; unknown fields are rejected so typos
 can't silently default.  Caps enforced by the loader: 64 recipes per table,
 16 zones per encounter, group components 2..6 (each an existing move label).
 `server --data-dir <dir> --validate` checks a data dir and exits.
+
+### Pages
+
+The kiosks are touchscreens with no keyboard and no address bar, so `/` is a
+**station directory**: three big buttons, one per page below.  It is what a
+kiosk boots into (`KIOSK_URL` defaults to `/`) and the only way to get from
+one station to another without a shell on the Pi.
+
+| Route             | Page                                                     | Back to `/` |
+| ----------------- | -------------------------------------------------------- | ----------- |
+| `/`               | Station directory (`web/index.html`)                      | —           |
+| `/game`           | The game (`web/game.html`)                                | no          |
+| `/config/{hash}`  | The game, running a saved `/tune` config                  | no          |
+| `/onboard`        | Badge colour kiosk — needs the bridge for the serial ports | yes        |
+| `/powerups`       | Powerup kiosk — same                                      | yes         |
+| `/tune`           | Config editor (operator tool; deliberately not on `/`)    | no          |
+
+The game has no back control on purpose: its canvas takes clicks for casting,
+so a corner button is a misfire waiting to happen mid-round.  Set
+`KIOSK_URL=/game` on a Pi that should come up playing and never show the
+directory; leave it at `/` on a station an operator retasks between sessions.
 
 ### /tune — in-browser config editor
 
@@ -393,8 +420,11 @@ src/
 bridge/
   index.js               Node bridge: spawns client, WebSocket relay, static files, /api/tune/save
 web/
-  index.html             canvas shell (also served at /config/{hash})
+  index.html             / station directory: big touch buttons to the pages below
+  game.html              /game canvas shell (also served at /config/{hash})
   game.js                canvas renderer: connecting / lobby / game / game_over phases
+  onboard.html, onboard.js    /onboard badge colour kiosk
+  powerups.html, powerups.js  /powerups powerup kiosk
   tune.html, tune.js     /tune config editor
 data/
   balance.json           grid, costs, recipes

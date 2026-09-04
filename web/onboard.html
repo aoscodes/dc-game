@@ -19,7 +19,7 @@
       overflow: hidden;
     }
     /* Same panel and the same 1:1 backing store as the game (see LAYOUT in
-       onboard.js and web/index.html): aspect-locked to the design space so it
+       onboard.js and web/game.html): aspect-locked to the design space so it
        fills whatever viewport the kiosk browser hands us. */
     canvas {
       display: block;
@@ -29,10 +29,44 @@
       max-height: 100vh;
       max-width: calc(100vh * 1024 / 600);
     }
+
+    /* Back to the station directory.  The kiosk browser has no address bar
+       and no back button, so without this the only way off this page is a
+       reload from a shell on the Pi.
+       Fixed and top-LEFT: the canvas draws its status strip along the bottom
+       edge (see draw() in onboard.js) and the top corners are flat zone
+       colour, so this is the one place it covers nothing.
+       Opaque backing for the same reason the status strip has one — what is
+       behind it is three arbitrary saturated colours, so it cannot rely on
+       contrast with the page. */
+    a.back {
+      position: fixed;
+      top: 14px;
+      left: 14px;
+      display: flex;
+      align-items: center;
+      min-height: 48px;
+      padding: 0 20px;
+      background: rgba(8, 8, 10, 0.82);
+      color: rgb(242, 244, 250);
+      font: 400 20px system-ui, -apple-system, sans-serif;
+      text-decoration: none;
+      border-radius: 24px;
+      /* Kills the 300ms double-tap delay and the browser's grey tap flash;
+         :active below is the press feedback instead, because a touchscreen
+         leaves :hover stuck on after the tap. */
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    a.back:active { background: rgb(8, 8, 10); }
+    a.back:focus-visible { outline: 3px solid rgb(242, 244, 250); outline-offset: 2px; }
   </style>
 </head>
 <body>
 <canvas id="canvas" width="1024" height="600"></canvas>
+<a class="back" href="/">&#8592;&nbsp; Menu</a>
 <!-- ?v= is a cache buster: CI rewrites "dev" to the commit SHA on deploy.
      palette.js FIRST: onboard.js reads its constants at load time. -->
 <script src="/palette.js?v=dev"></script>
