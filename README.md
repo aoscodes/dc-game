@@ -338,12 +338,23 @@ To get back to the kiosk, either log out and back in (labwc autostart runs
 script that runs the real binary as a *child*, so the process `pi-kiosk.sh`
 launches is not the browser — and its cmdline carries `--kiosk` all the same.
 Signalling it kills the script and orphans a fullscreen browser with no
-launcher and no pidfile, while the switch reports success. So `pi-kiosk.sh`
-walks its own process tree and publishes the browser (`kiosk_browser_pid`:
-deepest descendant with `--kiosk` and no `--type=`), and the bridge refuses
-any PID whose `/proc/PID/exe` is a shell. Both halves are asserted by
-`web/test/kioskpid_harness.mjs`, which builds that tree out of shells and
-`sleep` (Linux only; it skips elsewhere).
+launcher and no pidfile, while the switch reports success.
+
+So the pidfile is treated as a **starting point, not an answer**. `pi-kiosk.sh`
+publishes the browser when it can (`kiosk_browser_pid`), and the bridge
+descends the process tree from whatever it is given (`resolveKioskBrowser`),
+looking for the process with `--kiosk`, no `--type=`, and an `/proc/PID/exe`
+that is not a shell.
+
+The descent is not belt-and-braces, it is load-bearing: `pi-update.sh`
+refreshes the bridge on every commit but deliberately never rewrites
+`pi-kiosk.sh`, so **a Pi running a new bridge against an old launcher is the
+normal state** between re-provisions. A switch that needed both halves in step
+would be broken more often than not.
+
+`web/test/kioskpid_harness.mjs` asserts both, twice: once against `/proc` as
+an injected fixture (every platform), once against a real tree of shells and
+`sleep` (Linux only).
 
 How it stays distinguishable from a crash: the bridge writes a
 `$KIOSK_STATE_DIR/kiosk-exit` flag *before* signalling the browser, and

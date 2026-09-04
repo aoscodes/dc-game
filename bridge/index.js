@@ -515,9 +515,15 @@ function pidIsKioskBrowser(pid) {
   // Signalling that launcher is worse than refusing to: it kills the script
   // and leaves a fullscreen browser with no parent, no pidfile and no way to
   // be closed, while this route answers 200 and the operator watches a screen
-  // that does not change.  pi-kiosk.sh publishes the browser now (see
-  // kiosk_browser_pid there) — this is the second lock on the same door, so
-  // that a pidfile written by an older or hand-rolled launcher fails LOUDLY.
+  // that does not change.
+  //
+  // Two things separate the launcher from the browser, and both are needed:
+  // the launcher runs under a SHELL, and Chromium's own helpers (zygote, GPU,
+  // every renderer) carry --type=.  Without the second, a helper that happens
+  // to have inherited --kiosk would be a candidate, and SIGTERM to a renderer
+  // closes a tab while the kiosk stays up.
+  if (cmdline.split("\0").some((a) => a.startsWith("--type="))) return false;
+
   let exe;
   try {
     exe = path.basename(fs.readlinkSync(`/proc/${pid}/exe`));
@@ -529,6 +535,93 @@ function pidIsKioskBrowser(pid) {
   return !SHELL_EXES.has(exe);
 }
 
+/**
+ * PID -> its children, built from one sweep of /proc.
+ *
+ * /proc/PID/status rather than /proc/PID/stat: `stat` puts the comm field in
+ * parentheses in the middle of a space-separated line, and a process named
+ * `foo bar)` is a parsing bug waiting to happen.  `status` is line-oriented.
+ */
+function procChildren() {
+  const kids = new Map();
+  let entries;
+  try {
+    entries = fs.readdirSync("/proc");
+  } catch {
+    return kids;
+  }
+  for (const name of entries) {
+    if (!/^\d+$/.test(name)) continue;
+    let status;
+    try {
+      status = fs.readFileSync(`/proc/${name}/status`, "utf8");
+    } catch {
+      continue;  // exited between readdir and read; normal
+    }
+    const m = status.match(/^PPid:\s*(\d+)$/m);
+    if (!m) continue;
+    const parent = Number(m[1]);
+    if (!kids.has(parent)) kids.set(parent, []);
+    kids.get(parent).push(Number(name));
+  }
+  return kids;
+}
+
+/**
+ * The browser to signal, given whatever PID the pidfile holds.
+ *
+ * Returns the PID itself when it is already the browser, a descendant when
+ * the pidfile holds a LAUNCHER, or null when neither is true.
+ *
+ * The descent is not redundant with pi-kiosk.sh finding the browser itself.
+ * These two files are deployed on DIFFERENT SCHEDULES — pi-update.sh
+ * refreshes the bridge with every commit but deliberately never rewrites
+ * pi-kiosk.sh (see its "Flag provisioning drift" step), so a Pi that has
+ * pulled a new bridge and not been re-provisioned is the normal state of the
+ * world, not an edge case.  A kill switch that only works when both halves
+ * happen to be in step is a kill switch that does not work.
+ */
+function resolveKioskBrowser(rootPid) {
+  if (pidIsKioskBrowser(rootPid)) return rootPid;
+  if (!fs.existsSync("/proc")) return null;  // no tree to walk
+
+  // Breadth-first from the pidfile's PID.  Bounded by the tree itself, which
+  // for a browser is a few hundred processes at most.
+  const kids = procChildren();
+  const queue = [...(kids.get(rootPid) ?? [])];
+  const seen = new Set([rootPid]);
+  while (queue.length > 0) {
+    const pid = queue.shift();
+    if (seen.has(pid)) continue;
+    seen.add(pid);
+    if (pidIsKioskBrowser(pid)) return pid;
+    queue.push(...(kids.get(pid) ?? []));
+  }
+
+  // LAST RESORT: the pidfile led nowhere, so scan for the browser directly.
+  //
+  // This is the one place the bridge is allowed to look for a process it was
+  // not told about, and the reason is recovery, not convenience.  A kiosk is
+  // a fullscreen browser on a machine with no keyboard: when this button is
+  // the only way in and the pidfile is wrong — written by a launcher that has
+  // since died, left behind by a crash, stale after a manual relaunch — the
+  // alternative to a scan is a machine that cannot be opened at all without
+  // pulling its SD card.
+  //
+  // It is a scan, not a `pkill`: the predicate is the exact one used above
+  // (--kiosk, no --type=, not a shell), which no ordinary browser on this
+  // machine satisfies, and a unique match is required.  Two candidates means
+  // the guess is not safe to make, so it is not made.
+  const candidates = [];
+  for (const [, children] of kids) {
+    for (const pid of children) {
+      if (!seen.has(pid) && pidIsKioskBrowser(pid)) candidates.push(pid);
+    }
+  }
+  if (candidates.length === 1) return candidates[0];
+  return null;
+}
+
 function handleKioskExit(res) {
   const fail = (code, error) => {
     console.error(`[bridge] kiosk exit refused: ${error}`);
@@ -536,17 +629,33 @@ function handleKioskExit(res) {
     res.end(JSON.stringify({ ok: false, error }));
   };
 
-  let pid;
+  let published;
   try {
-    pid = parseInt(fs.readFileSync(KIOSK_PID_FILE, "utf8").trim(), 10);
+    published = parseInt(fs.readFileSync(KIOSK_PID_FILE, "utf8").trim(), 10);
   } catch {
     return fail(409, "no browser is running (pi-kiosk.sh publishes no PID)");
   }
-  if (!Number.isInteger(pid) || pid <= 1) {
+  if (!Number.isInteger(published) || published <= 1) {
     return fail(409, "kiosk pidfile is not a usable PID");
   }
-  if (!pidIsKioskBrowser(pid)) {
-    return fail(409, `PID ${pid} is not the kiosk browser (stale pidfile, or a launcher rather than the browser)`);
+  // The pidfile is a STARTING POINT, not the answer: an un-re-provisioned Pi
+  // is still running a pi-kiosk.sh that publishes the launcher.
+  //
+  // Wrapped, because everything this touches is /proc and /proc races with
+  // every process that exits mid-read.  A throw here would take the bridge
+  // down with it, and on a machine whose only way in is this button, the
+  // route failing must never become the kiosk failing.
+  let pid;
+  try {
+    pid = resolveKioskBrowser(published);
+  } catch (e) {
+    return fail(500, `could not identify the browser process: ${e.message}`);
+  }
+  if (pid === null) {
+    return fail(409, `PID ${published} is not the kiosk browser and no browser was found under or beside it`);
+  }
+  if (pid !== published) {
+    console.log(`[bridge] pidfile holds launcher ${published}; browser is ${pid}`);
   }
 
   // Flag before signal — see the note above; this ordering is load-bearing.
