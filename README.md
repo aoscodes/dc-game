@@ -55,9 +55,11 @@ The Zig client is headless — no window, no GPU. It reads server messages and k
 
 ## Raspberry Pi kiosk (self-hosted)
 
-A Pi that boots straight into the station directory: fast-forwards to the
-latest `main`, builds it, starts the bridge, and opens a fullscreen Chromium
-tab on `http://localhost:3000`.  Point `KIOSK_URL` at `/game` instead for a
+A Pi that boots ready to serve the station directory: fast-forwards to the
+latest `main`, builds it, and starts the bridge on `http://localhost:3000`.
+Whether it also *opens* a fullscreen Chromium tab is up to `KIOSK_AUTOSTART`,
+which is off by default — see [Launching the kiosk](#launching-the-kiosk).
+Point `KIOSK_URL` at `/game` instead for a
 station that should come up playing without a tap.  No nginx and no network dependency at play time —
 the bridge serves `web/` and `data/` itself and spawns a game server per
 lobby, so the whole stack is local.
@@ -115,10 +117,46 @@ at boot) before trusting `HDMI-A-1`.
 | --------------------------- | -------------------------------------------------------- |
 | `slimefeast-update.service` | oneshot: wait for wifi, fetch `origin/main`, build, publish |
 | `slimefeast-bridge.service` | the Node bridge on port 3000 (spawns a server per lobby)  |
-| `~/.config/labwc/autostart` | `pi-kiosk.sh` — waits for the bridge, opens Chromium      |
+| desktop autologin           | a labwc session for the browser to appear in             |
+| `~/.config/labwc/autostart` | `pi-kiosk.sh` — **only if `KIOSK_AUTOSTART=1`**          |
 
 The version check runs **once per boot**, never on a timer, so a deploy can
 never change the game under a table of players mid-session.
+
+### Launching the kiosk
+
+`KIOSK_AUTOSTART` decides whether the browser opens by itself at login.  It
+defaults to **0**, which is the opposite of what the word "kiosk" suggests and
+is deliberate: a fullscreen browser that relaunches itself a few seconds after
+every close is unescapable on a machine with no keyboard.  Arming that should
+be a decision made for a specific display, not the thing that happens when
+nobody chose.
+
+Off (the default), the Pi comes up to a desktop with the bridge already
+serving, and you start the kiosk when you want it:
+
+```
+/usr/local/lib/slimefeast/pi-kiosk.sh          # start
+touch /opt/slimefeast/state/kiosk-exit && pkill -f chromium   # stop
+```
+
+The exit flag is the part that matters: `pi-kiosk.sh` reopens the browser
+about three seconds after it closes, so killing Chromium alone just restarts
+it.  The flag is what ends the session.
+
+To arm autostart for an event, re-provision with it on:
+
+```
+KIOSK_AUTOSTART=1 sudo -E bash scripts/pi-setup.sh
+```
+
+Re-running with it unset removes the hook again — the block in
+`~/.config/labwc/autostart` is marker-delimited, so it goes in and comes out
+without touching the panel, desktop and notification lines the Pi session
+needs.  Only the browser is affected either way: autologin, the bridge and the
+update unit still start at boot.  Autologin in particular stays on by design,
+since without it a keyboardless Pi reaches a login prompt nobody can type at —
+a worse lockout than the one this avoids.
 
 ### Not racing the wifi
 
@@ -332,8 +370,8 @@ in `/etc/default/slimefeast`).  Unset — which is every non-Pi machine — and
 It is also refused for non-loopback callers, and nginx returns 404 for it
 outright, so it does not exist on the VPS.
 
-To get back to the kiosk, either log out and back in (labwc autostart runs
-`pi-kiosk.sh`) or run it from a terminal:
+To get back to the kiosk, run it from a terminal — or, if this Pi was
+provisioned with `KIOSK_AUTOSTART=1`, log out and back in:
 
 ```bash
 ~/slimefeast/scripts/pi-kiosk.sh &

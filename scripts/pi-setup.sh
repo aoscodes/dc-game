@@ -35,6 +35,28 @@ BRANCH="${BRANCH:-main}"
 PORT="${PORT:-3000}"
 KIOSK_URL="${KIOSK_URL:-http://localhost:${PORT}/}"
 
+# Whether the browser opens by itself at login.  OFF by default, which is the
+# opposite of what a kiosk sounds like it wants, and deliberate: a fullscreen
+# browser that relaunches itself is unescapable on a machine with no keyboard,
+# so arming that has to be a decision someone makes for a specific display
+# rather than the thing that happens when nobody chose.  Off, the Pi boots to
+# a desktop with the bridge already serving, and the kiosk is one command.
+#   KIOSK_AUTOSTART=1 sudo -E bash scripts/pi-setup.sh
+#
+# Only the browser is affected.  Autologin, the bridge and the update unit
+# still come up at boot: without autologin a keyboardless Pi reaches a login
+# prompt nobody can type at, which is a worse lockout than the one this
+# avoids.
+KIOSK_AUTOSTART="${KIOSK_AUTOSTART:-0}"
+case "$KIOSK_AUTOSTART" in
+  0|1) ;;
+  *) printf '[pi-setup] ERROR: KIOSK_AUTOSTART must be 0 or 1, got %q\n' "$KIOSK_AUTOSTART" >&2; exit 1 ;;
+esac
+
+# Set when autostart is off, so the closing summary can describe the machine
+# that was actually built rather than the one this script used to build.
+MANUAL_LAUNCH=0
+
 ZIG_VERSION="0.15.2"
 ZIG_TARBALL="https://ziglang.org/download/${ZIG_VERSION}/zig-aarch64-linux-${ZIG_VERSION}.tar.xz"
 ZIG_SHA256="958ed7d1e00d0ea76590d27666efbf7a932281b3d7ba0c6b01b0ff26498f667f"
@@ -334,35 +356,48 @@ systemctl enable slimefeast-update.service slimefeast-bridge.service >/dev/null
 # labwc autostart — the browser
 # ---------------------------------------------------------------------------
 
-log "hooking pi-kiosk.sh into the labwc session"
-
 LABWC_DIR="$USER_HOME/.config/labwc"
 AUTOSTART="$LABWC_DIR/autostart"
-as_user mkdir -p "$LABWC_DIR"
 
-# A user autostart REPLACES the system one rather than adding to it, so seed
-# from /etc/xdg/labwc/autostart on first run — otherwise the Pi's own session
-# startup (panel, desktop, notifications) silently disappears.
-if [[ ! -f "$AUTOSTART" ]]; then
-  if [[ -f /etc/xdg/labwc/autostart ]]; then
-    log "seeding $AUTOSTART from the system default"
-    install -o "$KIOSK_USER" -g "$KIOSK_USER" -m 755 /etc/xdg/labwc/autostart "$AUTOSTART"
-  else
-    warn "no /etc/xdg/labwc/autostart found — is this labwc? creating a bare one"
-    as_user touch "$AUTOSTART"
-    chmod 755 "$AUTOSTART"
-  fi
-fi
-
-# Marker-delimited block so re-running this script updates in place instead of
-# appending a second launcher.
+# Marker-delimited so this script owns exactly its own lines: re-running
+# updates the block in place instead of appending a second launcher, and
+# turning autostart off removes it without disturbing whatever else the
+# session starts.
 MARKER_BEGIN="# >>> slimefeast kiosk >>>"
 MARKER_END="# <<< slimefeast kiosk <<<"
-if grep -qF "$MARKER_BEGIN" "$AUTOSTART"; then
-  log "replacing existing kiosk block in $AUTOSTART"
+
+# The existing block comes out either way.  That is what makes
+# KIOSK_AUTOSTART=0 an instruction rather than merely an omission: a machine
+# provisioned with autostart on is un-provisioned by a re-run, which matters
+# because re-running this script is the only way to change the boot path.
+if [[ -f "$AUTOSTART" ]] && grep -qF "$MARKER_BEGIN" "$AUTOSTART"; then
+  log "removing the existing kiosk block from $AUTOSTART"
   sed -i "/${MARKER_BEGIN}/,/${MARKER_END}/d" "$AUTOSTART"
 fi
-cat >> "$AUTOSTART" <<EOF
+
+if (( KIOSK_AUTOSTART )); then
+  log "hooking pi-kiosk.sh into the labwc session"
+  as_user mkdir -p "$LABWC_DIR"
+
+  # A user autostart REPLACES the system one rather than adding to it, so seed
+  # from /etc/xdg/labwc/autostart on first run — otherwise the Pi's own session
+  # startup (panel, desktop, notifications) silently disappears.
+  #
+  # Only when a block is actually being added: with autostart off there is no
+  # reason to shadow the system file, and a stray copy of it is one more thing
+  # to explain to whoever debugs this session next.
+  if [[ ! -f "$AUTOSTART" ]]; then
+    if [[ -f /etc/xdg/labwc/autostart ]]; then
+      log "seeding $AUTOSTART from the system default"
+      install -o "$KIOSK_USER" -g "$KIOSK_USER" -m 755 /etc/xdg/labwc/autostart "$AUTOSTART"
+    else
+      warn "no /etc/xdg/labwc/autostart found — is this labwc? creating a bare one"
+      as_user touch "$AUTOSTART"
+      chmod 755 "$AUTOSTART"
+    fi
+  fi
+
+  cat >> "$AUTOSTART" <<EOF
 $MARKER_BEGIN
 # Managed by scripts/pi-setup.sh — edits here are overwritten on re-run.
 # Backgrounded so it cannot stall the rest of the session while it waits for
@@ -371,7 +406,11 @@ mkdir -p "\$HOME/.local/state"
 $LIBDIR/pi-kiosk.sh >> "\$HOME/.local/state/slimefeast-kiosk.log" 2>&1 &
 $MARKER_END
 EOF
-chown "$KIOSK_USER:$KIOSK_USER" "$AUTOSTART"
+  chown "$KIOSK_USER:$KIOSK_USER" "$AUTOSTART"
+else
+  log "kiosk autostart OFF — the browser will not open at boot"
+  MANUAL_LAUNCH=1
+fi
 
 # ---------------------------------------------------------------------------
 # Pi behaviour: autologin, no blanking
@@ -420,8 +459,29 @@ cat <<EOF
   pin version  sudo ln -sfn $ROOT/builds/<sha> $ROOT/current.new \\
                  && sudo mv -T $ROOT/current.new $ROOT/current \\
                  && sudo systemctl mask slimefeast-update
+EOF
+
+if (( MANUAL_LAUNCH )); then
+  cat <<EOF
+  start kiosk  $LIBDIR/pi-kiosk.sh
+  stop kiosk   touch $ROOT/state/kiosk-exit && pkill -f chromium
+
+The browser does NOT open at boot: this Pi comes up to a desktop with the
+bridge already serving, and you start the kiosk when you want it.  Note that
+pi-kiosk.sh reopens the browser a few seconds after it closes, so the exit
+flag above is what actually ends a session.
+
+Re-run with KIOSK_AUTOSTART=1 to have it open at login instead.
+
+Reboot to verify the boot path (autologin -> bridge -> desktop):
+
+  sudo reboot
+EOF
+else
+  cat <<EOF
 
 Reboot to verify the whole path (autologin -> bridge -> kiosk tab):
 
   sudo reboot
 EOF
+fi
