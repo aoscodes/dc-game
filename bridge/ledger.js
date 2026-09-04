@@ -158,30 +158,44 @@ async function writeAtomic(file, text, fsync, backup = false) {
 }
 
 /**
- * Read a badges.json, or null when it is absent, unparseable, or not shaped
- * like one.
+ * Read a badges.json.
  *
- * The shape check is part of "readable" on purpose: a file that parses but has
+ * Three outcomes, kept distinct because the caller must treat them
+ * differently and a single `null` for "nothing usable here" hid a bug: an
+ * ABSENT snapshot is an ordinary first run, while an UNREADABLE one is a
+ * damaged record that has to be preserved and reported even when the backup
+ * makes recovery invisible.
+ *
+ * The shape check counts as unreadable on purpose: a file that parses but has
  * no `badges` map cannot be loaded, and treating that as success would leave
  * the ledger running on an empty document and overwrite the real record with
  * it on the next snapshot.
+ *
+ * @returns {Promise<{ status: "ok", doc: object }
+ *                  | { status: "absent" }
+ *                  | { status: "unreadable", reason: string }>}
  */
 async function readSnapshot(file) {
   let raw;
   try {
     raw = await fsp.readFile(file, "utf8");
-  } catch {
-    return null;
+  } catch (err) {
+    if (err.code === "ENOENT") return { status: "absent" };
+    return { status: "unreadable", reason: err.message };
   }
   let doc;
   try {
     doc = JSON.parse(raw);
-  } catch {
-    return null;
+  } catch (err) {
+    return { status: "unreadable", reason: err.message };
   }
-  if (typeof doc !== "object" || doc === null) return null;
-  if (typeof doc.badges !== "object" || doc.badges === null) return null;
-  return doc;
+  if (typeof doc !== "object" || doc === null) {
+    return { status: "unreadable", reason: "not an object" };
+  }
+  if (typeof doc.badges !== "object" || doc.badges === null) {
+    return { status: "unreadable", reason: "no badges map" };
+  }
+  return { status: "ok", doc };
 }
 
 class Ledger {
@@ -245,33 +259,44 @@ class Ledger {
   async #init() {
     await fsp.mkdir(this.gamesDir, { recursive: true }); // makes this.dir too
 
+    const primary = await readSnapshot(this.snapshotFile);
+
+    // A damaged badges.json is moved aside whenever it is damaged — NOT only
+    // when the backup also fails.  Two reasons, and the second is the one that
+    // bites:
+    //
+    //   it is a record, and an unreadable one may still be recoverable by
+    //     hand, so it must never be silently overwritten; and
+    //   leaving it in place means the next snapshot's writeAtomic copies the
+    //     CORRUPT file over the still-good .bak before renaming.  That takes a
+    //     directory holding one good copy to one holding none, for the width
+    //     of a rename — which is precisely the crash window .bak exists to
+    //     cover.  Recovering from the backup and then destroying the backup is
+    //     worse than not recovering at all.
+    if (primary.status === "unreadable") {
+      const aside = `${this.snapshotFile}.corrupt-${stamp()}`;
+      await fsp.rename(this.snapshotFile, aside);
+      console.error(
+        `[ledger] badges.json unreadable (${primary.reason}); ` +
+        `moved to ${path.basename(aside)}`);
+    }
+
     // The .bak is tried second because writeAtomic guarantees it is the
     // PREVIOUS whole copy: at worst one debounce interval stale, and the
     // events file covers that gap.
-    const loaded = await readSnapshot(this.snapshotFile) ??
-      await readSnapshot(`${this.snapshotFile}.bak`);
+    const loaded = primary.status === "ok"
+      ? primary
+      : await readSnapshot(`${this.snapshotFile}.bak`);
 
-    if (loaded !== null) {
+    if (loaded.status === "ok") {
       this.doc = {
         version: LEDGER_VERSION,
-        updatedAt: loaded.updatedAt ?? null,
-        badges: loaded.badges,
+        updatedAt: loaded.doc.updatedAt ?? null,
+        badges: loaded.doc.badges,
       };
-    } else {
-      // Neither copy is loadable.  Distinguish "first run" from "there is a
-      // file there and it is unreadable": the second must be moved aside
-      // rather than silently overwritten, because it is a record, and an
-      // unreadable record may still be recoverable by hand.
-      let present = true;
-      try {
-        await fsp.access(this.snapshotFile);
-      } catch {
-        present = false;
-      }
-      if (present) {
-        const aside = `${this.snapshotFile}.corrupt-${stamp()}`;
-        await fsp.rename(this.snapshotFile, aside);
-        console.error(`[ledger] badges.json unreadable; moved to ${path.basename(aside)}`);
+      if (primary.status === "unreadable") {
+        const badges = Object.keys(this.doc.badges).length;
+        console.error(`[ledger] recovered ${badges} badge(s) from badges.json.bak`);
       }
     }
 

@@ -376,6 +376,44 @@ const FULL = "CTRL:STAT appetite=7 babies=1,0,2,0,0 powerups=3 critter=3 " +
   eq(banked[0].gid, 7, "intact");
 }
 
+// --- a corrupt badges.json with a good .bak --------------------------------
+{
+  // The likeliest corruption there is: the power goes at the wrong moment and
+  // badges.json is left half-written, while the .bak beside it is whole.
+  //
+  // Recovering is the easy half. The half that matters is that the damaged
+  // file must be moved aside even though the backup rescued us — because if it
+  // is left in place, the next snapshot's copy-then-rename copies the CORRUPT
+  // file over the GOOD backup, and a directory with one good copy briefly
+  // becomes a directory with none.
+  const dir = mkDir();
+  const l0 = new Ledger({ dir });
+  l0.badgeLinked({ uid: "BADGE-P", uidSource: "serial", port: "/dev/p", link: 1 });
+  await l0.stop("test");
+
+  const { writeFileSync, copyFileSync } = await import("node:fs");
+  copyFileSync(join(dir, "badges.json"), join(dir, "badges.json.bak"));
+  writeFileSync(join(dir, "badges.json"), '{"version":1,"upd'); // power cut
+
+  const l1 = new Ledger({ dir });
+  l1.badgeLinked({ uid: "BADGE-Q", uidSource: "serial", port: "/dev/q", link: 2 });
+  await l1.stop("test");
+
+  const snap = readSnapshot(dir);
+  check(snap.badges["BADGE-P"] !== undefined, "the old badge is recovered from .bak");
+  check(snap.badges["BADGE-Q"] !== undefined, "and the new run's badge is there too");
+
+  const bak = readFileSync(join(dir, "badges.json.bak"), "utf8");
+  check(bak.includes("BADGE-P"),
+    "the good .bak is NOT overwritten by the corrupt primary");
+  check(JSON.parse(bak).badges !== undefined, "and is still parseable");
+
+  const aside = readdirSync(dir).filter((n) => n.includes(".corrupt-"));
+  eq(aside.length, 1, "the damaged file is preserved for hand recovery");
+  eq(readFileSync(join(dir, aside[0]), "utf8"), '{"version":1,"upd',
+    "byte for byte, exactly as it was found");
+}
+
 // --- a corrupt snapshot is moved aside, not overwritten --------------------
 {
   const dir = mkDir();
