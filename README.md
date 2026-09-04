@@ -441,6 +441,43 @@ to the newest lobby, or waiting until one exists. Assignment is sticky by the
 board's USB serial number: replugging returns it to its tab pairing, or (within
 a 30s grace window) to its headless player.
 
+### The badge ledger
+
+Every badge plug-in, powerup grant, onboarding roll and game is recorded to
+disk by `bridge/ledger.js`, under `BADGE_LOG_DIR` (default: `records/` beside
+the repo; `$ROOT/records` on the Pi). Three things live there:
+
+| file | what it is |
+| --- | --- |
+| `events-<stamp>.jsonl` | append-only event stream, one file per bridge run |
+| `badges.json` | latest state and full connection history, per badge uid |
+| `games/<gameId>.json` | one file per game: roster, final score, hatched babies |
+
+It only ever grows — no retention, no caps — because the records *are* the
+event's history. Back it up by copying the directory.
+
+**It is deliberately write-only.** There is no read API and no query, and this
+is enforced by a test. A badge's own flash is the only authority on what that
+badge contains; a queryable record of what the bridge last saw would become a
+second one, and the two would disagree the first time a badge was plugged into
+a different machine. So the ledger observes and never answers.
+
+Consequences of that stance, visible in the files:
+
+- Stats the bridge assumed rather than received are flagged `statReported:
+  false`; stats written by the `/api/dev` inject routes carry `source:
+  "dev_inject"`. Neither is presented as something a badge said.
+- Powerup counts are only ever recorded as the *badge* reported them back in
+  its ack — never as this side's arithmetic.
+- A uid is recorded with `uidSource`. `"serial"` is the board's flash unique
+  id and identifies a badge; `"path"` is a port that a board without a serial
+  number was plugged into, and the next board there inherits the name.
+- A connection left open by a bridge that was killed is closed on the next run
+  as `endedBy: "bridge_exit"` with `disconnectedAt: null` — the end is not
+  known, so no time is invented for it. A clean shutdown records
+  `"bridge_stopped"` *with* a timestamp, because that one happened at a known
+  moment.
+
 ## Project layout
 
 ```
@@ -472,6 +509,9 @@ src/
     debug.zig            debug/snapshot utilities (no Raylib dependency)
 bridge/
   index.js               Node bridge: spawns client, WebSocket relay, static files, /api/tune/save
+  session.js             PlayerSession: one headless Zig client, its stdio protocol
+  controllers.js         dc_rp2040 badges over USB serial: link, stats, palette, powerups, scores
+  ledger.js              write-only record of every badge, grant and game (see above)
 web/
   index.html             / station directory: big touch buttons to the pages below
   kiosk.js               the directory's hidden hold-5s exit to the desktop

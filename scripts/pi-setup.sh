@@ -148,7 +148,7 @@ fi
 # ---------------------------------------------------------------------------
 
 log "creating $ROOT"
-mkdir -p "$ROOT"/{builds,state,custom-configs,node_modules,zig-cache,zig-global-cache}
+mkdir -p "$ROOT"/{builds,state,records,custom-configs,node_modules,zig-cache,zig-global-cache}
 chown -R "$KIOSK_USER:$KIOSK_USER" "$ROOT"
 
 # Everything under $ROOT is owned and written by the kiosk user, so the clone
@@ -206,6 +206,15 @@ KIOSK_USER=$KIOSK_USER
 # directory.  Its presence is what enables POST /api/kiosk/exit — comment this
 # line out and the route 404s, which is how the VPS is configured.
 KIOSK_STATE_DIR=$ROOT/state
+
+# Where the badge ledger writes: every badge plug-in, every powerup grant,
+# every game.  Outside \$ROOT/builds on purpose — each deploy is a fresh
+# worktree, so a repo-relative path would strand last week's records in last
+# week's checkout and KEEP_BUILDS would eventually delete them.
+#
+# It only ever grows, and is meant to: the records ARE the event's history.
+# Budget roughly a megabyte per busy day; back it up by copying the directory.
+BADGE_LOG_DIR=$ROOT/records
 
 # Seconds to wait for git fetch before booting the last known good build.
 FETCH_TIMEOUT=60

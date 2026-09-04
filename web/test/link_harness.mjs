@@ -17,6 +17,8 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const { Controller, ControllerManager } =
   require(new URL("../../bridge/controllers.js", import.meta.url).pathname);
+const { NULL_LEDGER } =
+  require(new URL("../../bridge/ledger.js", import.meta.url).pathname);
 
 let failures = 0;
 function check(cond, what) {
@@ -28,7 +30,9 @@ function eq(a, b, what) {
 
 /** An inert linked board: real state machine, stubbed transport. */
 function mkBoard(linkId = 1) {
-  const manager = { assign() {}, boardsChanged() {}, dropController() {} };
+  const manager = {
+    assign() {}, boardsChanged() {}, dropController() {}, ledger: NULL_LEDGER,
+  };
   const ctrl = new Controller(`/dev/fake${linkId}`, `uid${linkId}`, manager);
   const sent = [];
   ctrl.write = (line) => { sent.push(line); };

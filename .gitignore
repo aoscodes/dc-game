@@ -1,3 +1,7 @@
 .zig-cache/
 zig-out/
 custom-configs/
+# The badge ledger's default location on a dev box (BADGE_LOG_DIR).  On the
+# kiosk it lives at $ROOT/records, outside the repo, because each deploy is a
+# fresh worktree — see bridge/ledger.js.
+records/

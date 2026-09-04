@@ -181,6 +181,7 @@ function parsePowerupList(text) {
 const { SerialPort } = require("serialport");
 const { ReadlineParser } = require("@serialport/parser-readline");
 const { PlayerSession } = require("./session");
+const { NULL_LEDGER, stamp } = require("./ledger");
 
 // USB identity of the dc_rp2040 firmware (usb_descriptors.c).
 const VENDOR_ID = "cafe";
@@ -333,16 +334,72 @@ function nextPowerupId() {
 // the id simply stops resolving.
 let lastLinkId = 0;
 
+// Per-game id for the ledger.  All three parts earn their place:
+//
+//   the room code — but only that, and it is not an identity: codes are unique
+//     among LIVE rooms (uniqueCode in index.js checks the registry, nothing
+//     more) and are reissued once a lobby dies, so two games a night apart can
+//     share one;
+//   the timestamp — which separates those two, and orders the games directory
+//     usefully when it is listed;
+//   the counter — because the timestamp is only millisecond-resolved, and a
+//     RESTART mints the next game the instant the last one closed.  Without it
+//     two games can collide, and a collision here does not merely confuse a
+//     reader: the second game's file is written over the first's, and a record
+//     that silently loses records is worse than no record.
+//
+// The counter resets on a bridge restart, which is harmless — a restart takes
+// far longer than the millisecond the timestamp would have to match.
+let lastGameSeq = 0;
+function nextGameId(roomCode) {
+  return `${stamp()}-${roomCode}-${++lastGameSeq}`;
+}
+
+/**
+ * A board's REPORTED state as plain JSON.
+ *
+ * ONE definition, on Controller.statLines's terms and for the same reason: it
+ * has three consumers now — /api/dev/boards, the ledger's badge record and the
+ * ledger's per-game roster — and three hand-rolled copies of "which fields are
+ * a badge's state" is three chances for a field to be added to two of them.
+ *
+ * `critter`, `colors` and `seed` are null when the board has not reported
+ * them, which is a state distinct from any value: see the CTRL:STAT handler.
+ *
+ * @param {Controller} ctrl
+ */
+function boardStateView(ctrl) {
+  return {
+    appetite: ctrl.appetite,
+    babies: [...ctrl.babies],
+    powerups: [...ctrl.powerups],
+    critter: ctrl.critter,
+    colors: ctrl.led === null
+      ? null
+      : ctrl.led.map((c) => c.toString(16).padStart(6, "0")),
+    seed: ctrl.broodSeed === null
+      ? null
+      : ctrl.broodSeed.toString(16).padStart(8, "0"),
+  };
+}
+
 /** One physical board on a serial port. */
 class Controller {
   /**
    * @param {string} path
    * @param {string} uid  USB serial number (flash unique ID)
    * @param {ControllerManager} manager
+   * @param {"serial" | "path"} [uidSource]  where `uid` came from.  A serial
+   *   number is the board's flash unique id and so identifies a BADGE; the
+   *   port-path fallback identifies a PORT, which the next badge plugged into
+   *   it inherits.  Only the ledger cares, and only so that its records can
+   *   say which kind of claim they rest on.  Defaults to the weaker of the
+   *   two, so a caller that does not know cannot accidentally assert identity.
    */
-  constructor(path, uid, manager) {
+  constructor(path, uid, manager, uidSource = "path") {
     this.path = path;
     this.uid = uid;
+    this.uidSource = uidSource;
     this.manager = manager;
     this.port = null;
     this.linked = false;
@@ -399,7 +456,7 @@ class Controller {
     this.lastActive = null;
     this.helloTimer = null;
     this.hbTimer = null;
-    /** In-flight GAME:SCORE ({ line, gid, attempts }), or null. */
+    /** In-flight GAME:SCORE ({ line, gid, attempts, gameId }), or null. */
     this.scorePending = null;
     this.scoreTimer = null;
     /** In-flight LED:SET ({ line, gid, attempts, done }), or null. */
@@ -417,7 +474,7 @@ class Controller {
       (err) => {
         if (err) {
           console.error(`[ctrl] open failed (${this.path}):`, err.message);
-          this.manager.dropController(this);
+          this.manager.dropController(this, "open_failed");
         }
       },
     );
@@ -438,11 +495,11 @@ class Controller {
 
     port.on("close", () => {
       console.log(`[ctrl] port closed ${this.path}`);
-      this.manager.dropController(this);
+      this.manager.dropController(this, "unplugged");
     });
     port.on("error", (err) => {
       console.error(`[ctrl] port error (${this.path}):`, err.message);
-      this.manager.dropController(this);
+      this.manager.dropController(this, "port_error");
     });
   }
 
@@ -505,11 +562,22 @@ class Controller {
         this.linkId = ++lastLinkId;
         console.log(
           `[ctrl] linked ${this.path} (uid=${this.uid}, link=${this.linkId})`);
+        // Opens the ledger's connection record.  Deliberately BEFORE any stats
+        // exist: CTRL:STAT is a separate, later serial line, so the record is
+        // a lifecycle (opened here, stat-stamped below, closed in
+        // dropController) rather than one write that would have to either be
+        // empty or wait on a report that may never come.
+        this.manager.ledger.badgeLinked({
+          uid: this.uid,
+          uidSource: this.uidSource,
+          port: this.path,
+          link: this.linkId,
+        });
         this.hbTimer = setInterval(() => {
           this.write("GAME:HB");
           if (Date.now() - this.lastRxMs > LINK_TIMEOUT_MS) {
             console.warn(`[ctrl] heartbeat timeout ${this.path}`);
-            this.manager.dropController(this);
+            this.manager.dropController(this, "heartbeat_timeout");
           }
         }, HB_INTERVAL_MS);
         // Held back until CTRL:STAT lands (statSeen); this call covers the
@@ -526,6 +594,21 @@ class Controller {
             `[ctrl] no CTRL:STAT from ${this.path} in ${STAT_WAIT_MS}ms; ` +
             `joining at defaults (no appetite, babies, critter or palette)`);
           this.statSeen = true;
+          // Recorded, flagged as NOT a badge report: the state below is this
+          // side's defaults, and a record that did not distinguish them from a
+          // badge that genuinely carries nothing would be a record of a
+          // fiction.
+          this.manager.ledger.badgeStat({
+            uid: this.uid,
+            link: this.linkId,
+            state: boardStateView(this),
+            statReported: false,
+            // NOT "badge".  Nothing here came from one — the badge stayed
+            // silent and these are this side's defaults.  `statReported` says
+            // so too, but a `source` of "badge" sitting next to it is the
+            // exact kind of small lie this file exists to not tell.
+            source: "timeout",
+          });
           this.manager.assign();
         }, STAT_WAIT_MS);
         // A new link is a new badge for the onboarding queue to roll.
@@ -638,6 +721,14 @@ class Controller {
       if (this.playerSession !== null) {
         for (const l of this.statLines()) this.playerSession.writeToZig(l);
       }
+      // Stamps the ledger's open connection record with what the badge said.
+      this.manager.ledger.badgeStat({
+        uid: this.uid,
+        link: this.linkId,
+        state: boardStateView(this),
+        statReported: true,
+        source: "badge",
+      });
       // Release the assignment gate: this board can now be made a player
       // that knows what it is.  Idempotent — a board that re-reports while
       // already seated has a playerSession, so assign passes over it.
@@ -656,6 +747,12 @@ class Controller {
       const arg = line.slice("CTRL:SCORE_ACK ".length).trim();
       if (this.scorePending !== null && arg === `g=${this.scorePending.gid}`) {
         console.log(`[ctrl] score banked (uid=${this.uid}, ${arg})`);
+        this.manager.ledger.scoreBanked({
+          gameId: this.scorePending.gameId,
+          uid: this.uid,
+          link: this.linkId,
+          gid: this.scorePending.gid,
+        });
         this.clearScoreRetry();
       }
       return;
@@ -737,8 +834,13 @@ class Controller {
    * hatch counts: each hatched baby is saved to every connected board.
    * @param {number} score  final team score (u32)
    * @param {number[]} hatched  babies hatched, per BabyType ordinal
+   * @param {string | null} [gameId]  the ledger's id for the game this score
+   *   ends, carried on the pending report so the ack — which lands seconds
+   *   later, on the serial line, long after the render frame that knew which
+   *   game it was — can still be filed against it.  Null when unknown; the
+   *   hardware path does not depend on it.
    */
-  sendScore(score, hatched) {
+  sendScore(score, hatched, gameId = null) {
     if (!this.linked) return;
     const gid = nextScoreId();
     const counts = Array.from(
@@ -750,7 +852,16 @@ class Controller {
       line: `GAME:SCORE s=${score >>> 0} g=${gid} b=${counts.join(",")}`,
       gid,
       attempts: 0,
+      gameId,
     };
+    this.manager.ledger.scoreDelivered({
+      gameId,
+      uid: this.uid,
+      link: this.linkId,
+      gid,
+      score: score >>> 0,
+      hatched: counts,
+    });
     const attempt = () => {
       const p = this.scorePending;
       if (p === null) return;
@@ -758,6 +869,16 @@ class Controller {
         console.warn(
           `[ctrl] score never acked (uid=${this.uid}, g=${p.gid}); giving up`,
         );
+        // Not proof the badge lacks the score: the ack may have been lost
+        // after the save, exactly as the powerup cap's comment describes.
+        // Recorded as an unanswered delivery, which is all this side knows.
+        this.manager.ledger.scoreFailed({
+          gameId: p.gameId,
+          uid: this.uid,
+          link: this.linkId,
+          gid: p.gid,
+          reason: "no_ack",
+        });
         this.clearScoreRetry();
         return;
       }
@@ -961,6 +1082,12 @@ class ControllerSession extends PlayerSession {
     this.started = true;
     /** msg.phase of the last render frame (game-over edge detection). */
     this.lastPhase = null;
+    /** Ledger game id this board has already been recorded as SEATED in, or
+     *  null.  Keyed by game rather than a boolean so that the next game in the
+     *  same room — a RESTART — records the seat again. */
+    this.seatedIn = null;
+    /** Same, for having been recorded as an observer (the game was full). */
+    this.observingIn = null;
   }
 
   start() {
@@ -1000,12 +1127,62 @@ class ControllerSession extends PlayerSession {
         this.controller.sendShape(
           shapeFromRender(msg, this.manager.moveLabels(this.room.configHash)),
         );
+        this.noteGame(msg);
         // Game just ended: bank the final team score — and the encounter's
-        // hatched babies — on the board.
-        if (score !== null) this.controller.sendScore(score, hatchedFromRender(msg));
+        // hatched babies — on the board.  The game id is read BEFORE closing,
+        // because every board in the room reaches this edge and only the first
+        // closes the record — but all of them still have a score to deliver
+        // against it.
+        if (score !== null) {
+          const hatched = hatchedFromRender(msg);
+          const gameId = this.manager.gameIdFor(this.room);
+          this.manager.closeGame(this.room, score, msg.stats ?? null, hatched);
+          this.controller.sendScore(score, hatched, gameId);
+        }
       }
     } else {
       console.warn(`[bridge] unknown Zig frame tag (${this.label}):`, msg.tag);
+    }
+  }
+
+  /**
+   * Keep the ledger's picture of the room's current game up to date from this
+   * board's own render frames.
+   *
+   * Each board is its own headless client with its own frame stream, so four
+   * boards in one game see the same events four times.  The de-duplication
+   * lives one level up (ControllerManager.openGame is per ROOM), and what is
+   * per-board here is only this board's standing in that game.
+   *
+   * Seat detection reads `game.observer` — the flag the client computes for
+   * exactly this question — rather than comparing player_id against a copy of
+   * the protocol's NO_PLAYER sentinel kept on this side.  A frame that carries
+   * neither is left alone rather than guessed at.
+   */
+  noteGame(msg) {
+    const game = msg.game;
+    if (msg.phase !== "game" || !game) return;
+    const gameId = this.manager.openGame(this.room, game.encounter ?? "");
+    if (gameId === null) return;
+
+    if (game.observer === false) {
+      if (this.seatedIn === gameId) return;
+      this.seatedIn = gameId;
+      this.manager.ledger.badgeSeated({
+        gameId,
+        uid: this.controller.uid,
+        link: this.controller.linkId,
+        playerId: game.player_id ?? null,
+        state: boardStateView(this.controller),
+      });
+    } else if (game.observer === true) {
+      if (this.observingIn === gameId) return;
+      this.observingIn = gameId;
+      this.manager.ledger.badgeObserving({
+        gameId,
+        uid: this.controller.uid,
+        link: this.controller.linkId,
+      });
     }
   }
 
@@ -1052,9 +1229,13 @@ class ControllerManager {
    * @param {(() => void)} [hooks.boardsChanged]  the set of linked boards grew
    *   or shrank; the onboarding screen re-reads listLinked().  Optional: board
    *   players work fine without anyone watching.
+   * @param {object} [hooks.ledger]  the badge ledger (bridge/ledger.js).
+   *   WRITE-ONLY by construction — nothing here reads from it, and nothing here
+   *   may start to; see that file's header.  Defaults to NULL_LEDGER, which is
+   *   what the hardware-free test harnesses run against.
    */
   constructor({ clientBin, pickRoom, roomJoined, roomLeft, isRoomAlive, moveLabels,
-    boardsChanged }) {
+    boardsChanged, ledger }) {
     this.clientBin = clientBin;
     this.pickRoom = pickRoom;
     this.roomJoined = roomJoined;
@@ -1062,11 +1243,70 @@ class ControllerManager {
     this.isRoomAlive = isRoomAlive;
     this.moveLabels = moveLabels;
     this.onBoardsChanged = boardsChanged ?? (() => {});
+    this.ledger = ledger ?? NULL_LEDGER;
     /** @type {Map<string, Controller>} port path -> controller */
     this.controllers = new Map();
     this.scanTimer = null;
     /** Tail of the serialised powerup-grant queue (see grantPowerup). */
     this.grantQueue = Promise.resolve();
+    /**
+     * The game each room is currently playing, for the ledger.
+     *
+     * Keyed by the room OBJECT, not its code: a code only identifies a room
+     * among the live ones (index.js's isRoomAlive compares object identity for
+     * exactly this reason), and it is reissued once a lobby dies.  A WeakMap
+     * because a room that has been garbage collected can have no more games,
+     * so there is nothing to clean up and no way to leak.
+     *
+     * @type {WeakMap<object, { gameId: string, closed: boolean }>}
+     */
+    this.games = new WeakMap();
+  }
+
+  /**
+   * The ledger id of the room's current game, minting one if the room has no
+   * open game.  Idempotent per room, which is the point: every board in the
+   * room reports the same game from its own frame stream.
+   *
+   * A CLOSED entry is left in place rather than deleted, so the boards that
+   * reach the game-over edge after the first one can still name the game their
+   * score belongs to.  The next game in that room (a RESTART) mints afresh
+   * because the entry it finds is closed.
+   *
+   * @param {object} room  LobbyRoom
+   * @param {string} encounter  the encounter label from the render frame
+   * @returns {string | null} null when the room is no longer alive
+   */
+  openGame(room, encounter) {
+    const open = this.games.get(room);
+    if (open !== undefined && !open.closed) return open.gameId;
+    if (!this.isRoomAlive(room)) return null;
+    const gameId = nextGameId(room.code);
+    this.games.set(room, { gameId, closed: false });
+    this.ledger.gameOpened({ gameId, roomCode: room.code, encounter });
+    return gameId;
+  }
+
+  /**
+   * The room's current game id — open or just closed — or null if it has
+   * never had one.  Read, never minted: callers on the game-over path want to
+   * name the game that just ended, not start one.
+   */
+  gameIdFor(room) {
+    return this.games.get(room)?.gameId ?? null;
+  }
+
+  /**
+   * Close the room's game with its final score and the server's match report.
+   * Idempotent: the first board to reach the game-over edge closes it and the
+   * rest pass through, which is what turns four identical per-board edges into
+   * one game record.
+   */
+  closeGame(room, score, stats, hatched) {
+    const open = this.games.get(room);
+    if (open === undefined || open.closed) return;
+    open.closed = true;
+    this.ledger.gameClosed({ gameId: open.gameId, score, stats, hatched });
   }
 
   /** A board linked or went away. */
@@ -1118,10 +1358,15 @@ class ControllerManager {
    * transaction to be had here anyway — the powerups are already in other
    * badges' flash by then.
    *
-   * The stdout report is the point of the feature, not a debug aid: the badge
-   * is the only place a powerup count lives, so this log is the sole record
-   * that a grant happened at all, and it prints each badge's counts as the
-   * BADGE reports them (from the ack), never as this side's arithmetic.
+   * The stdout report is the point of the feature, not a debug aid, and it
+   * prints each badge's counts as the BADGE reports them (from the ack), never
+   * as this side's arithmetic.  It is no longer the ONLY record — the ledger
+   * files the same pass durably (bridge/ledger.js) — but it remains the one an
+   * operator standing at the kiosk actually reads, and it stays for that.
+   *
+   * Note that neither record is an inventory.  The badge's flash is still the
+   * only place a count lives; both of these say "a grant happened, and here is
+   * what the badge said it then held", which is a different claim.
    *
    * @param {number} kind  powerup ordinal, 0..POWERUP_KIND_COUNT-1
    * Grants are SERIALISED across callers: a second one waits for the first to
@@ -1180,6 +1425,9 @@ class ControllerManager {
     const granted = results.filter((r) => r.ok).length;
     console.log(
       `[ctrl] powerups: ${granted}/${results.length} badge(s) banked 1 ${name}`);
+    this.ledger.powerupGrantPass({
+      kind, name, targets: results.length, granted, skipped,
+    });
     for (const r of results) {
       const counts = r.powerups
         .map((n, i) => `${POWERUP_NAMES[i] ?? `kind ${i}`}=${n}`)
@@ -1187,6 +1435,15 @@ class ControllerManager {
       console.log(
         `[ctrl]   uid=${r.uid} link=${r.linkId} ` +
         `${r.ok ? "ok" : `FAILED (${r.reason})`}  ${counts}`);
+      this.ledger.powerupGranted({
+        uid: r.uid,
+        link: r.linkId,
+        kind,
+        name,
+        ok: r.ok,
+        reason: r.reason,
+        powerups: r.powerups,
+      });
     }
     return { kind, results };
   }
@@ -1207,8 +1464,12 @@ class ControllerManager {
       const pid = (p.productId || "").toLowerCase();
       if (vid !== VENDOR_ID || pid !== PRODUCT_ID) continue;
       if (this.controllers.has(p.path)) continue;
+      // A serial number is the board's flash unique id, so it identifies a
+      // BADGE.  The path fallback identifies a PORT, and the next badge
+      // plugged into it inherits the name — which the ledger has to be able to
+      // say, or a shared port reads as one badge with a long history.
       const uid = p.serialNumber || p.path;
-      const ctrl = new Controller(p.path, uid, this);
+      const ctrl = new Controller(p.path, uid, this, p.serialNumber ? "serial" : "path");
       this.controllers.set(p.path, ctrl);
       ctrl.open();
     }
@@ -1267,8 +1528,14 @@ class ControllerManager {
    *
    * The controller is closed and deregistered BEFORE the session teardown:
    * teardown re-runs the assignment pass, which must not see this board.
+   *
+   * @param {Controller} ctrl
+   * @param {string} [reason]  why, for the ledger's connection record: which
+   *   of unplugged / port_error / heartbeat_timeout / open_failed happened is
+   *   the difference between a player walking off with their badge and a badge
+   *   whose link is failing while it sits in the port.
    */
-  dropController(ctrl) {
+  dropController(ctrl, reason = "dropped") {
     if (ctrl.closed) return;
     const player = ctrl.playerSession;
     const wasLinked = ctrl.linked;
@@ -1276,6 +1543,12 @@ class ControllerManager {
     ctrl.close();
     this.controllers.delete(ctrl.path);
     console.log(`[ctrl] dropped ${ctrl.path} (uid=${ctrl.uid})`);
+    // Closes the ledger's connection record, and only for a board that had one
+    // — a port that never completed CTRL:HELLO opened nothing.  Same gate
+    // boardsChanged uses below, for the same reason.
+    if (wasLinked) {
+      this.ledger.badgeUnlinked({ uid: ctrl.uid, link: ctrl.linkId, reason });
+    }
     if (player) {
       player.controller = null;
       player.destroy("controller disconnected");
@@ -1292,6 +1565,9 @@ module.exports = {
   ControllerSession,
   shapeFromRender,
   finalScoreFromRender,
+  // One definition of "a board's reported state as JSON", shared by
+  // /api/dev/boards and the ledger's badge and per-game records.
+  boardStateView,
   // Shapes of a board's stats, for validating anything that rewrites them
   // (index.js's /api/dev routes) against the same constants the parser uses.
   BABY_TYPE_COUNT,

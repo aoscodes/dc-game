@@ -72,8 +72,9 @@ const { PlayerSession } = require("./session");
 const {
   ControllerManager, BABY_TYPE_COUNT, PALETTE_COLOR_COUNT,
   POWERUP_KIND_COUNT, POWERUP_COUNT_MAX, POWERUP_NAMES,
-  isPalette,
+  isPalette, boardStateView,
 } = require("./controllers");
+const { Ledger } = require("./ledger");
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -91,6 +92,13 @@ const DEV_INJECT  = process.env.DEV_INJECT === "1";
 // alone arms the route, so there is no way to configure a bridge that thinks
 // the switch is enabled but has nowhere to write.
 const KIOSK_STATE_DIR = process.env.KIOSK_STATE_DIR || null;
+// Where the badge ledger writes (bridge/ledger.js).  Set to an ABSOLUTE path
+// outside the repo by pi-setup.sh, because pi-update.sh deploys into a fresh
+// worktree each time and a repo-relative default would leave last week's
+// records in last week's checkout.  The default here is repo-relative anyway:
+// it is for a dev box, where that is exactly what you want.
+const BADGE_LOG_DIR = process.env.BADGE_LOG_DIR ||
+  path.join(__dirname, "..", "records");
 // Both filenames are a contract with scripts/pi-kiosk.sh, which publishes the
 // PID and consumes the flag.  Renaming either here alone breaks the switch
 // silently, so they are named in exactly these two places.
@@ -701,6 +709,17 @@ function handleDevInject(req, res) {
         `powerups=${ctrl.powerups.join(",")} ` +
         `seed=${ctrl.broodSeed === null ? "-" : ctrl.broodSeed.toString(16)} ` +
         `reseat=${reseat && wasSeated}`);
+      // Recorded, and recorded as an INJECTION.  These stats did not come from
+      // the badge and the badge does not know about them, so a record that
+      // filed them alongside real CTRL:STAT reports would be a record of games
+      // that were never really played with these creatures.
+      ledger.badgeStat({
+        uid: ctrl.uid,
+        link: ctrl.linkId,
+        state: boardStateView(ctrl),
+        statReported: true,
+        source: "dev_inject",
+      });
     }
     reply(200, { applied });
   });
@@ -858,9 +877,19 @@ let onboardSession = null;
  *  @type {Set<PowerupSession>} */
 const powerupSessions = new Set();
 
+/**
+ * The badge ledger: a durable, append-only OBSERVATION of what the badges did.
+ *
+ * Write-only by construction, and it matters that it stays that way — a badge's
+ * flash is the only authority on its own contents, and a queryable record of
+ * what the bridge last saw would become a second one.  See bridge/ledger.js.
+ */
+const ledger = new Ledger({ dir: BADGE_LOG_DIR });
+
 // Hardware controllers (dc_rp2040 boards on USB serial).  Every linked board
 // is its own player (ControllerSession) in the active lobby.
 const controllerManager = new ControllerManager({
+  ledger,
   clientBin: CLIENT_BIN,
   // Boards join the single active lobby, or the newest when several exist
   // (Map preserves insertion order), or wait when there is none.
@@ -1097,8 +1126,20 @@ class OnboardSession {
       // running out of retries, or on the board going away mid-roll — so the
       // page can never be left waiting on a badge that will never answer.
       ctrl.sendPalette(msg.colors, (err) => {
-        if (err === null) this.send({ tag: "committed", linkId });
-        else this.send({ tag: "commit_failed", linkId, reason: err });
+        // The ledger is told on BOTH edges.  A failed roll is the interesting
+        // one: it is the case where the operator saw a badge refuse, and the
+        // colours it is actually wearing are whatever it had before.
+        if (err === null) {
+          this.send({ tag: "committed", linkId });
+          ledger.onboardCommitted({
+            uid: ctrl.uid, link: linkId, colors: msg.colors,
+          });
+        } else {
+          this.send({ tag: "commit_failed", linkId, reason: err });
+          ledger.onboardFailed({
+            uid: ctrl.uid, link: linkId, colors: msg.colors, reason: err,
+          });
+        }
       });
       return;
     }
@@ -1335,3 +1376,35 @@ httpServer.listen(PORT, () => {
 });
 
 controllerManager.start();
+
+/**
+ * Settle the ledger on the way out.
+ *
+ * Only the ledger: everything else here is either already durable or has no
+ * business surviving the process.  The badges keep their own contents in
+ * flash, so a bridge that dies mid-game costs nothing but the record of it —
+ * which is precisely what this recovers.
+ *
+ * Exit is guaranteed three ways, because a handler that can hang is a kiosk
+ * that cannot be stopped without pulling the plug: a timeout, a second signal,
+ * and a swallowed rejection that still exits.
+ */
+let stopping = false;
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, () => {
+    if (stopping) {
+      console.warn(`[bridge] ${sig} again — exiting now`);
+      process.exit(130);
+    }
+    stopping = true;
+    console.log(`[bridge] ${sig} — settling the ledger`);
+    const bail = setTimeout(() => {
+      console.warn("[bridge] ledger did not settle in 3s — exiting anyway");
+      process.exit(130);
+    }, 3000);
+    bail.unref();
+    ledger.stop(sig)
+      .catch((err) => console.error("[bridge] ledger stop failed:", err.message))
+      .then(() => process.exit(0));
+  });
+}
