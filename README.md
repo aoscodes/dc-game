@@ -52,6 +52,98 @@ The Zig client is headless — no window, no GPU. It reads server messages and k
 | `zig build test`        | Unit + integration tests                                   |
 | `zig build e2e`         | Zig e2e test: spawn server + 2 bot clients, full game loop |
 
+## Raspberry Pi kiosk (self-hosted)
+
+A Pi that boots straight into the game: fast-forwards to the latest `main`,
+builds it, starts the bridge, and opens a fullscreen Chromium tab on
+`http://localhost:3000`.  No nginx and no network dependency at play time —
+the bridge serves `web/` and `data/` itself and spawns a game server per
+lobby, so the whole stack is local.
+
+Requires **64-bit** Raspberry Pi OS (Bookworm or later, labwc/Wayland) and a
+read-only GitHub deploy key already installed for the kiosk user.
+
+```
+git clone git@github.com:aoscodes/dc-game.git
+sudo bash dc-game/scripts/pi-setup.sh
+sudo reboot
+```
+
+`pi-setup.sh` is re-runnable and is also how you apply a change to the boot
+path.  It installs Zig 0.15.2 (pinned + checksummed), Node 22 and Chromium,
+adds the kiosk user to `dialout` for the USB controllers, lays out
+`/opt/slimefeast`, writes the two systemd units, hooks the browser into the
+labwc session, and turns on desktop autologin with screen blanking off.
+
+### What runs at boot
+
+| Unit / hook                 | Does                                                     |
+| --------------------------- | -------------------------------------------------------- |
+| `slimefeast-update.service` | oneshot: fetch `origin/main`, build it, publish it        |
+| `slimefeast-bridge.service` | the Node bridge on port 3000 (spawns a server per lobby)  |
+| `~/.config/labwc/autostart` | `pi-kiosk.sh` — waits for the bridge, opens Chromium      |
+
+The version check runs **once per boot**, never on a timer, so a deploy can
+never change the game under a table of players mid-session.
+
+### Atomic deploys
+
+`pi-update.sh` builds each commit in its own git worktree and moves a
+`current` symlink only once that build has compiled *and* its `data/*.json`
+have passed `server --validate`:
+
+```
+/opt/slimefeast/
+  src/                fetch-only clone
+  builds/<sha>/       worktree per commit, built here
+  current -> builds/<sha>     last commit that actually worked
+  custom-configs/     saved /tune configs, symlinked into every build
+  node_modules/       shared (serialport is native), rebuilt only on lockfile change
+  zig-cache/          shared, so an update is not a cold build
+```
+
+This matters because building in place is not safe: the bridge serves
+`web/game.js` off the working tree while the client/server binaries come from
+`zig-out/`, so a pull that lands a new renderer and then fails to build gives
+you a kiosk that looks fine and cannot play.
+
+**`pi-update.sh` always exits 0.** No network, a force-pushed branch, a broken
+commit, a full disk — every failure is logged and leaves the previous
+deployment serving.  The Pi always boots into a playable game; the journal
+explains why it is on the version it is on.
+
+The boot scripts themselves are *not* self-updating (rewriting a shell script
+under its own running interpreter is a hazard, and changing how the kiosk
+boots deserves to be deliberate).  When a deployed commit changes
+`scripts/pi-*.sh`, the update logs a nudge to re-run `pi-setup.sh`.
+
+### Operating it
+
+```
+# what happened at boot
+journalctl -u slimefeast-update -u slimefeast-bridge -f
+tail -f ~/.local/state/slimefeast-kiosk.log        # the browser side
+
+# force an update now
+sudo systemctl restart slimefeast-update slimefeast-bridge
+
+# pin to a known-good build and stop updating
+sudo ln -sfn /opt/slimefeast/builds/<sha> /opt/slimefeast/current.new
+sudo mv -T /opt/slimefeast/current.new /opt/slimefeast/current
+sudo systemctl mask slimefeast-update
+sudo systemctl restart slimefeast-bridge
+```
+
+Knobs live in `/etc/default/slimefeast` (`BRANCH`, `PORT`, `KIOSK_URL`,
+`FETCH_TIMEOUT`, `KEEP_BUILDS`, `BRIDGE_WAIT`, `DISPLAY_SETUP`).  Edit, then
+restart the two units.  `DISPLAY_SETUP` is an empty shell hook for display
+config once the kiosk hardware is settled, e.g.
+`DISPLAY_SETUP='wlr-randr --output HDMI-A-1 --transform 90'`.
+
+Tests are not run on the Pi — the `test` step needs python3 + PIL for the
+sprite-atlas check and spends ~14s on the render-gate probe, and CI already
+gates `main`.
+
 ## Deploy to a VPS
 
 ### One-time VPS setup
@@ -310,6 +402,9 @@ data/
 custom-configs/          saved /tune configs (gitignored, content-addressed)
 scripts/
   vps-setup.sh           one-time VPS provisioning (Nginx, Node.js, systemd, deploy user)
+  pi-setup.sh            one-time Pi kiosk provisioning (Zig, Node, Chromium, units, autostart)
+  pi-update.sh           boot-time: fast-forward to main, build, publish atomically
+  pi-kiosk.sh            session: wait for the bridge, open the fullscreen tab
 .github/workflows/
   deploy.yml             CI: test → build → deploy on push to main
 ```
