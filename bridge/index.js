@@ -485,6 +485,9 @@ function handleTuneSave(req, res) {
 // below refuses to signal anything that is not still that browser — a pidfile
 // outliving its process is otherwise a licence to kill a recycled PID.
 
+/** Interpreters a kiosk LAUNCHER runs under; see pidIsKioskBrowser. */
+const SHELL_EXES = new Set(["sh", "bash", "dash", "zsh", "ash", "busybox"]);
+
 /**
  * Verify a PID is still the kiosk browser before signalling it.
  *
@@ -503,7 +506,27 @@ function pidIsKioskBrowser(pid) {
   }
   // Argv is NUL-separated.  --kiosk is the flag that makes this the fullscreen
   // browser rather than some other Chromium the operator opened.
-  return cmdline.split("\0").includes("--kiosk");
+  if (!cmdline.split("\0").includes("--kiosk")) return false;
+
+  // --kiosk alone is not enough, because on Raspberry Pi OS `chromium-browser`
+  // is a SHELL SCRIPT that runs the real binary as a child — so the launcher's
+  // cmdline carries every flag the browser's does, including this one.
+  //
+  // Signalling that launcher is worse than refusing to: it kills the script
+  // and leaves a fullscreen browser with no parent, no pidfile and no way to
+  // be closed, while this route answers 200 and the operator watches a screen
+  // that does not change.  pi-kiosk.sh publishes the browser now (see
+  // kiosk_browser_pid there) — this is the second lock on the same door, so
+  // that a pidfile written by an older or hand-rolled launcher fails LOUDLY.
+  let exe;
+  try {
+    exe = path.basename(fs.readlinkSync(`/proc/${pid}/exe`));
+  } catch {
+    // Unreadable /proc/PID/exe means the process is not ours to signal
+    // anyway; let the kill itself produce the error.
+    return true;
+  }
+  return !SHELL_EXES.has(exe);
 }
 
 function handleKioskExit(res) {
@@ -523,7 +546,7 @@ function handleKioskExit(res) {
     return fail(409, "kiosk pidfile is not a usable PID");
   }
   if (!pidIsKioskBrowser(pid)) {
-    return fail(409, `PID ${pid} is not the kiosk browser (stale pidfile)`);
+    return fail(409, `PID ${pid} is not the kiosk browser (stale pidfile, or a launcher rather than the browser)`);
   }
 
   // Flag before signal — see the note above; this ordering is load-bearing.

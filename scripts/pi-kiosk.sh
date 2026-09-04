@@ -159,6 +159,86 @@ except BaseException:
 PY
 }
 
+# ---------------------------------------------------------------------------
+# Which PID is the browser
+# ---------------------------------------------------------------------------
+#
+# NOT `$!`.  On Raspberry Pi OS `chromium-browser` is a shell script — it is
+# the wrapper that reads /etc/chromium.d/* for the Pi's hardware flags, which
+# is the whole reason we prefer it — and it runs the real binary as a CHILD
+# rather than exec-ing it.  So `$!` is the wrapper's PID.
+#
+# That is not a PID that merely fails to work; it is one that fails while
+# looking like it worked.  The wrapper's own cmdline still carries --kiosk, so
+# it passes the bridge's pidIsKioskBrowser check, the kill switch answers 200,
+# and SIGTERM reaps the script and ORPHANS a fullscreen browser that now has
+# no launcher, no pidfile and no way to be closed.  The operator sees a held
+# button, no error, and a screen that did not change.
+#
+# So walk down from the launcher and publish the process that IS the browser.
+#
+# The discriminator: Chromium's helpers (zygote, GPU, every renderer) all carry
+# --type=, and the browser process is the one that does not.  That leaves the
+# wrapper and the browser as the only two candidates in the tree, and the
+# browser is the deeper — hence breadth-first, keeping the LAST match, which
+# is the deepest one.  Matching on --kiosk as well as the tree walk because
+# this must agree with the bridge's check exactly: a PID that satisfies one
+# and not the other is the failure above with the roles swapped.
+kiosk_browser_pid() {
+  local queue=("$1") best="" pid cmdline kids
+  while (( ${#queue[@]} > 0 )); do
+    pid="${queue[0]}"
+    queue=("${queue[@]:1}")
+    # Argv is NUL-separated; the bounding spaces make " --kiosk " an exact
+    # word match rather than a prefix one.
+    cmdline=" $(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)"
+    if [[ "$cmdline" == *" --kiosk "* && "$cmdline" != *" --type="* ]]; then
+      best="$pid"
+    fi
+    if kids="$(pgrep -P "$pid" 2>/dev/null)"; then
+      # shellcheck disable=SC2206  # word splitting is the point: one PID per line
+      queue+=($kids)
+    fi
+  done
+  [[ -n "$best" ]] || return 1
+  printf '%s\n' "$best"
+}
+
+# Poll, because the wrapper has not spawned the browser yet at the instant we
+# are handed its PID.  Bounded: a launcher that never produces a browser is a
+# broken install, and blocking here forever would cost the kiosk its restart
+# loop as well as its kill switch.
+KIOSK_PID_WAIT="${KIOSK_PID_WAIT:-15}"
+publish_browser_pid() {
+  local launcher=$1 waited=0 pid
+  # No /proc means no process tree to walk (a dev box, macOS).  There is also
+  # no wrapper to see through there, and the bridge's own check degrades the
+  # same way, so the launcher PID is the honest answer rather than a failure.
+  if [[ ! -d /proc ]]; then
+    printf '%s\n' "$launcher" > "$PIDFILE"
+    return 0
+  fi
+  while (( waited < KIOSK_PID_WAIT )); do
+    if pid="$(kiosk_browser_pid "$launcher")"; then
+      printf '%s\n' "$pid" > "$PIDFILE"
+      if [[ "$pid" == "$launcher" ]]; then
+        log "browser pid $pid (launcher exec'd into it; kill switch armed)"
+      else
+        log "browser pid $pid under launcher $launcher (kill switch armed)"
+      fi
+      return 0
+    fi
+    kill -0 "$launcher" 2>/dev/null || { warn "launcher $launcher died before a browser appeared"; return 1; }
+    sleep 1
+    (( waited++ ))
+  done
+  # Publishing the launcher anyway would re-arm the exact failure this
+  # function exists to prevent, so publish nothing: the kill switch reports
+  # "no browser is running", which is a message an operator can act on.
+  warn "no browser process found under $launcher in ${KIOSK_PID_WAIT}s — kill switch disarmed"
+  return 1
+}
+
 mkdir -p "$KIOSK_STATE_DIR"
 
 # A leftover flag would quit the kiosk the instant it came up, which on a
@@ -184,11 +264,14 @@ while :; do
 
   clear_crash_flags
 
-  # Backgrounded so the PID can be published for the bridge to signal, then
-  # waited on so the loop still blocks for the browser's whole lifetime.
+  # Backgrounded so the loop can go on to publish a PID for the bridge, then
+  # waited on so it still blocks for the browser's whole lifetime.
   # A pidfile rather than the bridge pattern-matching `pkill`: the bridge must
-  # never guess which process is the kiosk, and `chromium-browser` on Pi OS is
-  # a wrapper script whose name does not survive to the real process anyway.
+  # never guess which process is the kiosk.
+  #
+  # LAUNCHER, not browser: on Pi OS this name is a wrapper script and the two
+  # are different processes.  `wait` wants this one (it is our child); the
+  # pidfile and every kill below want the one publish_browser_pid finds.
   "$CHROMIUM" \
     --kiosk "$KIOSK_URL" \
     --user-data-dir="$PROFILE" \
@@ -201,8 +284,11 @@ while :; do
     --disable-pinch \
     --autoplay-policy=no-user-gesture-required \
     --check-for-update-interval=31536000 &
-  chromium_pid=$!
-  printf '%s\n' "$chromium_pid" > "$PIDFILE"
+  launcher_pid=$!
+  # A failure here disarms the kill switch and nothing else: a kiosk that
+  # cannot be closed from the screen is still a kiosk, so it is logged and
+  # played on rather than fatal.
+  publish_browser_pid "$launcher_pid" || true
 
   # We launched onto Chromium's connection-error page, which has no
   # auto-refresh.  On a machine with no keyboard that is a dead end, so watch
@@ -212,20 +298,22 @@ while :; do
   # notice it is parked on an error.
   reloading=0
   if (( bridge_ready == 0 )); then
-    while kill -0 "$chromium_pid" 2>/dev/null; do
+    while kill -0 "$launcher_pid" 2>/dev/null; do
       if bridge_up; then
         log "bridge came up — reloading the kiosk onto the game"
         reloading=1
-        # Not mistakable for the kill switch: only the bridge ever writes
-        # EXITFLAG, and it is checked below on its own terms.
-        kill "$chromium_pid" 2>/dev/null
+        # The browser, not the launcher, for the same reason the pidfile holds
+        # the browser: killing a wrapper leaves its child on screen, and here
+        # that would be a stale error page nothing ever replaces.  Falls back
+        # to the launcher only when no browser PID was ever published.
+        kill "$(cat "$PIDFILE" 2>/dev/null || printf '%s' "$launcher_pid")" 2>/dev/null
         break
       fi
       sleep 2
     done
   fi
 
-  wait "$chromium_pid"
+  wait "$launcher_pid"
   chromium_status=$?
   # A non-zero status is expected and uninteresting when we did the killing.
   if (( reloading == 0 && chromium_status != 0 )); then

@@ -90,8 +90,13 @@ log "provisioning kiosk: user=$KIOSK_USER root=$ROOT branch=$BRANCH port=$PORT"
 log "installing base packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
+# wlr-randr is what DISPLAY_SETUP is written in (see the tunable above), and
+# Pi OS does not ship it.  Installed unconditionally rather than only when
+# DISPLAY_SETUP mentions it: it is ~50KB, and it is also the only way to ASK
+# the running compositor for its output names, which is the first thing anyone
+# setting a rotation needs.
 apt-get install -y --no-install-recommends \
-  git curl ca-certificates xz-utils rsync
+  git curl ca-certificates xz-utils rsync wlr-randr
 
 # Chromium: Raspberry Pi OS packages it as chromium-browser (with a wrapper
 # that applies the Pi's hardware flags); plain Debian calls it chromium.
@@ -110,6 +115,20 @@ if (( node_major < NODE_MAJOR )); then
   apt-get install -y nodejs
 else
   log "Node.js major $node_major already satisfies >= $NODE_MAJOR"
+fi
+
+# A DISPLAY_SETUP naming a command that does not exist is the worst kind of
+# wrong: pi-kiosk.sh runs it at session start, warns into a logfile nobody is
+# tailing, and launches Chromium anyway — so the symptom is a kiosk that comes
+# up looking completely normal and simply is not rotated.  Checked here, where
+# the operator is watching, and only for the leading word: the rest is an
+# arbitrary snippet whose arguments cannot be validated off the display.
+if [[ -n "$DISPLAY_SETUP" ]]; then
+  ds_cmd="${DISPLAY_SETUP%% *}"
+  if [[ "$ds_cmd" != *=* ]] && ! command -v "$ds_cmd" >/dev/null; then
+    die "DISPLAY_SETUP starts with '$ds_cmd', which is not installed"
+  fi
+  log "DISPLAY_SETUP: $DISPLAY_SETUP"
 fi
 
 # ---------------------------------------------------------------------------
