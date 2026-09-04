@@ -116,6 +116,98 @@
       border-radius: 4px;
       margin-bottom: 4px;
     }
+
+    /* ---------------------------------------------------------------------
+       The kiosk exit.  Invisible, top-left, hold five seconds.
+       Hidden because it is for whoever runs the event, on the same screen an
+       attendee is prodding: a labelled "Quit" button on a kiosk gets pressed.
+       A long hold is the affordance instead — no label to read, and nothing
+       a stray palm or a curious child completes by accident.
+       It reveals a progress arc ONLY once held, so an operator who knows it
+       is here gets confirmation while it stays invisible to everyone else.
+       --------------------------------------------------------------------- */
+    #exit {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 96px;
+      height: 96px;
+      /* No background, border or text: `opacity` would still leave the arc
+         invisible when it is revealed, so the button itself is simply blank
+         and the arc inside it is what fades in. */
+      background: none;
+      border: none;
+      padding: 0;
+      cursor: default;
+      /* Above the tiles: the grid starts below this corner on the 1024x600
+         panel, but a narrow viewport stacks the tiles and the first one would
+         otherwise cover the corner. */
+      z-index: 2;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+      -webkit-user-select: none;
+      /* A long press is the whole interaction, so suppress the two things a
+         long press normally does on a touchscreen: the iOS callout and the
+         Android/desktop context menu (also cancelled in JS, since Firefox
+         ignores the property). */
+      -webkit-touch-callout: none;
+      touch-action: none;
+    }
+    #exit svg {
+      display: block;
+      width: 100%;
+      height: 100%;
+      opacity: 0;
+      transition: opacity 120ms linear;
+    }
+    #exit.holding svg { opacity: 1; }
+    #exit .track {
+      fill: rgba(238, 242, 250, 0.9);
+      stroke: rgba(28, 32, 44, 0.18);
+      stroke-width: 5;
+    }
+    /* The arc is one CSS transition on stroke-dashoffset, not a rAF loop:
+       the compositor owns the timing, so a busy main thread (the bridge
+       reconnecting, a big page) cannot make the hold LOOK shorter than the
+       timer that actually fires.  Its duration is set from JS so the five
+       seconds is written once, in one language.
+       Dropping .holding removes the transition with it, so a cancelled hold
+       snaps back to empty instead of unwinding. */
+    #exit .arc {
+      fill: none;
+      stroke: rgb(28, 32, 44);
+      stroke-width: 5;
+      stroke-linecap: round;
+      /* 2*pi*34 — the circumference of the r=34 circle in the markup. */
+      stroke-dasharray: 213.6;
+      stroke-dashoffset: 213.6;
+      /* Start the arc at 12 o'clock rather than 3. */
+      transform: rotate(-90deg);
+      transform-origin: 48px 48px;
+    }
+    #exit.holding .arc {
+      stroke-dashoffset: 0;
+      transition-property: stroke-dashoffset;
+      transition-timing-function: linear;
+    }
+
+    /* Only ever seen when the exit could NOT be honoured.  Without it, a
+       failed hold is indistinguishable from a hold that did not register,
+       and the operator's next move is to try it ten more times. */
+    #exit-msg {
+      position: fixed;
+      top: 100px;
+      left: 8px;
+      max-width: 320px;
+      padding: 10px 12px;
+      background: rgb(28, 32, 44);
+      color: rgb(246, 249, 255);
+      font-size: 13px;
+      line-height: 1.4;
+      border-radius: 8px;
+      z-index: 2;
+    }
+    #exit-msg[hidden] { display: none; }
   </style>
 </head>
 <body>
@@ -138,5 +230,24 @@
     <span class="label">Calibrate</span>
   </a>
 </nav>
+
+<!-- The hidden kiosk exit.  Deliberately unlabelled and not in the tab order:
+     it is for the person running the event, not for whoever is standing at the
+     screen.  aria-label so that anyone who does reach it is told what it does
+     and that it needs holding, rather than finding an anonymous button. -->
+<button id="exit" type="button" tabindex="-1"
+        aria-label="Close the kiosk to the desktop — hold for five seconds">
+  <svg viewBox="0 0 96 96" aria-hidden="true">
+    <circle class="track" cx="48" cy="48" r="34" />
+    <circle class="arc" cx="48" cy="48" r="34" />
+  </svg>
+</button>
+<p id="exit-msg" role="status" hidden></p>
+
+<!-- ?v= is a cache buster: CI rewrites "dev" to the commit SHA on deploy.
+     The navigation above is plain anchors and does not need this file: if it
+     fails to load, the three stations are still reachable and only the hidden
+     exit stops working. -->
+<script src="/kiosk.js?v=dev"></script>
 </body>
 </html>

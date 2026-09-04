@@ -201,6 +201,12 @@ PORT=$PORT
 KIOSK_URL=$KIOSK_URL
 KIOSK_USER=$KIOSK_USER
 
+# Arms the hidden hold-to-exit button on the station directory: the bridge and
+# pi-kiosk.sh exchange the browser's PID and the exit request through this
+# directory.  Its presence is what enables POST /api/kiosk/exit — comment this
+# line out and the route 404s, which is how the VPS is configured.
+KIOSK_STATE_DIR=$ROOT/state
+
 # Seconds to wait for git fetch before booting the last known good build.
 FETCH_TIMEOUT=60
 # Completed builds kept for manual rollback.

@@ -137,10 +137,14 @@ sudo systemctl restart slimefeast-bridge
 ```
 
 Knobs live in `/etc/default/slimefeast` (`BRANCH`, `PORT`, `KIOSK_URL`,
-`FETCH_TIMEOUT`, `KEEP_BUILDS`, `BRIDGE_WAIT`, `DISPLAY_SETUP`).  Edit, then
+`FETCH_TIMEOUT`, `KEEP_BUILDS`, `BRIDGE_WAIT`, `DISPLAY_SETUP`,
+`KIOSK_STATE_DIR`).  Edit, then
 restart the two units.  `DISPLAY_SETUP` is an empty shell hook for display
 config once the kiosk hardware is settled, e.g.
 `DISPLAY_SETUP='wlr-randr --output HDMI-A-1 --transform 90'`.
+`KIOSK_STATE_DIR` is the handshake directory that arms the hold-to-exit button
+(see [Closing the kiosk to the desktop](#closing-the-kiosk-to-the-desktop));
+comment it out to disable the button entirely.
 
 Tests are not run on the Pi — the `test` step needs python3 + PIL for the
 sprite-atlas check and spends ~14s on the render-gate probe, and CI already
@@ -249,6 +253,37 @@ The game has no back control on purpose: its canvas takes clicks for casting,
 so a corner button is a misfire waiting to happen mid-round.  Set
 `KIOSK_URL=/game` on a Pi that should come up playing and never show the
 directory; leave it at `/` on a station an operator retasks between sessions.
+
+#### Closing the kiosk to the desktop
+
+Chromium runs with `--kiosk`: no address bar, no tab bar, no window chrome,
+and the Pi has no keyboard.  The directory page carries an **invisible button
+in its top-left corner — hold it for five seconds** and the browser closes to
+the desktop.  A progress ring appears once the hold starts, so it is
+discoverable to whoever knows it is there and invisible to everyone else; a
+visible "Quit" on a screen attendees are prodding gets pressed.
+
+It is only on `/`, because that is the one page reachable from every station
+and the one page with no gameplay to misfire into.
+
+The switch is **armed by the `KIOSK_STATE_DIR` env var** (`pi-setup.sh` sets it
+in `/etc/default/slimefeast`).  Unset — which is every non-Pi machine — and
+`POST /api/kiosk/exit` 404s and the button reports that it is not enabled.
+It is also refused for non-loopback callers, and nginx returns 404 for it
+outright, so it does not exist on the VPS.
+
+To get back to the kiosk, either log out and back in (labwc autostart runs
+`pi-kiosk.sh`) or run it from a terminal:
+
+```bash
+~/slimefeast/scripts/pi-kiosk.sh &
+```
+
+How it stays distinguishable from a crash: the bridge writes a
+`$KIOSK_STATE_DIR/kiosk-exit` flag *before* signalling the browser, and
+`pi-kiosk.sh` — which otherwise relaunches a dead browser after 3s — checks for
+that flag and stops instead.  A browser that dies without the flag is still a
+crash, and is still healed automatically.
 
 ### /tune — in-browser config editor
 
@@ -439,6 +474,7 @@ bridge/
   index.js               Node bridge: spawns client, WebSocket relay, static files, /api/tune/save
 web/
   index.html             / station directory: big touch buttons to the pages below
+  kiosk.js               the directory's hidden hold-5s exit to the desktop
   game.html              /game canvas shell (also served at /config/{hash})
   game.js                canvas renderer: connecting / game / game_over / error / full phases
   onboard.html, onboard.js    /onboard badge colour kiosk
@@ -452,7 +488,8 @@ scripts/
   vps-setup.sh           one-time VPS provisioning (Nginx, Node.js, systemd, deploy user)
   pi-setup.sh            one-time Pi kiosk provisioning (Zig, Node, Chromium, units, autostart)
   pi-update.sh           boot-time: fast-forward to main, build, publish atomically
-  pi-kiosk.sh            session: wait for the bridge, open the fullscreen tab
+  pi-kiosk.sh            session: wait for the bridge, open the fullscreen tab,
+                         relaunch it if it dies — unless the exit was asked for
 .github/workflows/
   deploy.yml             CI: test → build → deploy on push to main
 ```

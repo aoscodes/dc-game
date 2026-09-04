@@ -40,6 +40,11 @@
  *       /onboard           the badge colour kiosk
  *       /powerups          the powerup kiosk
  *       /tune              the config editor
+ *     and one endpoint that is not a page:
+ *       POST /api/kiosk/exit  closes the fullscreen browser to the desktop,
+ *                          for the hold-to-exit button on `/`.  Armed only by
+ *                          KIOSK_STATE_DIR and only for loopback callers;
+ *                          404 everywhere else, including the VPS.
  *   - Hardware controller discovery over USB serial (controllers.js): every
  *     board is its own player with a dedicated Zig client; selected-shape
  *     feedback flows back to the board's e-paper.
@@ -80,6 +85,17 @@ const PORT        = parseInt(process.env.PORT || "3000", 10);
 // be able to do and a thing the event machine must not.  An env var is the
 // one switch that cannot be reached by anyone holding only the HTTP port.
 const DEV_INJECT  = process.env.DEV_INJECT === "1";
+// The kiosk kill switch (POST /api/kiosk/exit).  Set to $ROOT/state by
+// pi-setup.sh, and UNSET everywhere else — including the VPS, which has no
+// browser to close and is reachable from the public internet.  Its presence
+// alone arms the route, so there is no way to configure a bridge that thinks
+// the switch is enabled but has nowhere to write.
+const KIOSK_STATE_DIR = process.env.KIOSK_STATE_DIR || null;
+// Both filenames are a contract with scripts/pi-kiosk.sh, which publishes the
+// PID and consumes the flag.  Renaming either here alone breaks the switch
+// silently, so they are named in exactly these two places.
+const KIOSK_PID_FILE  = KIOSK_STATE_DIR && path.join(KIOSK_STATE_DIR, "chromium.pid");
+const KIOSK_EXIT_FLAG = KIOSK_STATE_DIR && path.join(KIOSK_STATE_DIR, "kiosk-exit");
 // Locally: zig build puts the binaries at zig-out/bin/ (one level up from bridge/).
 // On the VPS: deploy installs them flat at /opt/dragoncon/ (same level as bridge/).
 const _binDir     = path.resolve(__dirname, "..");
@@ -104,6 +120,19 @@ const CUSTOM_DIR  = path.resolve(__dirname, "../custom-configs");
 
 /** Config hashes are 16 lowercase hex chars (sha256 prefix). */
 const HASH_RE = /^[0-9a-f]{16}$/;
+
+/**
+ * Is this remote address this machine?
+ *
+ * Node reports IPv4 loopback as "127.0.0.1" and IPv6 as "::1", and a v4
+ * connection to a dual-stack listener as the v4-mapped "::ffff:127.0.0.1".
+ * 127.0.0.0/8 is loopback entirely, not just .1.
+ */
+function isLoopback(addr) {
+  if (typeof addr !== "string") return false;
+  const bare = addr.startsWith("::ffff:") ? addr.slice("::ffff:".length) : addr;
+  return bare === "::1" || /^127\.\d+\.\d+\.\d+$/.test(bare);
+}
 
 /** Data dir for a config hash, or the shipped defaults when hash is null. */
 function dataDirFor(hash) {
@@ -184,6 +213,25 @@ const httpServer = http.createServer((req, res) => {
 
   if (req.method === "POST" && rawPath === "/api/tune/save") {
     handleTuneSave(req, res);
+    return;
+  }
+
+  // /api/kiosk/exit — close the fullscreen browser to the desktop.
+  // 404 rather than 403 when unarmed, like /api/dev/*: a bridge without
+  // KIOSK_STATE_DIR should be indistinguishable from one built without the
+  // route.  Loopback-only on top of that, because the only caller that should
+  // ever exist is a page in the browser running on this same machine.
+  // NOTE the loopback test does NOT survive a reverse proxy — nginx forwards
+  // from 127.0.0.1 — which is why the env var, not this check, is what keeps
+  // the switch off the public VPS.  vps-setup.sh also refuses the path at the
+  // nginx layer so that neither one is load-bearing alone.
+  if (rawPath === "/api/kiosk/exit") {
+    if (!KIOSK_STATE_DIR) { res.writeHead(404); res.end("Not found"); return; }
+    if (req.method !== "POST") { res.writeHead(405); res.end("Method not allowed"); return; }
+    if (!isLoopback(req.socket.remoteAddress)) {
+      res.writeHead(403); res.end("Forbidden"); return;
+    }
+    handleKioskExit(res);
     return;
   }
 
@@ -402,6 +450,89 @@ function handleTuneSave(req, res) {
     console.log(`[tune] saved config ${hash}`);
     reply(200, { url, hash });
   });
+}
+
+// ---------------------------------------------------------------------------
+// Kiosk kill switch  (/api/kiosk/exit, KIOSK_STATE_DIR only)
+// ---------------------------------------------------------------------------
+//
+// The Pi has no keyboard, and Chromium runs with --kiosk, so there is no tab
+// bar, no address bar and no window chrome to close.  Getting to the desktop
+// meant SSH-ing in.  This route is the hidden hold-button on the station
+// directory reaching the one process that can do something about it.
+//
+// Closing the browser is only half of it: pi-kiosk.sh RELAUNCHES Chromium 3
+// seconds after any exit, on purpose, so that a crash at an unattended event
+// heals itself.  So the flag is written first and the signal sent second —
+// the flag is what tells that loop this exit was asked for.  Written first
+// because the ordering is the whole guarantee: a browser reaped before the
+// flag landed would be restarted, and the operator would be left holding a
+// button that appears to do nothing.
+//
+// Not a `pkill`: the bridge must never guess which process is the kiosk.
+// pi-kiosk.sh publishes the PID it actually launched, and the cmdline check
+// below refuses to signal anything that is not still that browser — a pidfile
+// outliving its process is otherwise a licence to kill a recycled PID.
+
+/**
+ * Verify a PID is still the kiosk browser before signalling it.
+ *
+ * Linux only, which is where kiosks run; on anything without /proc this
+ * cannot be checked and the PID is taken on trust (a dev box that set
+ * KIOSK_STATE_DIR asked for this).
+ */
+function pidIsKioskBrowser(pid) {
+  let cmdline;
+  try {
+    cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8");
+  } catch {
+    // ENOENT on Linux means the process is gone; on macOS it means /proc
+    // does not exist.  Distinguished by whether /proc itself is there.
+    return !fs.existsSync("/proc");
+  }
+  // Argv is NUL-separated.  --kiosk is the flag that makes this the fullscreen
+  // browser rather than some other Chromium the operator opened.
+  return cmdline.split("\0").includes("--kiosk");
+}
+
+function handleKioskExit(res) {
+  const fail = (code, error) => {
+    console.error(`[bridge] kiosk exit refused: ${error}`);
+    res.writeHead(code, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: false, error }));
+  };
+
+  let pid;
+  try {
+    pid = parseInt(fs.readFileSync(KIOSK_PID_FILE, "utf8").trim(), 10);
+  } catch {
+    return fail(409, "no browser is running (pi-kiosk.sh publishes no PID)");
+  }
+  if (!Number.isInteger(pid) || pid <= 1) {
+    return fail(409, "kiosk pidfile is not a usable PID");
+  }
+  if (!pidIsKioskBrowser(pid)) {
+    return fail(409, `PID ${pid} is not the kiosk browser (stale pidfile)`);
+  }
+
+  // Flag before signal — see the note above; this ordering is load-bearing.
+  try {
+    fs.writeFileSync(KIOSK_EXIT_FLAG, `${new Date().toISOString()}\n`);
+  } catch (e) {
+    return fail(500, `could not write the exit flag: ${e.message}`);
+  }
+
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch (e) {
+    // The flag would otherwise sit there and quit the NEXT browser to exit.
+    try { fs.unlinkSync(KIOSK_EXIT_FLAG); } catch { /* nothing to undo */ }
+    return fail(500, `could not signal PID ${pid}: ${e.message}`);
+  }
+
+  console.log(`[bridge] kiosk exit requested — SIGTERM to PID ${pid}`);
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ ok: true, pid }));
 }
 
 // ---------------------------------------------------------------------------

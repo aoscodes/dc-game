@@ -148,6 +148,17 @@ server {
         proxy_send_timeout 3600s;
     }
 
+    # The kiosk kill switch closes a fullscreen browser on a Pi standing in a
+    # hall.  There is no such browser here, and this server answers the public
+    # internet, so the route is refused before it can reach the bridge.
+    # Belt and braces: the bridge already 404s it unless KIOSK_STATE_DIR is
+    # set, and this unit's environment does not set it.  Neither guard is
+    # load-bearing alone, which is the point — the `location /api/` prefix
+    # below would otherwise proxy anything new added under /api/ by default.
+    location = /api/kiosk/exit {
+        return 404;
+    }
+
     # Tuning API (save configs) -> Node bridge
     location /api/ {
         proxy_pass       http://127.0.0.1:3000;

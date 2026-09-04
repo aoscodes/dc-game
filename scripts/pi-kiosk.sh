@@ -36,8 +36,15 @@ BRIDGE_WAIT="${BRIDGE_WAIT:-90}"
 # Empty by default: guessing a display config for a kiosk you have not seen
 # is worse than leaving it at the compositor's own defaults.
 DISPLAY_SETUP="${DISPLAY_SETUP:-}"
+# Where the browser's PID and the exit request are exchanged with the bridge.
+# The bridge derives the same two filenames from KIOSK_STATE_DIR (see the
+# /api/kiosk/exit route in bridge/index.js) — if you rename either file, both
+# sides have to change or the kill switch silently stops working.
+KIOSK_STATE_DIR="${KIOSK_STATE_DIR:-$ROOT/state}"
 
 PROFILE="$ROOT/state/chromium"
+PIDFILE="$KIOSK_STATE_DIR/chromium.pid"
+EXITFLAG="$KIOSK_STATE_DIR/kiosk-exit"
 
 log()  { printf '[pi-kiosk] %s\n' "$*"; }
 warn() { printf '[pi-kiosk] WARN: %s\n' "$*" >&2; }
@@ -134,11 +141,25 @@ except BaseException:
 PY
 }
 
+mkdir -p "$KIOSK_STATE_DIR"
+
+# A leftover flag would quit the kiosk the instant it came up, which on a
+# machine whose power is cut nightly is a brick.  The flag means "the exit
+# button was held SINCE THIS SCRIPT STARTED" and nothing else.
+rm -f "$EXITFLAG"
+
 log "launching $CHROMIUM at $KIOSK_URL"
+
+trap 'rm -f "$PIDFILE"' EXIT
 
 while :; do
   clear_crash_flags
 
+  # Backgrounded so the PID can be published for the bridge to signal, then
+  # waited on so the loop still blocks for the browser's whole lifetime.
+  # A pidfile rather than the bridge pattern-matching `pkill`: the bridge must
+  # never guess which process is the kiosk, and `chromium-browser` on Pi OS is
+  # a wrapper script whose name does not survive to the real process anyway.
   "$CHROMIUM" \
     --kiosk "$KIOSK_URL" \
     --user-data-dir="$PROFILE" \
@@ -150,13 +171,27 @@ while :; do
     --disable-features=Translate \
     --disable-pinch \
     --autoplay-policy=no-user-gesture-required \
-    --check-for-update-interval=31536000 \
-    || warn "chromium exited non-zero"
+    --check-for-update-interval=31536000 &
+  chromium_pid=$!
+  printf '%s\n' "$chromium_pid" > "$PIDFILE"
 
-  # A deliberate quit (or a crash) on an unattended kiosk should come back,
-  # not leave a bare desktop.  The pause keeps a hard-failing browser from
-  # spinning the CPU; the game is a fresh page load either way, so nothing
-  # is lost by restarting.
+  wait "$chromium_pid" || warn "chromium exited non-zero"
+  rm -f "$PIDFILE"
+
+  # The exit flag is the ONLY thing that distinguishes an operator holding the
+  # hidden button from a crash.  The bridge writes it before it signals, so by
+  # the time the browser is reaped it is already on disk — a crash can never
+  # be mistaken for a request, and a request can never be restarted over.
+  if [[ -e "$EXITFLAG" ]]; then
+    rm -f "$EXITFLAG"
+    log "exit requested from the kiosk page — leaving the desktop up"
+    log "to bring the kiosk back, run: $0"
+    exit 0
+  fi
+
+  # A crash on an unattended kiosk should come back, not leave a bare desktop.
+  # The pause keeps a hard-failing browser from spinning the CPU; the game is
+  # a fresh page load either way, so nothing is lost by restarting.
   warn "chromium exited — restarting in 3s"
   sleep 3
 done
