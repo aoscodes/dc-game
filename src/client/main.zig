@@ -369,14 +369,11 @@ fn process_recv() void {
                 // A fresh outro must not survive into the next encounter.
                 g_state.game.final_score = null;
                 g_state.game.final_stats = null;
-                // A holding encounter shows the pre-match guide until a
-                // browser tab clicks past it (another game_start follows).
-                g_state.phase = if (p.prematch) .pre_match else .game;
+                // A game_start always means play: the encounter is running by
+                // the time anyone can receive one.
+                g_state.phase = .game;
                 // ALWAYS, not just on a phase change: a re-issued game_start
                 // is how a seat grant reaches us, and player_id is on screen.
-                // The pre-match guide also depends on this — a holding session
-                // broadcasts no game_state at all, so nothing else would ever
-                // get the guide drawn.
                 g_state.render_gate.note_standing();
             },
             .game_state => {
@@ -532,9 +529,6 @@ pub fn main() !void {
 
         switch (g_state.phase) {
             .connecting => {},
-            // Same input handling as play: seat keys (p / Shift+P) must work
-            // while the guide holds; gameplay sends are ignored server-side.
-            .pre_match => update_game(),
             .game => update_game(),
             .game_over => {
                 // The end screen holds until a browser tab CLICKS the

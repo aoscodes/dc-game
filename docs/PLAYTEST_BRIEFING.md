@@ -119,11 +119,13 @@ feedback — it's the single most useful artifact you can send us.
 ## 5. Getting into a game
 
 1. Go to **http://198.74.58.178/game** (or tap **Play** on the directory at
-   the bare address). A game is always running; you join it.
-2. Press **p** to take a seat (or watch as an observer).
-3. The pre-match guide lists every move and group; a click starts play.
-4. In game: `1`/`2` turn the wheel, arrows aim, `Enter` casts. The report's
-   button starts the next encounter.
+   the bare address). A game is always running; you join it — there is no
+   screen in front of it, so you land straight on the board.
+2. Press **p** to take a seat (or watch as an observer). The Lil Guys do not
+   start eating until somebody sits, so an empty board is just waiting.
+3. In game: `1`/`2` turn the wheel, arrows aim, `Enter` casts. Your held shape
+   and cooldown are in your seat's panel at the bottom. The report's button
+   starts the next encounter.
 
 ---
 

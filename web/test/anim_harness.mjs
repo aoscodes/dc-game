@@ -270,7 +270,10 @@ function build({ activateOn = {}, maxDepth = 3, blastChains = false } = {}) {
   // asserted above, is not one of them).
   const calls = [...src.matchAll(/(?<!function )drawTile\(([^;]*?)\);/g)]
     .map((m) => m[1]);
-  ok(calls.length >= 3, "found the drawTile call sites", calls.length);
+  // Both live on the field (the swap tween and the tile draw); the third was
+  // the pre-match guide's mini-board demo, gone with that screen.  The floor
+  // is here so a regex that matched NOTHING cannot pass the loop vacuously.
+  ok(calls.length >= 2, "found the drawTile call sites", calls.length);
   for (const args of calls) {
     // Top-level commas only: an argument may itself contain a call.
     let depth = 0, n = 1;

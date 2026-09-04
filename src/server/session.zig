@@ -37,7 +37,8 @@
 //!   percent, see balance.bite_interval_effective) the Lil Guys BITE the
 //!   front `feast_width` columns and the field settles.  An empty table
 //!   never bites: with nobody seated the timer disarms, and it re-arms from
-//!   scratch when someone sits down or a hold (pre-match, end screen) lifts.
+//!   scratch when someone sits down or the end-screen hold lifts.  This is
+//!   what lets an encounter launch into an empty room and simply wait.
 //!
 //!   THE COOLDOWN.  Each player may cast once per `balance.cast_cooldown_ms`;
 //!   a press inside the cooldown is silently dropped (the client shows the
@@ -194,13 +195,6 @@ pub const Session = struct {
     /// that starts the next encounter — and seat changes — arrive through
     /// it.  Cleared by start_game.
     restart_pending: bool = false,
-    /// The encounter is holding at its PRE-MATCH screen (the browser's
-    /// recipe guide): everything is seeded and seats can be taken, but
-    /// gameplay input is ignored and no state is broadcast until a browser
-    /// tab's `restart` click begins play.  Entered at server boot and on
-    /// every end-screen restart, NOT by start_game itself — the test seam
-    /// (and the bot harness) start encounters that play immediately.
-    prematch: bool = false,
     world: GameWorld,
     tick_count: u32 = 0,
     current_encounter: ?*const enc.Encounter = null,
@@ -238,9 +232,8 @@ pub const Session = struct {
     /// how many times the field has settled, plus one.
     bite: u16 = 0,
     /// The session clock, in accumulated milliseconds of PLAY time.  Fed by
-    /// `tick(dt)` and FROZEN while the session holds (pre-match, end
-    /// screen), so cooldowns and the group window never expire while nobody
-    /// can play.  f64 so sub-ms ticks accumulate without loss; read through
+    /// `tick(dt)` and FROZEN while the session holds at the end screen, so
+    /// cooldowns and the group window never expire while nobody can play.  f64 so sub-ms ticks accumulate without loss; read through
     /// `now_ms`.
     clock_ms: f64 = 0,
     /// Session clock time (ms) the next bite fires at, or 0 while the bite
@@ -459,7 +452,6 @@ pub const Session = struct {
         self.hatched = [_]u16{0} ** c.BabyType.size;
 
         self.restart_pending = false;
-        self.prematch = false;
         self.current_encounter = encounter;
         self.recent_count = 0;
         // Everyone opens on the first move in the table: the encounter is a
@@ -705,15 +697,14 @@ pub const Session = struct {
         try self.drain_queues();
         self.profiler.end(.drain);
 
-        // Holding — at the end screen (board final, already broadcast) or at
-        // the pre-match guide (board seeded, nothing moving yet): nothing
+        // Holding at the end screen (board final, already broadcast): nothing
         // below has anything to add, and the CLOCK FREEZES so cooldowns and
         // the group window cannot expire while nobody can play.  The drain
         // above is what lets a `restart` (or a seat change) through — a
-        // restart clears its flag inside the drain and play resumes this
-        // same tick.  The bite timer disarms so the hold's dead time is not
-        // billed to the next meal.
-        if (self.restart_pending or self.prematch) {
+        // restart clears the flag inside the drain and the next encounter
+        // resumes this same tick.  The bite timer disarms so the hold's dead
+        // time is not billed to the next meal.
+        if (self.restart_pending) {
             self.next_bite_at = 0;
             // A frozen clock can never retire a settle window, so a lock left
             // over from before the hold would still be standing on resume —
@@ -1122,29 +1113,23 @@ pub const Session = struct {
                 try self.send_game_start_to_conn(conn_id);
             },
             .restart => {
-                // Advances a HOLD; mid-game it is a stray click.  Any
-                // connection is honored — the browser tab that sends it may
-                // well be the room's observer display.
+                // Releases the END-SCREEN hold; mid-game it is a stray click.
+                // Any connection is honored — the browser tab that sends it
+                // may well be the room's observer display.  The next encounter
+                // begins PLAYING immediately: there is no screen between the
+                // report and the board, so this is the round's only click.
                 if (self.restart_pending) {
-                    // End screen -> next encounter's PRE-MATCH guide.  Seats
-                    // are kept; the pool and the bar re-seed from them.
+                    // Seats are kept; the pool and the bar re-seed from them.
                     const label = self.cfg.encounters.default().label;
-                    std.log.info("restart requested — next encounter, holding at pre-match", .{});
+                    std.log.info("restart requested — next encounter begins", .{});
                     try self.start_game(label);
-                    self.prematch = true;
                     try self.broadcast_game_start(label);
-                } else if (self.prematch) {
-                    // Pre-match guide -> play.
-                    std.log.info("pre-match dismissed — play begins", .{});
-                    self.prematch = false;
-                    const encounter = self.current_encounter orelse return;
-                    try self.broadcast_game_start(encounter.label);
                 }
             },
             .cycle_shape => {
                 const p = try proto.decode_cycle_shape(fbs.reader());
                 const player_id = seat orelse return;
-                if (self.restart_pending or self.prematch) return;
+                if (self.restart_pending) return;
                 const moves = self.cfg.balance.player_recipes.len;
                 // An empty move table is impossible (config.zig rejects it),
                 // but cycling would divide by zero, so guard rather than trust.
@@ -1161,7 +1146,7 @@ pub const Session = struct {
                 // queued after this one.
                 const p = try proto.decode_move_cursor(fbs.reader());
                 const player_id = seat orelse return;
-                if (self.restart_pending or self.prematch) return;
+                if (self.restart_pending) return;
                 const d = p.dir.delta();
                 // Clamped, so any number of steps in any direction leaves the
                 // cursor on a real cell.
@@ -1170,7 +1155,7 @@ pub const Session = struct {
             },
             .cast => {
                 const player_id = seat orelse return;
-                if (self.restart_pending or self.prematch) return;
+                if (self.restart_pending) return;
                 const bal = &self.cfg.balance;
                 const now = self.now_ms();
                 // Still cooling down: silent ignore.  The client draws the
@@ -1433,7 +1418,6 @@ pub const Session = struct {
             .encounter_label_len = @intCast(@min(label.len, 32)),
             .player_id = player_id,
             .join_code = self.join_code,
-            .prematch = self.prematch,
             .cast_cooldown_ms = self.cfg.balance.cast_cooldown_ms,
             .team_window_ms = self.cfg.balance.team_window_ms,
             .charges = self.charges,

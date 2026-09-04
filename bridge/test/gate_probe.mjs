@@ -133,8 +133,8 @@ let withBite = 0, biteWithBoard = 0;
 let withCasts = 0, castsWithBoard = 0;
 let dupTicks = 0, lastTick = null;
 let sawGrid = 0;
-let clickedPast = false;
 let preFrames = 0;
+let sawFirstBoard = false;
 const t0 = Date.now();
 // Wall-clock of the first and last in-game frame, for the observed tick period.
 let tFirst = null, tLast = null;
@@ -144,26 +144,27 @@ class Probe extends PlayerSession {
   onZigFrame(msg) {
     if (msg?.tag !== "render") return;
 
-    // The pre-match guide holds play, and the server returns before it
-    // broadcasts a board — so without this click there is no board to observe
-    // and every assertion below would vacuously pass on an empty sample.  The
-    // browser tab clicks past it; so do we, once.  Counted apart: there is no
-    // live tick behind these.
-    if (msg.phase === "pre_match" || msg.phase === "connecting") {
-      preFrames++;
-      if (msg.phase === "pre_match" && !clickedPast) {
-        clickedPast = true;
-        this.writeToZig("RESTART\n");
-      }
-      return;
+    const g = msg.game;
+    const hasBoard = Array.isArray(g?.grid) && g.grid.length > 0;
+
+    // Frames from before the FIRST board: the `connecting` screen, and the
+    // standing-only frame `note_standing` arms when a game_start lands ahead
+    // of the first game_state.  Counted apart because no server tick is behind
+    // them — folding them in would break the one-frame-per-tick invariant
+    // every assertion below rests on, and would drag the tick span back to the
+    // blank snapshot's tick 0.
+    //
+    // The bucket CLOSES on the first board and never reopens, so a board-less
+    // frame once play is under way still fails as it should.
+    if (!sawFirstBoard) {
+      if (!hasBoard) { preFrames++; return; }
+      sawFirstBoard = true;
     }
 
     frames++;
     if (tFirst === null) tFirst = Date.now();
     tLast = Date.now();
-    const g = msg.game;
     if (!g) return;
-    const hasBoard = Array.isArray(g.grid) && g.grid.length > 0;
     if (hasBoard) sawGrid++;
 
     // A repeated tick number is a duplicate emit — the amplification that came
@@ -220,7 +221,7 @@ const elapsed = (Date.now() - t0) / 1000;
 const ticksElapsed = tickMin === null ? 0 : tickMax - tickMin + 1;
 const msSpan = (tFirst === null || tLast === null) ? 0 : tLast - tFirst;
 console.log(`\n--- ${elapsed.toFixed(1)}s at --tick-ms ${TICK_MS} ---`);
-console.log(`pre-match frames:     ${preFrames}`);
+console.log(`pre-board frames:     ${preFrames}`);
 console.log(`frames emitted:       ${frames}  (${(frames / elapsed).toFixed(1)}/s)`);
 console.log(`frames with a board:  ${sawGrid}`);
 console.log(`server tick span:     ${tickMin}..${tickMax} (${ticksElapsed} ticks elapsed)`);

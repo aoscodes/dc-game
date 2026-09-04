@@ -299,30 +299,11 @@ const LAYOUT = {
     recipeFont: 24, verdictFont: 56, verdictDy: -70,
   },
 
-  preLobby: {
-    titleX: 40, titleY: 60, titleFont: 32,
-    optX: 60, optY0: 160, optGap: 40, optFont: 22,
-    errorDy: 100, errorFont: 18,
-    codePromptY: 160, codeY: 210, codeFont: 36, codeHintY: 270, codeHintFont: 16,
-  },
-
-  // The pre-match screen: title + game id up top, the study guide below,
-  // and the BEGIN button (gameOver.button geometry) at the bottom.
-  guide: {
-    titleX: 40, titleY: 52, titleFont: 32,
-    codeX: 40, codeY: 92, codeFont: 22,
-    guideX: 40, guideY: 140, guideFont: 13, guideLineH: 19,
-    recipeHeaderGap: 10, recipeRowH: 25, recipeFont: 14,
-    recipeLabelW: 170, recipeSlotGap: 10, recipeArrowGap: 24,
-    // Mini-board cell size for the shape demo inside each recipe card, and
-    // the grid the card's demo slot is budgeted for: every card reserves a
-    // demoGridMax × demoGridMax box (shapes centre inside it), so all cards
-    // come out the same size whatever shape they hold.
-    demoCell: 20, demoGridMax: 6,
-  },
-
   connecting: { x: 40, y: 60, font: 24 },
   full: { x: 40, titleDy: -16, titleFont: 24, subDy: 16, subFont: 18 },
+  // The dead end: a room that could not be entered.  Same shape as `full`,
+  // one line of cause over one line of remedy, with the hold button below.
+  error: { x: 40, titleDy: -20, titleFont: 24, subDy: 14, subFont: 18 },
   gameOver: {
     x: 40, titleY: 56, titleFont: 26,
     scoreY: 92, scoreFont: 20,
@@ -435,7 +416,6 @@ const C_MUTED = "rgba(150,110,110,0.9)";
  *  than borrowing a tier's. */
 const C_CHARGE = "rgba(200,140,0,1)";
 /** A recipe that costs nothing — green, because it is always castable. */
-const C_FREE = "rgba(30,150,70,1)";
 /** The coming bite's wasted mouthfuls: hazards it will nibble for hunger and
  *  no score (and the bite-strip ground wash).  Deliberately cold and dull:
  *  a nibble is not a threat, it is wasted opportunity. */
@@ -524,6 +504,37 @@ function shapeOffsets(rows) {
  */
 const PAGE_CONFIG_HASH =
   (location.pathname.match(/^\/config\/([0-9a-f]{16})/) || [])[1] ?? null;
+
+/**
+ * The server's join-code charset (CODE_CHARSET in bridge/index.js), not merely
+ * `[A-Z0-9]{6}`: the excluded letters (I, O) and digits (0, 1) exist so a code
+ * read off a screen cannot be mistyped into a DIFFERENT valid code.  Accepting
+ * them here would forward a guaranteed miss to the bridge, which would answer
+ * `not_found` — blaming the lobby for a typo.
+ */
+const JOIN_CODE_RE = /^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$/;
+
+/**
+ * The room this page is for, read off the query string.
+ *
+ * The URL is the WHOLE of the room choice — there is no picker screen.  Absent
+ * (`/game`, `/config/{hash}`) means "make me a new one"; present means "put me
+ * in that one".
+ *
+ * Read AFRESH on every socket open rather than cached at load: a create
+ * rewrites the URL (see the `joining` handler), and the reconnect that follows
+ * a bridge restart must re-read the code it wrote there.  A snapshot taken at
+ * load would still say "no code" and ask for a second lobby.
+ *
+ * @returns {string} the code, or "" when none was asked for, or null when one
+ *   was asked for and is malformed — a dead end raised locally, never sent.
+ */
+function pageJoinCode() {
+  const raw = new URLSearchParams(location.search).get("code");
+  if (raw === null) return "";
+  const code = raw.trim().toUpperCase();
+  return JOIN_CODE_RE.test(code) ? code : null;
+}
 
 /** Config hash whose balance tables are currently loaded. */
 let loadedConfigHash = null;
@@ -705,52 +716,6 @@ function drawConnecting() {
   text("Connecting to server...", L.x, L.y, L.font, C_TEXT);
 }
 
-// ---------------------------------------------------------------------------
-// Pre-lobby screen (create / join)
-// ---------------------------------------------------------------------------
-
-/**
- * "choose"        — show Create / Join options
- * "entering_code" — user is typing a 6-char lobby code
- */
-let preLobbyMode = "choose";
-let preLobbyCode = "";
-let preLobbyError = "";
-
-/** Reset all pre-lobby state (called on server pre_lobby / joining / error messages). */
-function resetPreLobby() {
-  preLobbyMode = "choose";
-  preLobbyCode = "";
-  preLobbyError = "";
-}
-
-function drawPreLobby() {
-  clear();
-  const L = LAYOUT.preLobby;
-
-  if (preLobbyMode === "choose") {
-    const highlight = "rgba(170,120,0,1)";
-    text("[C]  Create lobby", L.optX, L.optY0, L.optFont, highlight);
-    text("[J]  Join existing lobby", L.optX, L.optY0 + L.optGap, L.optFont, C_TEXT);
-    if (PAGE_CONFIG_HASH) {
-      text(`(custom config ${PAGE_CONFIG_HASH})`,
-        L.optX, L.optY0 + 2 * L.optGap, L.errorFont, "rgba(110,110,120,1)");
-    }
-    if (preLobbyError) {
-      text(preLobbyError, L.optX, L.optY0 + 2 * L.optGap + L.errorDy, L.errorFont, "rgba(200,50,50,1)");
-    }
-  } else if (preLobbyMode === "entering_code") {
-    text("Enter lobby code:", L.optX, L.codePromptY, L.optFont, C_TEXT);
-    // Show typed code + blinking underscore cursor.
-    const display = preLobbyCode.padEnd(6, "_");
-    text(display, L.optX, L.codeY, L.codeFont, "rgba(170,120,0,1)");
-    text("[ENTER] to confirm    [ESC] back", L.optX, L.codeHintY, L.codeHintFont, "rgba(110,110,120,1)");
-    if (preLobbyError) {
-      text(preLobbyError, L.optX, L.codeHintY + 40, L.errorFont, "rgba(200,50,50,1)");
-    }
-  }
-}
-
 function drawFull() {
   clear();
   const L = LAYOUT.full;
@@ -758,273 +723,27 @@ function drawFull() {
   text("Close another tab to free a slot.", L.x, SH / 2 + L.subDy, L.subFont, C_TEXT);
 }
 
-/** Draw colored text parts left-to-right; returns the x after the last part. */
-function drawParts(x, y, font, parts, gap) {
-  let dx = x;
-  ctx.font = `${font}px monospace`;
-  for (const p of parts) {
-    text(p.str, dx, y, font, p.color);
-    ctx.font = `${font}px monospace`;
-    dx += ctx.measureText(p.str).width + gap;
-  }
-  return dx;
-}
-
-/** Width a drawParts run occupies (no trailing gap), so callers can center
- *  it before drawing. */
-function partsWidth(font, parts, gap) {
-  if (parts.length === 0) return 0;
-  ctx.font = `${font}px monospace`;
-  let w = -gap;
-  for (const p of parts) w += ctx.measureText(p.str).width + gap;
-  return w;
-}
-
 /**
- * Colored parts for a recipe's charge cost.  Every recipe shows one, including
- * the free ones: "0" is a real tactical option and hiding it would make a free
- * recipe look like an unpriced oversight.
- */
-function costParts(cost) {
-  const n = cost ?? 0;
-  return [{ str: `${n}\u26a1`, color: n === 0 ? C_FREE : C_CHARGE }];
-}
-
-/**
- * Draw a recipe's shape as a MINI BOARD, rendered with the same pieces the
- * field uses: every cell gets the recessed socket rect, and each covered ("#")
- * cell wears the INVERTED slime tile art — the game's own mark for "a cast
- * covers this cell" — over a SHAPE_COLOR footprint outline at the socket edge.
- * The anchor cell (the one you aim at; every other cell lands relative to it)
- * is bracketed at the cell edge in C_OWN_ROW, the same aim-cell convention as
- * the action menu's shape (drawSpellShape).
+ * Why this tab could not enter a room, or null while nothing has failed.
  *
- * @param {number} cx   - horizontal centre of the demo grid
- * @param {number} top  - top edge of the demo grid
- * @param {string[]} rows - authored shape rows ("###" / ".#.")
- * @param {number} cell - cell size in design px (LAYOUT.guide.demoCell)
+ * A DEAD END on purpose.  Room choice is made by the URL now, so there is no
+ * picker to bounce back to and no way to amend the request in place: the only
+ * way on is `way`, which the button carries out.  `way.href` is a THUNK, not a
+ * string, so it reads the address at click time rather than at failure time.
+ *
+ * @type {{ title: string, hint: string, way: { label: string, href: () => string } } | null}
  */
-function drawShapeDemo(cx, top, rows, cell) {
-  const nR = rows.length;
-  const nC = rows[0]?.length ?? 0;
-  if (nR === 0 || nC === 0) return;
-  const anchorR = Math.floor(nR / 2);
-  const anchorC = Math.floor(nC / 2);
-  const x0 = cx - (nC * cell) / 2;
+let roomError = null;
 
-  const inset = cell * FIELD.tileGap;
-  const body = cell - inset * 2;
-  for (let r = 0; r < nR; r++) {
-    for (let cl = 0; cl < nC; cl++) {
-      const cxp = x0 + cl * cell;
-      const cyp = top + r * cell;
-      // Socket: the same ground every field cell stands on.
-      rect(cxp + inset, cyp + inset, body, body, FIELD.socketFill);
-      rectStroke(cxp + inset, cyp + inset, body, body, 1, FIELD.socketBorder);
-      if (rows[r][cl] === "#") {
-        // Covered cell: inverted hazard tile + footprint outline, exactly the
-        // pair the live cast preview paints on the field.
-        drawTile("red", cxp, cyp, cell, 1, 1, true);
-        ctx.save();
-        ctx.strokeStyle = SHAPE_COLOR;
-        ctx.lineWidth = 1.5;
-        ctx.strokeRect(cxp + inset, cyp + inset, body, body);
-        ctx.restore();
-      }
-      if (r === anchorR && cl === anchorC) {
-        rectStroke(cxp, cyp, cell, cell, 1.5, C_OWN_ROW);
-      }
-    }
-  }
-}
-
-/**
- * Lobby study guide: how casting works + every move on the shape wheel and
- * every group, all in parity colors (slime = agent = hunger block).
- * Moves appear in data/balance.json order, which IS the wheel order.
- */
-function drawRecipeGuide() {
-  const L = LAYOUT.guide;
-  let y = L.guideY;
-
-  y += L.guideLineH;
-  const descColor = "rgba(70,70,85,0.95)";
-  // The realtime loop: casts resolve the moment they are pressed (throttled
-  // by the cooldown), and the Lil Guys bite on their own clock.
-  const castingLine = [
-    { str: `Press A to CAST`, color: descColor },
-    { str: "Each cast disperses Neutralizing Agent the instant it fires; the", color: RECIPE_COLOR_TEAM },
-    { str: "Lil Guys bite the field on their own clock", color: RECIPE_COLOR_TEAM },
-  ];
-  const descLines = [
-    [
-      { str: "GAMEPLAY INSTRUCTIONS TO COME", color: descColor },
-      //  { str: "AIM with the arrow keys. Turn the SHAPE WHEEL to pick your move:", color: descColor },
-      //  { str: "1 next", color: WHEEL_COLOR.forward },
-      //  { str: "2 back", color: WHEEL_COLOR.backward },
-      //],
-      //[
-      //  { str: "Your pick STAYS until you turn the wheel again — it survives casting and the turn end.", color: descColor },
-      //],
-      //[
-      //  { str: "Each move below stamps its SHAPE on the grid, centred on your cursor.", color: descColor },
-      //],
-      //[
-      //  { str: "Every covered cell steps down one tier:", color: descColor },
-      //  { str: `${TIER_CHAR.red}red`, color: TIER_COLOR.red },
-      //  { str: "→", color: descColor },
-      //  { str: `${TIER_CHAR.yellow}yellow`, color: TIER_COLOR.yellow },
-      //  { str: "→", color: descColor },
-      //  { str: `${TIER_CHAR.green}green`, color: TIER_COLOR.green },
-      //  { str: "→ defused (harmless to eat).", color: descColor },
-      //],
-      //[
-      //  { str: "Aim is captured when you press ENTER — re-aiming will not move a cast already locked in.", color: descColor },
-      //],
-      //[
-      //  { str: "Nothing lands until the turn resolves, so you can see the whole plan first.", color: descColor },
-      //  { str: "ESC takes back your last lock-in.", color: C_BAD },
-      //],
-      //[
-      //  { str: "The turn ends once EVERYONE has locked in: every cast lands at once, then the Lil Guys pour in from the LEFT.", color: descColor },
-      //],
-      //[
-      //  { str: "They only eat what they can WALK to. Live hazard slime is a wall — everything behind it survives.", color: descColor },
-      //],
-      //[
-      //  { str: "Defuse a wall and you open a road. Survivors fall to the bottom, then fresh slime drops in on top.", color: descColor },
-      //],
-      //[
-      //  { str: "Every cast spends from ONE shared pool", color: descColor },
-      //  { str: "\u26a1", color: C_CHARGE },
-      //  { str: "that lasts the WHOLE encounter and never refills. A cast the turn cannot afford is REFUSED, costing nothing.", color: descColor },
-    ],
-    //  castingLine,
-
-  ];
-  for (const line of descLines) {
-    drawParts(L.guideX, y, L.guideFont, line, 8);
-    y += L.guideLineH;
-  }
-  y += L.recipeHeaderGap;
-
-  text("MOVES", L.guideX, y, L.guideFont + 2, C_HEADER);
-  y += L.guideLineH;
-
-  // Each recipe is a bordered CARD with its parts stacked vertically (label,
-  // components, shape, cost).  Every card is the SAME fixed size, budgeted
-  // for the largest shape the demo may hold (demoGridMax × demoGridMax), so
-  // the grid of cards stays regular whatever each recipe contains: each part
-  // lives in a fixed slot, and slots a card has no content for stay blank.
-  // Cards flow LEFT-TO-RIGHT, wrapping to a new row when the next card would
-  // run past the canvas edge.
-  const maxX = SW - L.guideX; // right margin mirrors the left one
-  const cardGap = L.recipeSlotGap;
-  const cardPad = 8;
-  const cardBorder = "rgba(0,0,0,0.25)";
-  const lineH = L.guideLineH;
-  const demoGapY = 4; // breathing room above and below the mini board
-  const demoBox = L.demoGridMax * L.demoCell; // demo slot: fits a 6×6 shape
-  const cardW = cardPad * 2 + demoBox;
-  const cardH = cardPad + L.recipeFont // label baseline
-    + lineH                            // component slot (blank for moves)
-    + demoGapY + demoBox + demoGapY    // mini-board demo slot
-    + lineH                            // cost line
-    + lineH                            // suffix slot (blank for moves)
-    + cardPad;
-  let x = L.guideX;
-
-  /** Close out the current flow row (no-op if nothing is on it). */
-  const flushRow = () => {
-    if (x > L.guideX) {
-      y += cardH + cardGap;
-      x = L.guideX;
-    }
-  };
-
-  /**
-   * One guide card: label, what it is made of, its shape (a mini board drawn
-   * with the game's own tiles — see drawShapeDemo), its cost — stacked top to
-   * bottom inside a border box, every line centred on the card and the shape
-   * centred in its slot.  `made` is the components line — empty for a move
-   * (the wheel is how you pick it), the component move labels for a group.
-   */
-  const drawRecipeRow = (r, labelColor, made, suffix) => {
-    if (x > L.guideX && x + cardW > maxX) flushRow();
-    rectStroke(x, y, cardW, cardH, 1, cardBorder);
-    const cx = x + cardW / 2;
-    ctx.font = `${L.recipeFont}px monospace`;
-    let by = y + cardPad + L.recipeFont; // label baseline
-    text(r.label, cx - ctx.measureText(r.label).width / 2, by,
-      L.recipeFont, labelColor);
-    by += lineH; // component slot, blank when there are none
-    if (made.length > 0) {
-      drawParts(cx - partsWidth(L.recipeFont, made, L.recipeSlotGap) / 2, by,
-        L.recipeFont, made, L.recipeSlotGap);
-    }
-    const rows = r.rows ?? ["#"];
-    // Centre the shape inside the fixed demo slot, both axes.
-    by += demoGapY;
-    drawShapeDemo(cx, by + (demoBox - rows.length * L.demoCell) / 2,
-      rows, L.demoCell);
-    by += demoBox + demoGapY;
-    by += lineH;
-    const cost = costParts(r.cost);
-    drawParts(cx - partsWidth(L.recipeFont, cost, L.recipeSlotGap) / 2, by,
-      L.recipeFont, cost, L.recipeSlotGap);
-    if (suffix) {
-      by += lineH;
-      ctx.font = `${L.guideFont}px monospace`;
-      text(suffix, cx - ctx.measureText(suffix).width / 2, by,
-        L.guideFont, RECIPE_COLOR_TEAM);
-    }
-    x += cardW + cardGap;
-  };
-
-  for (const r of PLAYER_RECIPES) {
-    drawRecipeRow(r, RECIPE_COLOR_PLAYER, [], null);
-  }
-  flushRow();
-
-  if (TEAM_RECIPES.length > 0) {
-    y += L.recipeHeaderGap;
-    text("GROUPS", L.guideX, y, L.guideFont + 2, C_HEADER);
-    y += L.guideLineH;
-    for (const r of TEAM_RECIPES) {
-      // Components are move labels joined by "+": each must come from a
-      // DIFFERENT player, so the count doubles as "how many of you it takes".
-      const made = [];
-      r.components.forEach((ci, i) => {
-        if (i > 0) made.push({ str: "+", color: descColor });
-        made.push({ str: PLAYER_RECIPES[ci]?.label ?? "?", color: RECIPE_COLOR_PLAYER });
-      });
-      drawRecipeRow(r, RECIPE_COLOR_TEAM, made, `(needs ${r.components.length} players)`);
-    }
-    flushRow();
-  }
-}
-
-/**
- * The pre-match screen: shown before EVERY encounter (server holds play on
- * its `prematch` flag).  The study guide, the game id so others can join,
- * and the BEGIN button that starts play — a browser click, like the end
- * screen's, so a round never begins by accident.
- */
-function drawPreMatch(game) {
+function drawError() {
   clear();
-  const L = LAYOUT.guide;
-  text(`Game ${game?.join_code ?? "------"}`, L.codeX, L.codeY, L.codeFont, C_TEXT);
-  const standing = game?.observer
-    ? "Press P to play once game starts"
-    : `You are seated as P${game?.player_id ?? "?"}.`;
-  ctx.save();
-  ctx.font = `${L.codeFont - 6}px monospace`;
-  text(standing, L.codeX + 260, L.codeY, L.codeFont - 6,
-    game?.observer ? C_TEXT : playerColor(game?.player_id));
-  ctx.restore();
-
-  drawRecipeGuide();
-  drawRestartButton("SCAN FOR NEARBY SLIME");
+  const L = LAYOUT.error;
+  text(roomError?.title ?? "Something went wrong.",
+    L.x, SH / 2 + L.titleDy, L.titleFont, "rgba(200,50,50,1)");
+  if (roomError?.hint) {
+    text(roomError.hint, L.x, SH / 2 + L.subDy, L.subFont, "rgba(110,110,120,1)");
+  }
+  drawHoldButton(roomError?.way.label ?? "BACK TO MENU");
 }
 
 /**
@@ -4811,8 +4530,7 @@ function drawSeatPowerups(e, x, y) {
 /**
  * Draw a spell's shape as a small grid of filled cells, centred on (cx, cy)
  * and fitted inside maxW×maxH.  The anchor cell — the one the cursor aims —
- * is outlined, matching the anchor bracket of the lobby guide's shape demos
- * (drawShapeDemo).  `dim` mutes the
+ * is outlined.  `dim` mutes the
  * fill for a menu whose player is locked in: the spell is still held, but no
  * cast of it is available this round.
  */
@@ -5388,7 +5106,7 @@ function drawGameOver(msg) {
   text(`Neutral slime consumed: ${score}${hungerText}`, L.x, L.scoreY, L.scoreFont, C_SLIME_HDR);
 
   if (!stats) {
-    drawRestartButton("START NEXT ROUND");
+    drawHoldButton("START NEXT ROUND");
     return;
   }
 
@@ -5433,33 +5151,39 @@ function drawGameOver(msg) {
   text(`total spells cast: ${stats.casts_total}  ·  slime eaten: ${eaten}/${stats.slime_total ?? 0}`,
     P.name, y, L.rowFont, "rgba(70,70,85,0.95)");
 
-  drawRestartButton("START NEXT ROUND");
+  drawHoldButton("START NEXT ROUND");
 }
 
-/** Design-space bounds of the next-round button.  Fixed geometry, so click
+/** Design-space bounds of the hold-screen button.  Fixed geometry, so click
  *  hit-testing needs no per-frame state. */
-const RESTART_BUTTON = (() => {
+const HOLD_BUTTON = (() => {
   const B = LAYOUT.gameOver.button;
   return { x: (SW - B.w) / 2, y: SH - B.h - B.bottomGap, w: B.w, h: B.h };
 })();
-let restartHover = false;
+let holdHover = false;
 
-/** True while a HOLD screen is up and the button should exist: the report
- *  (once its outro replay lands) or the pre-match guide.  Clicks anywhere
- *  else must not advance the match. */
-function restartButtonActive() {
+/**
+ * True while a HOLD screen is up and the button should exist: the report
+ * (once its outro replay lands) or the dead end.  Clicks anywhere else must
+ * not advance the match.
+ *
+ * ONE rect serves both because they are mutually exclusive phases; what the
+ * press MEANS is decided by the phase at click time (see the click handler),
+ * never by the geometry.
+ */
+function holdButtonActive() {
   return (latestMsg?.phase === "game_over" && !outroActive()) ||
-    latestMsg?.phase === "pre_match";
+    latestMsg?.phase === "error";
 }
 
-/** The one way the match advances past a hold: a CLICK, from a browser tab.
- *  Drawn as a real button so the trigger is unmistakably deliberate. */
-function drawRestartButton(label) {
+/** The one way past a hold: a CLICK, from a browser tab.  Drawn as a real
+ *  button so the trigger is unmistakably deliberate. */
+function drawHoldButton(label) {
   const B = LAYOUT.gameOver.button;
-  const r = RESTART_BUTTON;
+  const r = HOLD_BUTTON;
   rect(r.x, r.y, r.w, r.h,
-    restartHover ? "rgba(60,90,200,0.18)" : "rgba(60,90,200,0.08)");
-  rectStroke(r.x, r.y, r.w, r.h, restartHover ? 3 : 2, C_HEADER);
+    holdHover ? "rgba(60,90,200,0.18)" : "rgba(60,90,200,0.08)");
+  rectStroke(r.x, r.y, r.w, r.h, holdHover ? 3 : 2, C_HEADER);
   ctx.save();
   ctx.font = `bold ${B.font}px monospace`;
   ctx.fillStyle = C_HEADER;
@@ -5679,11 +5403,11 @@ function renderFrame(msg, dt) {
   lastPhase = msg.phase;
 
   switch (msg.phase) {
-    case "pre_lobby": drawPreLobby(); break;
     case "connecting": drawConnecting(); break;
-    case "pre_match": drawPreMatch(msg.game); break;
     case "game": drawGame(msg.game, dt); break;
     case "game_over": drawGameOver(msg); break;
+    case "error": drawError(); break;
+    case "full": drawFull(); break;
     default: drawConnecting();
   }
 }
@@ -5709,12 +5433,86 @@ function gameLoop(ts) {
 
 let ws = null;
 
+/**
+ * This page's URL with the room code stripped off — which is to say, the same
+ * page asking for a NEW game instead of a departed one.
+ *
+ * The path is kept deliberately: dropping to `/` from `/config/{hash}?code=…`
+ * would silently throw away the saved config the link exists to carry, and the
+ * kiosk has no address bar to type it back in with.
+ */
+function newGameHref() {
+  const url = new URL(location.href);
+  url.searchParams.delete("code");
+  return url.toString();
+}
+
+/**
+ * Raise the dead end.  Every room failure is terminal for THIS request: it came
+ * from the URL, so there is nothing on the page the player could amend.
+ *
+ * Each reason therefore names its own way out, because they do not share one:
+ * a game that has finished is fixed by starting another, but a config that is
+ * missing would fail again on the very next attempt, so that one leaves.
+ *
+ * @param {string} reason - a bridge `error` reason, or one raised locally.
+ */
+function showRoomError(reason) {
+  const RETRY = { label: "START A NEW GAME", href: newGameHref };
+  const MENU = { label: "BACK TO MENU", href: () => "/" };
+  const KNOWN = {
+    not_found: {
+      title: "That game has finished.",
+      hint: "Games close a short while after everyone has left.",
+      way: RETRY,
+    },
+    invalid_code: {
+      title: "That game code isn't valid.",
+      hint: "Codes are six characters long.",
+      way: RETRY,
+    },
+    config_not_found: {
+      // RETRY would ask for the same missing config and land right back here.
+      title: "That saved setup is gone.",
+      hint: "Re-save it at /tune to get a new link.",
+      way: MENU,
+    },
+    server_error: {
+      title: "Couldn't start the game.",
+      hint: "Something went wrong at our end.",
+      way: RETRY,
+    },
+  };
+  roomError = KNOWN[reason] ??
+    { title: "Couldn't join the game.", hint: `(${reason})`, way: MENU };
+  // Queued frames describe a game we never entered; replaying their events
+  // over the dead end would be nonsense.
+  inbox.length = 0;
+  latestMsg = { phase: "error" };
+}
+
 function connect() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${proto}//${location.host}/ws`;
   ws = new WebSocket(url);
 
-  ws.addEventListener("open", () => console.log("[game] connected to bridge"));
+  // The browser SPEAKS FIRST.  The bridge used to open with a "pick a room"
+  // prompt and wait; the choice now arrives with the page, so stating it here
+  // costs the tab nothing and removes a screen from the path to play.
+  ws.addEventListener("open", () => {
+    console.log("[game] connected to bridge");
+    const code = pageJoinCode();
+    if (code === null) {
+      // Nothing is sent: a malformed code has no room to ask about, and the
+      // socket is left open so the close/reconnect loop never starts.
+      showRoomError("invalid_code");
+    } else if (code === "") {
+      // Creating from /config/{hash} keeps that saved config's tables.
+      ws.send(JSON.stringify({ action: "create", config: PAGE_CONFIG_HASH ?? undefined }));
+    } else {
+      ws.send(JSON.stringify({ action: "join", code }));
+    }
+  });
   ws.addEventListener("close", () => setTimeout(connect, 1_000));
   ws.addEventListener("error", (e) => console.error("[game] ws error", e));
   ws.addEventListener("message", (ev) => {
@@ -5726,20 +5524,24 @@ function connect() {
       // landed since the last one, so a frame arriving in the same rAF gap as
       // another cannot bury its one-shot events.
       inbox.push(msg);
-    } else if (msg.tag === "pre_lobby") {
-      // Bridge is asking us to pick a room.
-      resetPreLobby();
-      // Not a render frame: queued frames describe a game we are leaving, and
-      // replaying their events over a lobby screen would be nonsense.
-      inbox.length = 0;
-      latestMsg = { phase: "pre_lobby" };
     } else if (msg.tag === "joining") {
       // Bridge confirmed the room exists and is connecting us.
       // Switch to connecting screen immediately so the user gets feedback
       // and any stale error text disappears.
-      resetPreLobby();
+      roomError = null;
+      // Not a render frame: queued frames describe a game we are leaving, and
+      // replaying their events over a hold screen would be nonsense.
       inbox.length = 0;
       latestMsg = { phase: "connecting" };
+      // Pin the room INTO THE ADDRESS.  Without this a create is stated only
+      // once, and the reconnect that follows a bridge restart would state it
+      // again — spawning a fresh lobby every second the bridge is down, and
+      // stranding the boards that had joined the first one.
+      if (typeof msg.code === "string" && msg.code !== pageJoinCode()) {
+        const url = new URL(location.href);
+        url.searchParams.set("code", msg.code);
+        history.replaceState(null, "", url);
+      }
       // Adopt the lobby's config: a room created from /config/{hash} uses
       // that hash's balance tables; joiners from any page must match.
       const roomConfig = typeof msg.config === "string" ? msg.config : null;
@@ -5748,18 +5550,13 @@ function connect() {
           console.error("[game] failed to load lobby config", err));
       }
     } else if (msg.tag === "error") {
-      // Every pre-lobby action is user-initiated (C/J keys), so always show
-      // the reason.
-      const errMsg =
-        msg.reason === "not_found" ? "Lobby not found." :
-          msg.reason === "config_not_found" ? "Saved config not found — re-save it at /tune." :
-            `Error: ${msg.reason}`;
-      resetPreLobby();
-      preLobbyError = errMsg;
-      inbox.length = 0;
-      latestMsg = { phase: "pre_lobby" };
+      showRoomError(msg.reason);
     } else if (msg.tag === "full") {
-      drawFull();
+      // Through the phase, not a direct paint: the loop redraws `latestMsg`
+      // every animation frame, so a one-off paint here would be wiped by the
+      // connecting screen on the very next one.
+      inbox.length = 0;
+      latestMsg = { phase: "full" };
     }
   });
 }
@@ -5796,12 +5593,6 @@ function sendKey(key) {
 }
 
 document.addEventListener("keydown", (e) => {
-  // During pre_lobby, handle input locally — do not forward to Zig.
-  if (latestMsg && latestMsg.phase === "pre_lobby") {
-    handlePreLobbyKey(e);
-    return;
-  }
-
   if (!FORWARDED_KEYS.has(e.key)) return;
   e.preventDefault();
   // Play is REALTIME: keys stay live even while a feast replay flourishes
@@ -5844,88 +5635,44 @@ function canvasCoords(e) {
   };
 }
 
-function overRestartButton(e) {
-  if (!restartButtonActive()) return false;
+function overHoldButton(e) {
+  if (!holdButtonActive()) return false;
   const { x, y } = canvasCoords(e);
-  const r = RESTART_BUTTON;
+  const r = HOLD_BUTTON;
   return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
 }
 
 canvas.addEventListener("mousemove", (e) => {
-  restartHover = overRestartButton(e);
-  canvas.style.cursor = restartHover ? "pointer" : "default";
+  holdHover = overHoldButton(e);
+  canvas.style.cursor = holdHover ? "pointer" : "default";
 });
 
 // Starting the next round is a CLICK on the report's button — deliberately
 // not a key, so nobody mashing casts at the buzzer relaunches the game by
 // accident.  Computed from the event (not the hover flag) so touch works.
 canvas.addEventListener("click", (e) => {
-  if (!overRestartButton(e)) return;
+  if (!overHoldButton(e)) return;
+  // The dead end's button NAVIGATES rather than advances: there is no room to
+  // restart, and the socket it would be asked over is the one that failed.  A
+  // full load rather than a reconnect, so nothing from the failed attempt —
+  // the socket, the balance tables, the reconnect timer — outlives it.
+  if (latestMsg?.phase === "error") {
+    location.href = roomError?.way.href() ?? "/";
+    return;
+  }
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ action: "restart" }));
   }
 });
 
-/** Send a pre-lobby room action to the bridge. */
-function sendPreLobbyAction(action) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(action));
-  }
-}
-
-/**
- * Handle a keydown event while the pre_lobby screen is shown.
- * Input is handled entirely in the browser — nothing is forwarded to Zig.
- * @param {KeyboardEvent} e
- */
-function handlePreLobbyKey(e) {
-  e.preventDefault();
-
-  if (preLobbyMode === "choose") {
-    if (e.key === "c" || e.key === "C") {
-      // Creating from /config/{hash} keeps that saved config's tables.
-      preLobbyError = "";
-      sendPreLobbyAction({ action: "create", config: PAGE_CONFIG_HASH ?? undefined });
-    } else if (e.key === "j" || e.key === "J") {
-      preLobbyMode = "entering_code";
-      preLobbyCode = "";
-      preLobbyError = "";
-    }
-    return;
-  }
-
-  if (preLobbyMode === "entering_code") {
-    if (e.key === "Escape") {
-      preLobbyMode = "choose";
-      preLobbyCode = "";
-      preLobbyError = "";
-      return;
-    }
-    if (e.key === "Backspace") {
-      preLobbyCode = preLobbyCode.slice(0, -1);
-      preLobbyError = "";
-      return;
-    }
-    if (e.key === "Enter") {
-      if (preLobbyCode.length === 6) {
-        preLobbyError = "";
-        sendPreLobbyAction({ action: "join", code: preLobbyCode });
-      } else {
-        preLobbyError = "Code must be 6 characters.";
-      }
-      return;
-    }
-    // Accept alphanumeric characters (auto-uppercase, max 6).
-    if (preLobbyCode.length < 6 && /^[a-zA-Z0-9]$/.test(e.key)) {
-      preLobbyCode += e.key.toUpperCase();
-      preLobbyError = "";
-    }
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Boot: load assets, then start loop and connect
 // ---------------------------------------------------------------------------
+
+// Seeded, not left null: the bridge no longer opens with a screen of its own,
+// so the first thing to arrive is a render frame from a server that has to be
+// spawned first.  Without this the canvas is blank for that whole beat.
+latestMsg = { phase: "connecting" };
 
 loadAssets().then(() => {
   requestAnimationFrame(gameLoop);

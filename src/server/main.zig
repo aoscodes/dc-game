@@ -201,12 +201,13 @@ pub fn main() !void {
     session = try Session.init(allocator, join_code, &g_loaded.config);
     defer if (session) |*s| s.deinit();
 
-    // A game is ALWAYS live: launch the default encounter immediately, but
-    // hold it at the PRE-MATCH screen (the browser's recipe guide) — play
-    // begins when a tab clicks past it.  Seats can be taken meanwhile.
+    // A game is ALWAYS live: launch the default encounter immediately, already
+    // playing.  There is no screen in front of it — a tab that connects is in
+    // the game.  Nothing is lost by starting empty: `tick` disarms the bite
+    // timer while no seat is taken, so the encounter idles on a still board
+    // until the first player arrives, and the timer then arms from THAT moment.
     if (session) |*s| {
         try s.start_game(g_loaded.config.encounters.default().label);
-        s.prematch = true;
     }
 
     std.log.info("Room code: {s}", .{join_code});

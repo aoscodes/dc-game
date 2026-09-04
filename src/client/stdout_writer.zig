@@ -81,9 +81,9 @@ pub const Writer = struct {
 /// times (60Hz out, 20Hz in), which is what made the loss look intermittent.
 ///
 /// STRICT BY DESIGN: no heartbeat.  A frame goes out only when the client has
-/// something new to say, so a held game costs nothing — and both holds (the
-/// pre-match guide and the end screen) stop broadcasting `game_state`
-/// entirely, which is why `note_standing` exists.  The renderer keeps drawing
+/// something new to say, so a held game costs nothing — and the end-screen
+/// hold stops broadcasting `game_state` entirely, which is why
+/// `note_standing` exists.  The renderer keeps drawing
 /// the last frame it was given, so one emit is all a static screen needs.
 pub const RenderGate = struct {
     pending: bool = false,
@@ -110,7 +110,7 @@ pub const RenderGate = struct {
     }
 };
 
-pub const ClientPhaseTag = enum { connecting, pre_match, game, game_over };
+pub const ClientPhaseTag = enum { connecting, game, game_over };
 
 pub const LastActionEntry = struct { entity: u32, anim: c.ActionAnimation };
 
@@ -361,8 +361,6 @@ fn write_render_inner(
         // final `game_state` before `game_over` for exactly this — so it costs
         // nothing but the bytes.  `bite_settled` is cleared after one write,
         // so the outro starts once and the frames after it are static.
-        // Carried in `pre_match` too: the guide screen needs the game id and
-        // the viewer's standing (seats can be taken while it holds).
         .game = if (phase != .connecting) JsonGame{
             .encounter = game.encounter_label[0..game.encounter_label_len],
             .join_code = &game.join_code,
@@ -1012,9 +1010,9 @@ test "RenderGate: a tick's messages coalesce into one frame" {
 }
 
 test "RenderGate: standing alone arms a frame, with no board" {
-    // Both holds — the pre-match guide and the end screen — return from the
-    // session tick BEFORE it broadcasts game_state, so a gate that waited for
-    // a board would leave those screens undrawn forever.
+    // The end-screen hold returns from the session tick BEFORE it broadcasts
+    // game_state, so a gate that waited for a board would leave the report
+    // undrawn forever.
     var gate: RenderGate = .{};
     gate.note_standing();
     try testing.expect(gate.take());

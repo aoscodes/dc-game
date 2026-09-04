@@ -389,14 +389,6 @@ fn run_bot_inner(ctx: *BotCtx) !void {
                     }
                     continue;
                 }
-                if (start.prematch) {
-                    // The pre-match guide is holding play: click past it, as
-                    // the browser tab would.  Both bots may send this; the
-                    // second is a stray click the server ignores.
-                    std.debug.print("[e2e] {s} at pre-match; beginning play\n", .{ctx.name});
-                    try send_restart(&client);
-                    continue;
-                }
                 in_game = true;
                 my_player_id = start.player_id;
                 ctx.result.grid_cells =
@@ -502,14 +494,6 @@ fn send_take_slot(client: *ws.Client) !void {
     var buf: [64]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     try proto.encode(fbs.writer(), .take_slot, proto.TakeSlot{});
-    try client.writeBin(fbs.getWritten());
-}
-
-/// Advance a hold (the pre-match guide here) — the browser tab's click.
-fn send_restart(client: *ws.Client) !void {
-    var buf: [2]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    try proto.encode(fbs.writer(), .restart, {});
     try client.writeBin(fbs.getWritten());
 }
 

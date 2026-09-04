@@ -261,20 +261,38 @@ pool, hunger budget).  Saving POSTs to `/api/tune/save`:
 - The bridge content-addresses the config (`sha256` prefix) into
   `custom-configs/{hash}/` and validates it with `server --validate` —
   rejections show the loader's exact messages.
-- On success you get a **shareable `/config/{hash}` URL**.  Creating a lobby
-  from that page runs the game with that config; players joining by room
-  code adopt its balance tables automatically.
+- On success you get a **shareable `/config/{hash}` URL**.  Opening that page
+  starts a lobby running that config; players joining by room code adopt its
+  balance tables automatically.
 - Edit an existing config with `/tune?from={hash}`.
 
 Saved configs are never garbage-collected (tiny JSON dirs).
 
 ## Gameplay
 
-**Lobby**
+**Getting into a game**
 
-| Key     | Action       |
-| ------- | ------------ |
-| `Enter` | Toggle ready |
+Room choice lives entirely in the URL — there is no create/join screen.
+
+| URL                 | Effect                                       |
+| ------------------- | -------------------------------------------- |
+| `/game`             | Start a lobby on the shipped balance tables  |
+| `/config/{hash}`    | Start a lobby on that saved `/tune` config   |
+| `/game?code=XXXXXX` | Join that lobby (its config wins)            |
+
+A tab that creates a lobby rewrites its own address to include the code, so a
+reload or a dropped connection rejoins the same room instead of spawning
+another.  The code is shown in the top-right of the board while playing.
+Hardware badges never need it — they join the newest lobby on their own.
+
+Asking for a room that has closed is a dead end with one button, which starts
+a fresh game on the same page (keeping the `/config/{hash}` setup, if any).
+
+There is **no screen in front of the game**: the tile press lands on a live
+board.  An encounter launches with the server and simply waits — the bite
+timer stays disarmed until the first player takes a seat, then arms from that
+moment, so nothing is lost by starting an empty room.  The same holds between
+rounds: the report's one button starts the next encounter playing.
 
 **Play (shape wheel, realtime)**
 
@@ -384,9 +402,9 @@ e-paper via `FB:SHAPE`.
 Hybrid player model: a linked board first pairs with the oldest started tab
 session lacking a controller (it drives that tab's player); when no tab is
 free it becomes its own player — a headless Zig client named `Board-N` joined
-to the active lobby (C toggles ready). Assignment is sticky by the board's
-USB serial number: replugging returns it to its tab pairing, or (within a 30s
-grace window) to its headless player.
+to the newest lobby, or waiting until one exists. Assignment is sticky by the
+board's USB serial number: replugging returns it to its tab pairing, or (within
+a 30s grace window) to its headless player.
 
 ## Project layout
 
@@ -422,7 +440,7 @@ bridge/
 web/
   index.html             / station directory: big touch buttons to the pages below
   game.html              /game canvas shell (also served at /config/{hash})
-  game.js                canvas renderer: connecting / lobby / game / game_over phases
+  game.js                canvas renderer: connecting / game / game_over / error / full phases
   onboard.html, onboard.js    /onboard badge colour kiosk
   powerups.html, powerups.js  /powerups powerup kiosk
   tune.html, tune.js     /tune config editor

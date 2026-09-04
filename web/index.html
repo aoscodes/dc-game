@@ -119,27 +119,23 @@
   </style>
 </head>
 <body>
-<header>
-  <h1>Slime Feast</h1>
-  <p>Pick a station.</p>
-</header>
-<!-- Plain anchors, no JS: the bridge restarts (a new lobby, a reconnect, a
-     deploy) must never be able to leave this page unable to navigate. -->
 <nav>
+  <!-- One tap to a running game: /game starts a lobby on open, so there is no
+       create/join screen behind this tile.  There was, and it could only be
+       worked with the [C] and [J] keys — on a panel with no keyboard, which
+       made Play a dead end.  Joining a specific game is /game?code=XXXXXX,
+       and badges find the newest lobby by themselves. -->
   <a class="tile" href="/game">
     <span class="swatch" style="background: rgb(104, 196, 132)"></span>
-    <span class="label">Play</span>
-    <span class="hint">Feed the Lil Guys before the hunger bar fills</span>
+    <span class="label">Scan For Substance </span>
   </a>
   <a class="tile" href="/onboard">
     <span class="swatch" style="background: rgb(228, 108, 148)"></span>
-    <span class="label">Badge Setup</span>
-    <span class="hint">Plug in a badge and pick its colour</span>
+    <span class="label">Discovery</span>
   </a>
   <a class="tile" href="/powerups">
     <span class="swatch" style="background: rgb(240, 190, 70)"></span>
-    <span class="label">Powerups</span>
-    <span class="hint">Hand powerups to every badge plugged in</span>
+    <span class="label">Calibrate</span>
   </a>
 </nav>
 </body>

@@ -21,7 +21,7 @@
  * button ({ action: "restart" } → RESTART stdio line); only tabs have one.
  *
  * Responsibilities per TabSession:
- *   - Show pre_lobby screen until a room is chosen
+ *   - Create or join the room the tab's URL asks for, on its first message
  *   - Spawn ./zig-out/bin/client and manage its lifecycle
  *   - Connect to the chosen lobby's server WebSocket (owns reconnect loop)
  *   - Relay server frames → Zig stdin as  WIRE:<hex>\n
@@ -230,6 +230,13 @@ const httpServer = http.createServer((req, res) => {
   // the station directory: the kiosks are touchscreens with no keyboard and no
   // address bar, so without a page that links the stations there is no way to
   // reach one but to edit KIOSK_URL over a shell on the Pi.
+  //
+  // Opening it IS the room request: bare, it creates a lobby; with `?code=`,
+  // it joins that one.  The query string is the whole of the choice, which is
+  // what lets the directory's one Play tile reach play in a single tap — a
+  // create/join screen behind it could only be worked with a keyboard the
+  // kiosks do not have.
+  //
   // NOTE: this page alone has no link back to the directory, unlike the two
   // kiosks.  The canvas takes clicks for casting, so a corner control here is
   // a misfire waiting to happen mid-round.  A station that should never show
@@ -657,13 +664,13 @@ function spawnLobbyServer(code, port, configHash) {
 
   proc.on("error", (err) => {
     // Spawn failure (e.g. ENOENT: binary missing) emits 'error' without 'exit',
-    // so clean up here and bounce affected tabs back to pre_lobby instead of
-    // leaving them stuck on the connecting screen forever.
+    // so clean up here and show affected tabs the reason instead of leaving
+    // them stuck on the connecting screen forever.
     console.error(`[lobby] server proc error (${code}):`, err.message);
     usedPorts.delete(port);
     lobbyRegistry.delete(code);
     for (const s of activeSessions) {
-      if (s.room && s.room.code === code) s.failToPreLobby("server_error");
+      if (s.room && s.room.code === code) s.failWithError("server_error");
     }
   });
 
@@ -764,7 +771,7 @@ class TabSession extends PlayerSession {
 
   onZigSpawnError(_err) {
     // Without handling, the tab hangs on "Connecting..." forever.
-    this.failToPreLobby("server_error");
+    this.failWithError("server_error");
   }
 
   // ---- Room routing -------------------------------------------------------
@@ -789,21 +796,24 @@ class TabSession extends PlayerSession {
   }
 
   /**
-   * Send a pre_lobby error to the browser and reset to pre_lobby state so the
-   * user can try again.
+   * Tell the browser this tab has no room.  Terminal from the tab's point of
+   * view: room choice is made by its URL, so there is nothing it can amend in
+   * place and it shows a dead end offering the station directory.
    * @param {string} reason
    */
-  sendPreLobbyError(reason) {
+  sendRoomError(reason) {
     if (this.tabWs.readyState === WebSocket.OPEN) {
       this.tabWs.send(JSON.stringify({ tag: "error", reason }));
     }
   }
 
   /**
-   * Handle a browser action message while in the pre_lobby state.
-   * @param {{ action: string, code?: string, player_id?: number }} msg
+   * Handle the room request a tab sends the moment its socket opens.  The tab
+   * reads it off its own URL — `/game` and `/config/{hash}` create, `?code=`
+   * joins — so this runs once per session, before any key can be forwarded.
+   * @param {{ action: string, code?: string, config?: string }} msg
    */
-  async handlePreLobbyAction(msg) {
+  async handleRoomAction(msg) {
     if (this.started) return; // already in a room
 
     if (msg.action === "create") {
@@ -812,7 +822,7 @@ class TabSession extends PlayerSession {
       if (typeof msg.config === "string" && msg.config.length > 0) {
         if (!HASH_RE.test(msg.config) || !fs.existsSync(dataDirFor(msg.config))) {
           console.warn(`[lobby] create with unknown config '${msg.config}'`);
-          this.sendPreLobbyError("config_not_found");
+          this.sendRoomError("config_not_found");
           return;
         }
         configHash = msg.config;
@@ -821,16 +831,17 @@ class TabSession extends PlayerSession {
       let port;
       try { port = await findFreePort(); } catch (err) {
         console.error("[lobby] findFreePort failed:", err);
-        this.sendPreLobbyError("server_error");
+        this.sendRoomError("server_error");
         return;
       }
       const room = spawnLobbyServer(code, port, configHash);
       console.log(`[lobby] created room code=${code} port=${port}`);
-      // Acknowledge before the Zig client has connected so the browser
-      // transitions away from pre_lobby immediately.  `config` lets the tab
-      // load the matching balance tables.
+      // Acknowledge before the Zig client has connected so the browser shows
+      // the connecting screen immediately.  `config` lets the tab load the
+      // matching balance tables; `code` is what it pins into its own URL, so
+      // a reconnect rejoins THIS room instead of asking for another one.
       if (this.tabWs.readyState === WebSocket.OPEN) {
-        this.tabWs.send(JSON.stringify({ tag: "joining", config: room.configHash }));
+        this.tabWs.send(JSON.stringify({ tag: "joining", code: room.code, config: room.configHash }));
       }
       this.startInRoom(room);
       return;
@@ -839,52 +850,50 @@ class TabSession extends PlayerSession {
     if (msg.action === "join") {
       const rawCode = (msg.code || "").toUpperCase().trim();
       if (rawCode.length !== 6) {
-        this.sendPreLobbyError("invalid_code");
+        this.sendRoomError("invalid_code");
         return;
       }
       const room = lobbyRegistry.get(rawCode);
       if (!room) {
         console.log(`[lobby] join: code=${rawCode} not found; registry=${[...lobbyRegistry.keys()].join(",") || "(empty)"}`);
-        this.sendPreLobbyError("not_found");
+        this.sendRoomError("not_found");
         return;
       }
       console.log(`[lobby] join: code=${rawCode} found, routing tab`);
-      // Acknowledge immediately so the browser clears the pre_lobby screen
+      // Acknowledge immediately so the browser leaves the connecting screen
       // before the Zig client finishes connecting to the server.  `config`
       // makes joiners adopt the lobby's balance tables (may differ from the
       // page they joined from).
       if (this.tabWs.readyState === WebSocket.OPEN) {
-        this.tabWs.send(JSON.stringify({ tag: "joining", config: room.configHash }));
+        this.tabWs.send(JSON.stringify({ tag: "joining", code: room.code, config: room.configHash }));
       }
       this.startInRoom(room);
       return;
     }
 
-    console.warn("[bridge] unknown pre_lobby action:", msg.action);
+    console.warn("[bridge] unknown room action:", msg.action);
   }
 
   // ---- Lifecycle ----------------------------------------------------------
 
-  /** Announce the pre_lobby state to the browser and wait for a room choice. */
-  sendPreLobby() {
-    if (this.tabWs.readyState === WebSocket.OPEN) {
-      this.tabWs.send(JSON.stringify({ tag: "pre_lobby" }));
-    }
-  }
-
   /**
-   * Abort the current room attempt and return the tab to the pre_lobby
-   * screen with an error, so the user can retry without a page refresh.
-   * Unlike teardown(), the browser WebSocket stays open.
+   * Abort the current room attempt and show the tab a dead end.  Unlike
+   * teardown(), the browser WebSocket stays open — closing it would start the
+   * tab's reconnect loop, which would re-state the same doomed request every
+   * second and bury the reason under a flickering connecting screen.
+   *
+   * `started` is cleared so a tab that does come back around (a reload, a
+   * hand-edited URL) is treated as a fresh request rather than one already in
+   * a room.
    * @param {string} reason
    */
-  failToPreLobby(reason) {
+  failWithError(reason) {
     if (this.closed) return;
     this.closeShared();
     if (this.room) { roomTabLeft(this.room); this.room = null; }
     this.started = false;
-    console.warn(`[bridge] tab bounced to pre_lobby (${reason})`);
-    this.sendPreLobbyError(reason);
+    console.warn(`[bridge] tab left without a room (${reason})`);
+    this.sendRoomError(reason);
   }
 
   teardown() {
@@ -1172,18 +1181,18 @@ browserWss.on("connection", (tabWs) => {
       return;
     }
 
-    // Room-selection actions are handled before a room is chosen.
+    // create / join, sent unprompted the moment the tab's socket opens.
     if (typeof msg.action === "string") {
-      session.handlePreLobbyAction(msg).catch((err) => {
-        console.error("[bridge] handlePreLobbyAction error:", err);
-        session.sendPreLobbyError("server_error");
+      session.handleRoomAction(msg).catch((err) => {
+        console.error("[bridge] handleRoomAction error:", err);
+        session.sendRoomError("server_error");
       });
       return;
     }
   });
 
-  // Tell the browser to show the lobby-selection screen.
-  session.sendPreLobby();
+  // Nothing is sent to open with: the tab already knows which room it wants
+  // (its URL says so) and states it without being asked.
 });
 
 // ---------------------------------------------------------------------------
