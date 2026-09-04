@@ -10,7 +10,7 @@
  *                      CTRL:BTN <name> <D|U>   button press/release edges
  *                      CTRL:STAT appetite=<u32> babies=<a,b,c,d,e>
  *                                critter=<0..4> led=<rrggbb>,<rrggbb>,<rrggbb>
- *                                seed=<u32 hex>
+ *                                seed=<u32 hex> powerups=<a[,b,...]>
  *                                              persistent flash stats, sent
  *                                              once after CTRL:HELLO; appetite
  *                                              feeds the player's hunger
@@ -23,14 +23,27 @@
  *                                              brood seed, which is what its
  *                                              BABIES look like: the renderer
  *                                              rolls one palette per badge
- *                                              from it.  Every key but
- *                                              appetite is absent on old
+ *                                              from it.  powerups is what the
+ *                                              badge CARRIES (one count per
+ *                                              powerup kind, ordinal order),
+ *                                              handed out at the /powerups
+ *                                              kiosk; the badge only counts
+ *                                              them, this side decides what
+ *                                              holding one means.  Every key
+ *                                              but appetite is absent on old
  *                                              firmware; each falls back on
  *                                              its own.
  *                      CTRL:SCORE_ACK g=<u32>  score banked to flash (sent
  *                                              AFTER the save; re-sent on retries)
  *                      CTRL:LED_ACK g=<u32>    palette banked to flash, on
  *                                              exactly the same terms
+ *                      CTRL:POWERUP_ACK g=<u32> p=<a[,b,...]>
+ *                                              powerup banked to flash, same
+ *                                              terms again, and carrying the
+ *                                              RESULTING counts — the kiosk
+ *                                              shows a number going up, and
+ *                                              the badge's own copy is the
+ *                                              only one that cannot drift
  *   bridge -> board:   GAME:HELLO v=1          link request (repeated until acked)
  *                      GAME:HB                 1s keepalive
  *                      GAME:PHASE <game|over>  session phase edge: "game" while
@@ -61,6 +74,18 @@
  *                                              board to bank into its flash.
  *                                              g = per-roll id; retried every
  *                                              1s until acked, bounded.
+ *                      POWERUP:GRANT k=<0..N-1> g=<u32>
+ *                                              add ONE powerup of kind k to
+ *                                              the badge's permanent
+ *                                              inventory, from the /powerups
+ *                                              kiosk.  g = per-grant id;
+ *                                              retried every 1s until acked,
+ *                                              bounded.  An INCREMENT, not a
+ *                                              total: the badge's count is
+ *                                              the only copy that matters, so
+ *                                              its dedupe on g — not any
+ *                                              bookkeeping here — is what
+ *                                              stops a retry granting twice.
  *
  * Unknown lines in either direction are ignored (the board emits unrelated
  * sibling-link chatter like "dev cnt=..." until the link is established).
@@ -113,6 +138,46 @@ function parseBabyList(text) {
   return counts;
 }
 
+// Powerup kinds a badge can carry, in the ordinal order that IS their flash
+// and wire identity — must match the firmware's powerup_kind_t
+// (board/src/game/types.h) and the kiosk's button list (web/powerups.js).
+// Three copies with no codegen between them, exactly as BABY_TYPE_COUNT
+// already is; appending is safe, reordering is not.
+const POWERUP_KIND_COUNT = 1;
+
+// Display names for those ordinals, for the operator console. Used nowhere
+// that matters to the protocol — the wire carries the ordinal — so a name may
+// be improved freely.
+const POWERUP_NAMES = ["neutralizer canister"];
+
+// The badge's per-kind ceiling: firmware stores each count in a u8 and
+// SATURATES rather than wrapping (board/src/store/store.h POWERUP_COUNT_MAX),
+// so a count above this did not come from a badge and never will.
+const POWERUP_COUNT_MAX = 255;
+
+/**
+ * Parse a badge's powerup counts, "a,b,c", into POWERUP_KIND_COUNT u8s.
+ *
+ * Rejects the whole list on a miscount rather than padding or truncating: a
+ * badge running firmware that knows a different number of kinds is reporting
+ * counts this side cannot align to ordinals, and a silently shifted list
+ * would read as the wrong powerup rather than as nothing.
+ *
+ * @returns {number[] | null} null when malformed or miscounted
+ */
+function parsePowerupList(text) {
+  const parts = text.split(",");
+  if (parts.length !== POWERUP_KIND_COUNT) return null;
+  const counts = [];
+  for (const p of parts) {
+    if (!/^\d+$/.test(p.trim())) return null;
+    const n = Number(p.trim());
+    if (n > POWERUP_COUNT_MAX) return null;
+    counts.push(n >>> 0);
+  }
+  return counts;
+}
+
 const { SerialPort } = require("serialport");
 const { ReadlineParser } = require("@serialport/parser-readline");
 const { PlayerSession } = require("./session");
@@ -148,6 +213,15 @@ const SCORE_RETRY_MAX = 5;
 // doubles as how long a player stares at a stalled kiosk.
 const PALETTE_RETRY_MS = 1000;
 const PALETTE_RETRY_MAX = 5;
+// POWERUP:GRANT retry cadence and cap, on the palette's reasoning again: the
+// board parks its renderer around the flash erase, and the /powerups kiosk is
+// waiting on the ack to show the new count. Giving up is safe here BECAUSE
+// the board dedupes on the grant id — an ack lost after the save still leaves
+// the powerup granted, so the worst case of exhausting the cap is a kiosk
+// that reports a failure for a badge that in fact got it. Under-granting is
+// impossible; over-granting is what the cap and the dedupe together prevent.
+const POWERUP_RETRY_MS = 1000;
+const POWERUP_RETRY_MAX = 5;
 
 // How many colours a palette carries: one per RGB LED on the badge
 // (LED_RGB_COUNT in the firmware's led/rgb.h). The onboarding screen's three
@@ -238,6 +312,19 @@ function nextPaletteId() {
   return lastPaletteId;
 }
 
+// Grant ids for POWERUP:GRANT, on those same terms — and here uniqueness is
+// load-bearing rather than merely tidy, because the board's dedupe on this id
+// is the ONLY thing standing between a retry and a second powerup. Two boards
+// granted in the same millisecond get different ids (the +1 branch), and a
+// bridge restarted within the same millisecond as its last grant cannot
+// reissue one, because the clock is what seeds it.
+let lastPowerupId = 0;
+function nextPowerupId() {
+  const t = Date.now() >>> 0;
+  lastPowerupId = t > lastPowerupId ? t : (lastPowerupId + 1) >>> 0;
+  return lastPowerupId;
+}
+
 // Identifies one LINK, not one board.  The /onboard screen addresses badges by
 // this and nothing else, which is what makes its queue correct: a badge that
 // is unplugged and replugged is a new link and so is rolled again, while a
@@ -285,6 +372,13 @@ class Controller {
      *  panel is 1bpp, so it has no reason to own an opinion about the shade,
      *  and a seed is the whole brood in four bytes with nothing in flash. */
     this.broodSeed = null;
+    /** Powerups this badge CARRIES (CTRL:STAT, then every CTRL:POWERUP_ACK),
+     *  per powerup kind ordinal; zeros until it says.
+     *
+     *  Mirrored from the badge rather than counted here, and re-read from
+     *  every ack: the badge's flash is the only copy, it saturates at 255,
+     *  and it survives a bridge restart the way nothing on this side does. */
+    this.powerups = new Array(POWERUP_KIND_COUNT).fill(0);
     /** Whether this board's one-per-link CTRL:STAT has been accounted for.
      *
      *  This board does not become a player until it has (see
@@ -311,6 +405,9 @@ class Controller {
     /** In-flight LED:SET ({ line, gid, attempts, done }), or null. */
     this.palettePending = null;
     this.paletteTimer = null;
+    /** In-flight POWERUP:GRANT ({ line, gid, attempts, done }), or null. */
+    this.powerupPending = null;
+    this.powerupTimer = null;
     this.closed = false;
   }
 
@@ -371,12 +468,20 @@ class Controller {
    * rather than sent as a default.  The client's "unreported" is a distinct
    * state from any value that could stand in for it.
    *
+   * Powerups are NOT omitted: they ride with appetite and babies, always
+   * sent.  There is no "unreported" state for them - a board that has never
+   * been granted anything genuinely carries none, and the server needs the
+   * count either way to size the charge grant it makes on the player's
+   * behalf.  `this.powerups` starts at all zeros and is only ever replaced by
+   * a full list the badge itself reported, so this line is never a guess.
+   *
    * @returns {string[]} newline-terminated lines, in read order
    */
   statLines() {
     const lines = [
       `STAT:appetite=${this.appetite}\n`,
       `STAT:babies=${this.babies.join(",")}\n`,
+      `STAT:powerups=${this.powerups.join(",")}\n`,
     ];
     if (this.critter !== null) lines.push(`STAT:critter=${this.critter}\n`);
     if (this.led !== null) {
@@ -497,6 +602,15 @@ class Controller {
           known = true;
           continue;
         }
+        const powerups = arg.match(/^powerups=([\d,]+)$/);
+        if (powerups !== null) {
+          const counts = parsePowerupList(powerups[1]);
+          if (counts !== null) {
+            this.powerups = counts;
+            known = true;
+          }
+          continue;
+        }
       }
       if (!known) {
         console.warn(`[ctrl] unknown stat line '${line}' from ${this.path}`);
@@ -514,7 +628,8 @@ class Controller {
         `led=${this.led === null ? "unset" : this.led
           .map((c) => c.toString(16).padStart(6, "0")).join(",")}, ` +
         `seed=${this.broodSeed === null ? "unreported"
-          : this.broodSeed.toString(16).padStart(8, "0")})`);
+          : this.broodSeed.toString(16).padStart(8, "0")}, ` +
+        `powerups=${this.powerups.join(",")})`);
       // Forward to the player; the stats only count if they land before the
       // seat is taken (the server freezes the share at count time).  Usually
       // a no-op: the board reports once per link, which is normally before
@@ -554,6 +669,40 @@ class Controller {
       if (this.palettePending !== null && arg === `g=${this.palettePending.gid}`) {
         console.log(`[ctrl] palette banked (uid=${this.uid}, ${arg})`);
         this.clearPaletteRetry(null); // null is the success reason; see below
+      }
+      return;
+    }
+
+    if (line.startsWith("CTRL:POWERUP_ACK ")) {
+      // Granted and banked on the board. The ack carries the badge's
+      // RESULTING counts, so this is also where the mirror is refreshed —
+      // including for the saturated badge, whose numbers do not move.
+      const arg = line.slice("CTRL:POWERUP_ACK ".length).trim();
+      const m = arg.match(/^g=(\d+) p=([\d,]+)$/);
+      if (m === null) {
+        console.warn(`[ctrl] malformed powerup ack '${line}' from ${this.path}`);
+        return;
+      }
+      const counts = parsePowerupList(m[2]);
+      if (counts === null) {
+        // A count list this side cannot align to its own ordinals is worse
+        // than no list: the mirror keeps the last good one and the grant is
+        // left to time out, so the kiosk reports a failure rather than a
+        // confident wrong number.
+        console.warn(
+          `[ctrl] powerup ack with unreadable counts '${line}' from ${this.path}`);
+        return;
+      }
+      // Recorded even for a stale ack (an earlier grant's retries): the
+      // counts are the badge's own and are news whichever grant produced
+      // them. Only the settling below is gated on the id.
+      this.powerups = counts;
+      if (this.powerupPending !== null &&
+          Number(m[1]) === this.powerupPending.gid) {
+        console.log(
+          `[ctrl] powerup banked (uid=${this.uid}, g=${m[1]}, ` +
+          `powerups=${counts.join(",")})`);
+        this.clearPowerupRetry(null); // null is the success reason
       }
       return;
     }
@@ -702,6 +851,72 @@ class Controller {
     if (pending !== null && reason !== undefined) pending.done(reason);
   }
 
+  /**
+   * Hand this badge ONE powerup of `kind` to keep: POWERUP:GRANT retried
+   * until CTRL:POWERUP_ACK (or the bounded attempts run out).
+   *
+   * The grant id is what makes the retries safe. This side deliberately does
+   * NOT keep its own running total to add to — the badge's flash is the only
+   * copy, and an increment the badge dedupes is the one shape that survives
+   * a retry, a relink and a bridge restart without either end having to know
+   * what the other thinks the count is.
+   *
+   * One in flight per board: a second grant to a badge still waiting on the
+   * first supersedes it, on the palette's terms. That is a kiosk mash rather
+   * than a lost powerup — the superseded one may well already be in flash,
+   * which is exactly why its callback settles as an error rather than a
+   * silent success. The counts in the next ack are the truth either way.
+   *
+   * @param {number} kind  powerup ordinal, 0..POWERUP_KIND_COUNT-1
+   * @param {(err: string | null) => void} done  called exactly once: null on
+   *   ack, else a reason.
+   */
+  sendPowerup(kind, done) {
+    if (!Number.isInteger(kind) || kind < 0 || kind >= POWERUP_KIND_COUNT) {
+      done("bad_kind");
+      return;
+    }
+    if (!this.linked) { done("not_linked"); return; }
+    const gid = nextPowerupId();
+    this.clearPowerupRetry("superseded");
+    this.powerupPending = {
+      line: `POWERUP:GRANT k=${kind} g=${gid}`,
+      gid,
+      attempts: 0,
+      done,
+    };
+    const attempt = () => {
+      const p = this.powerupPending;
+      if (p === null) return;
+      if (p.attempts >= POWERUP_RETRY_MAX) {
+        console.warn(
+          `[ctrl] powerup never acked (uid=${this.uid}, g=${p.gid}); giving up`,
+        );
+        this.clearPowerupRetry("no_ack");
+        return;
+      }
+      p.attempts++;
+      this.write(p.line);
+    };
+    this.powerupTimer = setInterval(attempt, POWERUP_RETRY_MS);
+    attempt();
+  }
+
+  /**
+   * Drop any in-flight POWERUP:GRANT, settling its callback exactly once —
+   * the single place a grant ends, on clearPaletteRetry's terms.
+   *
+   * @param {string | null} [reason]  null = acked, string = why it failed,
+   *   absent = there was no grant to settle
+   */
+  clearPowerupRetry(reason) {
+    if (this.powerupTimer !== null) clearInterval(this.powerupTimer);
+    this.powerupTimer = null;
+    const pending = this.powerupPending;
+    this.powerupPending = null;
+    if (pending !== null && reason !== undefined) pending.done(reason);
+  }
+
   close() {
     this.closed = true;
     if (this.helloTimer !== null) clearInterval(this.helloTimer);
@@ -712,6 +927,11 @@ class Controller {
     // Unplugged mid-roll: settle the waiting onboarding screen so it can skip
     // this badge instead of hanging on an ack that can never arrive.
     this.clearPaletteRetry("unlinked");
+    // Same for a grant in flight. Note this does NOT mean the powerup was not
+    // granted — the badge may have banked it and been unplugged before the
+    // ack — so the kiosk reports it as unknown-for-this-badge, and the next
+    // link's CTRL:STAT settles the question with the badge's own count.
+    this.clearPowerupRetry("unlinked");
     this.helloTimer = null;
     this.hbTimer = null;
     if (this.port && this.port.isOpen) {
@@ -845,6 +1065,8 @@ class ControllerManager {
     /** @type {Map<string, Controller>} port path -> controller */
     this.controllers = new Map();
     this.scanTimer = null;
+    /** Tail of the serialised powerup-grant queue (see grantPowerup). */
+    this.grantQueue = Promise.resolve();
   }
 
   /** A board linked or went away. */
@@ -875,6 +1097,98 @@ class ControllerManager {
       if (c.linked && c.linkId === linkId) return c;
     }
     return null;
+  }
+
+  /**
+   * Hand ONE powerup of `kind` to every linked badge, then report what each
+   * of them now carries on this process's stdout.
+   *
+   * This is the /powerups kiosk's whole job. Two things about the targeting
+   * are deliberate:
+   *
+   * Every LINKED board, not every open port. A board that is plugged in but
+   * has not completed the CTRL:HELLO handshake has no link id, cannot be
+   * addressed, and would silently drop the line; it is counted in the report
+   * as skipped rather than pretended at. It is not waited for either — the
+   * operator pressed a button and wants an answer, and a badge that links a
+   * second later simply did not get this grant.
+   *
+   * Fan-out with no all-or-nothing: each badge settles on its own, and one
+   * that never acks does not hold up or roll back the others. There is no
+   * transaction to be had here anyway — the powerups are already in other
+   * badges' flash by then.
+   *
+   * The stdout report is the point of the feature, not a debug aid: the badge
+   * is the only place a powerup count lives, so this log is the sole record
+   * that a grant happened at all, and it prints each badge's counts as the
+   * BADGE reports them (from the ack), never as this side's arithmetic.
+   *
+   * @param {number} kind  powerup ordinal, 0..POWERUP_KIND_COUNT-1
+   * Grants are SERIALISED across callers: a second one waits for the first to
+   * settle rather than superseding it board-by-board. A badge can only have
+   * one grant in flight, and superseding one is genuinely ambiguous — the
+   * superseded grant may already be in the badge's flash — so the one case
+   * where that could happen (a double-pressed button, or two kiosk tabs) is
+   * removed rather than reported. The wait is bounded by the retry cap.
+   *
+   * @param {number} kind  powerup ordinal, 0..POWERUP_KIND_COUNT-1
+   * @returns {Promise<{kind: number, results: Array<{
+   *   uid: string, linkId: number | null, ok: boolean,
+   *   reason: string | null, powerups: number[]}>}>}
+   *   Resolves once every targeted badge has settled. Never rejects: a badge
+   *   that failed is a result with ok:false, because the kiosk has to show
+   *   the other badges' new counts regardless.
+   */
+  grantPowerup(kind) {
+    // Tail of the queue, never rejected (grantOne does not throw), so one
+    // grant cannot poison every later one.
+    this.grantQueue = this.grantQueue.then(() => this.grantOne(kind));
+    return this.grantQueue;
+  }
+
+  /** One serialised grant pass. Call through grantPowerup, not directly. */
+  async grantOne(kind) {
+    if (!Number.isInteger(kind) || kind < 0 || kind >= POWERUP_KIND_COUNT) {
+      console.warn(`[ctrl] powerup grant refused: no such kind ${kind}`);
+      return { kind, results: [] };
+    }
+    const name = POWERUP_NAMES[kind] ?? `kind ${kind}`;
+    const targets = [...this.controllers.values()]
+      .filter((c) => c.linked)
+      .sort((a, b) => a.linkId - b.linkId);
+    const skipped = this.controllers.size - targets.length;
+
+    console.log(
+      `[ctrl] granting 1 ${name} to ${targets.length} badge(s)` +
+      (skipped > 0 ? `; ${skipped} plugged but unlinked, skipped` : ""));
+
+    const results = await Promise.all(targets.map((ctrl) =>
+      new Promise((resolve) => {
+        ctrl.sendPowerup(kind, (err) => resolve({
+          uid: ctrl.uid,
+          linkId: ctrl.linkId,
+          ok: err === null,
+          reason: err,
+          // Read after settling, so a success carries the counts the ack
+          // just delivered. A failure carries the last ones known, which
+          // may predate the grant — the badge is the authority and it did
+          // not answer.
+          powerups: [...ctrl.powerups],
+        }));
+      })));
+
+    const granted = results.filter((r) => r.ok).length;
+    console.log(
+      `[ctrl] powerups: ${granted}/${results.length} badge(s) banked 1 ${name}`);
+    for (const r of results) {
+      const counts = r.powerups
+        .map((n, i) => `${POWERUP_NAMES[i] ?? `kind ${i}`}=${n}`)
+        .join(" ");
+      console.log(
+        `[ctrl]   uid=${r.uid} link=${r.linkId} ` +
+        `${r.ok ? "ok" : `FAILED (${r.reason})`}  ${counts}`);
+    }
+    return { kind, results };
   }
 
   start() {
@@ -982,5 +1296,8 @@ module.exports = {
   // (index.js's /api/dev routes) against the same constants the parser uses.
   BABY_TYPE_COUNT,
   PALETTE_COLOR_COUNT,
+  POWERUP_KIND_COUNT,
+  POWERUP_COUNT_MAX,
+  POWERUP_NAMES,
   isPalette,
 };

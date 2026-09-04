@@ -129,7 +129,7 @@ function stdinLines(ctrl) {
   return sent;
 }
 
-const FULL = "CTRL:STAT appetite=7 babies=1,0,2,0,0 critter=3 " +
+const FULL = "CTRL:STAT appetite=7 babies=1,0,2,0,0 powerups=3 critter=3 " +
   "led=d4506e,7ac0a0,e8c46a seed=1f3c9a04";
 
 // --- the parser ------------------------------------------------------------
@@ -138,6 +138,7 @@ const FULL = "CTRL:STAT appetite=7 babies=1,0,2,0,0 critter=3 " +
   ctrl.onLine(FULL);
   eq(ctrl.appetite, 7, "appetite parsed");
   eq(ctrl.babies.join(","), "1,0,2,0,0", "babies parsed");
+  eq(ctrl.powerups.join(","), "3", "powerups parsed");
   eq(ctrl.critter, 3, "critter parsed");
   eq(JSON.stringify(ctrl.led), JSON.stringify([0xd4506e, 0x7ac0a0, 0xe8c46a]),
     "led parsed as packed u24s");
@@ -163,6 +164,7 @@ const FULL = "CTRL:STAT appetite=7 babies=1,0,2,0,0 critter=3 " +
 
   check(sent.includes("STAT:appetite=7\n"), "appetite reaches the client");
   check(sent.includes("STAT:babies=1,0,2,0,0\n"), "babies reach the client");
+  check(sent.includes("STAT:powerups=3\n"), "powerups reach the client");
   check(sent.includes("STAT:critter=3\n"), "critter reaches the client");
   check(sent.includes("STAT:led=d4506e,7ac0a0,e8c46a\n"),
     "led reaches the client");
@@ -170,12 +172,12 @@ const FULL = "CTRL:STAT appetite=7 babies=1,0,2,0,0 critter=3 " +
 
   // Stated as a count too, so a stat added to the report and forgotten here
   // shows up as a failure rather than passing by omission.
-  eq(sent.length, 5, "every reported stat is forwarded and nothing else");
+  eq(sent.length, 6, "every reported stat is forwarded and nothing else");
 
   // Hex is zero-padded per channel: "0a" must not collapse to "a", which
   // would shift every following digit and recolour the creature.
   const ctrl2 = mkBoard();
-  ctrl2.onLine("CTRL:STAT appetite=0 babies=0,0,0,0,0 critter=0 " +
+  ctrl2.onLine("CTRL:STAT appetite=0 babies=0,0,0,0,0 powerups=0 critter=0 " +
     "led=000a0b,0c0d0e,0f1011");
   check(stdinLines(ctrl2).includes("STAT:led=000a0b,0c0d0e,0f1011\n"),
     "led channels stay zero-padded through the round trip");
@@ -225,10 +227,35 @@ const FULL = "CTRL:STAT appetite=7 babies=1,0,2,0,0 critter=3 " +
   eq(ctrl.critter, null, "old firmware reports no critter");
   eq(ctrl.led, null, "old firmware reports no palette");
   eq(ctrl.broodSeed, null, "old firmware reports no brood seed");
+  eq(ctrl.powerups.join(","), "0", "old firmware carries no powerups");
   const sent = stdinLines(ctrl);
-  eq(sent.length, 2, "only the stats it actually has are forwarded");
+  eq(sent.length, 3, "only the stats it actually has are forwarded");
   check(sent.includes("STAT:babies=0,0,0,0,0\n"),
     "babies default to none rather than going missing");
+  check(sent.includes("STAT:powerups=0\n"),
+    "...and so do powerups: carrying none is an ANSWER, not a silence");
+}
+
+// --- carrying nothing is not the same as saying nothing --------------------
+//
+// The rule that separates powerups from critter/led/seed. The cosmetic three
+// are withheld when unreported, because the client draws something different
+// for "unknown" than for any value. A powerup count has no such state: the
+// server turns it into charges, and a missing line would leave the player
+// holding whatever the previous STAT set — so zero must be SENT.
+{
+  const ctrl = mkBoard();
+  ctrl.onLine("CTRL:STAT appetite=1 powerups=4");
+  check(stdinLines(ctrl).includes("STAT:powerups=4\n"), "a full badge reports 4");
+
+  ctrl.onLine("CTRL:STAT appetite=1 powerups=0");
+  check(stdinLines(ctrl).includes("STAT:powerups=0\n"),
+    "a badge that spent them down to zero says so, rather than going quiet");
+
+  // A miscounted list is refused whole, same as a short led list: a partial
+  // tally would silently zero the kinds it omitted.
+  ctrl.onLine("CTRL:STAT powerups=1,2");
+  eq(ctrl.powerups.join(","), "0", "a miscounted powerup list is refused");
 }
 
 // --- a board with no stats yet ---------------------------------------------
@@ -238,7 +265,7 @@ const FULL = "CTRL:STAT appetite=7 babies=1,0,2,0,0 critter=3 " +
 // on a line that is not coming.
 {
   const sent = stdinLines(mkBoard());
-  eq(sent.length, 2, "a silent board still forwards its defaults");
+  eq(sent.length, 3, "a silent board still forwards its defaults");
   check(sent.includes("STAT:appetite=0\n"), "default appetite forwarded");
 }
 
@@ -298,7 +325,7 @@ const FULL = "CTRL:STAT appetite=7 babies=1,0,2,0,0 critter=3 " +
     eq(b.built.length, 0, "still waiting before the deadline");
     b.fireDeadline();
     eq(b.built.length, 1, "the deadline seats a silent board anyway");
-    eq(b.built[0].length, 2, "...at defaults, with no invented appearance");
+    eq(b.built[0].length, 3, "...at defaults, with no invented appearance");
 
     // The deadline fired and gave up; a stat line arriving later must not
     // produce a second player for the same board.

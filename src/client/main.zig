@@ -28,6 +28,12 @@ const STAT_BABIES_PREFIX = "STAT:babies=";
 const STAT_CRITTER_PREFIX = "STAT:critter=";
 const STAT_LED_PREFIX = "STAT:led=";
 const STAT_SEED_PREFIX = "STAT:seed=";
+/// The board's banked powerups as a comma list per PowerupKind ordinal, e.g.
+/// "STAT:powerups=3".  Same lifecycle as the appetite line.  Unlike the three
+/// cosmetic lines above, this one is sent for EVERY board, zeros included: a
+/// badge carrying nothing is a fact the bridge knows, not one it is waiting
+/// on, and the server needs the count either way to size the charge grant.
+const STAT_POWERUPS_PREFIX = "STAT:powerups=";
 
 /// How often the loop WAKES.  Not how often it emits: input is forwarded at
 /// this rate to keep presses responsive, while render frames go out only when
@@ -127,6 +133,9 @@ var g_babies: c.BabyCounts = [_]u32{0} ** c.BabyType.size;
 // Cosmetic appearance for take_slot, set via the STAT:critter= and STAT:led=
 // stdio lines; same lifecycle and threading story as g_appetite.
 var g_appearance: proto.Appearance = .{};
+// Powerups for take_slot, set via the STAT:powerups= stdio line; same
+// lifecycle and threading story as g_appetite.
+var g_powerups: c.PowerupCounts = [_]u8{0} ** c.PowerupKind.size;
 
 var g_stdout_mu: std.Thread.Mutex = .{};
 
@@ -201,8 +210,13 @@ fn stdin_reader(_: void) void {
                 continue;
             };
         } else if (std.mem.startsWith(u8, trimmed, STAT_BABIES_PREFIX)) {
-            g_babies = parse_baby_counts(trimmed[STAT_BABIES_PREFIX.len..]) orelse {
+            g_babies = parse_count_list(u32, c.BabyType.size, trimmed[STAT_BABIES_PREFIX.len..]) orelse {
                 std.log.warn("bad babies stat line: {s}", .{trimmed});
+                continue;
+            };
+        } else if (std.mem.startsWith(u8, trimmed, STAT_POWERUPS_PREFIX)) {
+            g_powerups = parse_count_list(u8, c.PowerupKind.size, trimmed[STAT_POWERUPS_PREFIX.len..]) orelse {
+                std.log.warn("bad powerups stat line: {s}", .{trimmed});
                 continue;
             };
         } else if (std.mem.startsWith(u8, trimmed, STAT_CRITTER_PREFIX)) {
@@ -251,15 +265,24 @@ fn emit_send(bytes: []const u8) void {
     stdout_writer().write_send(bytes);
 }
 
-/// Parse a "n,n,n,n,n" comma list into per-type baby counts.  Null on any
-/// malformed or miscounted list, so a garbled stat line is ignored whole
-/// rather than half-applied.
-fn parse_baby_counts(list: []const u8) ?c.BabyCounts {
-    var counts: c.BabyCounts = [_]u32{0} ** c.BabyType.size;
+/// Parse a "n,n,n" comma list of exactly `n` decimal counts — the shape every
+/// per-kind tally arrives in on a STAT line (babies per BabyType, powerups per
+/// PowerupKind).
+///
+/// Null on any malformed or MISCOUNTED list, so a garbled stat line is ignored
+/// whole rather than half-applied: a short list would otherwise silently zero
+/// the kinds it omitted, and since the board is the only source for these
+/// numbers there would be nothing left to correct it.  Keeping the previous
+/// tally standing is the safer failure — it is at worst stale, never invented.
+///
+/// The count is a parameter rather than read from the array type so a caller
+/// that has drifted out of step with the enum fails to COMPILE here.
+fn parse_count_list(comptime T: type, comptime n: usize, list: []const u8) ?[n]T {
+    var counts: [n]T = [_]T{0} ** n;
     var it = std.mem.splitScalar(u8, list, ',');
     for (&counts) |*count| {
         const field = it.next() orelse return null;
-        count.* = std.fmt.parseInt(u32, std.mem.trim(u8, field, " "), 10) catch return null;
+        count.* = std.fmt.parseInt(T, std.mem.trim(u8, field, " "), 10) catch return null;
     }
     if (it.next() != null) return null;
     return counts;
@@ -275,6 +298,7 @@ fn send_take_slot() void {
         .appetite = g_appetite,
         .babies = g_babies,
         .appearance = g_appearance,
+        .powerups = g_powerups,
     }) catch return;
     emit_send(fbs.getWritten());
 }

@@ -211,6 +211,15 @@ const SlimeGridJson = struct {
     cols: u8,
 };
 
+/// Tuning for the powerups a badge carries in.  Every field defaults, so
+/// `"powerups"` and any knob inside it are strictly opt-in — configs written
+/// before powerups keep validating, and so do the ones `/tune` writes: the
+/// editor does not know this key and drops it on save, which lands on these
+/// defaults rather than on zero.
+const PowerupsJson = struct {
+    neutralizer_canister_charges: u16 = balance.DEFAULT_NEUTRALIZER_CANISTER_CHARGES,
+};
+
 const BalanceJson = struct {
     hunger_cost_normal: u32,
     // Deliberately unvalidated beyond its type.  A chain cannot outrun the
@@ -253,6 +262,9 @@ const BalanceJson = struct {
     /// Per-special-kind tuning; defaulted so configs written before special
     /// kinds keep validating.
     specials: SpecialsJson = .{},
+    /// Powerup tuning; defaulted so configs written before powerups keep
+    /// validating.  See PowerupsJson.
+    powerups: PowerupsJson = .{},
     player_recipes: []const PlayerRecipeJson,
     team_recipes: []const TeamRecipeJson,
 };
@@ -470,6 +482,9 @@ fn parse_balance(a: std.mem.Allocator, bytes: []const u8) !balance.Balance {
         .feast_columns_per_guy = raw.feast_columns_per_guy,
         .specials_avoid_door_column = raw.specials_avoid_door_column,
         .specials = specials,
+        .powerups = .{
+            .neutralizer_canister_charges = raw.powerups.neutralizer_canister_charges,
+        },
         .player_recipes = players,
         .team_recipes = teams,
     };
@@ -1053,6 +1068,32 @@ test "a zero team window is rejected" {
     try std.testing.expectError(
         ConfigError.InvalidTeamWindow,
         parse(std.testing.allocator, bad, minimal_encounters),
+    );
+}
+
+test "powerup tuning is read when present and defaults when absent" {
+    // Both halves matter.  Present: a designer's number has to actually reach
+    // the pool, or the canisters are worth whatever the code says and the
+    // file is decoration.  Absent: `/tune` writes balance.json without this
+    // key (the editor does not know it), so every saved config lands on the
+    // default — which must be the shipped value, not zero.
+    const tuned =
+        \\{"hunger_cost_normal":1,
+        \\ "powerups":{"neutralizer_canister_charges":42},
+        \\ "player_recipes":[],"team_recipes":[]}
+    ;
+    var with_key = try parse(std.testing.allocator, tuned, minimal_encounters);
+    defer with_key.deinit();
+    try std.testing.expectEqual(
+        @as(u16, 42),
+        with_key.config.balance.powerups.neutralizer_canister_charges,
+    );
+
+    var without = try parse(std.testing.allocator, minimal_balance, minimal_encounters);
+    defer without.deinit();
+    try std.testing.expectEqual(
+        balance.DEFAULT_NEUTRALIZER_CANISTER_CHARGES,
+        without.config.balance.powerups.neutralizer_canister_charges,
     );
 }
 

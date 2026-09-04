@@ -163,6 +163,17 @@ pub const PlayerSlot = struct {
     /// is copied into the snapshot for the renderer and read nowhere else, so
     /// it can never affect who wins.
     appearance: proto.Appearance = .{},
+    /// The powerups banked on this player's board, per PowerupKind
+    /// (take_slot).  Like the babies they join the encounter with their owner
+    /// and leave with them.  The badge only COUNTS these; what each one is
+    /// worth is decided here (see `count_charge_grant`).
+    powerups: c.PowerupCounts = [_]u8{0} ** c.PowerupKind.size,
+    /// Charges this player's carried powerups put INTO the team pool, granted
+    /// when they were counted.  Recorded rather than recomputed so the number
+    /// given back on leaving is exactly the number granted, even if the
+    /// tuning is reloaded or their powerups change underneath us — the pool
+    /// must not be mintable by a mismatch between the two.
+    charge_grant: u32 = 0,
     entity: ecs.Entity = std.math.maxInt(ecs.Entity),
     /// Index into the session's connection registry; meaningful only while
     /// occupied.
@@ -374,6 +385,12 @@ pub const Session = struct {
         if (player_id >= MAX_PLAYERS) return;
         const slot = &self.players[player_id];
         if (!slot.occupied) return;
+        // The powerups leave with their owner, and they leave FIRST: the 1/n
+        // shrink below must divide the pool the team would have had WITHOUT
+        // this player's canisters, or an unplug/replug cycle would mint
+        // charges.  Granting last on the way in and reclaiming first on the
+        // way out makes the round trip exact (see `count_charge_grant`).
+        self.uncount_charge_grant(player_id);
         if (self.hunger_share[player_id] != 0) {
             // The leaver's proportion is 1/n of the REMAINING pool, where n
             // includes them.  The LAST player out takes nothing: the pool is
@@ -398,6 +415,8 @@ pub const Session = struct {
         slot.appetite = 0;
         slot.babies = [_]u32{0} ** c.BabyType.size;
         slot.appearance = .{};
+        slot.powerups = [_]u8{0} ** c.PowerupKind.size;
+        slot.charge_grant = 0;
         self.connections[slot.conn].player_id = null;
     }
 
@@ -460,6 +479,7 @@ pub const Session = struct {
         self.hunger = .{ .current = 0, .max = 0 };
         self.hunger_share = [_]u16{0} ** MAX_PLAYERS;
         for (&self.players) |*p| {
+            p.charge_grant = 0;
             if (!p.occupied) continue;
             self.count_hunger_share(p.player_id);
         }
@@ -471,6 +491,13 @@ pub const Session = struct {
         var grown: u32 = 1;
         while (grown < self.counted_players()) : (grown += 1) {
             logic.grow_charges(&self.charges, grown);
+        }
+        // Carried powerups pay out again for the new encounter, and LAST for
+        // the same reason as on a mid-game join: the seed above is what the
+        // team would have grown to on its own, and the canisters top it up.
+        for (&self.players) |*p| {
+            if (!p.occupied) continue;
+            self.count_charge_grant(p.player_id);
         }
         self.score = 0;
         self.slime_total = encounter.total_units();
@@ -516,6 +543,50 @@ pub const Session = struct {
         );
         self.hunger_share[player_id] = share;
         self.hunger.max +|= share;
+    }
+
+    /// Pay a player's carried powerups into the team charge pool.  IDEMPOTENT
+    /// on the same terms as `count_hunger_share`: a player whose grant is
+    /// already recorded is left alone, so a repeated count can never mint
+    /// charges.  A player carrying nothing records a grant of 0, which makes
+    /// "already counted" and "counted, contributed nothing" the same no-op.
+    ///
+    /// Today the one powerup is the Neutralizer Canister: spare Neutralizing
+    /// Agent, worth `balance.powerups.neutralizer_canister_charges` a can.
+    /// Saturating throughout — a badge may carry up to 255 of them, and the
+    /// pool is a u32 that must never wrap into a small number.
+    fn count_charge_grant(self: *Session, player_id: u8) void {
+        if (player_id >= MAX_PLAYERS) return;
+        const slot = &self.players[player_id];
+        if (slot.charge_grant != 0) return;
+        const cans = slot.powerups[@intFromEnum(c.PowerupKind.neutralizer_canister)];
+        if (cans == 0) return;
+        const grant = @as(u32, cans) *| self.cfg.balance.powerups.neutralizer_canister_charges;
+        slot.charge_grant = grant;
+        const before = self.charges;
+        self.charges +|= grant;
+        std.log.info("player {} brought {} canister(s) — charges {} -> {}", .{
+            player_id, cans, before, self.charges,
+        });
+    }
+
+    /// A player takes their powerups away again: the pool gives back what
+    /// they granted, or whatever is LEFT of it if the team has already spent
+    /// past that — charges that were spent are spent, exactly as eaten hunger
+    /// stays eaten (see `uncount_hunger_share`).  A depleted pool can
+    /// therefore give back less than was granted, and never goes negative.
+    fn uncount_charge_grant(self: *Session, player_id: u8) void {
+        if (player_id >= MAX_PLAYERS) return;
+        const slot = &self.players[player_id];
+        const grant = slot.charge_grant;
+        if (grant == 0) return;
+        slot.charge_grant = 0;
+        const taken = @min(grant, self.charges);
+        const before = self.charges;
+        self.charges -= taken;
+        std.log.info("player {} took {} canister charge(s) back — charges {} -> {}", .{
+            player_id, taken, before, self.charges,
+        });
     }
 
     /// A counted player left the game: give back their share of the UNUSED
@@ -1229,6 +1300,7 @@ pub const Session = struct {
         slot.appetite = req.appetite;
         slot.babies = req.babies;
         slot.appearance = req.appearance;
+        slot.powerups = req.powerups;
         slot.conn = conn_id;
         conn.player_id = slot.player_id;
         // A freed seat keeps nothing of its previous owner.
@@ -1237,6 +1309,10 @@ pub const Session = struct {
         // Fold them into the running game: pool first (their proportion of
         // what remains, see logic.grow_charges), then the bar, then a body.
         logic.grow_charges(&self.charges, self.counted_players());
+        // The grant lands AFTER the growth, so what the newcomer's share is
+        // computed from is the pool the team already had — see the matching
+        // note in release_slot for why the order is the whole mechanism.
+        self.count_charge_grant(slot.player_id);
         self.count_hunger_share(slot.player_id);
         try self.spawn_player_midgame(slot.player_id);
         try self.send_game_start_to_conn(conn_id);
@@ -1466,6 +1542,7 @@ pub const Session = struct {
                 .cursor_col = self.field.grid.col_of(self.cursors[own]),
                 .babies = self.players[own].babies,
                 .appearance = self.players[own].appearance,
+                .powerups = self.players[own].powerups,
             };
             snap.entity_count += 1;
         }

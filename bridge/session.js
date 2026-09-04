@@ -23,12 +23,15 @@
  *   stdin  <- READY\n       server WS is open   stdin <- JOIN\n  take a seat
  *   stdin  <- STAT:appetite=<n>\n board flash stat
  *   stdin  <- STAT:babies=<a,b,c,d,e>\n board flash babies (BabyType order)
+ *   stdin  <- STAT:powerups=<a>\n     board flash powerups (PowerupKind order)
  *   stdin  <- STAT:critter=<0..4>\n   the badge's resident Lil Guy
  *   stdin  <- STAT:led=<hex,hex,hex>\n its three onboarded colours
  *   stdin  <- STAT:seed=<u32 hex>\n    its brood seed: what its BABIES wear
  *     The last three are OMITTED, not defaulted, when the board has not said —
- *     see Controller.statLines.  All five must land before JOIN; the server
- *     freezes a player's stats when they take their seat.
+ *     see Controller.statLines.  Appetite, babies and powerups are always
+ *     sent: for those, "none" is an answer rather than a silence.  All of
+ *     them must land before JOIN; the server freezes a player's stats when
+ *     they take their seat.
  *   stdin  <- RESTART\n     start the next round (tab button click)
  *   stdout -> {"tag":"render",...}\n            stdout -> {"tag":"send","bytes":"<hex>"}\n
  */

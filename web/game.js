@@ -276,6 +276,14 @@ const LAYOUT = {
     // Gentle continuous breathing on the menu of the LAST committed action,
     // so "who moved most recently" stays readable after the swell ends.
     lastPulseHz: 1.4, lastPulseScale: 1.03,
+    // Carried canisters, stamped through the panel's TOP BORDER as a short
+    // overlapping stack (see drawSeatPowerups).  `pitch` under `size` is what
+    // makes them overlap; `max` is where the row stops and a count takes over,
+    // chosen so the widest stack still ends well left of the centred seat
+    // label.  Placeholder shapes — real art replaces the squares, not the
+    // geometry.
+    powerupSize: 9, powerupPitch: 6, powerupInset: 8, powerupMax: 10,
+    powerupCountFont: 9,
   },
 
   // Default floater lifetime ≥ 3s so feedback is readable; cosmetic chomps
@@ -4718,6 +4726,9 @@ function drawPlayerMenu(game, e, x, y) {
   rectStroke(x, y, P.w, P.h, locked ? 4 : 2,
     locked ? SHAPE_COLOR : playerColor(e.owner));
 
+  // What this player's badge carried in, punched through the border above.
+  drawSeatPowerups(e, x, y);
+
   // Seat label: whose menu this is, in their color.
   ctx.font = `${P.labelFont}px monospace`;
   ctx.textAlign = "center";
@@ -4751,6 +4762,50 @@ function drawPlayerMenu(game, e, x, y) {
     ctx.fillText("READY", x + P.w / 2, statusY);
   }
   ctx.restore();
+}
+
+/**
+ * Stamp a player's carried powerups through the TOP EDGE of their seat panel:
+ * one square per canister, centred ON the border line so each one interrupts
+ * it, and pitched closer together than they are wide so the row reads as a
+ * stack rather than a list.
+ *
+ * Drawn AFTER the panel's stroke, and each square lays down an opaque
+ * background before its fill — that background is what breaks the border under
+ * it and what separates one square from the one it overlaps, in a single pass
+ * with no clipping.  Left to right, so the newest can is on top.
+ *
+ * A badge may carry up to 255 canisters and a panel is 160px wide, so the row
+ * stops at `powerupMax` and the remainder becomes a count.  The stack is a
+ * quantity you read at a glance across the room; the number is there for the
+ * player who wants to know exactly.  Zero canisters draws nothing at all: an
+ * empty badge's panel is the plain rectangle it always was.
+ *
+ * @param {{powerups?: {neutralizer_canister?: number}}} e player's snapshot
+ * @param {number} x panel's left edge
+ * @param {number} y panel's TOP edge — the line the squares straddle
+ */
+function drawSeatPowerups(e, x, y) {
+  const P = LAYOUT.playerMenus;
+  const n = e.powerups?.neutralizer_canister ?? 0;
+  if (n <= 0) return;
+
+  const s = P.powerupSize;
+  const drawn = Math.min(n, P.powerupMax);
+  let cx = x + P.powerupInset;
+  const cy = y - s / 2; // centred on the border, half above and half below
+  for (let i = 0; i < drawn; i++) {
+    rect(cx, cy, s, s, C_BG);                    // break the line beneath
+    rect(cx + 1, cy + 1, s - 2, s - 2, CANISTER_COLOR);
+    cx += P.powerupPitch;
+  }
+  if (n > drawn) {
+    // The row ended early; say by how much rather than silently capping.
+    ctx.font = `${P.powerupCountFont}px monospace`;
+    ctx.textAlign = "left";
+    ctx.fillStyle = CANISTER_COLOR;
+    ctx.fillText(`x${n}`, cx + s - P.powerupPitch + 3, y + P.powerupCountFont / 2 - 1);
+  }
 }
 
 /**

@@ -200,6 +200,7 @@ fn write_render_inner(
             .cursor_row = e.cursor_row,
             .cursor_col = e.cursor_col,
             .babies = babies(e.babies),
+            .powerups = powerups(e.powerups),
             .critter = critter_name(e.appearance.critter),
             // Null and "black" are DIFFERENT pictures downstream (null draws
             // the art's authored greys), so this travels unflattened.
@@ -457,6 +458,11 @@ fn babies(values: c.BabyCounts) JsonBabies {
     };
 }
 
+/// Convert a per-PowerupKind u8 array into named JSON fields.
+fn powerups(values: c.PowerupCounts) JsonPowerups {
+    return .{ .neutralizer_canister = values[0] };
+}
+
 /// The critter name the renderer keys its sprite sheets by, or null when the
 /// board never said (browsers, bots, old firmware).  The NAME rather than the
 /// ordinal because game.js already names the five types and looks its atlases
@@ -517,6 +523,13 @@ const JsonBabies = struct {
     sky: u32,
     gold: u32,
     plum: u32,
+};
+
+/// Per-powerup-kind counts with NAMED fields (PowerupKind ordinal order), so
+/// the renderer reads `e.powerups.neutralizer_canister` rather than indexing a
+/// bare array — a name it cannot silently get wrong when a kind is appended.
+const JsonPowerups = struct {
+    neutralizer_canister: u8,
 };
 
 /// Match-wide feast totals over the whole encounter.  `covered` counts cells a
@@ -764,6 +777,11 @@ const JsonEntity = struct {
     /// The babies this player's board brought, per type — drawn beside their
     /// owner and gone when they leave.
     babies: JsonBabies,
+    /// The powerups this player's board brought, per kind — drawn on their
+    /// seat panel and gone when they leave.  Sent for every player (zeros
+    /// included): unlike the cosmetic fields below there is no "never said"
+    /// state, because a boardless player genuinely carries none.
+    powerups: JsonPowerups,
     /// Which of the five critters this player's board keeps, by name, or null
     /// when it never said — the renderer falls back to a default creature
     /// rather than drawing nothing.
@@ -1093,6 +1111,78 @@ test "a player's critter and colours reach the renderer" {
     try testing.expectEqual(@as(i64, 0x6E), led.items[0].array.items[2].integer);
     try testing.expectEqual(@as(i64, 0xA0), led.items[1].array.items[2].integer);
     try testing.expectEqual(@as(i64, 0xE8), led.items[2].array.items[0].integer);
+}
+
+test "a player's carried powerups reach the renderer, by name" {
+    // web/game.js `drawSeatPowerups` reads exactly
+    // `e.powerups.neutralizer_canister` and stamps that many squares through
+    // the seat panel's top border.  The field is hand-copied into JsonEntity
+    // from a bare array, which is the drift this file's tests exist to catch:
+    // a kind appended to PowerupKind without a matching field here would
+    // silently keep drawing the old one.
+    var game = GameState{};
+    game.snapshot.grid_rows = 3;
+    game.snapshot.grid_cols = 3;
+    game.snapshot.entity_count = 1;
+    game.snapshot.entities[0] = blk: {
+        var e = proto.EntitySnapshot.blank;
+        e.entity = 9;
+        e.owner = 0;
+        e.powerups[@intFromEnum(c.PowerupKind.neutralizer_canister)] = 4;
+        break :blk e;
+    };
+
+    var buf: [32768]u8 = undefined;
+    const json = try render_to_json(&buf, &game);
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        json,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const ent = parsed.value.object.get("game").?.object
+        .get("entities").?.array.items[0].object;
+    try testing.expectEqual(
+        @as(i64, 4),
+        ent.get("powerups").?.object.get("neutralizer_canister").?.integer,
+    );
+}
+
+test "a boardless player carries no powerups, not an absent field" {
+    // Unlike the cosmetic fields, "carries none" is a REAL answer rather than
+    // a missing one: a browser tab has no badge and so genuinely has zero
+    // canisters.  The renderer draws no squares either way, but the field has
+    // to be there for it to read — an absent one would be a JS undefined
+    // walking into the square count.
+    var game = GameState{};
+    game.snapshot.grid_rows = 3;
+    game.snapshot.grid_cols = 3;
+    game.snapshot.entity_count = 1;
+    game.snapshot.entities[0] = blk: {
+        var e = proto.EntitySnapshot.blank;
+        e.entity = 9;
+        e.owner = 0;
+        break :blk e;
+    };
+
+    var buf: [32768]u8 = undefined;
+    const json = try render_to_json(&buf, &game);
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        testing.allocator,
+        json,
+        .{},
+    );
+    defer parsed.deinit();
+
+    const ent = parsed.value.object.get("game").?.object
+        .get("entities").?.array.items[0].object;
+    try testing.expectEqual(
+        @as(i64, 0),
+        ent.get("powerups").?.object.get("neutralizer_canister").?.integer,
+    );
 }
 
 test "a boardless player's appearance is absent, not black" {

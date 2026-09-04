@@ -252,6 +252,37 @@ pub fn baby_total(counts: BabyCounts) u32 {
     return n;
 }
 
+/// The kinds of POWERUP a badge can carry into an encounter.
+///
+/// A powerup is a thing the badge merely COUNTS: firmware knows how many of
+/// each a badge holds and reports them, and nothing more — every effect lives
+/// here in the game.  The ordinal is the wire and flash identity, shared by
+/// hand with two other files that cannot import this one:
+///
+///   board/src/game/types.h   `powerup_kind_t` / POWERUP_KIND_COUNT
+///   bridge/controllers.js    POWERUP_KIND_COUNT / POWERUP_NAMES
+///
+/// APPENDING a kind is safe and needs all three bumped together; REORDERING
+/// silently rewrites what every already-flashed badge is carrying.  Same
+/// hand-kept contract as BabyType, and for the same reason: the C firmware
+/// has no way to read Zig.
+pub const PowerupKind = enum(u8) {
+    /// Spare Neutralizing Agent, canned.  Each one a seated player carries
+    /// adds `balance.powerups.neutralizer_canister_charges` to the team's
+    /// charge pool for as long as they are seated (server/session.zig).
+    neutralizer_canister = 0,
+
+    pub const size = @typeInfo(PowerupKind).@"enum".fields.len;
+};
+
+/// Per-kind powerup counts, indexed by PowerupKind ordinal — the shape powerup
+/// tallies travel in everywhere (take_slot, entity snapshots, board flash).
+///
+/// u8 because that is what the badge stores and reports: firmware saturates
+/// its counters at 255 (POWERUP_COUNT_MAX), so a wider type here would only
+/// promise a range no badge can ever reach.
+pub const PowerupCounts = [PowerupKind.size]u8;
+
 /// Upper bounds on the slime grid (wire + array sizing).  The config loader
 /// rejects `slime_grid` dimensions exceeding these.
 ///

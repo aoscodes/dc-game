@@ -18,6 +18,9 @@
   "specials_avoid_door_column": true,
   "max_chain_depth": 3,
   "blast_chains": false,
+  "powerups": {
+    "neutralizer_canister_charges": 10
+  },
   "specials": {
     "neutralizer": {
       "match_len": 3,

@@ -4063,6 +4063,174 @@ test "a freed seat can be taken by a NEW connection, which counts in fresh" {
 }
 
 // ---------------------------------------------------------------------------
+// POWERUPS the badge carries in.
+//
+// A badge only COUNTS its powerups; what they are worth is decided here.  The
+// one kind today is the Neutralizer Canister, worth
+// `balance.powerups.neutralizer_canister_charges` (10 in the fixture) to the
+// team pool for as long as its owner is seated.
+//
+// The grant is a LOAN, not income: it lands after the joiner's share has
+// grown the pool and is reclaimed before the leaver's share shrinks it, so a
+// player who sits down and stands up again leaves the pool exactly as they
+// found it.  These tests exist to pin that ordering — reversed, the round
+// trip mints charges and a badge could farm the pool by replugging.
+// ---------------------------------------------------------------------------
+
+test "a carried canister pays into the pool on sitting down and is reclaimed on standing up" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    s.sess.charges = 60; // pin the pool; growth is covered elsewhere
+
+    var late = TestPlayer{};
+    late.init(allocator);
+    defer late.deinit(allocator);
+    const conn_id = s.sess.connect(late.transport()) orelse return error.JoinFailed;
+    try enqueue_msg(&s.sess, conn_id, .take_slot, proto.TakeSlot{ .powerups = .{2} });
+    try flush(&s.sess);
+
+    // Their share first (60 + 60/2 = 90), THEN their two cans on top.
+    try std.testing.expectEqual(@as(u32, 90 + 2 * 10), s.sess.charges);
+
+    // Out again with nothing spent in between: the cans come off first
+    // (110 - 20 = 90), and only then does their 1/3 share shrink what is
+    // left (90 - 30 = 60).  Back exactly where it started — which is the
+    // whole point of the ordering.
+    s.sess.disconnect(conn_id);
+    try std.testing.expectEqual(@as(u32, 60), s.sess.charges);
+}
+
+test "a leaver can only reclaim what is LEFT of their canister grant" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    s.sess.charges = 60;
+
+    var late = TestPlayer{};
+    late.init(allocator);
+    defer late.deinit(allocator);
+    const conn_id = s.sess.connect(late.transport()) orelse return error.JoinFailed;
+    try enqueue_msg(&s.sess, conn_id, .take_slot, proto.TakeSlot{ .powerups = .{2} });
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u32, 110), s.sess.charges);
+
+    // The team spends nearly everything, then the donor walks.  Charges that
+    // were spent are SPENT — the same rule eaten hunger lives by — so the
+    // pool gives back the 5 it still holds rather than going negative, and
+    // the share shrink then divides nothing.
+    s.sess.charges = 5;
+    s.sess.disconnect(conn_id);
+    try std.testing.expectEqual(@as(u32, 0), s.sess.charges);
+}
+
+test "a player carrying no canisters moves the pool by their share alone" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    s.sess.charges = 60;
+
+    // The control case: identical to the test above but with an empty badge.
+    // A zero grant must be a genuine no-op, not a rounding of one.
+    var late = TestPlayer{};
+    late.init(allocator);
+    defer late.deinit(allocator);
+    const conn_id = s.sess.connect(late.transport()) orelse return error.JoinFailed;
+    try enqueue_msg(&s.sess, conn_id, .take_slot, proto.TakeSlot{});
+    try flush(&s.sess);
+    try std.testing.expectEqual(@as(u32, 90), s.sess.charges);
+
+    s.sess.disconnect(conn_id);
+    try std.testing.expectEqual(@as(u32, 60), s.sess.charges);
+}
+
+test "a repeated take_slot cannot pay the same canisters twice" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+    s.sess.charges = 60;
+
+    var late = TestPlayer{};
+    late.init(allocator);
+    defer late.deinit(allocator);
+    const conn_id = s.sess.connect(late.transport()) orelse return error.JoinFailed;
+    try enqueue_msg(&s.sess, conn_id, .take_slot, proto.TakeSlot{ .powerups = .{2} });
+    try flush(&s.sess);
+    const after_join = s.sess.charges;
+
+    // The second request is refused at the door (the connection already holds
+    // a seat), exactly as the hunger bar's equivalent test checks.  Belt and
+    // braces: the grant is recorded, so even a request that got through would
+    // find it already counted.
+    try enqueue_msg(&s.sess, conn_id, .take_slot, proto.TakeSlot{ .powerups = .{2} });
+    try flush(&s.sess);
+    try std.testing.expectEqual(after_join, s.sess.charges);
+}
+
+test "a new encounter pays the seated team's canisters again" {
+    const allocator = std.testing.allocator;
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+
+    // The canisters are on the badge, not on the encounter: a team that
+    // starts a second encounter still has them, so the fresh pool is the
+    // seed grown per seat PLUS what they carry.
+    s.sess.players[s.p[1].pid].powerups = .{3};
+    try start(&s, &enc_fifty_green);
+
+    // Seed 30, grown once for the second seat = 60, then 3 cans = 30 more.
+    try std.testing.expectEqual(@as(u32, 60 + 3 * 10), s.sess.charges);
+
+    // And again, from a pool the previous encounter left in any state: the
+    // grant is rebuilt from the badge, never carried over.
+    s.sess.charges = 7;
+    try start(&s, &enc_fifty_green);
+    try std.testing.expectEqual(@as(u32, 60 + 3 * 10), s.sess.charges);
+}
+
+test "a player's carried canisters reach every client's snapshot" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s: TwoPlayerSession = undefined;
+    try init_two_player_session(&s, allocator);
+    defer s.deinit();
+    try start(&s, &enc_fifty_green);
+
+    // Alice's badge, seen from BOB's connection: the seat HUD draws every
+    // player's canisters, so they have to travel to clients that do not own
+    // them.
+    s.sess.players[s.p[0].pid].powerups = .{4};
+    s.p[1].clear();
+    try s.sess.tick(1.0 / 60.0);
+
+    const msgs = try drain(s.p[1].buf.items, arena);
+    const gs = try last_game_state(msgs);
+    const ent = for (gs.entities[0..gs.entity_count]) |e| {
+        if (e.owner == s.p[0].pid) break e;
+    } else return error.NoEntity;
+    try std.testing.expectEqual(@as(u8, 4), ent.powerups[
+        @intFromEnum(c.PowerupKind.neutralizer_canister)
+    ]);
+}
+
+// ---------------------------------------------------------------------------
 // The post-bite settle window (balance.settle_lockout_ms).
 //
 // While the Lil Guys chew, the board is theirs: every cast is refused, table

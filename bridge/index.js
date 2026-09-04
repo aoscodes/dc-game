@@ -55,8 +55,11 @@ const fs          = require("fs");
 const path        = require("path");
 const { WebSocketServer, WebSocket } = require("ws");
 const { PlayerSession } = require("./session");
-const { ControllerManager, BABY_TYPE_COUNT, PALETTE_COLOR_COUNT, isPalette } =
-  require("./controllers");
+const {
+  ControllerManager, BABY_TYPE_COUNT, PALETTE_COLOR_COUNT,
+  POWERUP_KIND_COUNT, POWERUP_COUNT_MAX, POWERUP_NAMES,
+  isPalette,
+} = require("./controllers");
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -203,6 +206,14 @@ const httpServer = http.createServer((req, res) => {
   // bridge is what holds the serial ports.
   if (rawPath === "/onboard") {
     serveFile(res, WEB_DIR, "/onboard.html", { "Cache-Control": "no-cache" });
+    return;
+  }
+
+  // /powerups — the powerup kiosk, standalone on /onboard's terms and for the
+  // same reason: it hands items to badges over the serial ports the bridge
+  // holds, and has nothing to do with a game being in progress.
+  if (rawPath === "/powerups") {
+    serveFile(res, WEB_DIR, "/powerups.html", { "Cache-Control": "no-cache" });
     return;
   }
 
@@ -385,6 +396,7 @@ function devBoardView(ctrl) {
     uid: ctrl.uid,
     appetite: ctrl.appetite,
     babies: ctrl.babies,
+    powerups: ctrl.powerups,
     critter: ctrl.critter,
     colors: ctrl.led === null
       ? null
@@ -408,7 +420,7 @@ function handleDevBoards(res) {
 /**
  * POST body: { target?: "all" | <linkId number> | <uid string>,
  *              babies?: [a,b,c,d,e], colors?: ["rrggbb" x3] | null,
- *              seed?: <u32> | null, reseat?: boolean }
+ *              seed?: <u32> | null, powerups?: [n], reseat?: boolean }
  *
  * An ABSENT key leaves that stat alone; an explicit null clears it.  The two
  * have to be distinguishable because "no palette" is a state a real board can
@@ -456,6 +468,20 @@ function handleDevInject(req, res) {
       }
     }
 
+    let powerups;
+    if ("powerups" in msg) {
+      // Held to the same ceiling the badge itself saturates at, so an
+      // injected board is one a badge could actually be — a dev tool that can
+      // reach states the hardware cannot is a dev tool that tests fiction.
+      if (!Array.isArray(msg.powerups) || msg.powerups.length !== POWERUP_KIND_COUNT ||
+          !msg.powerups.every((n) => Number.isInteger(n) && n >= 0 && n <= POWERUP_COUNT_MAX)) {
+        errors.push(
+          `powerups must be ${POWERUP_KIND_COUNT} integers in 0..${POWERUP_COUNT_MAX}`);
+      } else {
+        powerups = msg.powerups.map((n) => n >>> 0);
+      }
+    }
+
     let colors;
     if ("colors" in msg) {
       if (msg.colors === null) colors = null;
@@ -496,6 +522,7 @@ function handleDevInject(req, res) {
     const applied = [];
     for (const ctrl of targeted) {
       if (babies !== undefined) ctrl.babies = [...babies];
+      if (powerups !== undefined) ctrl.powerups = [...powerups];
       if (colors !== undefined) ctrl.led = colors === null ? null : [...colors];
       if (seed !== undefined) ctrl.broodSeed = seed;
       // Reseat AFTER the rewrite, and only if the board is actually playing:
@@ -505,6 +532,7 @@ function handleDevInject(req, res) {
       if (reseat && wasSeated) ctrl.playerSession.destroy("dev inject");
       applied.push({ ...devBoardView(ctrl), reseated: reseat && wasSeated });
       console.log(`[dev] injected uid=${ctrl.uid} babies=${ctrl.babies.join(",")} ` +
+        `powerups=${ctrl.powerups.join(",")} ` +
         `seed=${ctrl.broodSeed === null ? "-" : ctrl.broodSeed.toString(16)} ` +
         `reseat=${reseat && wasSeated}`);
     }
@@ -657,6 +685,13 @@ const activeSessions = new Set();
 /** The single open onboarding kiosk (/onboard), or null.  @type {OnboardSession | null} */
 let onboardSession = null;
 
+/** Every open powerup kiosk (/powerups).  Unlike the onboarding kiosk this is
+ *  a SET: those pages only press buttons and read back counts, and the grants
+ *  themselves are serialised by the controller manager, so several open tabs
+ *  cannot race the way two colour rolls on one badge would.
+ *  @type {Set<PowerupSession>} */
+const powerupSessions = new Set();
+
 // Hardware controllers (dc_rp2040 boards on USB serial).  Every linked board
 // is its own player (ControllerSession) in the active lobby.
 const controllerManager = new ControllerManager({
@@ -673,9 +708,13 @@ const controllerManager = new ControllerManager({
   roomLeft: (room) => roomTabLeft(room),
   isRoomAlive: (room) => lobbyRegistry.get(room.code) === room,
   moveLabels: (configHash) => moveLabelsFor(configHash ?? null),
-  // The onboarding kiosk, when one is open, re-reads the board list on every
-  // link/unlink.  Nothing else cares.
-  boardsChanged: () => { if (onboardSession !== null) onboardSession.sendQueue(); },
+  // The kiosks re-read the board list on every link/unlink: the onboarding
+  // one to know what is left to roll, the powerup ones to show how many
+  // badges the next press will reach.  Nothing else cares.
+  boardsChanged: () => {
+    if (onboardSession !== null) onboardSession.sendQueue();
+    for (const s of powerupSessions) s.sendBoards();
+  },
 });
 
 class TabSession extends PlayerSession {
@@ -938,6 +977,111 @@ onboardWss.on("connection", (ws) => {
 });
 
 // ---------------------------------------------------------------------------
+// Powerup kiosk  (/powerups-ws)
+// ---------------------------------------------------------------------------
+
+/**
+ * The powerup kiosk: one button per powerup kind, and pressing one hands that
+ * powerup to every badge currently linked.
+ *
+ * Standalone on OnboardSession's terms — no lobby, no session slot, no Zig
+ * process — because handing out an item is a thing done to BADGES, and a badge
+ * carries what it carries whether or not a game is running.
+ *
+ * The bridge keeps no inventory of its own here, and that is the whole design.
+ * A powerup lives in one place, the badge's flash, which survives this process
+ * and every game played on it; this page is a remote control for a fan-out,
+ * and every count it displays came back off a badge in that badge's own ack.
+ * The alternative — a tally on this side — would be a second copy that is
+ * wrong the first time a badge is granted by another bridge run, saturates, or
+ * is reflashed.
+ *
+ * Several of these may be open at once (unlike the colour kiosk): they only
+ * press buttons, and the manager serialises the grants themselves.
+ */
+class PowerupSession {
+  /** @param {WebSocket} ws */
+  constructor(ws) {
+    this.ws = ws;
+    this.closed = false;
+  }
+
+  send(obj) {
+    if (!this.closed && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(obj));
+    }
+  }
+
+  /**
+   * Publish the powerups this bridge knows how to grant, as {ordinal, name}.
+   * The page renders one button per entry and sends back the ORDINAL, so the
+   * button list cannot drift out of step with the firmware's enum the way a
+   * list hardcoded in the page would.
+   */
+  sendKinds() {
+    this.send({
+      tag: "kinds",
+      kinds: POWERUP_NAMES.map((name, ordinal) => ({ ordinal, name })),
+    });
+  }
+
+  /** Publish how many badges the next press would reach. */
+  sendBoards() {
+    this.send({ tag: "boards", count: controllerManager.listLinked().length });
+  }
+
+  /** @param {{ action?: string, kind?: unknown }} msg */
+  handle(msg) {
+    if (msg.action === "grant") {
+      if (typeof msg.kind !== "number") return;
+      // grantPowerup settles for every targeted badge — on its post-save ack,
+      // on running out of retries, or on it being unplugged mid-grant — so the
+      // page can never be left waiting.  It also queues behind any grant
+      // already running, which is what makes a mashed button safe.
+      controllerManager.grantPowerup(msg.kind).then((summary) => {
+        this.send({ tag: "granted", kind: summary.kind, results: summary.results });
+        // The counts moved on every badge, not just this page's: a second
+        // kiosk tab showing stale numbers would invite granting twice.
+        for (const s of powerupSessions) {
+          if (s !== this) s.sendBoards();
+        }
+      });
+      return;
+    }
+
+    console.warn("[powerups] unknown action:", msg.action);
+  }
+
+  teardown() {
+    if (this.closed) return;
+    this.closed = true;
+    powerupSessions.delete(this);
+    console.log(`[powerups] kiosk closed (${powerupSessions.size} open)`);
+  }
+}
+
+// noServer, not { server, path }: see the upgrade router below.
+const powerupWss = new WebSocketServer({ noServer: true });
+
+powerupWss.on("connection", (ws) => {
+  const session = new PowerupSession(ws);
+  powerupSessions.add(session);
+  console.log(`[powerups] kiosk opened (${powerupSessions.size} open)`);
+
+  ws.on("close", () => session.teardown());
+  ws.on("error", () => session.teardown());
+  ws.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if (typeof msg !== "object" || msg === null) return;
+    session.handle(msg);
+  });
+
+  session.sendKinds();
+  session.sendBoards();
+});
+
+// ---------------------------------------------------------------------------
 // Browser WebSocket server  (/ws)
 // ---------------------------------------------------------------------------
 
@@ -957,6 +1101,7 @@ httpServer.on("upgrade", (req, socket, head) => {
   const pathname = new URL(req.url, "http://localhost").pathname;
   const wss = pathname === "/ws" ? browserWss
     : pathname === "/onboard-ws" ? onboardWss
+    : pathname === "/powerups-ws" ? powerupWss
     : null;
   if (wss === null) {
     socket.destroy();

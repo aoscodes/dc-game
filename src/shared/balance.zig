@@ -159,6 +159,10 @@ pub const DEFAULT_MATCH_LEN: u8 = 3;
 /// (board/src/game/balance.c), so a change here should be made there too.
 pub const DEFAULT_BABY_HUNGER: u16 = 10;
 
+/// Default charges one carried Neutralizer Canister adds to the team pool,
+/// used when `powerups` is absent from balance.json.
+pub const DEFAULT_NEUTRALIZER_CANISTER_CHARGES: u16 = 10;
+
 /// Default width of the turn-end bite, in grid columns from the left edge,
 /// used when `feast_columns` is absent from balance.json.  The first Lil Guy
 /// always eats at least one column.
@@ -213,6 +217,22 @@ pub const Activation = enum {
     pub fn on_eat(self: Activation) bool {
         return self == .eat or self == .eatcast;
     }
+};
+
+/// Designer knobs for the POWERUPS a badge carries into an encounter.
+///
+/// What each powerup DOES is hard-coded (see server/session.zig); this tunes
+/// only its numbers.  One flat field per kind rather than a per-kind array
+/// like `specials`, because powerups share no knobs with each other: a
+/// canister's charges and a future powerup's effect have nothing in common to
+/// factor out, and a common struct would be mostly-ignored fields on every
+/// kind — the failure mode SpecialTuning already lives with.
+pub const PowerupTuning = struct {
+    /// Charges added to the team pool for each Neutralizer Canister a SEATED
+    /// player carries.  Granted when they sit (after their share of the pool
+    /// is grown) and taken back when they leave (before their share shrinks),
+    /// so sitting down and standing up again is a round trip, not a mint.
+    neutralizer_canister_charges: u16 = DEFAULT_NEUTRALIZER_CANISTER_CHARGES,
 };
 
 /// Designer knobs for one SpecialKind.  What a kind DOES is hard-coded
@@ -372,6 +392,8 @@ pub const Balance = struct {
     /// Per-SpecialKind tuning, indexed by SpecialKind ordinal.
     specials: [c.SpecialKind.size]SpecialTuning =
         [_]SpecialTuning{.{}} ** c.SpecialKind.size,
+    /// What the powerups a badge carries in are worth.  See PowerupTuning.
+    powerups: PowerupTuning = .{},
     player_recipes: []const PlayerRecipe,
     team_recipes: []const TeamRecipe,
 

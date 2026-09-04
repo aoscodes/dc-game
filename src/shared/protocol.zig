@@ -75,6 +75,11 @@ pub const TakeSlot = struct {
     /// What this player's Lil Guy looks like on the shared screen.  Absent in
     /// both halves for boardless players, who get drawn as authored art.
     appearance: Appearance = .{},
+    /// The powerups banked on the joining player's board, per PowerupKind.
+    /// Like the babies they arrive with their owner and leave with them; what
+    /// each one DOES is decided by the server (server/session.zig), never by
+    /// the badge.  All zero for boardless players.
+    powerups: components.PowerupCounts = [_]u8{0} ** components.PowerupKind.size,
 };
 
 /// How many LEDs a badge has, and so how many colours it reports.
@@ -534,6 +539,11 @@ pub const EntitySnapshot = struct {
     /// for the same reason as the babies: every client draws every player, so
     /// the appearance has to reach clients that are not its owner.
     appearance: Appearance,
+    /// The powerups this player's board brought, per PowerupKind (from
+    /// take_slot).  Snapshotted for the same reason as the babies: every
+    /// client draws every seat's HUD, so a player's canisters have to reach
+    /// clients that are not their owner — and a reconnect recovers them.
+    powerups: components.PowerupCounts,
 
     pub const blank = EntitySnapshot{
         .entity = 0,
@@ -545,6 +555,7 @@ pub const EntitySnapshot = struct {
         .cursor_col = 0,
         .babies = [_]u32{0} ** components.BabyType.size,
         .appearance = .{},
+        .powerups = [_]u8{0} ** components.PowerupKind.size,
     };
 };
 
@@ -753,6 +764,7 @@ pub fn encode(writer: anytype, comptime tag: MsgTag, payload: anytype) !void {
             try writer.writeInt(u32, payload.appetite, .little);
             for (payload.babies) |b| try writer.writeInt(u32, b, .little);
             try encode_appearance(writer, payload.appearance);
+            for (payload.powerups) |u| try writer.writeByte(u);
         },
         .leave_slot => {},
         .restart => {},
@@ -893,6 +905,7 @@ fn encode_game_state(w: anytype, p: GameState) !void {
         try w.writeByte(e.cursor_col);
         for (e.babies) |b| try w.writeInt(u32, b, .little);
         try encode_appearance(w, e.appearance);
+        for (e.powerups) |u| try w.writeByte(u);
     }
     try encode_bar_summary(w, p.hunger);
     try w.writeInt(u32, p.charges, .little);
@@ -1053,6 +1066,7 @@ pub fn decode_take_slot(reader: anytype) !TakeSlot {
     var p = TakeSlot{ .appetite = try reader.readInt(u32, .little) };
     for (&p.babies) |*b| b.* = try reader.readInt(u32, .little);
     p.appearance = try decode_appearance(reader);
+    for (&p.powerups) |*u| u.* = try reader.readByte();
     return p;
 }
 
@@ -1106,6 +1120,7 @@ pub fn decode_game_state(reader: anytype) !GameState {
         e.cursor_col = try reader.readByte();
         for (&e.babies) |*b| b.* = try reader.readInt(u32, .little);
         e.appearance = try decode_appearance(reader);
+        for (&e.powerups) |*u| u.* = try reader.readByte();
         p.entities[i] = e;
     }
     p.hunger = try decode_bar_summary(reader);
@@ -1271,6 +1286,28 @@ test "round-trip: take_slot carries the appetite stat and the board's babies" {
     try std.testing.expectEqual(@as(u32, 0xFFEE_DDCC), decoded.appearance.brood_seed.?);
 }
 
+test "round-trip: take_slot carries the board's powerups, saturated ones included" {
+    // The powerups ride AFTER the appearance, whose colour bytes are written
+    // present or not; a decoder that mis-sizes the optional half would read
+    // colour bytes as counts, so this pins the tail of the message.  255 is
+    // the badge's saturation point (POWERUP_COUNT_MAX) and so the one value
+    // most likely to be truncated or sign-flipped on the way through.
+    var buf: [64]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+
+    try encode(fbs.writer(), .take_slot, TakeSlot{
+        .appearance = .{ .critter = .plum },
+        .powerups = .{255},
+    });
+    fbs.reset();
+    _ = try read_tag(fbs.reader());
+    const decoded = try decode_take_slot(fbs.reader());
+    try std.testing.expectEqual(components.BabyType.plum, decoded.appearance.critter.?);
+    try std.testing.expectEqual(@as(u8, 255), decoded.powerups[
+        @intFromEnum(components.PowerupKind.neutralizer_canister)
+    ]);
+}
+
 test "round-trip: a brood seed of zero is a seed, not an absence" {
     // Unlike `led`, where all-black doubles as "never onboarded", 0 is an
     // ordinary seed: it is derived from the flash uid rather than chosen, and
@@ -1362,6 +1399,7 @@ test "round-trip: game_state — bite, hunger, score, grid, and selection surviv
         .appearance = .{ .critter = .plum, .brood_seed = 0x0BAD_F00D, .led = .{
             .{ 0x11, 0x22, 0x33 }, .{ 0x44, 0x55, 0x66 }, .{ 0x77, 0x88, 0x99 },
         } },
+        .powerups = .{3},
     };
 
     try encode(fbs.writer(), .game_state, gs);
@@ -1406,6 +1444,8 @@ test "round-trip: game_state — bite, hunger, score, grid, and selection surviv
     try std.testing.expectEqual(@as(u8, 5), decoded.entities[0].cursor_col);
     // The board's babies travel with their owner.
     try std.testing.expectEqual([_]u32{ 0, 4, 0, 0, 1 }, decoded.entities[0].babies);
+    // So do their powerups: every client draws every seat's canisters.
+    try std.testing.expectEqual([_]u8{3}, decoded.entities[0].powerups);
     // ...and so does what its Lil Guy looks like, so that OTHER clients can
     // draw this player as their board dressed them.
     const look = decoded.entities[0].appearance;

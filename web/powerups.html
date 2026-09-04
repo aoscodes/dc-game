@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Powerups</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    /* /tune's palette rather than /onboard's near-black: this is an operator
+       console that shows text and numbers, not a screen full of colour. */
+    body {
+      background: #14141e;
+      color: #ddd;
+      font-family: monospace;
+      font-size: 14px;
+      padding: 24px;
+      max-width: 720px;
+      margin: 0 auto;
+    }
+    h1 { color: #ffd75e; font-size: 22px; margin-bottom: 4px; }
+    .subtitle { color: #888; margin-bottom: 24px; }
+
+    /* Rectangular, full width, and big: this is pressed by someone standing
+       at a table with a handful of badges, not by someone at a desk. */
+    button.powerup {
+      display: block;
+      width: 100%;
+      background: #2a2a3c;
+      color: #ffd75e;
+      border: 1px solid #555;
+      border-radius: 4px;
+      padding: 22px 18px;
+      font-family: monospace;
+      font-size: 18px;
+      text-align: left;
+      cursor: pointer;
+      margin-bottom: 12px;
+    }
+    button.powerup:hover:not(:disabled) { background: #3a3a52; }
+    button.powerup:disabled { opacity: 0.4; cursor: default; }
+
+    #boards { color: #aaa; margin-bottom: 18px; }
+    #boards.none { color: #e66; }
+
+    /* The grant log. Scrolls, newest last, and is never cleared: it is the
+       page's copy of the record the bridge is also printing to its stdout. */
+    #log {
+      border: 1px solid #333;
+      border-radius: 6px;
+      background: rgba(255,255,255,0.02);
+      padding: 12px 14px;
+      margin-top: 20px;
+      max-height: 40vh;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      color: #aaa;
+      font-size: 13px;
+    }
+    #log .ok { color: #8c8; }
+    #log .fail { color: #e66; }
+    #log .head { color: #ddd; }
+  </style>
+</head>
+<body>
+<h1>Powerups</h1>
+<p class="subtitle">
+  One press hands that powerup to every badge plugged in right now. The badge
+  keeps it in flash — the game reads it, the badge just carries it.
+</p>
+<p id="boards">connecting…</p>
+<div id="buttons"></div>
+<div id="log"></div>
+<!-- ?v= is a cache buster: CI rewrites "dev" to the commit SHA on deploy. -->
+<script src="/powerups.js?v=dev"></script>
+</body>
+</html>

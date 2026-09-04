@@ -20,6 +20,7 @@
 // Usage:
 //   node bridge/tools/inject.mjs --list
 //   node bridge/tools/inject.mjs --babies 3,2,1,1,2 --seed 1f3c9a04
+//   node bridge/tools/inject.mjs --powerups 3        # 3 canisters
 //   node bridge/tools/inject.mjs --sweep 6000
 //   node bridge/tools/inject.mjs --board 4 --colors none   # boardless look
 //   node bridge/tools/inject.mjs --clear
@@ -28,6 +29,15 @@ import { createContext, runInContext } from "node:vm";
 
 const BABY_TYPES = ["rose", "mint", "sky", "gold", "plum"];
 const DEFAULT_BABIES = [3, 2, 1, 1, 2];
+// Powerup kinds in ordinal order — a fourth copy of the list the firmware,
+// the bridge and the kiosk already keep (see controllers.js POWERUP_NAMES).
+// Only the LABELS are here; the bridge validates the count.
+const POWERUP_TYPES = ["canister"];
+// Absent unless asked for: unlike babies and the palette, powerups have a
+// mechanical effect (each canister is charges in the team pool), so a tool
+// that quietly defaulted them would change the balance of every run it
+// touched.  `--powerups` is opt-in and `--clear` zeroes them.
+const DEFAULT_POWERUPS = null;
 // Arbitrary, but FIXED: a default that rolled randomly would make "it looked
 // wrong on the last run" an unanswerable question.
 const DEFAULT_SEED = 0x1f3c9a04;
@@ -67,6 +77,7 @@ function usage(problem) {
   --list                 show linked boards and exit
   --board <linkId|uid>   which board (default: all linked)
   --babies <a,b,c,d,e>   per-type counts, ${BABY_TYPES.join("/")} (default: ${DEFAULT_BABIES.join(",")})
+  --powerups <a>         per-kind counts, ${POWERUP_TYPES.join("/")} (default: leave alone)
   --seed <hex>           brood seed, u32 (default: ${DEFAULT_SEED.toString(16)})
   --colors <a,b,c|auto|none|keep>
                          badge palette as six-digit hex.  auto = roll one from
@@ -83,7 +94,8 @@ function usage(problem) {
 
 function parseArgs(argv) {
   const out = {
-    list: false, target: "all", babies: undefined, seed: undefined,
+    list: false, target: "all", babies: undefined, powerups: DEFAULT_POWERUPS,
+    seed: undefined,
     colors: "auto", sweep: null, clear: false, reseat: true,
     port: Number(process.env.PORT ?? 3000),
   };
@@ -109,6 +121,14 @@ function parseArgs(argv) {
           usage(`--babies wants ${BABY_TYPES.length} non-negative integers`);
         }
         out.babies = parts.map(Number);
+        break;
+      }
+      case "--powerups": {
+        const parts = need().split(",");
+        if (parts.length !== POWERUP_TYPES.length || !parts.every((p) => /^\d+$/.test(p))) {
+          usage(`--powerups wants ${POWERUP_TYPES.length} non-negative integer(s)`);
+        }
+        out.powerups = parts.map(Number);
         break;
       }
       case "--seed": {
@@ -177,6 +197,15 @@ function broodPreview(seed) {
   return rollBroodPalette(seed).map((c) => `#${hex(c)}`);
 }
 
+/** A board's carried powerups, or "none" — the counts that become charges. */
+function describePowerups(counts) {
+  if (!Array.isArray(counts)) return "unknown (old bridge?)";
+  const named = counts
+    .map((n, i) => (n > 0 ? `${n} ${POWERUP_TYPES[i]}` : null))
+    .filter((s) => s !== null);
+  return named.length === 0 ? "none" : named.join(", ");
+}
+
 function describe(b) {
   const counts = b.babies
     .map((n, i) => (n > 0 ? `${n} ${BABY_TYPES[i]}` : null))
@@ -185,6 +214,7 @@ function describe(b) {
   const lines = [
     `  link ${b.linkId}  uid=${b.uid}${b.seated ? "" : "  (unseated)"}`,
     `    babies   ${total === 0 ? "none" : `${total} — ${counts.join(", ")}`}`,
+    `    powerups ${describePowerups(b.powerups)}`,
     `    palette  ${b.colors === null ? "none (renders greyscale)" : b.colors.map((c) => `#${c}`).join(" ")}`,
   ];
   if (b.seed === null) {
@@ -222,6 +252,7 @@ if (opts.clear) {
   const { applied } = await call(opts.port, "POST", "/api/dev/inject", {
     target: opts.target,
     babies: [0, 0, 0, 0, 0],
+    powerups: POWERUP_TYPES.map(() => 0),
     colors: null,
     seed: null,
     reseat: opts.reseat,
@@ -240,6 +271,9 @@ function bodyFor(seed) {
     seed,
     reseat: opts.reseat,
   };
+  // Omitted unless asked for, which is how the bridge tells "leave this stat
+  // alone" from "set it to zero" — see the note on DEFAULT_POWERUPS.
+  if (opts.powerups !== null) body.powerups = opts.powerups;
   if (opts.colors === "auto") {
     body.colors = rollPalette(mulberry32(seed)).map(hex);
   } else if (opts.colors === "none") {
