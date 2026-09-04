@@ -1114,10 +1114,17 @@ pub const Session = struct {
             },
             .restart => {
                 // Releases the END-SCREEN hold; mid-game it is a stray click.
-                // Any connection is honored — the browser tab that sends it
-                // may well be the room's observer display.  The next encounter
-                // begins PLAYING immediately: there is no screen between the
-                // report and the board, so this is the round's only click.
+                // Any connection is honored — whoever asks may well be the
+                // room's observer display rather than a seated player.  The
+                // next encounter begins PLAYING immediately: there is no
+                // screen between the report and the board.
+                //
+                // NOTHING in the shipped clients sends this: a round ends at
+                // the report, whose button returns the tab to the station, and
+                // the abandoned room is reaped.  A session that ends therefore
+                // normally holds until it dies.  Kept because it is the one
+                // way a LIVE session can play again, and it is how the tests
+                // and the e2e harness step from one encounter to the next.
                 if (self.restart_pending) {
                     // Seats are kept; the pool and the bar re-seed from them.
                     const label = self.cfg.encounters.default().label;
@@ -1385,8 +1392,10 @@ pub const Session = struct {
         });
         try self.broadcast_raw(fbs.getWritten());
 
-        // Hold at the end screen until a `restart` arrives; seated players
-        // keep their seats.
+        // Hold at the end screen until a `restart` arrives — which, for a
+        // shipped client, is never: the report's button walks the tab back to
+        // the station and the room is left to be reaped.  Seated players keep
+        // their seats, so a session that IS restarted resumes with its table.
         self.restart_pending = true;
     }
 

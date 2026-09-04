@@ -225,11 +225,18 @@ KIOSK_STATE_DIR=$ROOT/state
 # Budget roughly a megabyte per busy day; back it up by copying the directory.
 BADGE_LOG_DIR=$ROOT/records
 
-# Seconds to wait for git fetch before booting the last known good build.
+# Seconds to wait for origin to become genuinely reachable before giving up
+# and booting the last known good build.  network-online.target is reached
+# long before wifi carries traffic, so this — not the unit ordering — is what
+# stops the update racing the network.  Raise it if the access point is slow.
+NETWORK_WAIT=180
+# Seconds a single git fetch may hang before being killed.
 FETCH_TIMEOUT=60
 # Completed builds kept for manual rollback.
 KEEP_BUILDS=3
 # Seconds pi-kiosk.sh waits for the bridge before opening the browser anyway.
+# It keeps watching afterwards and reloads once the bridge appears, so this
+# does not need to cover a cold build.
 BRIDGE_WAIT=90
 
 # Shell snippet run before Chromium, for display setup (rotation, mode).
@@ -246,6 +253,25 @@ chmod 644 /etc/default/slimefeast
 
 log "writing systemd units"
 
+# network-online.target is only ever reached if something is enabled to pull
+# it in and wait.  On a default Pi OS install that is
+# NetworkManager-wait-online.service; if nothing enables it the target is
+# reached instantly and ordering after it means nothing at all.  Enabling it
+# does not make the target trustworthy on wifi (see pi-update.sh), it just
+# stops it being a complete no-op.
+for waiter in NetworkManager-wait-online.service systemd-networkd-wait-online.service; do
+  if systemctl list-unit-files "$waiter" &>/dev/null \
+     && systemctl list-unit-files "$waiter" | grep -q "$waiter"; then
+    if systemctl is-enabled "$waiter" &>/dev/null; then
+      log "$waiter already enabled"
+    else
+      log "enabling $waiter so network-online.target actually waits"
+      systemctl enable "$waiter" >/dev/null 2>&1 || warn "could not enable $waiter"
+    fi
+    break
+  fi
+done
+
 # Oneshot, not a timer: main is checked exactly once per boot, so the version
 # can never change under a table of players mid-session.  RemainAfterExit
 # keeps it "active" so the bridge's ordering dependency is satisfied.
@@ -253,6 +279,12 @@ log "writing systemd units"
 # It exits 0 even when it fails on purpose (see pi-update.sh) — a Requires=
 # on a unit that can legitimately fail would stop the kiosk booting offline,
 # which is the opposite of what an event machine needs.
+#
+# network-online.target is ordering only, and on wifi it is NOT enough: it is
+# reached once NetworkManager has finished managing its devices, which is
+# before association/DHCP/DNS work.  pi-update.sh therefore waits for origin
+# to be genuinely reachable itself.  The target stays because it is free and
+# usually gets us most of the way there.
 cat > /etc/systemd/system/slimefeast-update.service <<EOF
 [Unit]
 Description=Slime Feast kiosk: update to latest $BRANCH and build

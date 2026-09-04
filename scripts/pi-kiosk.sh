@@ -6,14 +6,19 @@
 # system service (slimefeast-bridge) and is NOT started here — this script
 # only owns the browser.
 #
-# Two things make this more than a one-line chromium invocation, both of them
+# Three things make this more than a one-line chromium invocation, all of them
 # lessons about a machine with no keyboard that gets its power cut nightly:
 #
 #   1. The session starts long before the bridge is listening, and Chromium
 #      caches the failure — land on ERR_CONNECTION_REFUSED once and the kiosk
 #      sits on an error page until someone reloads it.  So: wait for a real
 #      HTTP 200 before launching.
-#   2. An unclean shutdown leaves a crash flag in the profile, and the next
+#   2. That wait cannot be unbounded (a broken bridge would leave a bare
+#      desktop with no clue on screen) and cannot be short either, because the
+#      bridge waits on the update, which waits on wifi and may then do a cold
+#      build.  So: wait BRIDGE_WAIT, launch regardless, and keep watching —
+#      when the bridge finally answers, restart the browser onto the game.
+#   3. An unclean shutdown leaves a crash flag in the profile, and the next
 #      boot renders a "Restore pages?" bubble over the game with no input
 #      device able to dismiss it.  So: scrub the flag every launch.
 
@@ -26,9 +31,13 @@ ROOT="${ROOT:-/opt/slimefeast}"
 PORT="${PORT:-3000}"
 KIOSK_URL="${KIOSK_URL:-http://localhost:${PORT}/}"
 # How long to wait for the bridge before opening the browser anyway.  Giving
-# up and launching beats staring at a blank desktop: a bridge that is merely
-# slow will be picked up by Chromium's own retry, and one that is broken shows
-# an error page an operator can actually see.
+# up and launching beats staring at a blank desktop: a broken bridge then
+# shows an error page an operator can actually see and diagnose.
+#
+# It does NOT need to cover a slow boot.  Launching early is recoverable —
+# the loop below keeps polling and restarts the browser onto the game once
+# the bridge answers — so this is only the point at which we stop assuming
+# things are fine and put something on screen.
 BRIDGE_WAIT="${BRIDGE_WAIT:-90}"
 # Shell snippet run once before the browser, for display setup that is not
 # yet decided (rotation, mode, overscan) — e.g. a panel mounted upside down:
@@ -86,18 +95,19 @@ fi
 # Wait for the bridge
 # ---------------------------------------------------------------------------
 
-log "waiting for bridge on port $PORT (up to ${BRIDGE_WAIT}s)"
-deadline=$(( SECONDS + BRIDGE_WAIT ))
-# -s, and no -S: a connection-refused per second for up to BRIDGE_WAIT is
-# expected here, and logging every one of them would bury the real message.
-until curl -fs --max-time 2 -o /dev/null "http://localhost:${PORT}/"; do
-  if (( SECONDS >= deadline )); then
-    warn "bridge did not answer in ${BRIDGE_WAIT}s — launching anyway"
-    warn "check: systemctl status slimefeast-bridge"
-    break
-  fi
-  sleep 1
-done
+# -s, and no -S: a connection-refused per second while we poll is expected,
+# and logging every one of them would bury the real message.
+bridge_up() { curl -fs --max-time 2 -o /dev/null "http://localhost:${PORT}/"; }
+
+# 0 = bridge answered, 1 = gave up waiting.
+wait_for_bridge() {
+  local deadline=$(( SECONDS + BRIDGE_WAIT ))
+  until bridge_up; do
+    (( SECONDS >= deadline )) && return 1
+    sleep 1
+  done
+  return 0
+}
 
 # ---------------------------------------------------------------------------
 # Launch, and keep it up
@@ -161,6 +171,17 @@ log "launching $CHROMIUM at $KIOSK_URL"
 trap 'rm -f "$PIDFILE"' EXIT
 
 while :; do
+  # The bridge can legitimately be minutes late, not seconds: it is ordered
+  # after the update unit, which waits for wifi to actually carry traffic and
+  # may then do a cold Zig build.
+  if wait_for_bridge; then
+    bridge_ready=1
+  else
+    bridge_ready=0
+    warn "bridge did not answer in ${BRIDGE_WAIT}s — opening the browser anyway"
+    warn "check: systemctl status slimefeast-update slimefeast-bridge"
+  fi
+
   clear_crash_flags
 
   # Backgrounded so the PID can be published for the bridge to signal, then
@@ -183,7 +204,33 @@ while :; do
   chromium_pid=$!
   printf '%s\n' "$chromium_pid" > "$PIDFILE"
 
-  wait "$chromium_pid" || warn "chromium exited non-zero"
+  # We launched onto Chromium's connection-error page, which has no
+  # auto-refresh.  On a machine with no keyboard that is a dead end, so watch
+  # for the bridge and reload onto the game the moment it answers.  This is
+  # what makes a slow boot — long wifi wait, then a cold build — safe to sit
+  # through unattended: the kiosk heals itself instead of needing someone to
+  # notice it is parked on an error.
+  reloading=0
+  if (( bridge_ready == 0 )); then
+    while kill -0 "$chromium_pid" 2>/dev/null; do
+      if bridge_up; then
+        log "bridge came up — reloading the kiosk onto the game"
+        reloading=1
+        # Not mistakable for the kill switch: only the bridge ever writes
+        # EXITFLAG, and it is checked below on its own terms.
+        kill "$chromium_pid" 2>/dev/null
+        break
+      fi
+      sleep 2
+    done
+  fi
+
+  wait "$chromium_pid"
+  chromium_status=$?
+  # A non-zero status is expected and uninteresting when we did the killing.
+  if (( reloading == 0 && chromium_status != 0 )); then
+    warn "chromium exited non-zero (status $chromium_status)"
+  fi
   rm -f "$PIDFILE"
 
   # The exit flag is the ONLY thing that distinguishes an operator holding the
@@ -195,6 +242,12 @@ while :; do
     log "exit requested from the kiosk page — leaving the desktop up"
     log "to bring the kiosk back, run: $0"
     exit 0
+  fi
+
+  # A planned reload, so skip the cooldown: the bridge is up and the game
+  # should be on screen now, not in three seconds.
+  if (( reloading == 1 )); then
+    continue
   fi
 
   # A crash on an unattended kiosk should come back, not leave a bare desktop.

@@ -106,12 +106,40 @@ buttons) reading the pre-rotation frame.
 
 | Unit / hook                 | Does                                                     |
 | --------------------------- | -------------------------------------------------------- |
-| `slimefeast-update.service` | oneshot: fetch `origin/main`, build it, publish it        |
+| `slimefeast-update.service` | oneshot: wait for wifi, fetch `origin/main`, build, publish |
 | `slimefeast-bridge.service` | the Node bridge on port 3000 (spawns a server per lobby)  |
 | `~/.config/labwc/autostart` | `pi-kiosk.sh` — waits for the bridge, opens Chromium      |
 
 The version check runs **once per boot**, never on a timer, so a deploy can
 never change the game under a table of players mid-session.
+
+### Not racing the wifi
+
+`slimefeast-update.service` is ordered `After=network-online.target`, and on
+wifi **that is not enough** — the target is reached once NetworkManager has
+finished *managing* its devices, which happens well before association, DHCP
+and DNS actually work.  An update ordered only on the target loses the race
+every boot, fails its fetch, falls soft, and quietly runs forever on whatever
+it first built.
+
+So the target is kept as a cheap approximation and `pi-update.sh` establishes
+the real precondition itself: it polls `git ls-remote` — the authenticated
+operation it is about to depend on — for up to `NETWORK_WAIT` seconds (default
+180) before fetching.  Nothing cheaper is sufficient; DNS resolves before the
+wifi can route, the route exists before the deploy key is readable, and a
+captive portal answers everything. If it never comes up, git's actual error is
+logged once so a dead access point and a bad deploy key are distinguishable.
+
+`pi-setup.sh` also enables `NetworkManager-wait-online.service`, without which
+`network-online.target` is reached instantly and the ordering means nothing at
+all.
+
+The knock-on is that the bridge — ordered after the update — can be minutes
+late on a cold build. `pi-kiosk.sh` handles that by launching after
+`BRIDGE_WAIT` regardless and then *continuing to watch*: when the bridge
+finally answers it restarts the browser onto the game. Chromium's
+connection-error page has no auto-refresh, so on a device with no keyboard
+that recovery is the difference between a slow boot and a dead kiosk.
 
 ### Atomic deploys
 
@@ -162,9 +190,11 @@ sudo systemctl restart slimefeast-bridge
 ```
 
 Knobs live in `/etc/default/slimefeast` (`BRANCH`, `PORT`, `KIOSK_URL`,
-`FETCH_TIMEOUT`, `KEEP_BUILDS`, `BRIDGE_WAIT`, `DISPLAY_SETUP`,
-`KIOSK_STATE_DIR`).  Edit, then
-restart the two units.  `DISPLAY_SETUP` is an empty shell hook for display
+`NETWORK_WAIT`, `FETCH_TIMEOUT`, `KEEP_BUILDS`, `BRIDGE_WAIT`,
+`DISPLAY_SETUP`, `KIOSK_STATE_DIR`).  Edit, then
+restart the two units.  Raise `NETWORK_WAIT` if the venue's access point is
+slow to hand out a lease — it is the budget for wifi coming up, and spending
+it costs nothing on a Pi that is already online.  `DISPLAY_SETUP` is an empty shell hook for display
 config once the kiosk hardware is settled, e.g.
 `DISPLAY_SETUP='wlr-randr --output HDMI-A-1 --transform 90'`.
 `KIOSK_STATE_DIR` is the handshake directory that arms the hold-to-exit button

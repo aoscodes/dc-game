@@ -32,7 +32,9 @@
  *     sent: for those, "none" is an answer rather than a silence.  All of
  *     them must land before JOIN; the server freezes a player's stats when
  *     they take their seat.
- *   stdin  <- RESTART\n     start the next round (tab button click)
+ *   stdin  <- RESTART\n     release the end-screen hold into the next
+ *                          encounter (unsent: the report returns to the
+ *                          station instead — see index.js's header)
  *   stdout -> {"tag":"render",...}\n            stdout -> {"tag":"send","bytes":"<hex>"}\n
  */
 

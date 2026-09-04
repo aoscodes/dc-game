@@ -44,9 +44,28 @@ BRANCH="${BRANCH:-main}"
 # A captive-portal wifi that accepts the TCP connection and then never
 # answers is the case this exists for.
 FETCH_TIMEOUT="${FETCH_TIMEOUT:-60}"
+# How long to wait for wifi to actually carry traffic before giving up and
+# booting the last known good build.
+#
+# systemd's network-online.target is NOT sufficient here and was the original
+# bug: on Raspberry Pi OS it is satisfied once NetworkManager has finished
+# *managing* its devices, which on wifi happens well before association, DHCP
+# and DNS are usable — so the unit ordered "after network is online" still
+# raced the wifi and lost, every boot, silently (fetch failed, fail-soft
+# kicked in, the Pi quietly ran forever on whatever it first built).
+#
+# So the target is kept as a cheap first approximation and the real
+# precondition is established here, by probing the thing we actually need.
+NETWORK_WAIT="${NETWORK_WAIT:-180}"
 # Completed builds kept for rollback.  Each is a full worktree (~tens of MB
 # plus zig-out); three is enough to walk back from a bad deploy by hand.
 KEEP_BUILDS="${KEEP_BUILDS:-3}"
+
+# Non-interactive by construction.  Without BatchMode a missing or rejected
+# key makes ssh sit waiting for a passphrase on a unit with no terminal,
+# turning a clear failure into a hang until TimeoutStartSec.
+export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=10}"
+export GIT_TERMINAL_PROMPT=0
 
 SRC="$ROOT/src"
 BUILDS="$ROOT/builds"
@@ -78,12 +97,49 @@ done
 mkdir -p "$BUILDS" "$STATE" "$ROOT/custom-configs" || bail "cannot write under $ROOT"
 
 # ---------------------------------------------------------------------------
-# 1. What does origin say?
+# 1. Wait for the network to actually work
+# ---------------------------------------------------------------------------
+
+# Probes with the real operation — an authenticated ls-remote of the branch we
+# want — rather than a ping or a DNS lookup.  Anything cheaper passes while
+# the thing we need still fails: DNS resolves before the wifi can route, the
+# route exists before the deploy key is readable, and a captive portal answers
+# everything.  If this succeeds, the fetch below will succeed.
+wait_for_origin() {
+  local deadline=$(( SECONDS + NETWORK_WAIT )) attempt=0
+  while :; do
+    attempt=$(( attempt + 1 ))
+    if timeout 25 git -C "$SRC" ls-remote --exit-code --quiet origin \
+         "refs/heads/$BRANCH" >/dev/null 2>&1; then
+      (( attempt > 1 )) && log "origin reachable after ${SECONDS}s (attempt $attempt)"
+      return 0
+    fi
+    (( SECONDS >= deadline )) && return 1
+    # Every 5th attempt, so a slow-joining wifi leaves a readable trail in the
+    # journal instead of a wall of identical lines.
+    (( attempt % 5 == 1 )) && log "origin unreachable, waiting for network (${SECONDS}s/${NETWORK_WAIT}s)"
+    sleep 5
+  done
+}
+
+log "waiting for origin to become reachable (up to ${NETWORK_WAIT}s)"
+if ! wait_for_origin; then
+  # Show the real error once, now that we have stopped polling: a bad deploy
+  # key and a dead access point both look like "unreachable" above, and the
+  # difference is the whole diagnosis.
+  warn "last error from git:"
+  timeout 25 git -C "$SRC" ls-remote --exit-code origin "refs/heads/$BRANCH" 2>&1 \
+    | sed 's/^/[pi-update]   /' >&2
+  bail "origin unreachable after ${NETWORK_WAIT}s (wifi down? deploy key?)"
+fi
+
+# ---------------------------------------------------------------------------
+# 2. What does origin say?
 # ---------------------------------------------------------------------------
 
 log "fetching origin/$BRANCH"
 if ! timeout "$FETCH_TIMEOUT" git -C "$SRC" fetch --prune --quiet origin "$BRANCH"; then
-  bail "git fetch failed or timed out (offline?)"
+  bail "git fetch failed or timed out"
 fi
 
 SHA="$(git -C "$SRC" rev-parse --verify --quiet "refs/remotes/origin/$BRANCH")" \
@@ -105,7 +161,7 @@ fi
 log "target origin/$BRANCH = $SHORT"
 
 # ---------------------------------------------------------------------------
-# 2. Materialise the commit in its own worktree
+# 3. Materialise the commit in its own worktree
 # ---------------------------------------------------------------------------
 
 # A previous run may have died mid-build and left a partial tree.  It has no
@@ -134,7 +190,7 @@ abort_build() {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Wire in the state that must outlive a deploy
+# 4. Wire in the state that must outlive a deploy
 # ---------------------------------------------------------------------------
 
 # bridge/index.js resolves ../custom-configs and ../zig-out relative to
@@ -151,7 +207,7 @@ mkdir -p "$ROOT/node_modules"
 ln -sfn "$ROOT/node_modules" "$BUILD_DIR/bridge/node_modules"
 
 # ---------------------------------------------------------------------------
-# 4. npm deps — only when the lockfile actually moved
+# 5. npm deps — only when the lockfile actually moved
 # ---------------------------------------------------------------------------
 
 LOCK="$BUILD_DIR/bridge/package-lock.json"
@@ -183,7 +239,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Build
+# 6. Build
 # ---------------------------------------------------------------------------
 
 # The default step installs BOTH binaries (build.zig installs client and
@@ -209,7 +265,7 @@ for bin in client server; do
 done
 
 # ---------------------------------------------------------------------------
-# 6. Smoke check the shipped data files
+# 7. Smoke check the shipped data files
 # ---------------------------------------------------------------------------
 
 # The server loads data/*.json at process start and dies on an invalid file.
@@ -223,7 +279,7 @@ if ! "$BUILD_DIR/zig-out/bin/server" 0 --data-dir "$BUILD_DIR/data" --validate; 
 fi
 
 # ---------------------------------------------------------------------------
-# 7. Publish, atomically
+# 8. Publish, atomically
 # ---------------------------------------------------------------------------
 
 printf '%s\n' "$SHA" > "$STAMP"
@@ -241,7 +297,7 @@ fi
 log "now serving $SHORT"
 
 # ---------------------------------------------------------------------------
-# 8. Flag provisioning drift
+# 9. Flag provisioning drift
 # ---------------------------------------------------------------------------
 
 # The boot path (these scripts, the systemd units, the autostart hook) is
@@ -266,7 +322,7 @@ if [[ -f "$LIBDIR/pi-setup.sha256" && -f "$BUILD_DIR/scripts/pi-setup.sh" ]]; th
 fi
 
 # ---------------------------------------------------------------------------
-# 9. Prune
+# 10. Prune
 # ---------------------------------------------------------------------------
 
 # Keep the newest few stamped builds so an operator can roll back by moving

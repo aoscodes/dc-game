@@ -312,7 +312,7 @@ const LAYOUT = {
     // Match-wide feast tallies (one row per measure, label + colored cells).
     pcols: { name: 40, casts: 190, covered: 250, defused: 420, recipes: 590 },
     hintFont: 14,
-    // The clickable "next round" button, bottom-centred under the report.
+    // The clickable "back to station" button, bottom-centred under the report.
     button: { w: 320, h: 52, bottomGap: 28, font: 18 },
   },
 };
@@ -743,7 +743,7 @@ function drawError() {
   if (roomError?.hint) {
     text(roomError.hint, L.x, SH / 2 + L.subDy, L.subFont, "rgba(110,110,120,1)");
   }
-  drawHoldButton(roomError?.way.label ?? "BACK TO MENU");
+  drawHoldButton(roomError?.way.label ?? STATION_BUTTON_LABEL);
 }
 
 /**
@@ -5106,7 +5106,7 @@ function drawGameOver(msg) {
   text(`Neutral slime consumed: ${score}${hungerText}`, L.x, L.scoreY, L.scoreFont, C_SLIME_HDR);
 
   if (!stats) {
-    drawHoldButton("START NEXT ROUND");
+    drawHoldButton(STATION_BUTTON_LABEL);
     return;
   }
 
@@ -5151,8 +5151,22 @@ function drawGameOver(msg) {
   text(`total spells cast: ${stats.casts_total}  ·  slime eaten: ${eaten}/${stats.slime_total ?? 0}`,
     P.name, y, L.rowFont, "rgba(70,70,85,0.95)");
 
-  drawHoldButton("START NEXT ROUND");
+  drawHoldButton(STATION_BUTTON_LABEL);
 }
+
+/**
+ * Where a finished round lets out: the station directory.
+ *
+ * A round ENDS here — it does not roll over into the next one.  The report is
+ * the last thing this tab does, and the way on is the same three tiles the
+ * player started from, so a run that has been read is handed back to the
+ * station rather than relaunched under whoever walks up next.
+ *
+ * A navigation, not a reconnect: dropping the socket is what releases the
+ * room, and a fresh /game is what mints the next one.
+ */
+const STATION_HREF = "/";
+const STATION_BUTTON_LABEL = "BACK TO STATION";
 
 /** Design-space bounds of the hold-screen button.  Fixed geometry, so click
  *  hit-testing needs no per-frame state. */
@@ -5167,8 +5181,8 @@ let holdHover = false;
  * (once its outro replay lands) or the dead end.  Clicks anywhere else must
  * not advance the match.
  *
- * ONE rect serves both because they are mutually exclusive phases; what the
- * press MEANS is decided by the phase at click time (see the click handler),
+ * ONE rect serves both because they are mutually exclusive phases; where the
+ * press LEADS is decided by the phase at click time (see the click handler),
  * never by the geometry.
  */
 function holdButtonActive() {
@@ -5176,7 +5190,7 @@ function holdButtonActive() {
     latestMsg?.phase === "error";
 }
 
-/** The one way past a hold: a CLICK, from a browser tab.  Drawn as a real
+/** The one way off a hold: a CLICK, from a browser tab.  Drawn as a real
  *  button so the trigger is unmistakably deliberate. */
 function drawHoldButton(label) {
   const B = LAYOUT.gameOver.button;
@@ -5459,7 +5473,7 @@ function newGameHref() {
  */
 function showRoomError(reason) {
   const RETRY = { label: "START A NEW GAME", href: newGameHref };
-  const MENU = { label: "BACK TO MENU", href: () => "/" };
+  const MENU = { label: STATION_BUTTON_LABEL, href: () => STATION_HREF };
   const KNOWN = {
     not_found: {
       title: "That game has finished.",
@@ -5647,22 +5661,22 @@ canvas.addEventListener("mousemove", (e) => {
   canvas.style.cursor = holdHover ? "pointer" : "default";
 });
 
-// Starting the next round is a CLICK on the report's button — deliberately
-// not a key, so nobody mashing casts at the buzzer relaunches the game by
-// accident.  Computed from the event (not the hover flag) so touch works.
+// Leaving a hold is a CLICK on its button — deliberately not a key, so nobody
+// mashing casts at the buzzer walks the game out from under the table.
+// Computed from the event (not the hover flag) so touch works.
+//
+// BOTH holds NAVIGATE; neither resumes anything in place.  The dead end has no
+// room to return to, and the report's room is finished — so each is a full load
+// rather than a reconnect, and nothing from the attempt just ended (the socket,
+// the balance tables, the reconnect timer, the frame inbox) outlives it.
+//
+// The phase only picks the destination: the dead end's is per-reason, the
+// report's is always the station.
 canvas.addEventListener("click", (e) => {
   if (!overHoldButton(e)) return;
-  // The dead end's button NAVIGATES rather than advances: there is no room to
-  // restart, and the socket it would be asked over is the one that failed.  A
-  // full load rather than a reconnect, so nothing from the failed attempt —
-  // the socket, the balance tables, the reconnect timer — outlives it.
-  if (latestMsg?.phase === "error") {
-    location.href = roomError?.way.href() ?? "/";
-    return;
-  }
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ action: "restart" }));
-  }
+  location.href = latestMsg?.phase === "error"
+    ? (roomError?.way.href() ?? STATION_HREF)
+    : STATION_HREF;
 });
 
 // ---------------------------------------------------------------------------

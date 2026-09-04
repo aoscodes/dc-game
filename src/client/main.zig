@@ -186,10 +186,10 @@ fn stdin_reader(_: void) void {
             // ignored by the server when the game is full.
             send_take_slot();
         } else if (std.mem.eql(u8, trimmed, "RESTART")) {
-            // The browser tab's report-screen button was clicked: the ONLY
-            // way a next round starts.  It arrives as its own stdio line —
-            // never a KEY: — so no keyboard mash can trigger it, and board
-            // sessions (which have no button) can never send it.
+            // Releases the server's end-screen hold into the next encounter.
+            // No page asks for this now — the report's button returns the tab
+            // to the station — but it arrives as its own stdio line, never a
+            // KEY:, so a keyboard mash could not reach it if one did.
             send_restart();
         } else if (std.mem.startsWith(u8, trimmed, WIRE_PREFIX)) {
             const hex = trimmed[WIRE_PREFIX.len..];
@@ -531,11 +531,12 @@ pub fn main() !void {
             .connecting => {},
             .game => update_game(),
             .game_over => {
-                // The end screen holds until a browser tab CLICKS the
-                // report's button (the RESTART stdio line); keys do nothing
-                // here, they are only drained so presses made at the buzzer
-                // cannot leak into the next round.  The phase flips when the
-                // server answers with a fresh game_start.
+                // The end screen holds for as long as this client lives: the
+                // report's button returns the tab to the station, which takes
+                // the client down with it.  Keys do nothing here, they are
+                // only drained so presses made at the buzzer cannot leak into
+                // whatever comes next (a RESTART, from a test or a tool, is
+                // still answered with a fresh game_start).
                 _ = g_key_queue.pop();
             },
         }

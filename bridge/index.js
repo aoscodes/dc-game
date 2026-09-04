@@ -17,8 +17,10 @@
  * A tab attaches as an OBSERVER of the running game.  Taking one of the four
  * player seats is the browser's P key (Shift+P leaves), forwarded like any
  * other key — the Zig client turns it into the take_slot/leave_slot protocol.
- * Starting the next round from the end screen is a CLICK on the report's
- * button ({ action: "restart" } → RESTART stdio line); only tabs have one.
+ * A round does NOT roll over: the end screen's button sends the tab back to
+ * the station directory, which drops this socket and lets the room go.  The
+ * next round is a fresh /game.  ({ action: "restart" } → RESTART is still
+ * carried for the protocol's sake, but no page sends it.)
  *
  * Responsibilities per TabSession:
  *   - Create or join the room the tab's URL asks for, on its first message
@@ -57,7 +59,8 @@
  *   Zig stdin  ← KEY:<name>\n   browser KeyboardEvent.key value
  *   Zig stdin  ← READY\n        sent when the server WS opens
  *   Zig stdin  ← JOIN\n         take a player seat (board sessions)
- *   Zig stdin  ← RESTART\n      start the next round (tab button click)
+ *   Zig stdin  ← RESTART\n      release the end-screen hold into the next
+ *                               encounter (no page sends this any more)
  *   Zig stdout → {"tag":"render",...}\n   full UI state for the browser
  *   Zig stdout → {"tag":"send","bytes":"<hex>"}\n  forward to server
  */
@@ -1345,9 +1348,10 @@ browserWss.on("connection", (tabWs) => {
       return;
     }
 
-    // The report screen's button: only browser tabs can start the next
-    // round, and only by this click (never a key), so the action routes
-    // here rather than through the KEY: path.
+    // Releases a server's end-screen hold into the next encounter.  Kept as
+    // an action rather than a KEY: so it can never be reached by mashing the
+    // keyboard — but nothing sends it now: the report's button returns the tab
+    // to the station instead, and the room is left to be reaped.
     if (msg.action === "restart") {
       if (session.started) session.writeToZig("RESTART\n");
       return;
