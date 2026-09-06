@@ -49,8 +49,11 @@ KIOSK_URL="${KIOSK_URL:-http://localhost:${PORT}/}"
 # avoids.
 KIOSK_AUTOSTART="${KIOSK_AUTOSTART:-0}"
 case "$KIOSK_AUTOSTART" in
-  0|1) ;;
-  *) printf '[pi-setup] ERROR: KIOSK_AUTOSTART must be 0 or 1, got %q\n' "$KIOSK_AUTOSTART" >&2; exit 1 ;;
+0 | 1) ;;
+*)
+  printf '[pi-setup] ERROR: KIOSK_AUTOSTART must be 0 or 1, got %q\n' "$KIOSK_AUTOSTART" >&2
+  exit 1
+  ;;
 esac
 
 # Set when autostart is off, so the closing summary can describe the machine
@@ -67,9 +70,12 @@ NODE_MAJOR=22
 # and a script must never be rewritten underneath its own running shell.
 LIBDIR="/usr/local/lib/slimefeast"
 
-log()  { printf '\n[pi-setup] %s\n' "$*"; }
+log() { printf '\n[pi-setup] %s\n' "$*"; }
 warn() { printf '[pi-setup] WARN: %s\n' "$*" >&2; }
-die()  { printf '[pi-setup] ERROR: %s\n' "$*" >&2; exit 1; }
+die() {
+  printf '[pi-setup] ERROR: %s\n' "$*" >&2
+  exit 1
+}
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -90,8 +96,8 @@ USER_HOME="$(getent passwd "$KIOSK_USER" | cut -d: -f6)"
 # The repo this script was run from — the source of truth for the copies we
 # install below, and for the origin URL of the clone we are about to make.
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_SRC="$(git -C "$SELF_DIR" rev-parse --show-toplevel 2>/dev/null)" \
-  || die "run this from a clone of the repo (scripts/pi-setup.sh)"
+REPO_SRC="$(git -C "$SELF_DIR" rev-parse --show-toplevel 2>/dev/null)" ||
+  die "run this from a clone of the repo (scripts/pi-setup.sh)"
 REPO_URL="${REPO_URL:-$(git -C "$REPO_SRC" remote get-url origin)}"
 
 log "provisioning kiosk: user=$KIOSK_USER root=$ROOT branch=$BRANCH port=$PORT"
@@ -114,14 +120,14 @@ apt-get install -y --no-install-recommends \
 # that applies the Pi's hardware flags); plain Debian calls it chromium.
 if ! command -v chromium-browser >/dev/null && ! command -v chromium >/dev/null; then
   log "installing chromium"
-  apt-get install -y chromium-browser || apt-get install -y chromium \
-    || die "could not install chromium"
+  apt-get install -y chromium-browser || apt-get install -y chromium ||
+    die "could not install chromium"
 fi
 
 # Node: match CI (22.x).  Pi OS ships an older major, so add NodeSource unless
 # what is already there is new enough.
 node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
-if (( node_major < NODE_MAJOR )); then
+if ((node_major < NODE_MAJOR)); then
   log "installing Node.js ${NODE_MAJOR}.x (found major: $node_major)"
   curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash -
   apt-get install -y nodejs
@@ -143,8 +149,8 @@ else
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
   curl -fsSL "$ZIG_TARBALL" -o "$tmp/zig.tar.xz"
-  printf '%s  %s\n' "$ZIG_SHA256" "$tmp/zig.tar.xz" | sha256sum -c - \
-    || die "Zig tarball checksum mismatch"
+  printf '%s  %s\n' "$ZIG_SHA256" "$tmp/zig.tar.xz" | sha256sum -c - ||
+    die "Zig tarball checksum mismatch"
   rm -rf "/opt/zig-$ZIG_VERSION"
   mkdir -p "/opt/zig-$ZIG_VERSION"
   tar -xJf "$tmp/zig.tar.xz" -C "/opt/zig-$ZIG_VERSION" --strip-components=1
@@ -152,7 +158,8 @@ else
   # would drop the new link inside the old version's directory).
   ln -sfn "/opt/zig-$ZIG_VERSION" /opt/zig
   ln -sfn /opt/zig/zig /usr/local/bin/zig
-  rm -rf "$tmp"; trap - EXIT
+  rm -rf "$tmp"
+  trap - EXIT
   [[ "$(zig version)" == "$ZIG_VERSION" ]] || die "Zig install did not take"
 fi
 
@@ -186,13 +193,13 @@ as_user mkdir -p "$USER_HOME/.ssh"
 as_user touch "$USER_HOME/.ssh/known_hosts"
 chmod 700 "$USER_HOME/.ssh"
 if ! as_user ssh-keygen -F github.com -f "$USER_HOME/.ssh/known_hosts" >/dev/null; then
-  ssh-keyscan -t ed25519 github.com 2>/dev/null >> "$USER_HOME/.ssh/known_hosts"
+  ssh-keyscan -t ed25519 github.com 2>/dev/null >>"$USER_HOME/.ssh/known_hosts"
   chown "$KIOSK_USER:$KIOSK_USER" "$USER_HOME/.ssh/known_hosts"
 fi
 
 log "checking deploy key can reach $REPO_URL"
-as_user git ls-remote --exit-code "$REPO_URL" "refs/heads/$BRANCH" >/dev/null \
-  || die "cannot reach $REPO_URL branch $BRANCH as $KIOSK_USER — install the read-only deploy key at $USER_HOME/.ssh/ first"
+as_user git ls-remote --exit-code "$REPO_URL" "refs/heads/$BRANCH" >/dev/null ||
+  die "cannot reach $REPO_URL branch $BRANCH as $KIOSK_USER — install the read-only deploy key at $USER_HOME/.ssh/ first"
 
 if [[ -d "$ROOT/src/.git" ]]; then
   log "clone already present at $ROOT/src"
@@ -214,10 +221,10 @@ for s in pi-update.sh pi-kiosk.sh; do
 done
 # Recorded so pi-update.sh can tell the journal when a newly deployed commit
 # changes provisioning and this script needs re-running.
-sha256sum "$REPO_SRC/scripts/pi-setup.sh" | cut -d' ' -f1 > "$LIBDIR/pi-setup.sha256"
+sha256sum "$REPO_SRC/scripts/pi-setup.sh" | cut -d' ' -f1 >"$LIBDIR/pi-setup.sha256"
 
 log "writing /etc/default/slimefeast"
-cat > /etc/default/slimefeast <<EOF
+cat >/etc/default/slimefeast <<EOF
 # Slime Feast kiosk configuration.  Read by slimefeast-update.service,
 # slimefeast-bridge.service and pi-kiosk.sh.  Edit, then:
 #   sudo systemctl restart slimefeast-update slimefeast-bridge
@@ -258,230 +265,230 @@ BRIDGE_WAIT=90
 EOF
 chmod 644 /etc/default/slimefeast
 
-# ---------------------------------------------------------------------------
-# systemd units
-# ---------------------------------------------------------------------------
-
-log "writing systemd units"
-
-# network-online.target is only ever reached if something is enabled to pull
-# it in and wait.  On a default Pi OS install that is
-# NetworkManager-wait-online.service; if nothing enables it the target is
-# reached instantly and ordering after it means nothing at all.  Enabling it
-# does not make the target trustworthy on wifi (see pi-update.sh), it just
-# stops it being a complete no-op.
-for waiter in NetworkManager-wait-online.service systemd-networkd-wait-online.service; do
-  if systemctl list-unit-files "$waiter" &>/dev/null \
-     && systemctl list-unit-files "$waiter" | grep -q "$waiter"; then
-    if systemctl is-enabled "$waiter" &>/dev/null; then
-      log "$waiter already enabled"
-    else
-      log "enabling $waiter so network-online.target actually waits"
-      systemctl enable "$waiter" >/dev/null 2>&1 || warn "could not enable $waiter"
-    fi
-    break
-  fi
-done
-
-# Oneshot, not a timer: main is checked exactly once per boot, so the version
-# can never change under a table of players mid-session.  RemainAfterExit
-# keeps it "active" so the bridge's ordering dependency is satisfied.
+## ---------------------------------------------------------------------------
+## systemd units
+## ---------------------------------------------------------------------------
 #
-# It exits 0 even when it fails on purpose (see pi-update.sh) — a Requires=
-# on a unit that can legitimately fail would stop the kiosk booting offline,
-# which is the opposite of what an event machine needs.
+#log "writing systemd units"
 #
-# network-online.target is ordering only, and on wifi it is NOT enough: it is
-# reached once NetworkManager has finished managing its devices, which is
-# before association/DHCP/DNS work.  pi-update.sh therefore waits for origin
-# to be genuinely reachable itself.  The target stays because it is free and
-# usually gets us most of the way there.
-cat > /etc/systemd/system/slimefeast-update.service <<EOF
-[Unit]
-Description=Slime Feast kiosk: update to latest $BRANCH and build
-Wants=network-online.target
-After=network-online.target
-Before=slimefeast-bridge.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-User=$KIOSK_USER
-Group=$KIOSK_USER
-EnvironmentFile=/etc/default/slimefeast
-ExecStart=$LIBDIR/pi-update.sh
-# A cold Zig build on a Pi is minutes, not seconds.
-TimeoutStartSec=1800
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-# The bridge is the only long-lived process: it serves web/ + data/ + /ws and
-# spawns one game-server process per lobby itself (bridge/index.js), so there
-# is no separate server unit.
+## network-online.target is only ever reached if something is enabled to pull
+## it in and wait.  On a default Pi OS install that is
+## NetworkManager-wait-online.service; if nothing enables it the target is
+## reached instantly and ordering after it means nothing at all.  Enabling it
+## does not make the target trustworthy on wifi (see pi-update.sh), it just
+## stops it being a complete no-op.
+#for waiter in NetworkManager-wait-online.service systemd-networkd-wait-online.service; do
+#  if systemctl list-unit-files "$waiter" &>/dev/null \
+#     && systemctl list-unit-files "$waiter" | grep -q "$waiter"; then
+#    if systemctl is-enabled "$waiter" &>/dev/null; then
+#      log "$waiter already enabled"
+#    else
+#      log "enabling $waiter so network-online.target actually waits"
+#      systemctl enable "$waiter" >/dev/null 2>&1 || warn "could not enable $waiter"
+#    fi
+#    break
+#  fi
+#done
 #
-# WorkingDirectory is the `current` symlink, which pi-update.sh only ever
-# points at a commit that built and whose data files validated.  Ordering
-# after the update means the symlink is already correct at start — the bridge
-# is never restarted out from under players.
-cat > /etc/systemd/system/slimefeast-bridge.service <<EOF
-[Unit]
-Description=Slime Feast bridge (serves the game, spawns a server per lobby)
-After=network.target slimefeast-update.service
-Wants=slimefeast-update.service
-
-[Service]
-User=$KIOSK_USER
-Group=$KIOSK_USER
-SupplementaryGroups=dialout
-EnvironmentFile=/etc/default/slimefeast
-WorkingDirectory=$ROOT/current
-ExecStart=/usr/bin/node $ROOT/current/bridge/index.js
-Restart=always
-RestartSec=3
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable slimefeast-update.service slimefeast-bridge.service >/dev/null
-
-# ---------------------------------------------------------------------------
-# labwc autostart — the browser
-# ---------------------------------------------------------------------------
-
-LABWC_DIR="$USER_HOME/.config/labwc"
-AUTOSTART="$LABWC_DIR/autostart"
-
-# Marker-delimited so this script owns exactly its own lines: re-running
-# updates the block in place instead of appending a second launcher, and
-# turning autostart off removes it without disturbing whatever else the
-# session starts.
-MARKER_BEGIN="# >>> slimefeast kiosk >>>"
-MARKER_END="# <<< slimefeast kiosk <<<"
-
-# The existing block comes out either way.  That is what makes
-# KIOSK_AUTOSTART=0 an instruction rather than merely an omission: a machine
-# provisioned with autostart on is un-provisioned by a re-run, which matters
-# because re-running this script is the only way to change the boot path.
-if [[ -f "$AUTOSTART" ]] && grep -qF "$MARKER_BEGIN" "$AUTOSTART"; then
-  log "removing the existing kiosk block from $AUTOSTART"
-  sed -i "/${MARKER_BEGIN}/,/${MARKER_END}/d" "$AUTOSTART"
-fi
-
-if (( KIOSK_AUTOSTART )); then
-  log "hooking pi-kiosk.sh into the labwc session"
-  as_user mkdir -p "$LABWC_DIR"
-
-  # A user autostart REPLACES the system one rather than adding to it, so seed
-  # from /etc/xdg/labwc/autostart on first run — otherwise the Pi's own session
-  # startup (panel, desktop, notifications) silently disappears.
-  #
-  # Only when a block is actually being added: with autostart off there is no
-  # reason to shadow the system file, and a stray copy of it is one more thing
-  # to explain to whoever debugs this session next.
-  if [[ ! -f "$AUTOSTART" ]]; then
-    if [[ -f /etc/xdg/labwc/autostart ]]; then
-      log "seeding $AUTOSTART from the system default"
-      install -o "$KIOSK_USER" -g "$KIOSK_USER" -m 755 /etc/xdg/labwc/autostart "$AUTOSTART"
-    else
-      warn "no /etc/xdg/labwc/autostart found — is this labwc? creating a bare one"
-      as_user touch "$AUTOSTART"
-      chmod 755 "$AUTOSTART"
-    fi
-  fi
-
-  cat >> "$AUTOSTART" <<EOF
-$MARKER_BEGIN
-# Managed by scripts/pi-setup.sh — edits here are overwritten on re-run.
-# Backgrounded so it cannot stall the rest of the session while it waits for
-# the bridge; it logs to ~/.local/state/slimefeast-kiosk.log.
-mkdir -p "\$HOME/.local/state"
-$LIBDIR/pi-kiosk.sh >> "\$HOME/.local/state/slimefeast-kiosk.log" 2>&1 &
-$MARKER_END
-EOF
-  chown "$KIOSK_USER:$KIOSK_USER" "$AUTOSTART"
-else
-  log "kiosk autostart OFF — the browser will not open at boot"
-  MANUAL_LAUNCH=1
-fi
-
-# ---------------------------------------------------------------------------
-# Pi behaviour: autologin, no blanking
-# ---------------------------------------------------------------------------
-
-if command -v raspi-config >/dev/null; then
-  log "enabling desktop autologin for $KIOSK_USER and disabling screen blanking"
-  # B4 = boot to desktop, autologin.  Without it there is no Wayland session
-  # for the browser to appear in, and nobody to type a password at an event.
-  raspi-config nonint do_boot_behaviour B4 || warn "could not set boot behaviour"
-  # 1 = blanking off.  raspi-config knows where this lives for the current
-  # display stack, which is why this is not a hand-written config edit.
-  raspi-config nonint do_blanking 1 || warn "could not disable screen blanking"
-  if [[ "$KIOSK_USER" != "pi" ]]; then
-    warn "raspi-config autologin targets the default user; verify autologin is for $KIOSK_USER"
-  fi
-else
-  warn "raspi-config not found — set desktop autologin and disable screen blanking manually"
-fi
-
-# ---------------------------------------------------------------------------
-# First build
-# ---------------------------------------------------------------------------
-
-log "running the first update + build (this takes a while on a Pi)"
-systemctl start slimefeast-update.service || warn "update unit reported failure"
-
-if [[ -L "$ROOT/current" ]]; then
-  systemctl restart slimefeast-bridge.service
-  log "bridge started on http://localhost:$PORT/"
-else
-  warn "no build was published — the bridge cannot start yet"
-  warn "check: journalctl -u slimefeast-update -n 50"
-fi
-
-cat <<EOF
-
-=== pi-setup.sh complete ===
-
-  serving      $KIOSK_URL
-  deployment   $ROOT/current -> $(readlink "$ROOT/current" 2>/dev/null || echo '<none yet>')
-
-  logs         journalctl -u slimefeast-update -u slimefeast-bridge -f
-               tail -f $USER_HOME/.local/state/slimefeast-kiosk.log
-  force update sudo systemctl restart slimefeast-update slimefeast-bridge
-  pin version  sudo ln -sfn $ROOT/builds/<sha> $ROOT/current.new \\
-                 && sudo mv -T $ROOT/current.new $ROOT/current \\
-                 && sudo systemctl mask slimefeast-update
-EOF
-
-if (( MANUAL_LAUNCH )); then
-  cat <<EOF
-  start kiosk  $LIBDIR/pi-kiosk.sh
-  stop kiosk   touch $ROOT/state/kiosk-exit && pkill -f chromium
-
-The browser does NOT open at boot: this Pi comes up to a desktop with the
-bridge already serving, and you start the kiosk when you want it.  Note that
-pi-kiosk.sh reopens the browser a few seconds after it closes, so the exit
-flag above is what actually ends a session.
-
-Re-run with KIOSK_AUTOSTART=1 to have it open at login instead.
-
-Reboot to verify the boot path (autologin -> bridge -> desktop):
-
-  sudo reboot
-EOF
-else
-  cat <<EOF
-
-Reboot to verify the whole path (autologin -> bridge -> kiosk tab):
-
-  sudo reboot
-EOF
-fi
+## Oneshot, not a timer: main is checked exactly once per boot, so the version
+## can never change under a table of players mid-session.  RemainAfterExit
+## keeps it "active" so the bridge's ordering dependency is satisfied.
+##
+## It exits 0 even when it fails on purpose (see pi-update.sh) — a Requires=
+## on a unit that can legitimately fail would stop the kiosk booting offline,
+## which is the opposite of what an event machine needs.
+##
+## network-online.target is ordering only, and on wifi it is NOT enough: it is
+## reached once NetworkManager has finished managing its devices, which is
+## before association/DHCP/DNS work.  pi-update.sh therefore waits for origin
+## to be genuinely reachable itself.  The target stays because it is free and
+## usually gets us most of the way there.
+#cat > /etc/systemd/system/slimefeast-update.service <<EOF
+#[Unit]
+#Description=Slime Feast kiosk: update to latest $BRANCH and build
+#Wants=network-online.target
+#After=network-online.target
+#Before=slimefeast-bridge.service
+#
+#[Service]
+#Type=oneshot
+#RemainAfterExit=yes
+#User=$KIOSK_USER
+#Group=$KIOSK_USER
+#EnvironmentFile=/etc/default/slimefeast
+#ExecStart=$LIBDIR/pi-update.sh
+## A cold Zig build on a Pi is minutes, not seconds.
+#TimeoutStartSec=1800
+#StandardOutput=journal
+#StandardError=journal
+#
+#[Install]
+#WantedBy=multi-user.target
+#EOF
+#
+## The bridge is the only long-lived process: it serves web/ + data/ + /ws and
+## spawns one game-server process per lobby itself (bridge/index.js), so there
+## is no separate server unit.
+##
+## WorkingDirectory is the `current` symlink, which pi-update.sh only ever
+## points at a commit that built and whose data files validated.  Ordering
+## after the update means the symlink is already correct at start — the bridge
+## is never restarted out from under players.
+#cat > /etc/systemd/system/slimefeast-bridge.service <<EOF
+#[Unit]
+#Description=Slime Feast bridge (serves the game, spawns a server per lobby)
+#After=network.target slimefeast-update.service
+#Wants=slimefeast-update.service
+#
+#[Service]
+#User=$KIOSK_USER
+#Group=$KIOSK_USER
+#SupplementaryGroups=dialout
+#EnvironmentFile=/etc/default/slimefeast
+#WorkingDirectory=$ROOT/current
+#ExecStart=/usr/bin/node $ROOT/current/bridge/index.js
+#Restart=always
+#RestartSec=3
+#StandardOutput=journal
+#StandardError=journal
+#
+#[Install]
+#WantedBy=multi-user.target
+#EOF
+#
+#systemctl daemon-reload
+#systemctl enable slimefeast-update.service slimefeast-bridge.service >/dev/null
+#
+## ---------------------------------------------------------------------------
+## labwc autostart — the browser
+## ---------------------------------------------------------------------------
+#
+#LABWC_DIR="$USER_HOME/.config/labwc"
+#AUTOSTART="$LABWC_DIR/autostart"
+#
+## Marker-delimited so this script owns exactly its own lines: re-running
+## updates the block in place instead of appending a second launcher, and
+## turning autostart off removes it without disturbing whatever else the
+## session starts.
+#MARKER_BEGIN="# >>> slimefeast kiosk >>>"
+#MARKER_END="# <<< slimefeast kiosk <<<"
+#
+## The existing block comes out either way.  That is what makes
+## KIOSK_AUTOSTART=0 an instruction rather than merely an omission: a machine
+## provisioned with autostart on is un-provisioned by a re-run, which matters
+## because re-running this script is the only way to change the boot path.
+#if [[ -f "$AUTOSTART" ]] && grep -qF "$MARKER_BEGIN" "$AUTOSTART"; then
+#  log "removing the existing kiosk block from $AUTOSTART"
+#  sed -i "/${MARKER_BEGIN}/,/${MARKER_END}/d" "$AUTOSTART"
+#fi
+#
+#if (( KIOSK_AUTOSTART )); then
+#  log "hooking pi-kiosk.sh into the labwc session"
+#  as_user mkdir -p "$LABWC_DIR"
+#
+#  # A user autostart REPLACES the system one rather than adding to it, so seed
+#  # from /etc/xdg/labwc/autostart on first run — otherwise the Pi's own session
+#  # startup (panel, desktop, notifications) silently disappears.
+#  #
+#  # Only when a block is actually being added: with autostart off there is no
+#  # reason to shadow the system file, and a stray copy of it is one more thing
+#  # to explain to whoever debugs this session next.
+#  if [[ ! -f "$AUTOSTART" ]]; then
+#    if [[ -f /etc/xdg/labwc/autostart ]]; then
+#      log "seeding $AUTOSTART from the system default"
+#      install -o "$KIOSK_USER" -g "$KIOSK_USER" -m 755 /etc/xdg/labwc/autostart "$AUTOSTART"
+#    else
+#      warn "no /etc/xdg/labwc/autostart found — is this labwc? creating a bare one"
+#      as_user touch "$AUTOSTART"
+#      chmod 755 "$AUTOSTART"
+#    fi
+#  fi
+#
+#  cat >> "$AUTOSTART" <<EOF
+#$MARKER_BEGIN
+## Managed by scripts/pi-setup.sh — edits here are overwritten on re-run.
+## Backgrounded so it cannot stall the rest of the session while it waits for
+## the bridge; it logs to ~/.local/state/slimefeast-kiosk.log.
+#mkdir -p "\$HOME/.local/state"
+#$LIBDIR/pi-kiosk.sh >> "\$HOME/.local/state/slimefeast-kiosk.log" 2>&1 &
+#$MARKER_END
+#EOF
+#  chown "$KIOSK_USER:$KIOSK_USER" "$AUTOSTART"
+#else
+#  log "kiosk autostart OFF — the browser will not open at boot"
+#  MANUAL_LAUNCH=1
+#fi
+#
+## ---------------------------------------------------------------------------
+## Pi behaviour: autologin, no blanking
+## ---------------------------------------------------------------------------
+#
+#if command -v raspi-config >/dev/null; then
+#  log "enabling desktop autologin for $KIOSK_USER and disabling screen blanking"
+#  # B4 = boot to desktop, autologin.  Without it there is no Wayland session
+#  # for the browser to appear in, and nobody to type a password at an event.
+#  raspi-config nonint do_boot_behaviour B4 || warn "could not set boot behaviour"
+#  # 1 = blanking off.  raspi-config knows where this lives for the current
+#  # display stack, which is why this is not a hand-written config edit.
+#  raspi-config nonint do_blanking 1 || warn "could not disable screen blanking"
+#  if [[ "$KIOSK_USER" != "pi" ]]; then
+#    warn "raspi-config autologin targets the default user; verify autologin is for $KIOSK_USER"
+#  fi
+#else
+#  warn "raspi-config not found — set desktop autologin and disable screen blanking manually"
+#fi
+#
+## ---------------------------------------------------------------------------
+## First build
+## ---------------------------------------------------------------------------
+#
+#log "running the first update + build (this takes a while on a Pi)"
+#systemctl start slimefeast-update.service || warn "update unit reported failure"
+#
+#if [[ -L "$ROOT/current" ]]; then
+#  systemctl restart slimefeast-bridge.service
+#  log "bridge started on http://localhost:$PORT/"
+#else
+#  warn "no build was published — the bridge cannot start yet"
+#  warn "check: journalctl -u slimefeast-update -n 50"
+#fi
+#
+#cat <<EOF
+#
+#=== pi-setup.sh complete ===
+#
+#  serving      $KIOSK_URL
+#  deployment   $ROOT/current -> $(readlink "$ROOT/current" 2>/dev/null || echo '<none yet>')
+#
+#  logs         journalctl -u slimefeast-update -u slimefeast-bridge -f
+#               tail -f $USER_HOME/.local/state/slimefeast-kiosk.log
+#  force update sudo systemctl restart slimefeast-update slimefeast-bridge
+#  pin version  sudo ln -sfn $ROOT/builds/<sha> $ROOT/current.new \\
+#                 && sudo mv -T $ROOT/current.new $ROOT/current \\
+#                 && sudo systemctl mask slimefeast-update
+#EOF
+#
+#if (( MANUAL_LAUNCH )); then
+#  cat <<EOF
+#  start kiosk  $LIBDIR/pi-kiosk.sh
+#  stop kiosk   touch $ROOT/state/kiosk-exit && pkill -f chromium
+#
+#The browser does NOT open at boot: this Pi comes up to a desktop with the
+#bridge already serving, and you start the kiosk when you want it.  Note that
+#pi-kiosk.sh reopens the browser a few seconds after it closes, so the exit
+#flag above is what actually ends a session.
+#
+#Re-run with KIOSK_AUTOSTART=1 to have it open at login instead.
+#
+#Reboot to verify the boot path (autologin -> bridge -> desktop):
+#
+#  sudo reboot
+#EOF
+#else
+#  cat <<EOF
+#
+#Reboot to verify the whole path (autologin -> bridge -> kiosk tab):
+#
+#  sudo reboot
+#EOF
+#fi
